@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+memory/agent_memory.db
+workspace/*.log
+workspace/*.csv
+workspace/*.xlsx
+.env

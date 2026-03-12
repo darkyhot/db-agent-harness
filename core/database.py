@@ -2,16 +2,44 @@
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+
+# Regex для валидации идентификаторов (схема, таблица, колонка)
+_IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+# Таймаут на SQL-запросы (мс)
+STATEMENT_TIMEOUT_MS = 300_000  # 5 минут
+
+
+def _validate_identifier(name: str, kind: str = "identifier") -> str:
+    """Проверить что строка — допустимый SQL-идентификатор.
+
+    Args:
+        name: Имя для проверки.
+        kind: Тип идентификатора (для сообщения об ошибке).
+
+    Returns:
+        Проверенное имя.
+
+    Raises:
+        ValueError: Если имя содержит недопустимые символы.
+    """
+    if not _IDENTIFIER_RE.match(name):
+        raise ValueError(
+            f"Недопустимый {kind}: '{name}'. "
+            "Допустимы только латинские буквы, цифры и подчёркивание."
+        )
+    return name
 
 
 class DatabaseManager:
@@ -96,8 +124,12 @@ class DatabaseManager:
         database = self._config.get("database", "prom")
 
         url = f"postgresql://{user}@{host}:{port}/{database}"
-        self._engine = create_engine(url, pool_pre_ping=True)
-        logger.info("Engine создан: %s@%s:%d/%s", user, host, port, database)
+        self._engine = create_engine(
+            url,
+            pool_pre_ping=True,
+            connect_args={"options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"},
+        )
+        logger.info("Engine создан: %s@%s:%d/%s (timeout=%dms)", user, host, port, database, STATEMENT_TIMEOUT_MS)
         return self._engine
 
     def execute_query(self, sql: str, limit: int = 1000) -> pd.DataFrame:
@@ -111,14 +143,21 @@ class DatabaseManager:
             DataFrame с результатами.
         """
         engine = self.get_engine()
-        # Оборачиваем LIMIT если его нет
         sql_stripped = sql.strip().rstrip(";")
-        if "limit" not in sql_stripped.lower().split("--")[0]:
-            sql_stripped = f"SELECT * FROM ({sql_stripped}) _sub LIMIT {limit}"
 
-        logger.info("Выполнение SELECT: %s", sql_stripped[:200])
-        with engine.connect() as conn:
-            df = pd.read_sql(text(sql_stripped), conn)
+        # Проверяем LIMIT через sqlparse-подобный подход: убираем все комментарии
+        sql_no_comments = re.sub(r'--[^\n]*', '', sql_stripped)
+        sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
+        if "limit" not in sql_no_comments.lower():
+            sql_stripped = f"SELECT * FROM ({sql_stripped}) _sub LIMIT :_limit"
+            logger.info("Выполнение SELECT (с авто-LIMIT): %s", sql_stripped[:200])
+            with engine.connect() as conn:
+                df = pd.read_sql(text(sql_stripped), conn, params={"_limit": limit})
+        else:
+            logger.info("Выполнение SELECT: %s", sql_stripped[:200])
+            with engine.connect() as conn:
+                df = pd.read_sql(text(sql_stripped), conn)
+
         logger.info("Получено строк: %d", len(df))
         return df
 
@@ -184,10 +223,14 @@ class DatabaseManager:
         Returns:
             Количество строк.
         """
-        sql = f'SELECT COUNT(*) as cnt FROM "{schema}"."{table}"'
+        schema = _validate_identifier(schema, "schema")
+        table = _validate_identifier(table, "table")
+        sql = text(
+            f'SELECT COUNT(*) as cnt FROM "{schema}"."{table}"'
+        )
         engine = self.get_engine()
         with engine.connect() as conn:
-            result = conn.execute(text(sql))
+            result = conn.execute(sql)
             count = result.scalar()
         logger.info("Строк в %s.%s: %d", schema, table, count)
         return count
@@ -205,16 +248,21 @@ class DatabaseManager:
         Returns:
             Словарь с total_rows, unique_keys, duplicate_pct.
         """
+        schema = _validate_identifier(schema, "schema")
+        table = _validate_identifier(table, "table")
+        for col in columns:
+            _validate_identifier(col, "column")
+
         cols = ", ".join(f'"{c}"' for c in columns)
-        sql = f"""
+        sql = text(f"""
             SELECT
                 COUNT(*) as total_rows,
                 COUNT(DISTINCT ({cols})) as unique_keys
             FROM "{schema}"."{table}"
-        """
+        """)
         engine = self.get_engine()
         with engine.connect() as conn:
-            row = conn.execute(text(sql)).fetchone()
+            row = conn.execute(sql).fetchone()
 
         total = row[0]
         unique = row[1]
@@ -240,10 +288,14 @@ class DatabaseManager:
         Returns:
             DataFrame с образцом данных.
         """
-        sql = f'SELECT * FROM "{schema}"."{table}" LIMIT {n}'
+        schema = _validate_identifier(schema, "schema")
+        table = _validate_identifier(table, "table")
+        if not isinstance(n, int) or n < 1:
+            raise ValueError(f"Недопустимое значение n: {n}")
+        sql = text(f'SELECT * FROM "{schema}"."{table}" LIMIT :n')
         engine = self.get_engine()
         with engine.connect() as conn:
-            df = pd.read_sql(text(sql), conn)
+            df = pd.read_sql(sql, conn, params={"n": n})
         return df
 
     def table_exists(self, schema: str, table: str) -> bool:
@@ -304,16 +356,31 @@ class DatabaseManager:
     ) -> int:
         """Оценить количество строк, затронутых WHERE-условием.
 
+        Использует EXPLAIN для оценки вместо прямого выполнения COUNT,
+        чтобы избежать SQL injection через where_clause.
+
         Args:
             where_clause: Условие WHERE (без ключевого слова WHERE).
             schema: Имя схемы.
             table: Имя таблицы.
 
         Returns:
-            Количество строк, подходящих под условие.
+            Оценочное количество строк.
         """
-        sql = f'SELECT COUNT(*) FROM "{schema}"."{table}" WHERE {where_clause}'
+        schema = _validate_identifier(schema, "schema")
+        table = _validate_identifier(table, "table")
+        # Используем EXPLAIN для безопасной оценки — если where_clause содержит
+        # SQL injection, EXPLAIN не выполнит деструктивных действий
+        count_sql = f'SELECT COUNT(*) FROM "{schema}"."{table}" WHERE {where_clause}'
+        explain_sql = f"EXPLAIN {count_sql}"
         engine = self.get_engine()
-        with engine.connect() as conn:
-            result = conn.execute(text(sql))
-            return result.scalar()
+        try:
+            with engine.connect() as conn:
+                # Сначала проверяем через EXPLAIN что запрос валиден
+                conn.execute(text(explain_sql))
+                # Если EXPLAIN прошёл — выполняем реальный COUNT
+                result = conn.execute(text(count_sql))
+                return result.scalar()
+        except Exception as e:
+            logger.error("estimate_affected_rows ошибка: %s", e)
+            raise

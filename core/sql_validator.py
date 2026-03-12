@@ -147,9 +147,20 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
 
 
 def _has_where_or_limit(sql: str) -> bool:
-    """Проверить наличие WHERE или LIMIT в запросе."""
-    upper = sql.upper()
-    # Игнорируем подзапросы — смотрим на основной запрос
+    """Проверить наличие WHERE или LIMIT в основном запросе.
+
+    Убирает подзапросы в скобках и строковые литералы перед проверкой,
+    чтобы избежать ложных срабатываний.
+    """
+    # Убираем строковые литералы
+    cleaned = re.sub(r"'[^']*'", "''", sql)
+    # Убираем содержимое подзапросов в скобках (рекурсивно, до 5 уровней)
+    for _ in range(5):
+        prev = cleaned
+        cleaned = re.sub(r'\([^()]*\)', '()', cleaned)
+        if cleaned == prev:
+            break
+    upper = cleaned.upper()
     return "WHERE" in upper or "LIMIT" in upper
 
 

@@ -13,26 +13,8 @@ from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator
 from core.database import DatabaseManager
 from graph.state import AgentState
-from tools.db_tools import DB_TOOLS
-from tools.fs_tools import FS_TOOLS
-from tools.schema_tools import SCHEMA_TOOLS
 
 logger = logging.getLogger(__name__)
-
-ALL_TOOLS = FS_TOOLS + DB_TOOLS + SCHEMA_TOOLS
-
-# Описание инструментов для LLM
-TOOLS_DESCRIPTION = "\n".join(
-    f"- {t.name}: {t.description}" for t in ALL_TOOLS
-)
-
-
-def _build_tool_map() -> dict[str, Any]:
-    """Построить словарь имя -> инструмент."""
-    return {t.name: t for t in ALL_TOOLS}
-
-
-TOOL_MAP = _build_tool_map()
 
 
 class GraphNodes:
@@ -47,6 +29,7 @@ class GraphNodes:
         schema_loader: SchemaLoader,
         memory: MemoryManager,
         sql_validator: SQLValidator,
+        tools: list,
     ) -> None:
         """Инициализация узлов графа.
 
@@ -56,12 +39,18 @@ class GraphNodes:
             schema_loader: Загрузчик схемы.
             memory: Менеджер памяти.
             sql_validator: Валидатор SQL.
+            tools: Список LangChain tools для агента.
         """
         self.llm = llm
         self.db = db_manager
         self.schema = schema_loader
         self.memory = memory
         self.validator = sql_validator
+        self.tools = tools
+        self.tool_map: dict[str, Any] = {t.name: t for t in tools}
+        self.tools_description = "\n".join(
+            f"- {t.name}: {t.description}" for t in tools
+        )
 
     def _get_system_prompt(self) -> str:
         """Сформировать системный промпт с контекстом."""
@@ -78,7 +67,7 @@ class GraphNodes:
             "Ты помогаешь аналитикам: отвечаешь на вопросы по структуре БД, пишешь и валидируешь SQL,\n"
             "делаешь выгрузки, проектируешь модели данных.\n\n"
             "Доступные инструменты:\n"
-            f"{TOOLS_DESCRIPTION}\n\n"
+            f"{self.tools_description}\n\n"
             "Правила:\n"
             "1. Всегда проверяй SQL через валидатор перед выполнением.\n"
             "2. Для JOIN-ов проверяй уникальность ключей.\n"
@@ -126,7 +115,7 @@ class GraphNodes:
             "last_error": None,
             "messages": state["messages"] + [
                 {"role": "user", "content": user_input},
-                {"role": "assistant", "content": f"План:\n" + "\n".join(plan)},
+                {"role": "assistant", "content": "План:\n" + "\n".join(plan)},
             ],
         }
 
@@ -173,15 +162,16 @@ class GraphNodes:
         current_step = plan[step_idx]
         logger.info("Executor: шаг %d/%d: %s", step_idx + 1, len(plan), current_step[:100])
 
+        prev_context = "\n".join(
+            f"  {tc['tool']}: {tc['result'][:200]}"
+            for tc in state.get("tool_calls", [])[-5:]
+        )
+
         prompt = (
             f"{self._get_system_prompt()}\n\n"
-            "Текущий шаг плана: {current_step}\n\n"
-            "Контекст предыдущих шагов:\n"
-            + "\n".join(
-                f"  {tc['tool']}: {tc['result'][:200]}"
-                for tc in state.get("tool_calls", [])[-5:]
-            )
-            + "\n\nВыполни этот шаг. Верни JSON с полями:\n"
+            f"Текущий шаг плана: {current_step}\n\n"
+            f"Контекст предыдущих шагов:\n{prev_context}\n\n"
+            "Выполни этот шаг. Верни JSON с полями:\n"
             '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n'
             "Если шаг не требует инструмента, верни:\n"
             '{"tool": "none", "result": "текстовый ответ"}\n'
@@ -229,15 +219,39 @@ class GraphNodes:
         }
 
     def _parse_tool_call(self, response: str) -> dict[str, Any]:
-        """Извлечь вызов инструмента из ответа LLM."""
+        """Извлечь вызов инструмента из ответа LLM.
+
+        Использует нежадный regex для корректного извлечения первого JSON-объекта.
+        """
         try:
-            match = re.search(r'\{.*\}', response, re.DOTALL)
+            match = re.search(r'\{.*?\}', response, re.DOTALL)
             if match:
                 parsed = json.loads(match.group())
                 if "tool" in parsed:
                     return parsed
         except (json.JSONDecodeError, ValueError):
             pass
+
+        # Пробуем найти вложенный JSON (с args внутри)
+        try:
+            # Ищем от первого { до последнего } — но только если первый простой regex не сработал
+            start = response.find('{')
+            if start != -1:
+                depth = 0
+                for i in range(start, len(response)):
+                    if response[i] == '{':
+                        depth += 1
+                    elif response[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            candidate = response[start:i + 1]
+                            parsed = json.loads(candidate)
+                            if "tool" in parsed:
+                                return parsed
+                            break
+        except (json.JSONDecodeError, ValueError):
+            pass
+
         return {"tool": "none", "result": response}
 
     def _call_tool(self, tool_name: str, args: dict[str, Any]) -> str:
@@ -250,16 +264,24 @@ class GraphNodes:
         Returns:
             Результат выполнения.
         """
-        if tool_name not in TOOL_MAP:
+        if tool_name not in self.tool_map:
             return f"Инструмент '{tool_name}' не найден."
         try:
-            tool_fn = TOOL_MAP[tool_name]
+            tool_fn = self.tool_map[tool_name]
             result = tool_fn.invoke(args)
             logger.info("Tool %s выполнен успешно", tool_name)
             return str(result)
         except Exception as e:
             logger.error("Tool %s ошибка: %s", tool_name, e)
             return f"Ошибка инструмента {tool_name}: {e}"
+
+    def _is_tool_error(self, result: str) -> bool:
+        """Проверить, является ли результат ошибкой инструмента.
+
+        Проверяет по префиксу 'Ошибка инструмента' вместо поиска слова 'Ошибка'
+        в произвольном месте строки, чтобы избежать ложных срабатываний на данных.
+        """
+        return result.startswith("Ошибка инструмента ") or result.startswith("Ошибка выполнения запроса:")
 
     def sql_validator_node(self, state: AgentState) -> dict[str, Any]:
         """Узел валидации SQL: проверяет SQL перед выполнением.
@@ -277,11 +299,12 @@ class GraphNodes:
         logger.info("Validator: проверка SQL: %s", sql[:200])
         result = self.validator.validate(sql)
 
-        # Требуется подтверждение пользователя
+        # Требуется подтверждение пользователя — сохраняем SQL в состоянии
         if result.needs_confirmation:
             return {
                 "needs_confirmation": True,
                 "confirmation_message": result.confirmation_message,
+                "sql_to_validate": sql,
                 "messages": state["messages"] + [
                     {"role": "assistant", "content": f"⚠️ {result.confirmation_message}"}
                 ],
@@ -351,16 +374,17 @@ class GraphNodes:
                                 f"Последняя ошибка: {error}",
             }
 
+        prev_context = "\n".join(
+            f"  {tc['tool']}: {tc['result'][:200]}"
+            for tc in state.get("tool_calls", [])[-3:]
+        )
+
         prompt = (
             f"{self._get_system_prompt()}\n\n"
             f"Текущий шаг: {current_step}\n"
             f"Ошибка: {error}\n\n"
-            "Контекст предыдущих вызовов:\n"
-            + "\n".join(
-                f"  {tc['tool']}: {tc['result'][:200]}"
-                for tc in state.get("tool_calls", [])[-3:]
-            )
-            + "\n\nИсправь ошибку. Верни исправленный вызов инструмента в формате JSON:\n"
+            f"Контекст предыдущих вызовов:\n{prev_context}\n\n"
+            "Исправь ошибку. Верни исправленный вызов инструмента в формате JSON:\n"
             '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}'
         )
 
@@ -382,7 +406,7 @@ class GraphNodes:
         # Вызов исправленного инструмента
         result = self._call_tool(tool_call["tool"], tool_call.get("args", {}))
 
-        if "Ошибка" in str(result):
+        if self._is_tool_error(result):
             return {
                 "last_error": str(result),
                 "retry_count": retry_count + 1,
@@ -425,10 +449,12 @@ class GraphNodes:
             for tc in state.get("tool_calls", [])
         )
 
+        plan_text = "\n".join(state.get("plan", []))
+
         prompt = (
             "Сформируй краткий и информативный ответ пользователю на основе результатов.\n\n"
             f"Запрос пользователя: {state['user_input']}\n\n"
-            f"План:\n" + "\n".join(state.get("plan", [])) + "\n\n"
+            f"План:\n{plan_text}\n\n"
             f"Результаты инструментов:\n{tool_results}\n\n"
             "Дай ответ на русском языке. Если были получены данные — включи их в ответ.\n"
             "Если были предупреждения — упомяни их."

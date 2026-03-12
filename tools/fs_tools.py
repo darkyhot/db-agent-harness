@@ -174,13 +174,13 @@ def create_directory(path: str) -> str:
 
 
 @tool
-def save_dataframe(data_json: str, filename: str, format: str = "csv") -> str:
+def save_dataframe(data_json: str, filename: str, output_format: str = "csv") -> str:
     """Сохранить данные (JSON-строку DataFrame) в файл в workspace/.
 
     Args:
         data_json: JSON-строка с данными (формат pandas orient='records').
         filename: Имя файла для сохранения.
-        format: Формат файла — 'csv' или 'excel'.
+        output_format: Формат файла — 'csv' или 'excel'.
 
     Returns:
         Сообщение об успехе или ошибке.
@@ -191,7 +191,7 @@ def save_dataframe(data_json: str, filename: str, format: str = "csv") -> str:
 
         df = pd.read_json(data_json, orient="records")
 
-        if format == "excel":
+        if output_format == "excel":
             df.to_excel(file_path, index=False)
         else:
             df.to_csv(file_path, index=False, encoding="utf-8")

@@ -10,10 +10,11 @@ from core.database import DatabaseManager
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.schema_loader import SchemaLoader
-from core.sql_validator import SQLValidator
+from core.sql_validator import SQLValidator, detect_mode, SQLMode
 from graph.graph import build_graph, create_initial_state
-from tools.db_tools import init_db_tools
-from tools.schema_tools import init_schema_tools
+from tools.db_tools import create_db_tools
+from tools.fs_tools import FS_TOOLS
+from tools.schema_tools import create_schema_tools
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +71,14 @@ class CLIInterface:
         self.schema = SchemaLoader()
         self.validator = SQLValidator(self.db)
 
-        # Инициализация tools
-        init_db_tools(self.db)
-        init_schema_tools(self.schema)
+        # Создание tools через DI (замыкания)
+        db_tools = create_db_tools(self.db, self.validator)
+        schema_tools = create_schema_tools(self.schema)
+        all_tools = FS_TOOLS + db_tools + schema_tools
 
         # Сборка графа
         self.graph = build_graph(
-            self.llm, self.db, self.schema, self.memory, self.validator
+            self.llm, self.db, self.schema, self.memory, self.validator, all_tools
         )
 
         # Стартуем сессию
@@ -128,9 +130,7 @@ class CLIInterface:
 
     def _handle_reset(self) -> None:
         """Сброс контекста текущей сессии."""
-        # Сохраняем резюме текущей сессии
         self._save_session_summary()
-        # Начинаем новую
         user_id = self.db._config.get("user_id", "")
         self.memory.start_session(user_id)
         print("✓ Контекст сброшен. Новая сессия начата.")
@@ -139,6 +139,7 @@ class CLIInterface:
         """Завершение работы с сохранением резюме."""
         print("\nСохранение резюме сессии...")
         self._save_session_summary()
+        self.memory.close()
         print("До свидания! 👋")
 
     def _save_session_summary(self) -> None:
@@ -147,7 +148,6 @@ class CLIInterface:
         if not messages:
             return
 
-        # Формируем контекст для резюме
         dialog = "\n".join(
             f"{m['role']}: {m['content'][:200]}" for m in messages[-20:]
         )
@@ -177,10 +177,8 @@ class CLIInterface:
                 print(f"\n⚠️  {msg}")
                 confirm = input("Введите YES для подтверждения: ").strip()
                 if confirm.upper() == "YES":
-                    # Повторяем с подтверждением — выполняем SQL напрямую
                     sql = result.get("sql_to_validate", "")
                     if sql:
-                        from core.sql_validator import detect_mode, SQLMode
                         mode = detect_mode(sql)
                         if mode == SQLMode.WRITE:
                             res = self.db.execute_write(sql)
@@ -191,6 +189,8 @@ class CLIInterface:
                         else:
                             df = self.db.execute_query(sql)
                             print(f"\n{df.to_markdown(index=False)}")
+                    else:
+                        print("SQL не найден в состоянии. Операция не выполнена.")
                     self.memory.add_message("assistant", "Запрос подтверждён и выполнен.")
                 else:
                     print("Отменено.")

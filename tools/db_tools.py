@@ -95,7 +95,7 @@ def create_db_tools(
 
     @tool
     def check_key_uniqueness(schema: str, table: str, columns: str) -> str:
-        """Проверить уникальность комбинации колонок (для валидации JOIN).
+        """Проверить уникальность комбинации колонок из CSV-справочника (для валидации JOIN).
 
         Args:
             schema: Имя схемы.
@@ -103,10 +103,35 @@ def create_db_tools(
             columns: Имена колонок через запятую (например: 'id,date').
 
         Returns:
-            Результат проверки уникальности.
+            Результат проверки уникальности по данным CSV.
         """
+        cols = [c.strip() for c in columns.split(",")]
+        if schema_loader is not None:
+            result = schema_loader.check_key_uniqueness(schema, table, cols)
+            if result.get("error"):
+                return result["error"]
+            if result["is_unique"]:
+                reason = "все колонки являются PK" if result["all_pk"] else "одна из колонок уникальна на 100%"
+                return (
+                    f"Ключ ({columns}) в {schema}.{table} уникален ({reason}).\n"
+                    + "\n".join(
+                        f"  {c}: unique_perc={d.get('unique_perc', '?')}%, is_pk={d.get('is_primary_key', False)}"
+                        for c, d in result["columns"].items()
+                        if d.get("found")
+                    )
+                )
+            return (
+                f"Ключ ({columns}) в {schema}.{table} НЕ уникален.\n"
+                f"Минимальный unique_perc среди колонок: {result['min_unique_perc']}% "
+                f"(дублей ~{result['duplicate_pct']}%)\n"
+                + "\n".join(
+                    f"  {c}: unique_perc={d.get('unique_perc', '?')}%, is_pk={d.get('is_primary_key', False)}"
+                    for c, d in result["columns"].items()
+                    if d.get("found")
+                )
+            )
+        # Fallback на БД если schema_loader не передан
         try:
-            cols = [c.strip() for c in columns.split(",")]
             result = db_manager.check_key_uniqueness(schema, table, cols)
             if result["is_unique"]:
                 return f"Ключ ({columns}) в {schema}.{table} уникален. Строк: {result['total_rows']:,}"

@@ -3,9 +3,10 @@
 import logging
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 logger = logging.getLogger(__name__)
 
@@ -25,55 +26,57 @@ class MemoryManager:
         self._db_path = db_path or DB_PATH
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._session_id: str | None = None
-        self._conn: sqlite3.Connection | None = None
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
-        """Получить или переиспользовать соединение с SQLite."""
-        if self._conn is None:
-            self._conn = sqlite3.connect(
-                str(self._db_path),
-                timeout=30,
-                check_same_thread=False,
-            )
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA busy_timeout=30000")
-        return self._conn
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
+        """Открыть соединение, выполнить операцию, закрыть."""
+        conn = sqlite3.connect(
+            str(self._db_path),
+            timeout=30,
+            check_same_thread=False,
+        )
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def close(self) -> None:
-        """Закрыть соединение с SQLite."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """Совместимость с прежним API (соединения теперь закрываются автоматически)."""
 
     def _init_db(self) -> None:
         """Создать таблицы если не существуют."""
-        conn = self._get_conn()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                timestamp TEXT,
-                summary TEXT,
-                user_id TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT REFERENCES sessions(id),
-                role TEXT,
-                content TEXT,
-                timestamp TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS long_term_memory (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at TEXT
-            )
-        """)
-        conn.commit()
+        with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    timestamp TEXT,
+                    summary TEXT,
+                    user_id TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT REFERENCES sessions(id),
+                    role TEXT,
+                    content TEXT,
+                    timestamp TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS long_term_memory (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT
+                )
+            """)
         logger.info("SQLite память инициализирована: %s", self._db_path)
 
     def start_session(self, user_id: str = "") -> str:
@@ -87,7 +90,7 @@ class MemoryManager:
         """
         self._session_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             conn.execute(
                 "INSERT INTO sessions (id, timestamp, summary, user_id) VALUES (?, ?, ?, ?)",
                 (self._session_id, now, "", user_id),
@@ -112,7 +115,7 @@ class MemoryManager:
             return
 
         now = datetime.now(timezone.utc).isoformat()
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             conn.execute(
                 "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
                 (self._session_id, role, content, now),
@@ -128,7 +131,7 @@ class MemoryManager:
             logger.warning("Нет активной сессии для сохранения резюме")
             return
 
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             conn.execute(
                 "UPDATE sessions SET summary = ? WHERE id = ?",
                 (summary, self._session_id),
@@ -144,7 +147,7 @@ class MemoryManager:
         Returns:
             Список словарей с id, timestamp, summary.
         """
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             cursor = conn.execute(
                 "SELECT id, timestamp, summary FROM sessions "
                 "WHERE summary != '' ORDER BY timestamp DESC LIMIT ?",
@@ -188,7 +191,7 @@ class MemoryManager:
         if not sid:
             return []
 
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             cursor = conn.execute(
                 "SELECT role, content, timestamp FROM messages "
                 "WHERE session_id = ? ORDER BY id",
@@ -211,7 +214,7 @@ class MemoryManager:
             value: Значение.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO long_term_memory (key, value, updated_at) "
                 "VALUES (?, ?, ?)",
@@ -228,7 +231,7 @@ class MemoryManager:
         Returns:
             Значение или None если не найдено.
         """
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             cursor = conn.execute(
                 "SELECT value FROM long_term_memory WHERE key = ?",
                 (key,),
@@ -242,7 +245,7 @@ class MemoryManager:
         Returns:
             Словарь key -> value.
         """
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             cursor = conn.execute("SELECT key, value FROM long_term_memory")
             rows = cursor.fetchall()
         return {r[0]: r[1] for r in rows}
@@ -253,14 +256,14 @@ class MemoryManager:
         Args:
             key: Ключ для удаления.
         """
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             conn.execute("DELETE FROM long_term_memory WHERE key = ?", (key,))
         logger.info("Долгосрочная память удалена: key=%s", key)
 
     @property
     def session_count(self) -> int:
         """Количество сессий с резюме."""
-        with self._get_conn() as conn:
+        with self._connect() as conn:
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM sessions WHERE summary != ''"
             )

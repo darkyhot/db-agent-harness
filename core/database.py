@@ -127,7 +127,6 @@ class DatabaseManager:
         self._engine = create_engine(
             url,
             pool_pre_ping=True,
-            pool_recycle=180,
             connect_args={"options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"},
         )
         logger.info("Engine создан: %s@%s:%d/%s (timeout=%dms)", user, host, port, database, STATEMENT_TIMEOUT_MS)

@@ -4,12 +4,15 @@
 """
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
 
 from core.database import DatabaseManager
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
+
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +241,38 @@ def create_db_tools(
             logger.error("execute_ddl error: %s", e)
             return f"Ошибка: {e}"
 
+    @tool
+    def export_query(sql: str, filename: str, output_format: str = "csv") -> str:
+        """Выполнить SELECT-запрос и сохранить результат в файл в workspace/.
+
+        Используй этот инструмент когда нужно сделать выгрузку данных в файл.
+        Не нужно сначала вызывать execute_query, а потом save_dataframe —
+        этот инструмент делает всё за один шаг.
+
+        Args:
+            sql: SQL-запрос (SELECT).
+            filename: Имя файла (например: 'report.csv', 'sample/outflow.csv').
+            output_format: Формат — 'csv' или 'excel'.
+
+        Returns:
+            Сообщение об успехе с количеством строк или ошибка.
+        """
+        try:
+            df = db_manager.execute_query(sql)
+            file_path = WORKSPACE_DIR / filename
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if output_format == "excel":
+                df.to_excel(file_path, index=False)
+            else:
+                df.to_csv(file_path, index=False, encoding="utf-8")
+
+            logger.info("Экспорт: %s (%d строк)", file_path, len(df))
+            return f"Сохранено в {filename} ({len(df)} строк)"
+        except Exception as e:
+            logger.error("export_query error: %s", e)
+            return f"Ошибка экспорта: {e}"
+
     tools_list = [
         execute_query,
         get_row_count,
@@ -249,5 +284,6 @@ def create_db_tools(
         execute_write,
         estimate_affected_rows,
         execute_ddl,
+        export_query,
     ]
     return tools_list

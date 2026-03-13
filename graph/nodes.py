@@ -218,10 +218,15 @@ class GraphNodes:
         current_step = plan[step_idx]
         logger.info("Executor: шаг %d/%d: %s", step_idx + 1, len(plan), current_step[:100])
 
-        prev_context = "\n".join(
-            f"  {tc['tool']}: {tc['result'][:200]}"
-            for tc in state.get("tool_calls", [])[-5:]
-        )
+        recent_calls = state.get("tool_calls", [])[-5:]
+        if recent_calls:
+            *old_calls, last_call = recent_calls
+            prev_context = "\n".join(
+                f"  {tc['tool']}: {tc['result'][:200]}" for tc in old_calls
+            )
+            prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
+        else:
+            prev_context = ""
 
         # Ищем упоминания таблиц в шаге и контексте — добавляем полные описания колонок
         tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
@@ -436,10 +441,15 @@ class GraphNodes:
                                 f"Последняя ошибка: {error}",
             }
 
-        prev_context = "\n".join(
-            f"  {tc['tool']}: {tc['result'][:200]}"
-            for tc in state.get("tool_calls", [])[-3:]
-        )
+        recent_calls = state.get("tool_calls", [])[-3:]
+        if recent_calls:
+            *old_calls, last_call = recent_calls
+            prev_context = "\n".join(
+                f"  {tc['tool']}: {tc['result'][:200]}" for tc in old_calls
+            )
+            prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
+        else:
+            prev_context = ""
 
         tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
         tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail else ""

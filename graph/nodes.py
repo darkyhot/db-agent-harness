@@ -52,6 +52,45 @@ class GraphNodes:
             f"- {t.name}: {t.description}" for t in tools
         )
 
+    def _get_tables_detail_context(self, text: str) -> str:
+        """Найти упоминания таблиц в тексте и вернуть полное описание их колонок из CSV.
+
+        Сканирует паттерны schema.table, сверяет с каталогом tables_list.csv
+        и для найденных таблиц возвращает get_table_info() из attr_list.csv.
+
+        Args:
+            text: Текст для сканирования (текущий шаг + контекст предыдущих).
+
+        Returns:
+            Форматированная строка с деталями таблиц или пустая строка.
+        """
+        df = self.schema.tables_df
+        if df.empty:
+            return ""
+
+        # Ищем паттерн schema.table в тексте
+        pattern = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b')
+        found = set()
+        for m in pattern.finditer(text):
+            schema_name, table_name = m.group(1).lower(), m.group(2).lower()
+            mask = (
+                df["schema_name"].str.lower() == schema_name
+            ) & (
+                df["table_name"].str.lower() == table_name
+            )
+            if not df[mask].empty:
+                row = df[mask].iloc[0]
+                found.add((row["schema_name"], row["table_name"]))
+
+        if not found:
+            return ""
+
+        details = [self.schema.get_table_info(s, t) for s, t in sorted(found)]
+        return (
+            "Детальное описание задействованных таблиц (колонки из справочника):\n"
+            + "\n\n".join(details)
+        )
+
     def _get_schema_context(self) -> str:
         """Сформировать краткий каталог таблиц из SchemaLoader."""
         df = self.schema.tables_df
@@ -184,8 +223,13 @@ class GraphNodes:
             for tc in state.get("tool_calls", [])[-5:]
         )
 
+        # Ищем упоминания таблиц в шаге и контексте — добавляем полные описания колонок
+        tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
+        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail else ""
+
         prompt = (
             f"{self._get_system_prompt()}\n\n"
+            f"{tables_detail_section}"
             f"Текущий шаг плана: {current_step}\n\n"
             f"Контекст предыдущих шагов:\n{prev_context}\n\n"
             "Выполни этот шаг. Верни JSON с полями:\n"
@@ -397,8 +441,12 @@ class GraphNodes:
             for tc in state.get("tool_calls", [])[-3:]
         )
 
+        tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
+        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail else ""
+
         prompt = (
             f"{self._get_system_prompt()}\n\n"
+            f"{tables_detail_section}"
             f"Текущий шаг: {current_step}\n"
             f"Ошибка: {error}\n\n"
             f"Контекст предыдущих вызовов:\n{prev_context}\n\n"

@@ -52,6 +52,56 @@ class GraphNodes:
             f"- {t.name}: {t.description}" for t in tools
         )
 
+    def _get_tables_detail_context(self, text: str) -> str:
+        """Найти упоминания таблиц в тексте и вернуть полное описание их колонок из CSV.
+
+        Сканирует паттерны schema.table, сверяет с каталогом tables_list.csv
+        и для найденных таблиц возвращает get_table_info() из attr_list.csv.
+
+        Args:
+            text: Текст для сканирования (текущий шаг + контекст предыдущих).
+
+        Returns:
+            Форматированная строка с деталями таблиц или пустая строка.
+        """
+        df = self.schema.tables_df
+        if df.empty:
+            return ""
+
+        # Ищем паттерн schema.table в тексте
+        pattern = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b')
+        found = set()
+        for m in pattern.finditer(text):
+            schema_name, table_name = m.group(1).lower(), m.group(2).lower()
+            mask = (
+                df["schema_name"].str.lower() == schema_name
+            ) & (
+                df["table_name"].str.lower() == table_name
+            )
+            if not df[mask].empty:
+                row = df[mask].iloc[0]
+                found.add((row["schema_name"], row["table_name"]))
+
+        if not found:
+            return ""
+
+        details = [self.schema.get_table_info(s, t) for s, t in sorted(found)]
+        return (
+            "Детальное описание задействованных таблиц (колонки из справочника):\n"
+            + "\n\n".join(details)
+        )
+
+    def _get_schema_context(self) -> str:
+        """Сформировать краткий каталог таблиц из SchemaLoader."""
+        df = self.schema.tables_df
+        if df.empty:
+            return "Каталог таблиц пуст. Используй search_tables для поиска."
+        lines = ["Доступные таблицы (schema.table — описание):"]
+        for _, row in df.iterrows():
+            desc = row.get("description", "")
+            lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
+        return "\n".join(lines)
+
     def _get_system_prompt(self) -> str:
         """Сформировать системный промпт с контекстом."""
         sessions_ctx = self.memory.get_sessions_context()
@@ -62,18 +112,24 @@ class GraphNodes:
                 f"  {k}: {v}" for k, v in long_term.items()
             )
 
+        schema_ctx = self._get_schema_context()
+
         return (
             "Ты — аналитический агент для работы с базой данных Greenplum (PostgreSQL-совместимый).\n"
             "Ты помогаешь аналитикам: отвечаешь на вопросы по структуре БД, пишешь и валидируешь SQL,\n"
             "делаешь выгрузки, проектируешь модели данных.\n\n"
+            f"{schema_ctx}\n\n"
             "Доступные инструменты:\n"
             f"{self.tools_description}\n\n"
             "Правила:\n"
-            "1. Всегда проверяй SQL через валидатор перед выполнением.\n"
-            "2. Для JOIN-ов проверяй уникальность ключей.\n"
-            "3. Для деструктивных операций (DELETE, DROP, TRUNCATE) запрашивай подтверждение.\n"
-            "4. Сохраняй результаты выгрузок в workspace/.\n"
-            "5. Отвечай на русском языке.\n\n"
+            "1. ВСЕГДА используй ТОЛЬКО реальные имена таблиц из каталога выше в формате schema.table. "
+            "НЕ придумывай имена схем и таблиц. Если нужной таблицы нет в каталоге — "
+            "сначала найди её через search_tables или search_by_description.\n"
+            "2. Всегда проверяй SQL через валидатор перед выполнением.\n"
+            "3. Для JOIN-ов проверяй уникальность ключей.\n"
+            "4. Для деструктивных операций (DELETE, DROP, TRUNCATE) запрашивай подтверждение.\n"
+            "5. Сохраняй результаты выгрузок в workspace/.\n"
+            "6. Отвечай на русском языке.\n\n"
             f"{sessions_ctx}{lt_ctx}"
         )
 
@@ -162,13 +218,23 @@ class GraphNodes:
         current_step = plan[step_idx]
         logger.info("Executor: шаг %d/%d: %s", step_idx + 1, len(plan), current_step[:100])
 
-        prev_context = "\n".join(
-            f"  {tc['tool']}: {tc['result'][:200]}"
-            for tc in state.get("tool_calls", [])[-5:]
-        )
+        recent_calls = state.get("tool_calls", [])[-5:]
+        if recent_calls:
+            *old_calls, last_call = recent_calls
+            prev_context = "\n".join(
+                f"  {tc['tool']}: {tc['result'][:200]}" for tc in old_calls
+            )
+            prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
+        else:
+            prev_context = ""
+
+        # Ищем упоминания таблиц в шаге и контексте — добавляем полные описания колонок
+        tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
+        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail else ""
 
         prompt = (
             f"{self._get_system_prompt()}\n\n"
+            f"{tables_detail_section}"
             f"Текущий шаг плана: {current_step}\n\n"
             f"Контекст предыдущих шагов:\n{prev_context}\n\n"
             "Выполни этот шаг. Верни JSON с полями:\n"
@@ -176,7 +242,8 @@ class GraphNodes:
             "Если шаг не требует инструмента, верни:\n"
             '{"tool": "none", "result": "текстовый ответ"}\n'
             "Если нужно выполнить SQL, верни:\n"
-            '{"tool": "execute_query", "args": {"sql": "SELECT ..."}}'
+            '{"tool": "execute_query", "args": {"sql": "SELECT ... FROM schema.table"}}\n'
+            "ВАЖНО: В SQL всегда указывай схему перед таблицей (schema.table)."
         )
 
         response = self.llm.invoke(prompt)
@@ -374,13 +441,22 @@ class GraphNodes:
                                 f"Последняя ошибка: {error}",
             }
 
-        prev_context = "\n".join(
-            f"  {tc['tool']}: {tc['result'][:200]}"
-            for tc in state.get("tool_calls", [])[-3:]
-        )
+        recent_calls = state.get("tool_calls", [])[-3:]
+        if recent_calls:
+            *old_calls, last_call = recent_calls
+            prev_context = "\n".join(
+                f"  {tc['tool']}: {tc['result'][:200]}" for tc in old_calls
+            )
+            prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
+        else:
+            prev_context = ""
+
+        tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
+        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail else ""
 
         prompt = (
             f"{self._get_system_prompt()}\n\n"
+            f"{tables_detail_section}"
             f"Текущий шаг: {current_step}\n"
             f"Ошибка: {error}\n\n"
             f"Контекст предыдущих вызовов:\n{prev_context}\n\n"

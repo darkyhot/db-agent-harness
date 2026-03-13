@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import time
 from pathlib import Path
 
 from IPython.display import clear_output, display, Markdown
@@ -24,25 +25,46 @@ WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_FILE = WORKSPACE_DIR / "agent.log"
 
+# Маппинг узлов графа на пользовательские статусы
+_NODE_STATUS = {
+    "planner": "Анализирую запрос и составляю план...",
+    "executor": "Выполняю шаг плана...",
+    "sql_validator": "Проверяю SQL-запрос...",
+    "corrector": "Исправляю ошибку...",
+    "summarizer": "Формирую ответ...",
+}
+
+_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+# Ширина строки для полной перезаписи (Jupyter не поддерживает ANSI \033[K)
+_LINE_WIDTH = 80
+
+
+def _status_print(msg: str, done: bool = False) -> None:
+    """Вывести статус с перезаписью текущей строки."""
+    padded = msg.ljust(_LINE_WIDTH)[:_LINE_WIDTH]
+    if done:
+        sys.stdout.write(f"\r{padded}\n")
+    else:
+        sys.stdout.write(f"\r{padded}")
+    sys.stdout.flush()
+
 
 def setup_logging() -> None:
-    """Настройка логирования: INFO в консоль, DEBUG в файл."""
+    """Настройка логирования: только файл, консоль отключена."""
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # Консоль — INFO
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    # Убираем все существующие хендлеры, чтобы не дублировать при повторном вызове
+    root.handlers.clear()
 
-    # Файл — DEBUG
+    # Только файл — всё подробно (DEBUG). Консоль не нужна — есть статусная строка.
     file_handler = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     )
 
-    root.addHandler(console_handler)
     root.addHandler(file_handler)
 
 
@@ -72,7 +94,7 @@ class CLIInterface:
         self.validator = SQLValidator(self.db)
 
         # Создание tools через DI (замыкания)
-        db_tools = create_db_tools(self.db, self.validator)
+        db_tools = create_db_tools(self.db, self.validator, self.schema)
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
 
@@ -99,8 +121,6 @@ class CLIInterface:
 ║       Database Agent Harness v1.0        ║
 ║  Аналитический агент для работы с БД     ║
 ╚══════════════════════════════════════════╝
-
-⚠️  Режим доступа: FULL (READ + WRITE + DDL). Будьте внимательны с деструктивными операциями.
 
 Текущая конфигурация: {config_str}
 Загружено таблиц: {tables_count} | Загружено атрибутов: {attrs_count}
@@ -137,10 +157,10 @@ class CLIInterface:
 
     def _handle_exit(self) -> None:
         """Завершение работы с сохранением резюме."""
-        print("\nСохранение резюме сессии...")
+        _status_print("Сохранение резюме сессии...")
         self._save_session_summary()
         self.memory.close()
-        print("До свидания! 👋")
+        _status_print("До свидания!", done=True)
 
     def _save_session_summary(self) -> None:
         """Сгенерировать и сохранить резюме текущей сессии."""
@@ -158,7 +178,6 @@ class CLIInterface:
         )
         summary = self.llm.invoke(prompt)
         self.memory.save_session_summary(summary)
-        logger.info("Резюме сессии сохранено")
 
     def _process_query(self, user_input: str) -> None:
         """Обработать запрос пользователя через граф агента.
@@ -167,9 +186,31 @@ class CLIInterface:
             user_input: Запрос пользователя.
         """
         state = create_initial_state(user_input)
+        result = {}
+        spinner_idx = 0
+        start_time = time.time()
 
         try:
-            result = self.graph.invoke(state)
+            for event in self.graph.stream(state):
+                node_name = list(event.keys())[0]
+                result.update(event[node_name])
+
+                elapsed = time.time() - start_time
+                status_text = _NODE_STATUS.get(node_name, node_name)
+
+                # Дополняем статус executor номером шага
+                if node_name == "executor":
+                    step = result.get("current_step", 0)
+                    total = len(result.get("plan", []))
+                    if total:
+                        status_text = f"Выполняю шаг {step}/{total}..."
+
+                spinner = _SPINNER[spinner_idx % len(_SPINNER)]
+                spinner_idx += 1
+                _status_print(f"{spinner} {status_text} ({elapsed:.0f}с)")
+
+            # Очищаем статусную строку
+            _status_print("")
 
             # Проверяем нужно ли подтверждение
             if result.get("needs_confirmation"):
@@ -202,6 +243,7 @@ class CLIInterface:
             print(f"\n{answer}")
 
         except Exception as e:
+            _status_print("")
             logger.error("Ошибка обработки запроса: %s", e, exc_info=True)
             print(f"\n❌ Ошибка: {e}")
 

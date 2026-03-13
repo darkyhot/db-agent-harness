@@ -180,6 +180,101 @@ class SchemaLoader:
         logger.info("search_by_description('%s'): найдено %d", text, len(result))
         return result
 
+    def check_key_uniqueness(
+        self, schema: str, table: str, columns: list[str]
+    ) -> dict:
+        """Оценить уникальность комбинации колонок по данным CSV-справочника.
+
+        Логика:
+        - Если все колонки являются первичными ключами → уникален.
+        - Если хотя бы одна колонка имеет unique_perc == 100.0 → уникален
+          (одна полностью уникальная колонка гарантирует уникальность комбинации).
+        - Иначе — берём минимальный unique_perc среди колонок как оценку.
+
+        Args:
+            schema: Имя схемы.
+            table: Имя таблицы.
+            columns: Список колонок для проверки.
+
+        Returns:
+            Словарь с is_unique, all_pk, min_unique_perc и деталями по колонкам.
+        """
+        cols_df = self.get_table_columns(schema, table)
+        if cols_df.empty:
+            return {
+                "is_unique": None,
+                "all_pk": False,
+                "min_unique_perc": None,
+                "error": f"Таблица {schema}.{table} не найдена в справочнике.",
+            }
+
+        details = {}
+        all_pk = True
+        min_unique_perc = 100.0
+        any_fully_unique = False
+
+        for col in columns:
+            row = cols_df[cols_df["column_name"] == col]
+            if row.empty:
+                details[col] = {"found": False}
+                all_pk = False
+                continue
+            r = row.iloc[0]
+            is_pk = bool(r.get("is_primary_key", False))
+            u_perc = float(r.get("unique_perc", 0.0)) if pd.notna(r.get("unique_perc")) else 0.0
+            details[col] = {
+                "found": True,
+                "is_primary_key": is_pk,
+                "unique_perc": u_perc,
+            }
+            if not is_pk:
+                all_pk = False
+            if u_perc == 100.0:
+                any_fully_unique = True
+            min_unique_perc = min(min_unique_perc, u_perc)
+
+        is_unique = all_pk or any_fully_unique
+        duplicate_pct = round(100.0 - min_unique_perc, 2)
+
+        return {
+            "is_unique": is_unique,
+            "all_pk": all_pk,
+            "min_unique_perc": min_unique_perc,
+            "duplicate_pct": duplicate_pct,
+            "columns": details,
+        }
+
+    def generate_ddl(self, schema: str, table: str) -> str:
+        """Сгенерировать DDL таблицы из CSV-справочника атрибутов.
+
+        Args:
+            schema: Имя схемы.
+            table: Имя таблицы.
+
+        Returns:
+            Текстовое представление DDL (CREATE TABLE).
+        """
+        cols = self.get_table_columns(schema, table)
+        if cols.empty:
+            return f"Таблица {schema}.{table} не найдена в справочнике атрибутов."
+
+        lines = [f'CREATE TABLE "{schema}"."{table}" (']
+        for _, row in cols.iterrows():
+            not_null = " NOT NULL" if row.get("is_not_null") else ""
+            pk = " -- PK" if row.get("is_primary_key") else ""
+            desc = row.get("description", "")
+            comment = f" -- {desc}" if pd.notna(desc) and str(desc).strip() else ""
+            # PK-пометка идёт первой в комментарии
+            if pk and comment:
+                comment = f" -- PK | {str(desc).strip()}"
+            elif pk:
+                comment = pk
+            lines.append(f'    "{row["column_name"]}" {row["dType"]}{not_null}{comment},')
+
+        lines[-1] = lines[-1].rstrip(",")
+        lines.append(");")
+        return "\n".join(lines)
+
     def get_table_info(self, schema: str, table: str) -> str:
         """Получить текстовое описание таблицы с колонками для контекста LLM.
 

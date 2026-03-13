@@ -4,18 +4,24 @@
 """
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
 
 from core.database import DatabaseManager
+from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
+
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
 
 logger = logging.getLogger(__name__)
 
 
 def create_db_tools(
-    db_manager: DatabaseManager, sql_validator: SQLValidator | None = None
+    db_manager: DatabaseManager,
+    sql_validator: SQLValidator | None = None,
+    schema_loader: SchemaLoader | None = None,
 ) -> list:
     """Создать инструменты БД через замыкания (DI без глобальных переменных).
 
@@ -29,22 +35,42 @@ def create_db_tools(
 
     # === READ ===
 
+    # Максимум строк для отображения в ответе LLM (остальное — только в файл)
+    PREVIEW_ROWS = 20
+
     @tool
     def execute_query(sql: str, limit: int = 1000) -> str:
-        """Выполнить SELECT-запрос и вернуть результат в виде markdown-таблицы.
+        """Выполнить SELECT-запрос и вернуть результат.
+
+        Если строк больше 20 — показывает превью и автоматически сохраняет
+        полный результат в workspace/. Для целенаправленной выгрузки в файл
+        лучше использовать export_query.
 
         Args:
             sql: SQL-запрос (SELECT).
             limit: Максимальное количество строк (по умолчанию 1000).
 
         Returns:
-            Результат в формате markdown-таблицы или сообщение об ошибке.
+            Результат или превью с путём к файлу.
         """
         try:
             df = db_manager.execute_query(sql, limit=limit)
             if df.empty:
                 return "Запрос выполнен. Результат пуст."
-            return df.to_markdown(index=False)
+
+            total = len(df)
+            if total <= PREVIEW_ROWS:
+                return df.to_markdown(index=False)
+
+            # Большой результат — превью + автосохранение
+            preview = df.head(PREVIEW_ROWS).to_markdown(index=False)
+            auto_file = WORKSPACE_DIR / "last_query_result.csv"
+            df.to_csv(auto_file, index=False, encoding="utf-8")
+            return (
+                f"{preview}\n\n"
+                f"... показано {PREVIEW_ROWS} из {total} строк.\n"
+                f"Полный результат сохранён в last_query_result.csv"
+            )
         except Exception as e:
             logger.error("execute_query error: %s", e)
             return f"Ошибка выполнения запроса: {e}"
@@ -69,7 +95,7 @@ def create_db_tools(
 
     @tool
     def check_key_uniqueness(schema: str, table: str, columns: str) -> str:
-        """Проверить уникальность комбинации колонок (для валидации JOIN).
+        """Проверить уникальность комбинации колонок из CSV-справочника (для валидации JOIN).
 
         Args:
             schema: Имя схемы.
@@ -77,10 +103,35 @@ def create_db_tools(
             columns: Имена колонок через запятую (например: 'id,date').
 
         Returns:
-            Результат проверки уникальности.
+            Результат проверки уникальности по данным CSV.
         """
+        cols = [c.strip() for c in columns.split(",")]
+        if schema_loader is not None:
+            result = schema_loader.check_key_uniqueness(schema, table, cols)
+            if result.get("error"):
+                return result["error"]
+            if result["is_unique"]:
+                reason = "все колонки являются PK" if result["all_pk"] else "одна из колонок уникальна на 100%"
+                return (
+                    f"Ключ ({columns}) в {schema}.{table} уникален ({reason}).\n"
+                    + "\n".join(
+                        f"  {c}: unique_perc={d.get('unique_perc', '?')}%, is_pk={d.get('is_primary_key', False)}"
+                        for c, d in result["columns"].items()
+                        if d.get("found")
+                    )
+                )
+            return (
+                f"Ключ ({columns}) в {schema}.{table} НЕ уникален.\n"
+                f"Минимальный unique_perc среди колонок: {result['min_unique_perc']}% "
+                f"(дублей ~{result['duplicate_pct']}%)\n"
+                + "\n".join(
+                    f"  {c}: unique_perc={d.get('unique_perc', '?')}%, is_pk={d.get('is_primary_key', False)}"
+                    for c, d in result["columns"].items()
+                    if d.get("found")
+                )
+            )
+        # Fallback на БД если schema_loader не передан
         try:
-            cols = [c.strip() for c in columns.split(",")]
             result = db_manager.check_key_uniqueness(schema, table, cols)
             if result["is_unique"]:
                 return f"Ключ ({columns}) в {schema}.{table} уникален. Строк: {result['total_rows']:,}"
@@ -101,7 +152,7 @@ def create_db_tools(
         Args:
             schema: Имя схемы.
             table: Имя таблицы.
-            n: Количество строк (по умолчанию 10).
+            n: Количество строк (по умолчанию 10, максимум для превью — 20).
 
         Returns:
             Markdown-таблица с образцом данных.
@@ -110,7 +161,19 @@ def create_db_tools(
             df = db_manager.get_sample(schema, table, n)
             if df.empty:
                 return f"Таблица {schema}.{table} пуста."
-            return df.to_markdown(index=False)
+
+            total = len(df)
+            if total <= PREVIEW_ROWS:
+                return df.to_markdown(index=False)
+
+            preview = df.head(PREVIEW_ROWS).to_markdown(index=False)
+            auto_file = WORKSPACE_DIR / f"sample_{schema}_{table}.csv"
+            df.to_csv(auto_file, index=False, encoding="utf-8")
+            return (
+                f"{preview}\n\n"
+                f"... показано {PREVIEW_ROWS} из {total} строк.\n"
+                f"Полный результат сохранён в sample_{schema}_{table}.csv"
+            )
         except Exception as e:
             logger.error("get_sample error: %s", e)
             return f"Ошибка: {e}"
@@ -154,7 +217,7 @@ def create_db_tools(
 
     @tool
     def get_table_ddl(schema: str, table: str) -> str:
-        """Получить DDL (структуру) таблицы.
+        """Получить DDL (структуру) таблицы из CSV-справочника.
 
         Args:
             schema: Имя схемы.
@@ -163,6 +226,9 @@ def create_db_tools(
         Returns:
             DDL таблицы.
         """
+        if schema_loader is not None:
+            return schema_loader.generate_ddl(schema, table)
+        # Fallback на БД если schema_loader не передан
         try:
             return db_manager.get_table_ddl(schema, table)
         except Exception as e:
@@ -238,6 +304,38 @@ def create_db_tools(
             logger.error("execute_ddl error: %s", e)
             return f"Ошибка: {e}"
 
+    @tool
+    def export_query(sql: str, filename: str, output_format: str = "csv") -> str:
+        """Выполнить SELECT-запрос и сохранить результат в файл в workspace/.
+
+        Используй этот инструмент когда нужно сделать выгрузку данных в файл.
+        Не нужно сначала вызывать execute_query, а потом save_dataframe —
+        этот инструмент делает всё за один шаг.
+
+        Args:
+            sql: SQL-запрос (SELECT).
+            filename: Имя файла (например: 'report.csv', 'sample/outflow.csv').
+            output_format: Формат — 'csv' или 'excel'.
+
+        Returns:
+            Сообщение об успехе с количеством строк или ошибка.
+        """
+        try:
+            df = db_manager.execute_query(sql)
+            file_path = WORKSPACE_DIR / filename
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if output_format == "excel":
+                df.to_excel(file_path, index=False)
+            else:
+                df.to_csv(file_path, index=False, encoding="utf-8")
+
+            logger.info("Экспорт: %s (%d строк)", file_path, len(df))
+            return f"Сохранено в {filename} ({len(df)} строк)"
+        except Exception as e:
+            logger.error("export_query error: %s", e)
+            return f"Ошибка экспорта: {e}"
+
     tools_list = [
         execute_query,
         get_row_count,
@@ -249,5 +347,6 @@ def create_db_tools(
         execute_write,
         estimate_affected_rows,
         execute_ddl,
+        export_query,
     ]
     return tools_list

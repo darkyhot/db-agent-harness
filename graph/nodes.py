@@ -69,11 +69,13 @@ class GraphNodes:
             "Доступные инструменты:\n"
             f"{self.tools_description}\n\n"
             "Правила:\n"
-            "1. Всегда проверяй SQL через валидатор перед выполнением.\n"
-            "2. Для JOIN-ов проверяй уникальность ключей.\n"
-            "3. Для деструктивных операций (DELETE, DROP, TRUNCATE) запрашивай подтверждение.\n"
-            "4. Сохраняй результаты выгрузок в workspace/.\n"
-            "5. Отвечай на русском языке.\n\n"
+            "1. ВСЕГДА используй полное имя таблицы в формате schema.table (например: hr.employees, public.orders). "
+            "Никогда не пиши просто FROM table — только FROM schema.table.\n"
+            "2. Всегда проверяй SQL через валидатор перед выполнением.\n"
+            "3. Для JOIN-ов проверяй уникальность ключей.\n"
+            "4. Для деструктивных операций (DELETE, DROP, TRUNCATE) запрашивай подтверждение.\n"
+            "5. Сохраняй результаты выгрузок в workspace/.\n"
+            "6. Отвечай на русском языке.\n\n"
             f"{sessions_ctx}{lt_ctx}"
         )
 
@@ -176,7 +178,8 @@ class GraphNodes:
             "Если шаг не требует инструмента, верни:\n"
             '{"tool": "none", "result": "текстовый ответ"}\n'
             "Если нужно выполнить SQL, верни:\n"
-            '{"tool": "execute_query", "args": {"sql": "SELECT ..."}}'
+            '{"tool": "execute_query", "args": {"sql": "SELECT ... FROM schema.table"}}\n'
+            "ВАЖНО: В SQL всегда указывай схему перед таблицей (schema.table)."
         )
 
         response = self.llm.invoke(prompt)

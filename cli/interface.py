@@ -94,7 +94,7 @@ class CLIInterface:
         self.validator = SQLValidator(self.db)
 
         # Создание tools через DI (замыкания)
-        db_tools = create_db_tools(self.db, self.validator)
+        db_tools = create_db_tools(self.db, self.validator, self.schema)
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
 

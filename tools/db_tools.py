@@ -10,6 +10,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from core.database import DatabaseManager
+from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
@@ -18,7 +19,9 @@ logger = logging.getLogger(__name__)
 
 
 def create_db_tools(
-    db_manager: DatabaseManager, sql_validator: SQLValidator | None = None
+    db_manager: DatabaseManager,
+    sql_validator: SQLValidator | None = None,
+    schema_loader: SchemaLoader | None = None,
 ) -> list:
     """Создать инструменты БД через замыкания (DI без глобальных переменных).
 
@@ -189,7 +192,7 @@ def create_db_tools(
 
     @tool
     def get_table_ddl(schema: str, table: str) -> str:
-        """Получить DDL (структуру) таблицы.
+        """Получить DDL (структуру) таблицы из CSV-справочника.
 
         Args:
             schema: Имя схемы.
@@ -198,6 +201,9 @@ def create_db_tools(
         Returns:
             DDL таблицы.
         """
+        if schema_loader is not None:
+            return schema_loader.generate_ddl(schema, table)
+        # Fallback на БД если schema_loader не передан
         try:
             return db_manager.get_table_ddl(schema, table)
         except Exception as e:

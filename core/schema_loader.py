@@ -180,6 +180,37 @@ class SchemaLoader:
         logger.info("search_by_description('%s'): найдено %d", text, len(result))
         return result
 
+    def generate_ddl(self, schema: str, table: str) -> str:
+        """Сгенерировать DDL таблицы из CSV-справочника атрибутов.
+
+        Args:
+            schema: Имя схемы.
+            table: Имя таблицы.
+
+        Returns:
+            Текстовое представление DDL (CREATE TABLE).
+        """
+        cols = self.get_table_columns(schema, table)
+        if cols.empty:
+            return f"Таблица {schema}.{table} не найдена в справочнике атрибутов."
+
+        lines = [f'CREATE TABLE "{schema}"."{table}" (']
+        for _, row in cols.iterrows():
+            not_null = " NOT NULL" if row.get("is_not_null") else ""
+            pk = " -- PK" if row.get("is_primary_key") else ""
+            desc = row.get("description", "")
+            comment = f" -- {desc}" if pd.notna(desc) and str(desc).strip() else ""
+            # PK-пометка идёт первой в комментарии
+            if pk and comment:
+                comment = f" -- PK | {str(desc).strip()}"
+            elif pk:
+                comment = pk
+            lines.append(f'    "{row["column_name"]}" {row["dType"]}{not_null}{comment},')
+
+        lines[-1] = lines[-1].rstrip(",")
+        lines.append(");")
+        return "\n".join(lines)
+
     def get_table_info(self, schema: str, table: str) -> str:
         """Получить текстовое описание таблицы с колонками для контекста LLM.
 

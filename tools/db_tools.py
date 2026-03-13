@@ -32,22 +32,42 @@ def create_db_tools(
 
     # === READ ===
 
+    # Максимум строк для отображения в ответе LLM (остальное — только в файл)
+    PREVIEW_ROWS = 20
+
     @tool
     def execute_query(sql: str, limit: int = 1000) -> str:
-        """Выполнить SELECT-запрос и вернуть результат в виде markdown-таблицы.
+        """Выполнить SELECT-запрос и вернуть результат.
+
+        Если строк больше 20 — показывает превью и автоматически сохраняет
+        полный результат в workspace/. Для целенаправленной выгрузки в файл
+        лучше использовать export_query.
 
         Args:
             sql: SQL-запрос (SELECT).
             limit: Максимальное количество строк (по умолчанию 1000).
 
         Returns:
-            Результат в формате markdown-таблицы или сообщение об ошибке.
+            Результат или превью с путём к файлу.
         """
         try:
             df = db_manager.execute_query(sql, limit=limit)
             if df.empty:
                 return "Запрос выполнен. Результат пуст."
-            return df.to_markdown(index=False)
+
+            total = len(df)
+            if total <= PREVIEW_ROWS:
+                return df.to_markdown(index=False)
+
+            # Большой результат — превью + автосохранение
+            preview = df.head(PREVIEW_ROWS).to_markdown(index=False)
+            auto_file = WORKSPACE_DIR / "last_query_result.csv"
+            df.to_csv(auto_file, index=False, encoding="utf-8")
+            return (
+                f"{preview}\n\n"
+                f"... показано {PREVIEW_ROWS} из {total} строк.\n"
+                f"Полный результат сохранён в last_query_result.csv"
+            )
         except Exception as e:
             logger.error("execute_query error: %s", e)
             return f"Ошибка выполнения запроса: {e}"
@@ -104,7 +124,7 @@ def create_db_tools(
         Args:
             schema: Имя схемы.
             table: Имя таблицы.
-            n: Количество строк (по умолчанию 10).
+            n: Количество строк (по умолчанию 10, максимум для превью — 20).
 
         Returns:
             Markdown-таблица с образцом данных.
@@ -113,7 +133,19 @@ def create_db_tools(
             df = db_manager.get_sample(schema, table, n)
             if df.empty:
                 return f"Таблица {schema}.{table} пуста."
-            return df.to_markdown(index=False)
+
+            total = len(df)
+            if total <= PREVIEW_ROWS:
+                return df.to_markdown(index=False)
+
+            preview = df.head(PREVIEW_ROWS).to_markdown(index=False)
+            auto_file = WORKSPACE_DIR / f"sample_{schema}_{table}.csv"
+            df.to_csv(auto_file, index=False, encoding="utf-8")
+            return (
+                f"{preview}\n\n"
+                f"... показано {PREVIEW_ROWS} из {total} строк.\n"
+                f"Полный результат сохранён в sample_{schema}_{table}.csv"
+            )
         except Exception as e:
             logger.error("get_sample error: %s", e)
             return f"Ошибка: {e}"

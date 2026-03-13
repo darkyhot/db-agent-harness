@@ -36,37 +36,35 @@ _NODE_STATUS = {
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
+# Ширина строки для полной перезаписи (Jupyter не поддерживает ANSI \033[K)
+_LINE_WIDTH = 80
+
 
 def _status_print(msg: str, done: bool = False) -> None:
     """Вывести статус с перезаписью текущей строки."""
+    padded = msg.ljust(_LINE_WIDTH)[:_LINE_WIDTH]
     if done:
-        sys.stdout.write(f"\r\033[K{msg}\n")
+        sys.stdout.write(f"\r{padded}\n")
     else:
-        sys.stdout.write(f"\r\033[K{msg}")
+        sys.stdout.write(f"\r{padded}")
     sys.stdout.flush()
 
 
 def setup_logging() -> None:
-    """Настройка логирования: WARNING в консоль, DEBUG в файл."""
+    """Настройка логирования: только файл, консоль отключена."""
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
     # Убираем все существующие хендлеры, чтобы не дублировать при повторном вызове
     root.handlers.clear()
 
-    # Консоль — только WARNING+, без спама
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.WARNING)
-    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-
-    # Файл — всё подробно (DEBUG)
+    # Только файл — всё подробно (DEBUG). Консоль не нужна — есть статусная строка.
     file_handler = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     )
 
-    root.addHandler(console_handler)
     root.addHandler(file_handler)
 
 
@@ -212,9 +210,7 @@ class CLIInterface:
                 _status_print(f"{spinner} {status_text} ({elapsed:.0f}с)")
 
             # Очищаем статусную строку
-            _status_print("", done=False)
-            sys.stdout.write("\r\033[K")
-            sys.stdout.flush()
+            _status_print("")
 
             # Проверяем нужно ли подтверждение
             if result.get("needs_confirmation"):
@@ -247,9 +243,7 @@ class CLIInterface:
             print(f"\n{answer}")
 
         except Exception as e:
-            _status_print("", done=False)
-            sys.stdout.write("\r\033[K")
-            sys.stdout.flush()
+            _status_print("")
             logger.error("Ошибка обработки запроса: %s", e, exc_info=True)
             print(f"\n❌ Ошибка: {e}")
 

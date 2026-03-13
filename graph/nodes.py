@@ -52,6 +52,17 @@ class GraphNodes:
             f"- {t.name}: {t.description}" for t in tools
         )
 
+    def _get_schema_context(self) -> str:
+        """Сформировать краткий каталог таблиц из SchemaLoader."""
+        df = self.schema.tables_df
+        if df.empty:
+            return "Каталог таблиц пуст. Используй search_tables для поиска."
+        lines = ["Доступные таблицы (schema.table — описание):"]
+        for _, row in df.iterrows():
+            desc = row.get("description", "")
+            lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
+        return "\n".join(lines)
+
     def _get_system_prompt(self) -> str:
         """Сформировать системный промпт с контекстом."""
         sessions_ctx = self.memory.get_sessions_context()
@@ -62,15 +73,19 @@ class GraphNodes:
                 f"  {k}: {v}" for k, v in long_term.items()
             )
 
+        schema_ctx = self._get_schema_context()
+
         return (
             "Ты — аналитический агент для работы с базой данных Greenplum (PostgreSQL-совместимый).\n"
             "Ты помогаешь аналитикам: отвечаешь на вопросы по структуре БД, пишешь и валидируешь SQL,\n"
             "делаешь выгрузки, проектируешь модели данных.\n\n"
+            f"{schema_ctx}\n\n"
             "Доступные инструменты:\n"
             f"{self.tools_description}\n\n"
             "Правила:\n"
-            "1. ВСЕГДА используй полное имя таблицы в формате schema.table (например: hr.employees, public.orders). "
-            "Никогда не пиши просто FROM table — только FROM schema.table.\n"
+            "1. ВСЕГДА используй ТОЛЬКО реальные имена таблиц из каталога выше в формате schema.table. "
+            "НЕ придумывай имена схем и таблиц. Если нужной таблицы нет в каталоге — "
+            "сначала найди её через search_tables или search_by_description.\n"
             "2. Всегда проверяй SQL через валидатор перед выполнением.\n"
             "3. Для JOIN-ов проверяй уникальность ключей.\n"
             "4. Для деструктивных операций (DELETE, DROP, TRUNCATE) запрашивай подтверждение.\n"

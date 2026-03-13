@@ -31,7 +31,13 @@ class MemoryManager:
     def _get_conn(self) -> sqlite3.Connection:
         """Получить или переиспользовать соединение с SQLite."""
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self._db_path))
+            self._conn = sqlite3.connect(
+                str(self._db_path),
+                timeout=30,
+                check_same_thread=False,
+            )
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
         return self._conn
 
     def close(self) -> None:
@@ -42,29 +48,32 @@ class MemoryManager:
 
     def _init_db(self) -> None:
         """Создать таблицы если не существуют."""
-        with self._get_conn() as conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
-                    timestamp TEXT,
-                    summary TEXT,
-                    user_id TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT REFERENCES sessions(id),
-                    role TEXT,
-                    content TEXT,
-                    timestamp TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS long_term_memory (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    updated_at TEXT
-                );
-            """)
+        conn = self._get_conn()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                summary TEXT,
+                user_id TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT REFERENCES sessions(id),
+                role TEXT,
+                content TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS long_term_memory (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT
+            )
+        """)
+        conn.commit()
         logger.info("SQLite память инициализирована: %s", self._db_path)
 
     def start_session(self, user_id: str = "") -> str:

@@ -222,7 +222,7 @@ class GraphNodes:
         if recent_calls:
             *old_calls, last_call = recent_calls
             prev_context = "\n".join(
-                f"  {tc['tool']}: {tc['result'][:200]}" for tc in old_calls
+                f"  {tc['tool']}: {tc['result'][:1000]}" for tc in old_calls
             )
             prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
         else:
@@ -445,7 +445,7 @@ class GraphNodes:
         if recent_calls:
             *old_calls, last_call = recent_calls
             prev_context = "\n".join(
-                f"  {tc['tool']}: {tc['result'][:200]}" for tc in old_calls
+                f"  {tc['tool']}: {tc['result'][:1000]}" for tc in old_calls
             )
             prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
         else:
@@ -521,7 +521,7 @@ class GraphNodes:
             return {}
 
         tool_results = "\n".join(
-            f"- {tc['tool']}: {tc['result'][:300]}"
+            f"- {tc['tool']}: {tc['result'][:5000]}"
             for tc in state.get("tool_calls", [])
         )
 

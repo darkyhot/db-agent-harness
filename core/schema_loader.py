@@ -258,7 +258,7 @@ class SchemaLoader:
         if cols.empty:
             return f"Таблица {schema}.{table} не найдена в справочнике атрибутов."
 
-        lines = [f'CREATE TABLE "{schema}"."{table}" (']
+        lines = [f'CREATE TABLE {schema}.{table} (']
         for _, row in cols.iterrows():
             not_null = " NOT NULL" if row.get("is_not_null") else ""
             pk = " -- PK" if row.get("is_primary_key") else ""
@@ -269,7 +269,7 @@ class SchemaLoader:
                 comment = f" -- PK | {str(desc).strip()}"
             elif pk:
                 comment = pk
-            lines.append(f'    "{row["column_name"]}" {row["dType"]}{not_null}{comment},')
+            lines.append(f'    {row["column_name"]} {row["dType"]}{not_null}{comment},')
 
         lines[-1] = lines[-1].rstrip(",")
         lines.append(");")

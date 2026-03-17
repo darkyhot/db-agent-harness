@@ -5,7 +5,7 @@
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
 from langchain_core.tools import tool
 
@@ -40,7 +40,7 @@ def create_db_tools(
     PREVIEW_ROWS = 20
 
     @tool
-    def execute_query(sql: str = "", limit: int = 1000, query_spec: dict | None = None) -> str:
+    def execute_query(sql: str = "", limit: int = 1000, query_spec: Optional[Dict[str, Any]] = None) -> str:
         """Выполнить SELECT-запрос и вернуть результат.
 
         Принимает либо готовый SQL (параметр sql), либо структурированную

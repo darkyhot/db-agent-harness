@@ -33,7 +33,7 @@ class MemoryManager:
         """Открыть соединение, выполнить операцию, закрыть."""
         conn = sqlite3.connect(
             str(self._db_path),
-            timeout=30,
+            timeout=5,
             check_same_thread=False,
         )
         try:
@@ -48,36 +48,71 @@ class MemoryManager:
     def close(self) -> None:
         """Совместимость с прежним API (соединения теперь закрываются автоматически)."""
 
+    def _cleanup_stale_locks(self) -> None:
+        """Удалить WAL/SHM файлы, оставшиеся после аварийного завершения."""
+        for suffix in ("-wal", "-shm"):
+            lock_file = Path(str(self._db_path) + suffix)
+            if lock_file.exists():
+                try:
+                    lock_file.unlink()
+                    logger.info("Удалён stale lock-файл: %s", lock_file)
+                except OSError as e:
+                    logger.warning("Не удалось удалить %s: %s", lock_file, e)
+
+    def _create_tables(self, conn: sqlite3.Connection) -> None:
+        """Создать таблицы в БД."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                summary TEXT,
+                user_id TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT REFERENCES sessions(id),
+                role TEXT,
+                content TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS long_term_memory (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT
+            )
+        """)
+
     def _init_db(self) -> None:
-        """Создать таблицы если не существуют."""
-        logger.debug("_init_db: открываем соединение с %s", self._db_path)
-        with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
-                    timestamp TEXT,
-                    summary TEXT,
-                    user_id TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT REFERENCES sessions(id),
-                    role TEXT,
-                    content TEXT,
-                    timestamp TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS long_term_memory (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    updated_at TEXT
-                )
-            """)
+        """Создать таблицы если не существуют.
+
+        Если БД заблокирована (stale WAL-lock от предыдущего краша):
+        1. Удаляем WAL/SHM файлы и пробуем снова.
+        2. Если всё ещё заблокирована — удаляем БД целиком и создаём заново
+           (память некритична, потеря старых сессий допустима).
+        """
+        self._cleanup_stale_locks()
+
+        try:
+            with self._connect() as conn:
+                conn.execute("PRAGMA journal_mode=DELETE")
+                self._create_tables(conn)
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower():
+                raise
+            logger.warning("БД заблокирована, пересоздаём: %s", e)
+            # Удаляем все файлы БД и создаём заново
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                p = Path(str(self._db_path) + suffix)
+                if p.exists():
+                    p.unlink()
+            with self._connect() as conn:
+                conn.execute("PRAGMA journal_mode=DELETE")
+                self._create_tables(conn)
+
         logger.info("SQLite память инициализирована: %s", self._db_path)
 
     def start_session(self, user_id: str = "") -> str:

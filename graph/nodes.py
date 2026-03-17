@@ -435,6 +435,7 @@ class GraphNodes:
             logger.warning("Validator: SQL невалиден: %s", error_msg[:200])
             return {
                 "last_error": error_msg,
+                "sql_to_validate": None,
                 "messages": state["messages"] + [
                     {"role": "assistant", "content": f"Ошибка валидации:\n{error_msg}"}
                 ],
@@ -489,6 +490,7 @@ class GraphNodes:
                 "last_error": None,
                 "current_step": step_idx + 1,
                 "retry_count": 0,
+                "sql_to_validate": None,
                 "final_answer": f"Не удалось выполнить шаг '{current_step}' после {self.MAX_RETRIES} попыток. "
                                 f"Последняя ошибка: {error}",
             }

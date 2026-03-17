@@ -223,7 +223,7 @@ class GraphNodes:
         if recent_calls:
             *old_calls, last_call = recent_calls
             prev_context = "\n".join(
-                f"  {tc['tool']}: {tc['result'][:1000]}" for tc in old_calls
+                f"  {tc['tool']}: {tc['result'][:2000]}" for tc in old_calls
             )
             prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
         else:
@@ -231,48 +231,44 @@ class GraphNodes:
 
         # Ищем упоминания таблиц в шаге и контексте — добавляем полные описания колонок
         tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
-        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail else ""
+        tables_detail_section = (
+            f"\nСТРУКТУРА ЗАДЕЙСТВОВАННЫХ ТАБЛИЦ (используй ТОЛЬКО эти колонки):\n"
+            f"{tables_detail}\n"
+        ) if tables_detail else ""
 
         prompt = (
             f"{self._get_system_prompt()}\n\n"
-            f"{tables_detail_section}"
-            f"Текущий шаг плана: {current_step}\n\n"
-            f"Контекст предыдущих шагов:\n{prev_context}\n\n"
-            "Выполни этот шаг. Верни JSON с полями:\n"
-            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n'
-            "Если шаг не требует инструмента, верни:\n"
-            '{"tool": "none", "result": "текстовый ответ"}\n\n'
-            "ВАЖНО: Для SELECT-запросов НИКОГДА не пиши сырой SQL.\n"
-            "Вместо этого используй query_spec — структурированное описание запроса.\n"
-            "SQL будет сгенерирован автоматически движком, что исключит ошибки умножения строк.\n\n"
-            "Формат для SELECT-запроса:\n"
+            "СПРАВОЧНИК ФОРМАТА query_spec (для SELECT-запросов):\n"
             '{"tool": "execute_query", "args": {"query_spec": {\n'
-            '  "from": {"schema": "schema_name", "table": "table_name", "alias": "t"},\n'
+            '  "from": {"schema": "...", "table": "...", "alias": "t"},\n'
             '  "select": [\n'
-            '    {"expr": "column", "table": "t", "column": "col_name"},\n'
+            '    {"expr": "column", "table": "t", "column": "..."},\n'
             '    {"expr": "func", "func": "COUNT", "args": ["*"], "alias": "cnt"}\n'
             '  ],\n'
-            '  "joins": [{\n'
-            '    "type": "left",\n'
-            '    "schema": "schema_name", "table": "other_table", "alias": "o",\n'
-            '    "on": {"left": "t.id", "right": "o.t_id"},\n'
-            '    "use_subquery": false\n'
-            '  }],\n'
+            '  "joins": [{"type": "left", "schema": "...", "table": "...", "alias": "o",\n'
+            '    "on": {"left": "t.id", "right": "o.t_id"}, "use_subquery": false}],\n'
             '  "where": [{"column": "t.col", "op": ">", "value": 100}],\n'
             '  "group_by": ["t.col"],\n'
             '  "order_by": [{"expr": "cnt", "direction": "desc"}],\n'
             '  "limit": 100\n'
-            '}}}\n\n'
-            "Правило use_subquery: если правая таблица JOIN-а может содержать дубликаты\n"
-            "по ключу соединения (unique_perc < 100%), установи use_subquery: true.\n"
-            "Это предотвратит умножение строк.\n\n"
-            "Для оконных функций используй:\n"
-            '{"expr": "window", "func": "ROW_NUMBER", "partition_by": ["t.dept_id"],\n'
-            ' "order_by": [{"expr": "t.salary", "direction": "desc"}], "alias": "rn"}\n\n'
-            "Для CTE (WITH) добавь поле ctes в query_spec:\n"
-            '{"ctes": [{"name": "dept_avg", "spec": {...вложенная query_spec...}}], "from": ...}\n\n'
-            "Для INSERT/UPDATE/DELETE/DDL используй параметр sql (не query_spec):\n"
-            '{"tool": "execute_write", "args": {"sql": "INSERT INTO ..."}}'
+            '}}}\n'
+            "Оконные функции: "
+            '{"expr": "window", "func": "ROW_NUMBER", "partition_by": [...], '
+            '"order_by": [{"expr": "...", "direction": "desc"}], "alias": "rn"}\n'
+            "CTE: "
+            '{"ctes": [{"name": "...", "spec": {...query_spec...}}], "from": ...}\n'
+            "Правило use_subquery: если правая таблица JOIN может иметь дубликаты "
+            "(unique_perc < 100%) — ставь use_subquery: true.\n"
+            "Для INSERT/UPDATE/DELETE/DDL используй параметр sql: "
+            '{"tool": "execute_write", "args": {"sql": "INSERT INTO ..."}}\n\n'
+            f"Текущий шаг плана: {current_step}\n\n"
+            f"Контекст предыдущих шагов:\n{prev_context}\n\n"
+            f"{tables_detail_section}"
+            "Выполни текущий шаг. Для SELECT используй query_spec (НЕ сырой SQL).\n"
+            "Если есть описание таблиц выше — используй ТОЛЬКО перечисленные там колонки, "
+            "НЕ придумывай имена колонок.\n"
+            "Верни JSON: "
+            '{"tool": "имя", "args": {...}} или {"tool": "none", "result": "текст"}'
         )
 
         response = self.llm.invoke(prompt)
@@ -499,26 +495,28 @@ class GraphNodes:
         if recent_calls:
             *old_calls, last_call = recent_calls
             prev_context = "\n".join(
-                f"  {tc['tool']}: {tc['result'][:1000]}" for tc in old_calls
+                f"  {tc['tool']}: {tc['result'][:2000]}" for tc in old_calls
             )
             prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
         else:
             prev_context = ""
 
         tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
-        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail else ""
+        tables_detail_section = (
+            f"\nСТРУКТУРА ЗАДЕЙСТВОВАННЫХ ТАБЛИЦ (используй ТОЛЬКО эти колонки):\n"
+            f"{tables_detail}\n"
+        ) if tables_detail else ""
 
         prompt = (
             f"{self._get_system_prompt()}\n\n"
-            f"{tables_detail_section}"
             f"Текущий шаг: {current_step}\n"
             f"Ошибка: {error}\n\n"
             f"Контекст предыдущих вызовов:\n{prev_context}\n\n"
-            "Исправь ошибку. Верни исправленный вызов инструмента в формате JSON:\n"
-            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n\n'
-            "Для SELECT-запросов используй query_spec вместо сырого SQL:\n"
+            f"{tables_detail_section}"
+            "Исправь ошибку. Для SELECT используй query_spec (НЕ сырой SQL):\n"
             '{"tool": "execute_query", "args": {"query_spec": {"from": {...}, "select": [...], ...}}}\n'
-            "Если правая таблица JOIN может иметь дубликаты — установи use_subquery: true в join."
+            "Если есть описание таблиц выше — используй ТОЛЬКО перечисленные колонки.\n"
+            "Если правая таблица JOIN может иметь дубликаты — установи use_subquery: true."
         )
 
         response = self.llm.invoke(prompt)

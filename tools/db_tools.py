@@ -11,6 +11,7 @@ from langchain_core.tools import tool
 
 from core.database import DatabaseManager
 from core.schema_loader import SchemaLoader
+from core.sql_builder import SQLQueryBuilder, SQLBuilderError
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
@@ -39,21 +40,39 @@ def create_db_tools(
     PREVIEW_ROWS = 20
 
     @tool
-    def execute_query(sql: str, limit: int = 1000) -> str:
+    def execute_query(sql: str = "", limit: int = 1000, query_spec: dict | None = None) -> str:
         """Выполнить SELECT-запрос и вернуть результат.
+
+        Принимает либо готовый SQL (параметр sql), либо структурированную
+        спецификацию запроса (параметр query_spec). При передаче query_spec
+        SQL генерируется автоматически SQL-движком без участия LLM,
+        что исключает ошибки умножения строк при JOIN-ах.
 
         Если строк больше 20 — показывает превью и автоматически сохраняет
         полный результат в workspace/. Для целенаправленной выгрузки в файл
         лучше использовать export_query.
 
         Args:
-            sql: SQL-запрос (SELECT).
+            sql: SQL-запрос (SELECT). Используется если query_spec не задан.
             limit: Максимальное количество строк (по умолчанию 1000).
+            query_spec: Структурированная спецификация запроса (QuerySpec JSON).
+                        Если задан — sql игнорируется, SQL строится движком.
 
         Returns:
             Результат или превью с путём к файлу.
         """
         try:
+            if query_spec is not None:
+                try:
+                    builder = SQLQueryBuilder()
+                    sql = builder.build(query_spec)
+                    logger.info("execute_query: SQL построен из QuerySpec:\n%s", sql[:500])
+                except SQLBuilderError as e:
+                    return f"Ошибка построения SQL из QuerySpec: {e}"
+
+            if not sql:
+                return "Ошибка: не передан ни sql, ни query_spec."
+
             df = db_manager.execute_query(sql, limit=limit)
             if df.empty:
                 return "Запрос выполнен. Результат пуст."

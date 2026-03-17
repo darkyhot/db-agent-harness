@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.schema_loader import SchemaLoader
+from core.sql_builder import SQLQueryBuilder, SQLBuilderError
 from core.sql_validator import SQLValidator
 from core.database import DatabaseManager
 from graph.state import AgentState
@@ -240,10 +241,38 @@ class GraphNodes:
             "Выполни этот шаг. Верни JSON с полями:\n"
             '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n'
             "Если шаг не требует инструмента, верни:\n"
-            '{"tool": "none", "result": "текстовый ответ"}\n'
-            "Если нужно выполнить SQL, верни:\n"
-            '{"tool": "execute_query", "args": {"sql": "SELECT ... FROM schema.table"}}\n'
-            "ВАЖНО: В SQL всегда указывай схему перед таблицей (schema.table)."
+            '{"tool": "none", "result": "текстовый ответ"}\n\n'
+            "ВАЖНО: Для SELECT-запросов НИКОГДА не пиши сырой SQL.\n"
+            "Вместо этого используй query_spec — структурированное описание запроса.\n"
+            "SQL будет сгенерирован автоматически движком, что исключит ошибки умножения строк.\n\n"
+            "Формат для SELECT-запроса:\n"
+            '{"tool": "execute_query", "args": {"query_spec": {\n'
+            '  "from": {"schema": "schema_name", "table": "table_name", "alias": "t"},\n'
+            '  "select": [\n'
+            '    {"expr": "column", "table": "t", "column": "col_name"},\n'
+            '    {"expr": "func", "func": "COUNT", "args": ["*"], "alias": "cnt"}\n'
+            '  ],\n'
+            '  "joins": [{\n'
+            '    "type": "left",\n'
+            '    "schema": "schema_name", "table": "other_table", "alias": "o",\n'
+            '    "on": {"left": "t.id", "right": "o.t_id"},\n'
+            '    "use_subquery": false\n'
+            '  }],\n'
+            '  "where": [{"column": "t.col", "op": ">", "value": 100}],\n'
+            '  "group_by": ["t.col"],\n'
+            '  "order_by": [{"expr": "cnt", "direction": "desc"}],\n'
+            '  "limit": 100\n'
+            '}}}\n\n'
+            "Правило use_subquery: если правая таблица JOIN-а может содержать дубликаты\n"
+            "по ключу соединения (unique_perc < 100%), установи use_subquery: true.\n"
+            "Это предотвратит умножение строк.\n\n"
+            "Для оконных функций используй:\n"
+            '{"expr": "window", "func": "ROW_NUMBER", "partition_by": ["t.dept_id"],\n'
+            ' "order_by": [{"expr": "t.salary", "direction": "desc"}], "alias": "rn"}\n\n'
+            "Для CTE (WITH) добавь поле ctes в query_spec:\n"
+            '{"ctes": [{"name": "dept_avg", "spec": {...вложенная query_spec...}}], "from": ...}\n\n'
+            "Для INSERT/UPDATE/DELETE/DDL используй параметр sql (не query_spec):\n"
+            '{"tool": "execute_write", "args": {"sql": "INSERT INTO ..."}}'
         )
 
         response = self.llm.invoke(prompt)
@@ -254,13 +283,36 @@ class GraphNodes:
         if tool_call["tool"] == "none":
             result = tool_call.get("result", response)
         else:
-            # Проверяем, порождает ли шаг SQL для валидации
-            sql = tool_call.get("args", {}).get("sql")
-            if sql and tool_call["tool"] in ("execute_query", "execute_write", "execute_ddl"):
+            args = tool_call.get("args", {})
+            tool_name = tool_call["tool"]
+
+            # Извлекаем SQL для валидации — либо прямой sql, либо строим из query_spec
+            sql = args.get("sql")
+            query_spec = args.get("query_spec")
+
+            if query_spec and tool_name == "execute_query":
+                # Строим SQL из QuerySpec для передачи валидатору
+                try:
+                    sql = SQLQueryBuilder().build(query_spec)
+                except SQLBuilderError as e:
+                    result = f"Ошибка построения SQL из QuerySpec: {e}"
+                    self.memory.add_message("tool", f"[{tool_name}] {str(result)[:500]}")
+                    return {
+                        "tool_calls": state.get("tool_calls", []) + [
+                            {"tool": tool_name, "args": args, "result": str(result)}
+                        ],
+                        "current_step": step_idx + 1,
+                        "last_error": str(result),
+                        "messages": state["messages"] + [
+                            {"role": "assistant", "content": f"Шаг {step_idx + 1}: {result}"}
+                        ],
+                    }
+
+            if sql and tool_name in ("execute_query", "execute_write", "execute_ddl"):
                 return {
                     "sql_to_validate": sql,
                     "tool_calls": state.get("tool_calls", []) + [
-                        {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": "awaiting_validation"}
+                        {"tool": tool_name, "args": args, "result": "awaiting_validation"}
                     ],
                     "messages": state["messages"] + [
                         {"role": "assistant", "content": f"Шаг {step_idx + 1}: SQL отправлен на валидацию"}
@@ -268,7 +320,7 @@ class GraphNodes:
                 }
 
             # Вызов инструмента
-            result = self._call_tool(tool_call["tool"], tool_call.get("args", {}))
+            result = self._call_tool(tool_name, args)
 
         self.memory.add_message("tool", f"[{tool_call['tool']}] {str(result)[:500]}")
 
@@ -461,21 +513,37 @@ class GraphNodes:
             f"Ошибка: {error}\n\n"
             f"Контекст предыдущих вызовов:\n{prev_context}\n\n"
             "Исправь ошибку. Верни исправленный вызов инструмента в формате JSON:\n"
-            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}'
+            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n\n'
+            "Для SELECT-запросов используй query_spec вместо сырого SQL:\n"
+            '{"tool": "execute_query", "args": {"query_spec": {"from": {...}, "select": [...], ...}}}\n'
+            "Если правая таблица JOIN может иметь дубликаты — установи use_subquery: true в join."
         )
 
         response = self.llm.invoke(prompt)
         tool_call = self._parse_tool_call(response)
 
         # Если исправленный вызов содержит SQL — отправить на валидацию
-        sql = tool_call.get("args", {}).get("sql")
-        if sql and tool_call["tool"] in ("execute_query", "execute_write", "execute_ddl"):
+        args = tool_call.get("args", {})
+        tool_name = tool_call["tool"]
+        sql = args.get("sql")
+        query_spec = args.get("query_spec")
+
+        if query_spec and tool_name == "execute_query":
+            try:
+                sql = SQLQueryBuilder().build(query_spec)
+            except SQLBuilderError as e:
+                return {
+                    "last_error": f"Ошибка построения SQL из QuerySpec: {e}",
+                    "retry_count": retry_count + 1,
+                }
+
+        if sql and tool_name in ("execute_query", "execute_write", "execute_ddl"):
             return {
                 "sql_to_validate": sql,
                 "retry_count": retry_count + 1,
                 "last_error": None,
                 "tool_calls": state.get("tool_calls", []) + [
-                    {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": "awaiting_validation"}
+                    {"tool": tool_name, "args": args, "result": "awaiting_validation"}
                 ],
             }
 

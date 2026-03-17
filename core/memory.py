@@ -50,6 +50,7 @@ class MemoryManager:
 
     def _init_db(self) -> None:
         """Создать таблицы если не существуют."""
+        logger.debug("_init_db: открываем соединение с %s", self._db_path)
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=30000")

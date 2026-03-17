@@ -87,18 +87,25 @@ class CLIInterface:
         """Инициализация всех компонентов агента."""
         setup_logging()
 
+        print("[init] DatabaseManager...", flush=True)
         self.db = DatabaseManager()
+        print("[init] RateLimitedLLM...", flush=True)
         self.llm = RateLimitedLLM()
+        print("[init] MemoryManager...", flush=True)
         self.memory = MemoryManager()
+        print("[init] SchemaLoader...", flush=True)
         self.schema = SchemaLoader()
+        print("[init] SQLValidator...", flush=True)
         self.validator = SQLValidator(self.db)
 
         # Создание tools через DI (замыкания)
+        print("[init] Tools...", flush=True)
         db_tools = create_db_tools(self.db, self.validator, self.schema)
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
 
         # Сборка графа
+        print("[init] Graph...", flush=True)
         self.graph = build_graph(
             self.llm, self.db, self.schema, self.memory, self.validator, all_tools
         )
@@ -107,6 +114,7 @@ class CLIInterface:
         user_id = self.db._config.get("user_id", "")
         self.memory.start_session(user_id)
 
+        print("[init] Ready.", flush=True)
         logger.info("CLIInterface инициализирован")
 
     def _print_banner(self) -> None:
@@ -191,7 +199,7 @@ class CLIInterface:
         start_time = time.time()
 
         try:
-            for event in self.graph.stream(state):
+            for event in self.graph.stream(state, {"recursion_limit": 50}):
                 node_name = list(event.keys())[0]
                 result.update(event[node_name])
 

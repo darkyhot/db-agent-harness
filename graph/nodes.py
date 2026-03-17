@@ -556,6 +556,7 @@ class GraphNodes:
             return {
                 "last_error": str(result),
                 "retry_count": retry_count + 1,
+                "sql_to_validate": None,
                 "messages": state["messages"] + [
                     {"role": "assistant", "content": f"Повторная ошибка (попытка {retry_count + 1}): {result}"}
                 ],

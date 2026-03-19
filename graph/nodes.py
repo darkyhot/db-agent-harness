@@ -520,10 +520,14 @@ class GraphNodes:
             self.memory.add_message("assistant", state["final_answer"])
             return {}
 
-        tool_results = "\n".join(
-            f"- {tc['tool']}: {tc['result'][:5000]}"
-            for tc in state.get("tool_calls", [])
-        )
+        tool_results_parts = []
+        for tc in state.get("tool_calls", []):
+            sql = tc.get("args", {}).get("sql", "")
+            sql_line = f"\n  SQL: {sql}" if sql else ""
+            tool_results_parts.append(
+                f"- {tc['tool']}{sql_line}\n  Результат: {tc['result'][:5000]}"
+            )
+        tool_results = "\n".join(tool_results_parts)
 
         plan_text = "\n".join(state.get("plan", []))
 

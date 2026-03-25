@@ -369,18 +369,18 @@ class DatabaseManager:
         """
         schema = _validate_identifier(schema, "schema")
         table = _validate_identifier(table, "table")
-        # Используем EXPLAIN для безопасной оценки — если where_clause содержит
-        # SQL injection, EXPLAIN не выполнит деструктивных действий
+        # Выполняем COUNT в read-only транзакции для защиты от SQL-инъекций
+        # через where_clause (даже если where_clause содержит деструктивный подзапрос,
+        # read-only транзакция не позволит изменить данные)
         count_sql = f'SELECT COUNT(*) FROM "{schema}"."{table}" WHERE {where_clause}'
-        explain_sql = f"EXPLAIN {count_sql}"
         engine = self.get_engine()
         try:
             with engine.connect() as conn:
-                # Сначала проверяем через EXPLAIN что запрос валиден
-                conn.execute(text(explain_sql))
-                # Если EXPLAIN прошёл — выполняем реальный COUNT
+                conn.execute(text("SET TRANSACTION READ ONLY"))
                 result = conn.execute(text(count_sql))
-                return result.scalar()
+                count = result.scalar()
+                conn.rollback()  # завершаем read-only транзакцию без commit
+                return count
         except Exception as e:
             logger.error("estimate_affected_rows ошибка: %s", e)
             raise

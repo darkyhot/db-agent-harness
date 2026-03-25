@@ -349,41 +349,63 @@ class GraphNodes:
     def _parse_tool_call(self, response: str) -> dict[str, Any]:
         """Извлечь вызов инструмента из ответа LLM.
 
-        Использует нежадный regex для корректного извлечения первого JSON-объекта.
+        Использует парсер с подсчётом глубины скобок и учётом строковых литералов,
+        чтобы корректно обрабатывать вложенные объекты (например, args с SQL внутри).
         """
-        try:
-            match = re.search(r'\{.*?\}', response, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group())
-                if "tool" in parsed:
+        # Ищем все JSON-объекты верхнего уровня с учётом вложенности и строк
+        for candidate in self._extract_json_objects(response):
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict) and "tool" in parsed:
                     return parsed
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # Пробуем найти вложенный JSON (с args внутри)
-        try:
-            # Ищем от первого { до последнего } — но только если первый простой regex не сработал
-            start = response.find('{')
-            if start != -1:
-                depth = 0
-                for i in range(start, len(response)):
-                    if response[i] == '{':
-                        depth += 1
-                    elif response[i] == '}':
-                        depth -= 1
-                        if depth == 0:
-                            candidate = response[start:i + 1]
-                            parsed = json.loads(candidate)
-                            if "tool" in parsed:
-                                return parsed
-                            break
-        except (json.JSONDecodeError, ValueError):
-            pass
+            except (json.JSONDecodeError, ValueError):
+                continue
 
         return {"tool": "none", "result": response}
 
+    @staticmethod
+    def _extract_json_objects(text: str) -> list[str]:
+        """Извлечь JSON-объекты из текста с учётом вложенных скобок и строковых литералов.
+
+        Returns:
+            Список строк-кандидатов JSON-объектов.
+        """
+        candidates = []
+        i = 0
+        while i < len(text):
+            if text[i] == '{':
+                depth = 0
+                in_string = False
+                escape_next = False
+                start = i
+                for j in range(i, len(text)):
+                    ch = text[j]
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if ch == '\\' and in_string:
+                        escape_next = True
+                        continue
+                    if ch == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            candidates.append(text[start:j + 1])
+                            i = j
+                            break
+                else:
+                    break
+            i += 1
+        return candidates
+
     def _call_tool(self, tool_name: str, args: dict[str, Any]) -> str:
-        """Вызвать инструмент по имени.
+        """Вызвать инструмент по имени с валидацией аргументов.
 
         Args:
             tool_name: Имя инструмента.
@@ -394,8 +416,35 @@ class GraphNodes:
         """
         if tool_name not in self.tool_map:
             return f"Инструмент '{tool_name}' не найден."
+
+        tool_fn = self.tool_map[tool_name]
+
+        # Валидация аргументов: проверяем что все обязательные поля присутствуют
+        # и нет лишних ключей (LLM может галлюцинировать параметры)
+        if hasattr(tool_fn, "args_schema") and tool_fn.args_schema is not None:
+            schema = tool_fn.args_schema
+            if hasattr(schema, "model_fields"):
+                expected_fields = set(schema.model_fields.keys())
+                required_fields = {
+                    k for k, v in schema.model_fields.items()
+                    if v.is_required()
+                }
+                provided_fields = set(args.keys())
+                missing = required_fields - provided_fields
+                if missing:
+                    return (
+                        f"Ошибка инструмента {tool_name}: "
+                        f"отсутствуют обязательные параметры: {', '.join(sorted(missing))}"
+                    )
+                extra = provided_fields - expected_fields
+                if extra:
+                    logger.warning(
+                        "Tool %s: лишние аргументы будут проигнорированы: %s",
+                        tool_name, extra,
+                    )
+                    args = {k: v for k, v in args.items() if k in expected_fields}
+
         try:
-            tool_fn = self.tool_map[tool_name]
             result = tool_fn.invoke(args)
             logger.info("Tool %s выполнен успешно", tool_name)
             return str(result)

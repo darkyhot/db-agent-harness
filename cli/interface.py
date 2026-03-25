@@ -105,6 +105,11 @@ class CLIInterface:
             self.llm, self.db, self.schema, self.memory, self.validator, all_tools
         )
 
+        # Периодическая очистка старых сессий (старше 90 дней)
+        cleaned = self.memory.cleanup_old_sessions(keep_days=90)
+        if cleaned:
+            logger.info("Очищено %d старых сессий при старте", cleaned)
+
         # Стартуем сессию
         user_id = self.db._config.get("user_id", "")
         self.memory.start_session(user_id)

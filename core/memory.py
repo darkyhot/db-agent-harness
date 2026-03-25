@@ -279,6 +279,41 @@ class MemoryManager:
             conn.execute("DELETE FROM long_term_memory WHERE key = ?", (key,))
         logger.info("Долгосрочная память удалена: key=%s", key)
 
+    def cleanup_old_sessions(self, keep_days: int = 90) -> int:
+        """Удалить сессии и их сообщения старше keep_days дней.
+
+        Args:
+            keep_days: Сколько дней хранить (по умолчанию 90).
+
+        Returns:
+            Количество удалённых сессий.
+        """
+        cutoff = datetime.now(timezone.utc).isoformat()
+        # Вычисляем дату отсечения (ISO формат сортируется лексикографически)
+        from datetime import timedelta
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=keep_days)
+        cutoff = cutoff_dt.isoformat()
+
+        with self._connect() as conn:
+            # Сначала считаем сколько удалим
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE timestamp < ?", (cutoff,)
+            )
+            count = cursor.fetchone()[0]
+
+            if count > 0:
+                # Удаляем сообщения старых сессий
+                conn.execute(
+                    "DELETE FROM messages WHERE session_id IN "
+                    "(SELECT id FROM sessions WHERE timestamp < ?)",
+                    (cutoff,),
+                )
+                # Удаляем сессии
+                conn.execute("DELETE FROM sessions WHERE timestamp < ?", (cutoff,))
+                logger.info("Очищено %d старых сессий (старше %d дней)", count, keep_days)
+
+        return count
+
     @property
     def session_count(self) -> int:
         """Количество сессий с резюме."""

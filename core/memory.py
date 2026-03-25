@@ -1,5 +1,6 @@
 """Персистентная память агента на SQLite."""
 
+import json
 import logging
 import sqlite3
 import uuid
@@ -249,6 +250,24 @@ class MemoryManager:
             cursor = conn.execute("SELECT key, value FROM long_term_memory")
             rows = cursor.fetchall()
         return {r[0]: r[1] for r in rows}
+
+    def get_memory_list(self, key: str) -> list[str]:
+        """Получить значение из долгосрочной памяти как JSON-список.
+
+        Args:
+            key: Ключ.
+
+        Returns:
+            Список строк или пустой список если не найдено / ошибка парсинга.
+        """
+        raw = self.get_memory(key)
+        if not raw:
+            return []
+        try:
+            val = json.loads(raw)
+            return val if isinstance(val, list) else []
+        except (json.JSONDecodeError, ValueError):
+            return []
 
     def delete_memory(self, key: str) -> None:
         """Удалить запись из долгосрочной памяти.

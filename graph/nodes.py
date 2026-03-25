@@ -123,15 +123,51 @@ class GraphNodes:
             lines.append(f"  [{m['role']}] {content}")
         return "\n".join(lines)
 
+    def _get_long_term_memory_context(self) -> str:
+        """Сформировать контекст долгосрочной памяти со структурированными слоями."""
+        layer_keys = {"user_facts", "behavior_patterns", "user_instructions"}
+        sections = []
+
+        # Слой 1: Факты о пользователе
+        facts = self.memory.get_memory_list("user_facts")
+        if facts:
+            sections.append(
+                "Факты о пользователе:\n" + "\n".join(f"  - {f}" for f in facts)
+            )
+
+        # Слой 2: Паттерны поведения
+        patterns = self.memory.get_memory_list("behavior_patterns")
+        if patterns:
+            sections.append(
+                "Паттерны поведения пользователя (учитывай в стиле ответов):\n"
+                + "\n".join(f"  - {p}" for p in patterns)
+            )
+
+        # Слой 3: Инструкции пользователя
+        instructions = self.memory.get_memory_list("user_instructions")
+        if instructions:
+            sections.append(
+                "Инструкции пользователя (ОБЯЗАТЕЛЬНО соблюдай):\n"
+                + "\n".join(f"  - {i}" for i in instructions)
+            )
+
+        # Прочие ключи долгосрочной памяти (обратная совместимость)
+        all_memory = self.memory.get_all_memory()
+        other = {k: v for k, v in all_memory.items() if k not in layer_keys}
+        if other:
+            sections.append(
+                "Прочая долгосрочная память:\n"
+                + "\n".join(f"  {k}: {v}" for k, v in other.items())
+            )
+
+        if not sections:
+            return ""
+        return "\n\n" + "\n\n".join(sections)
+
     def _get_system_prompt(self) -> str:
         """Сформировать системный промпт с контекстом."""
         sessions_ctx = self.memory.get_sessions_context()
-        long_term = self.memory.get_all_memory()
-        lt_ctx = ""
-        if long_term:
-            lt_ctx = "\n\nДолгосрочная память:\n" + "\n".join(
-                f"  {k}: {v}" for k, v in long_term.items()
-            )
+        lt_ctx = self._get_long_term_memory_context()
 
         schema_ctx = self._get_schema_context()
         history_ctx = self._get_session_history_context()

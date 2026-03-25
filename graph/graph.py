@@ -22,6 +22,10 @@ def _route_after_executor(state: AgentState) -> str:
     Returns:
         Имя следующего узла.
     """
+    # Нужна disambiguation — выходим для уточнения у пользователя
+    if state.get("needs_disambiguation"):
+        return END
+
     # Есть SQL для валидации
     if state.get("sql_to_validate"):
         return "sql_validator"
@@ -129,6 +133,7 @@ def build_graph(
     graph.add_edge("planner", "executor")
 
     graph.add_conditional_edges("executor", _route_after_executor, {
+        END: END,
         "sql_validator": "sql_validator",
         "corrector": "corrector",
         "summarizer": "summarizer",
@@ -176,4 +181,6 @@ def create_initial_state(user_input: str) -> AgentState:
         user_input=user_input,
         needs_confirmation=False,
         confirmation_message="",
+        needs_disambiguation=False,
+        disambiguation_options=[],
     )

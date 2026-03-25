@@ -331,6 +331,30 @@ class GraphNodes:
             # Вызов инструмента
             result = self._call_tool(tool_call["tool"], tool_call.get("args", {}))
 
+        # Проверяем, нужна ли disambiguation (несколько таблиц найдено)
+        options = self._check_disambiguation_needed(
+            tool_call["tool"], str(result), state["user_input"],
+        )
+        if options is not None:
+            display_lines = ["Найдено несколько подходящих витрин данных:", ""]
+            for i, opt in enumerate(options, 1):
+                display_lines.append(f"  {i}. {opt['schema']}.{opt['table']} — {opt['description']}")
+                if opt.get("key_columns"):
+                    display_lines.append(f"     Ключевые колонки: {', '.join(opt['key_columns'])}")
+            display_msg = "\n".join(display_lines)
+
+            return {
+                "needs_disambiguation": True,
+                "disambiguation_options": options,
+                "confirmation_message": display_msg,
+                "tool_calls": state.get("tool_calls", []) + [
+                    {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": str(result)}
+                ],
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": display_msg}
+                ],
+            }
+
         self.memory.add_message("tool", f"[{tool_call['tool']}] {str(result)[:500]}")
 
         return {
@@ -403,6 +427,47 @@ class GraphNodes:
                     break
             i += 1
         return candidates
+
+    def _check_disambiguation_needed(
+        self, tool_name: str, result: str, user_input: str,
+    ) -> list[dict[str, Any]] | None:
+        """Проверить, вернул ли поиск несколько таблиц, требующих уточнения.
+
+        Returns:
+            Список опций для выбора пользователем или None.
+        """
+        if tool_name not in ("search_tables", "search_by_description"):
+            return None
+
+        match = re.search(r'Найдено таблиц:\s*(\d+)', result)
+        if not match or int(match.group(1)) <= 1:
+            return None
+
+        # Извлекаем schema.table из строк результата
+        table_pattern = re.compile(r'^\s+(\w+)\.(\w+)\s*—\s*(.*)$', re.MULTILINE)
+        options: list[dict[str, Any]] = []
+        for m in table_pattern.finditer(result):
+            schema_name, table_name, description = (
+                m.group(1), m.group(2), m.group(3).strip(),
+            )
+            options.append({
+                "schema": schema_name,
+                "table": table_name,
+                "description": description,
+                "key_columns": self.schema.get_primary_keys(schema_name, table_name),
+            })
+
+        if len(options) <= 1:
+            return None
+
+        # Если пользователь уже указал конкретную таблицу — не спрашиваем повторно
+        user_lower = user_input.lower()
+        for opt in options:
+            full_name = f"{opt['schema']}.{opt['table']}"
+            if full_name.lower() in user_lower:
+                return None
+
+        return options
 
     def _call_tool(self, tool_name: str, args: dict[str, Any]) -> str:
         """Вызвать инструмент по имени с валидацией аргументов.

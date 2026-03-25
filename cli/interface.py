@@ -290,6 +290,27 @@ class CLIInterface:
             # Очищаем статусную строку
             _status_print("")
 
+            # Проверяем нужна ли disambiguation (несколько таблиц)
+            if result.get("needs_disambiguation"):
+                msg = result.get("confirmation_message", "Найдено несколько таблиц.")
+                print(f"\n{msg}")
+                options = result.get("disambiguation_options", [])
+                choice = input(f"\nВведите номер витрины (1-{len(options)}): ").strip()
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(options):
+                        chosen = options[idx]
+                        chosen_table = f"{chosen['schema']}.{chosen['table']}"
+                        print(f"\n✓ Выбрана витрина: {chosen_table}")
+                        self.memory.add_message("user", f"Выбрана витрина: {chosen_table}")
+                        augmented_input = f"{user_input} (использовать таблицу {chosen_table})"
+                        self._process_query(augmented_input)
+                    else:
+                        print("Некорректный номер. Операция отменена.")
+                except ValueError:
+                    print("Некорректный ввод. Операция отменена.")
+                return
+
             # Проверяем нужно ли подтверждение
             if result.get("needs_confirmation"):
                 msg = result.get("confirmation_message", "Требуется подтверждение.")

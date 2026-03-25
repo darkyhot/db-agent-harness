@@ -31,3 +31,5 @@ class AgentState(TypedDict):
     user_input: str
     needs_confirmation: bool
     confirmation_message: str
+    needs_disambiguation: bool
+    disambiguation_options: list

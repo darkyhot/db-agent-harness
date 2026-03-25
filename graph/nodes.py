@@ -102,6 +102,27 @@ class GraphNodes:
             lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
         return "\n".join(lines)
 
+    def _get_session_history_context(self) -> str:
+        """Сформировать контекст истории текущей сессии для системного промпта."""
+        messages = self.memory.get_session_messages()
+        # Исключаем последнее сообщение — это текущий запрос пользователя,
+        # который уже присутствует в промпте явно
+        messages = messages[:-1] if messages else []
+        # Берём не более 20 последних сообщений
+        messages = messages[-20:]
+        if not messages:
+            return ""
+
+        limits = {"tool": 500, "user": 2000, "assistant": 2000}
+        lines = ["История текущей сессии:"]
+        for m in messages:
+            limit = limits.get(m["role"], 500)
+            content = m["content"]
+            if len(content) > limit:
+                content = content[:limit] + "..."
+            lines.append(f"  [{m['role']}] {content}")
+        return "\n".join(lines)
+
     def _get_system_prompt(self) -> str:
         """Сформировать системный промпт с контекстом."""
         sessions_ctx = self.memory.get_sessions_context()
@@ -113,6 +134,8 @@ class GraphNodes:
             )
 
         schema_ctx = self._get_schema_context()
+        history_ctx = self._get_session_history_context()
+        history_section = f"\n\n{history_ctx}" if history_ctx else ""
 
         return (
             "Ты — аналитический агент для работы с базой данных Greenplum (PostgreSQL-совместимый).\n"
@@ -130,7 +153,7 @@ class GraphNodes:
             "4. Для деструктивных операций (DELETE, DROP, TRUNCATE) запрашивай подтверждение.\n"
             "5. Сохраняй результаты выгрузок в workspace/.\n"
             "6. Отвечай на русском языке.\n\n"
-            f"{sessions_ctx}{lt_ctx}"
+            f"{sessions_ctx}{lt_ctx}{history_section}"
         )
 
     def planner(self, state: AgentState) -> dict[str, Any]:

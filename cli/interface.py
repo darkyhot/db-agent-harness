@@ -150,6 +150,66 @@ class CLIInterface:
         except Exception as e:
             logger.warning("Ошибка восстановления памяти из незавершённых сессий: %s", e)
 
+    def _build_memory_extraction_prompt(self, dialog: str) -> tuple[str, str]:
+        """Единый промпт для извлечения долгосрочной памяти.
+
+        Returns:
+            Кортеж (system_prompt, user_prompt) для invoke_with_system.
+        """
+        existing_facts = self.memory.get_memory("user_facts") or "[]"
+        existing_patterns = self.memory.get_memory("behavior_patterns") or "[]"
+        existing_instructions = self.memory.get_memory("user_instructions") or "[]"
+
+        system_prompt = (
+            "Ты — модуль извлечения памяти аналитического агента.\n"
+            "Анализируешь диалог и извлекаешь информацию о пользователе.\n\n"
+            "Верни СТРОГО JSON без пояснений:\n"
+            "{\n"
+            '  "user_facts": ["факт1", "факт2"],\n'
+            '  "behavior_patterns": ["паттерн1"],\n'
+            '  "user_instructions": ["инструкция1"]\n'
+            "}\n\n"
+            "Категории:\n"
+            "- user_facts: имя, стек, предпочтения, роль, контекст работы\n"
+            "- behavior_patterns: стиль взаимодействия (краткость, формат ответов)\n"
+            "- user_instructions: явные указания агенту (всегда LEFT JOIN, сохранять в /reports/)\n\n"
+            "Правила:\n"
+            "- Каждый элемент — одно короткое предложение\n"
+            "- Объедини с существующими, убери дубли\n"
+            "- Если нет новой информации — верни существующий список\n"
+            "- Не более 20 элементов в категории"
+        )
+
+        user_prompt = (
+            f"Существующие данные:\n"
+            f"  Факты: {existing_facts}\n"
+            f"  Паттерны: {existing_patterns}\n"
+            f"  Инструкции: {existing_instructions}\n\n"
+            f"Диалог:\n{dialog}"
+        )
+
+        return system_prompt, user_prompt
+
+    def _save_memory_from_llm_response(self, response: str) -> None:
+        """Парсинг и сохранение памяти из ответа LLM."""
+        try:
+            # Убираем markdown-обёртки
+            cleaned = re.sub(r'```(?:json)?\s*\n?', '', response)
+            cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.MULTILINE)
+            match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            if not match:
+                logger.warning("Не удалось найти JSON в ответе извлечения памяти")
+                return
+            data = json.loads(match.group())
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("Ошибка парсинга JSON извлечения памяти: %s", e)
+            return
+
+        for key in ("user_facts", "behavior_patterns", "user_instructions"):
+            value = data.get(key)
+            if isinstance(value, list):
+                self.memory.set_memory(key, json.dumps(value, ensure_ascii=False))
+
     def _extract_long_term_memory_from_messages(self, messages: list[dict]) -> None:
         """Извлечь долгосрочную память из произвольного списка сообщений."""
         if not messages:
@@ -159,54 +219,15 @@ class CLIInterface:
             f"{m['role']}: {m['content'][:200]}" for m in messages[-20:]
         )
 
-        existing_facts = self.memory.get_memory("user_facts") or "[]"
-        existing_patterns = self.memory.get_memory("behavior_patterns") or "[]"
-        existing_instructions = self.memory.get_memory("user_instructions") or "[]"
-
-        prompt = (
-            "Проанализируй диалог и извлеки информацию о пользователе в три категории.\n"
-            "Учитывай уже накопленную информацию — не дублируй, обновляй если изменилось, "
-            "добавляй только новое.\n\n"
-            f"Существующие данные:\n"
-            f"  Факты о пользователе: {existing_facts}\n"
-            f"  Паттерны поведения: {existing_patterns}\n"
-            f"  Инструкции пользователя: {existing_instructions}\n\n"
-            f"Диалог:\n{dialog}\n\n"
-            "Верни СТРОГО JSON без пояснений в формате:\n"
-            "{\n"
-            '  "user_facts": ["факт1", "факт2"],\n'
-            '  "behavior_patterns": ["паттерн1", "паттерн2"],\n'
-            '  "user_instructions": ["инструкция1", "инструкция2"]\n'
-            "}\n\n"
-            "Правила:\n"
-            "- user_facts: технологический стек, предпочтения, контекст работы, роль, имя "
-            "(например: 'пользователя зовут Влад', 'использует PostgreSQL')\n"
-            "- behavior_patterns: наблюдения о стиле взаимодействия\n"
-            "- user_instructions: явные указания пользователя агенту\n"
-            "- Каждый элемент — короткая строка (одно предложение)\n"
-            "- Объедини существующие данные с новыми, убери дубли и устаревшее\n"
-            "- Если ничего не найдено — верни существующий список без изменений\n"
-            "- Не более 20 элементов в каждой категории"
-        )
+        system_prompt, user_prompt = self._build_memory_extraction_prompt(dialog)
 
         try:
-            response = self.llm.invoke(prompt)
+            response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.1)
         except Exception as e:
             logger.warning("Ошибка LLM при извлечении долгосрочной памяти: %s", e)
             return
 
-        try:
-            match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not match:
-                return
-            data = json.loads(match.group())
-        except (json.JSONDecodeError, ValueError):
-            return
-
-        for key in ("user_facts", "behavior_patterns", "user_instructions"):
-            value = data.get(key)
-            if isinstance(value, list):
-                self.memory.set_memory(key, json.dumps(value, ensure_ascii=False))
+        self._save_memory_from_llm_response(response)
 
     def _print_banner(self) -> None:
         """Показать приветственное сообщение."""
@@ -285,16 +306,15 @@ class CLIInterface:
         dialog = "\n".join(
             f"{m['role']}: {m['content'][:200]}" for m in messages[-20:]
         )
-        prompt = (
-            "Сделай краткое резюме (2-3 предложения) этой сессии работы с базой данных.\n"
-            "Что спрашивал пользователь, какие результаты получены.\n\n"
-            f"Диалог:\n{dialog}"
+        summary = self.llm.invoke_with_system(
+            "Ты — модуль резюмирования. Верни 2-3 предложения: что спрашивал пользователь и какие результаты.",
+            f"Диалог:\n{dialog}",
+            temperature=0.3,
         )
-        summary = self.llm.invoke(prompt)
         self.memory.save_session_summary(summary)
 
     def _extract_long_term_memory(self) -> None:
-        """Извлечь слои долгосрочной памяти из сессии и объединить с существующими."""
+        """Извлечь слои долгосрочной памяти из текущей сессии."""
         messages = self.memory.get_session_messages()
         if not messages:
             return
@@ -303,63 +323,15 @@ class CLIInterface:
             f"{m['role']}: {m['content'][:200]}" for m in messages[-20:]
         )
 
-        # Загружаем существующую память для merge-контекста
-        existing_facts = self.memory.get_memory("user_facts") or "[]"
-        existing_patterns = self.memory.get_memory("behavior_patterns") or "[]"
-        existing_instructions = self.memory.get_memory("user_instructions") or "[]"
-
-        prompt = (
-            "Проанализируй диалог и извлеки информацию о пользователе в три категории.\n"
-            "Учитывай уже накопленную информацию — не дублируй, обновляй если изменилось, "
-            "добавляй только новое.\n\n"
-            f"Существующие данные:\n"
-            f"  Факты о пользователе: {existing_facts}\n"
-            f"  Паттерны поведения: {existing_patterns}\n"
-            f"  Инструкции пользователя: {existing_instructions}\n\n"
-            f"Диалог:\n{dialog}\n\n"
-            "Верни СТРОГО JSON без пояснений в формате:\n"
-            "{\n"
-            '  "user_facts": ["факт1", "факт2"],\n'
-            '  "behavior_patterns": ["паттерн1", "паттерн2"],\n'
-            '  "user_instructions": ["инструкция1", "инструкция2"]\n'
-            "}\n\n"
-            "Правила:\n"
-            "- user_facts: имя пользователя, технологический стек, предпочтения, контекст работы, роль "
-            "(например: 'пользователя зовут Влад', 'использует PostgreSQL', 'работает в отделе аналитики')\n"
-            "- behavior_patterns: наблюдения о стиле взаимодействия "
-            "(например: 'предпочитает краткие ответы', 'не любит альтернативные варианты без запроса')\n"
-            "- user_instructions: явные указания пользователя агенту "
-            "(например: 'всегда использовать LEFT JOIN', 'сохранять результаты в /reports/')\n"
-            "- Каждый элемент — короткая строка (одно предложение)\n"
-            "- Объедини существующие данные с новыми, убери дубли и устаревшее\n"
-            "- Если в диалоге нет новой информации для категории — верни существующий список без изменений\n"
-            "- Если ничего не найдено и ничего не было — верни пустой массив []\n"
-            "- Не более 20 элементов в каждой категории"
-        )
+        system_prompt, user_prompt = self._build_memory_extraction_prompt(dialog)
 
         try:
-            response = self.llm.invoke(prompt)
+            response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.1)
         except Exception as e:
             logger.warning("Ошибка LLM при извлечении долгосрочной памяти: %s", e)
             return
 
-        # Парсим JSON из ответа
-        try:
-            match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not match:
-                logger.warning("Не удалось найти JSON в ответе извлечения памяти")
-                return
-            data = json.loads(match.group())
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning("Ошибка парсинга JSON извлечения памяти: %s", e)
-            return
-
-        # Сохраняем каждый слой
-        for key in ("user_facts", "behavior_patterns", "user_instructions"):
-            value = data.get(key)
-            if isinstance(value, list):
-                self.memory.set_memory(key, json.dumps(value, ensure_ascii=False))
-
+        self._save_memory_from_llm_response(response)
         logger.info("Долгосрочная память (слои) обновлена")
 
     def _process_query(self, user_input: str) -> None:

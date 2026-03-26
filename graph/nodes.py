@@ -54,6 +54,7 @@ class GraphNodes:
         self.tools_description = "\n".join(
             f"- {t.name}: {t.description}" for t in tools
         )
+        self.tools_brief = ", ".join(t.name for t in tools)
 
     def _get_tables_detail_context(self, text: str) -> str:
         """Найти упоминания таблиц в тексте и вернуть полное описание их колонок из CSV.
@@ -167,42 +168,86 @@ class GraphNodes:
             return ""
         return "\n\n" + "\n\n".join(sections)
 
-    def _get_system_prompt(self) -> str:
-        """Сформировать системный промпт с контекстом."""
-        sessions_ctx = self.memory.get_sessions_context()
-        lt_ctx = self._get_long_term_memory_context()
+    def _get_planner_system_prompt(self) -> str:
+        """Системный промпт для планировщика.
 
-        schema_ctx = self._get_schema_context()
+        Включает полный каталог таблиц и инструменты — planner должен знать всё.
+        """
+        lt_ctx = self._get_long_term_memory_context()
         history_ctx = self._get_session_history_context()
-        history_section = f"\n\n{history_ctx}" if history_ctx else ""
+        schema_ctx = self._get_schema_context()
+        sessions_ctx = self.memory.get_sessions_context()
 
         return (
-            "Ты — аналитический агент для работы с базой данных Greenplum (PostgreSQL-совместимый).\n"
-            "Ты помогаешь аналитикам: отвечаешь на вопросы по структуре БД, пишешь и валидируешь SQL,\n"
-            "делаешь выгрузки, проектируешь модели данных.\n\n"
+            "Ты — планировщик аналитического агента для Greenplum (PostgreSQL).\n"
+            "Задача: составить пошаговый план выполнения запроса пользователя.\n\n"
             f"{schema_ctx}\n\n"
-            "ВАЖНО: Каталог таблиц выше — это твои знания о структуре БД. "
-            "Если пользователь спрашивает какие таблицы ты знаешь, какие данные доступны, "
-            "что есть в базе — отвечай на основе этого каталога. "
-            "Ты ЗНАЕШЬ эти таблицы, это твоя база знаний.\n\n"
-            "Доступные инструменты:\n"
-            f"{self.tools_description}\n\n"
+            "Это твоя база знаний о таблицах. Если пользователь спрашивает что есть в базе — "
+            "отвечай на основе этого каталога.\n\n"
+            f"Инструменты: {self.tools_brief}\n\n"
             "Правила:\n"
-            "1. ВСЕГДА используй ТОЛЬКО реальные имена таблиц из каталога выше в формате schema.table. "
-            "НЕ придумывай имена схем и таблиц. Если нужной таблицы нет в каталоге — "
-            "сначала найди её через search_tables или search_by_description.\n"
-            "2. Всегда проверяй SQL через валидатор перед выполнением.\n"
-            "3. Для JOIN-ов проверяй уникальность ключей.\n"
-            "4. Для деструктивных операций (DELETE, DROP, TRUNCATE) запрашивай подтверждение.\n"
-            "5. Сохраняй результаты выгрузок в workspace/.\n"
-            "6. Если пользователь просит сгенерировать или сохранить SQL-запрос, текст или отчёт — "
-            "используй create_file для сохранения в workspace/ (например, query.sql, report.txt).\n"
-            "7. Отвечай на русском языке. НО в SQL-коде алиасы (AS) пиши ТОЛЬКО на английском.\n"
-            "8. В SQL-запросах НИКОГДА не используй русские/кириллические алиасы. "
-            "Примеры правильно: AS outflow, AS total_revenue, AS client_count. "
-            'Примеры НЕПРАВИЛЬНО: AS "отток", AS "выручка", AS "кол_во_клиентов". '
-            "Это СТРОГОЕ правило для всех алиасов колонок, подзапросов и таблиц.\n\n"
-            f"{sessions_ctx}{lt_ctx}{history_section}"
+            "- Используй ТОЛЬКО реальные таблицы из каталога в формате schema.table\n"
+            "- Не пиши SQL в плане — только укажи нужные таблицы, SQL будет на этапе исполнения\n"
+            "- Если ответ уже есть в каталоге или контексте — план из одного шага без инструментов\n"
+            "- Алиасы в SQL ТОЛЬКО на английском (AS outflow, НЕ AS \"отток\")\n\n"
+            f"{sessions_ctx}{lt_ctx}"
+            f"{chr(10) + chr(10) + history_ctx if history_ctx else ''}"
+        )
+
+    def _get_executor_system_prompt(self) -> str:
+        """Системный промпт для исполнителя шагов.
+
+        Компактный: роль + правила SQL + формат ответа. Без каталога таблиц —
+        executor получает только релевантные таблицы через tables_context.
+        """
+        lt_ctx = self._get_long_term_memory_context()
+
+        return (
+            "Ты — исполнитель шагов аналитического агента для Greenplum.\n"
+            "Получаешь шаг плана и контекст. Вызываешь один инструмент или отвечаешь напрямую.\n\n"
+            f"Доступные инструменты:\n{self.tools_description}\n\n"
+            "Формат ответа — СТРОГО один JSON-объект:\n"
+            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n'
+            'Если инструмент не нужен: {"tool": "none", "result": "текст ответа"}\n\n'
+            "Правила SQL:\n"
+            "- Имена таблиц в формате schema.table\n"
+            "- Алиасы СТРОГО на английском: AS outflow, AS total_cnt\n"
+            '- ЗАПРЕЩЕНО: AS "отток", AS "выручка", кириллица в алиасах\n'
+            "- Изучи РАЗВЕДКУ ТАБЛИЦ (если есть) перед написанием SQL\n"
+            "- Пойми гранулярность (что = одна строка) перед COUNT/агрегатами\n"
+            "- Для JOIN проверяй уникальность ключей\n"
+            f"{lt_ctx}"
+        )
+
+    def _get_corrector_system_prompt(self) -> str:
+        """Системный промпт для корректора ошибок.
+
+        Компактный: роль + формат ответа + стратегии коррекции.
+        """
+        return (
+            "Ты — корректор ошибок аналитического агента для Greenplum.\n"
+            "Анализируешь ошибку предыдущего шага и выдаёшь исправленный вызов инструмента.\n\n"
+            f"Доступные инструменты:\n{self.tools_description}\n\n"
+            "Формат ответа — СТРОГО один JSON-объект:\n"
+            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n\n'
+            "Правила SQL:\n"
+            "- Имена таблиц в формате schema.table\n"
+            "- Алиасы СТРОГО на английском: AS outflow, AS total_cnt\n"
+            '- ЗАПРЕЩЕНО: AS "отток", AS "выручка", кириллица в алиасах\n'
+        )
+
+    def _get_summarizer_system_prompt(self) -> str:
+        """Системный промпт для формирования финального ответа."""
+        return (
+            "Ты — аналитический агент для Greenplum. Формируешь финальный ответ пользователю.\n\n"
+            "Правила ответа:\n"
+            "- Отвечай на русском языке\n"
+            "- SQL-алиасы только на английском\n"
+            "- Табличные данные оформляй в markdown-таблицу\n"
+            "- SQL-код оборачивай в ```sql блок\n"
+            "- Не пересказывай шаги плана — только результат\n"
+            "- Не повторяй вопрос пользователя\n"
+            "- Если были предупреждения — упомяни кратко в конце\n"
         )
 
     def planner(self, state: AgentState) -> dict[str, Any]:
@@ -219,40 +264,39 @@ class GraphNodes:
 
         self.memory.add_message("user", user_input)
 
-        prompt = (
-            f"{self._get_system_prompt()}\n\n"
-            "Задача: составь пронумерованный план шагов для выполнения запроса пользователя.\n"
-            "Для каждого шага укажи какой инструмент нужно вызвать и с какими параметрами.\n"
-            "Если задача простая — план может состоять из 1-2 шагов.\n\n"
-            "ОБЯЗАТЕЛЬНАЯ СТРАТЕГИЯ ДЛЯ АНАЛИТИЧЕСКИХ ВОПРОСОВ (подсчёты, агрегаты, выборки):\n"
-            "1. ПЕРВЫЙ ШАГ — определи какие таблицы нужны. Укажи их явно в формате schema.table.\n"
-            "   Если не уверен в таблице — используй search_tables или search_by_description.\n"
-            "2. НЕ ПИШИ SQL сразу. После определения таблиц система автоматически подгрузит\n"
-            "   структуру колонок и образец 10 строк данных. Ты увидишь их перед выполнением.\n"
-            "3. Только ПОСЛЕ изучения структуры и данных — строй SQL-запрос.\n\n"
-            "ПОЧЕМУ ЭТО ВАЖНО:\n"
-            "- Таблица-справочник может содержать неуникальные строки (например, одна сущность\n"
-            "  представлена несколькими строками с разными атрибутами). COUNT(*) без понимания\n"
-            "  гранулярности даст неверный результат.\n"
-            "- Без знания колонок и типов данных ты не сможешь написать корректный SQL.\n"
-            "- Образец данных покажет формат значений, NULL'ы, дубликаты.\n\n"
-            "ВАЖНО: Если ответ на вопрос пользователя уже содержится в каталоге таблиц, "
-            "долгосрочной памяти или контексте выше — НЕ вызывай инструменты. "
-            "Вместо этого верни план из одного шага: "
-            '[\"Ответить на основе контекста (без вызова инструментов)\"]\n'
-            "Верни ТОЛЬКО JSON-массив строк, без пояснений.\n"
-            "Пример аналитического запроса:\n"
-            "[\"Шаг 1: Определить нужные таблицы — schema.table_name (система подгрузит структуру и семпл)\",\n"
-            " \"Шаг 2: Проанализировать структуру и данные, определить гранулярность таблицы\",\n"
-            " \"Шаг 3: Написать SQL-запрос с учётом структуры данных\"]\n"
-            "Пример без инструмента: [\"Ответить на основе контекста (без вызова инструментов)\"]\n\n"
-            f"Запрос пользователя: {user_input}"
+        system_prompt = self._get_planner_system_prompt()
+
+        user_prompt = (
+            f"Запрос пользователя: {user_input}\n\n"
+            "Составь план шагов. Верни ТОЛЬКО JSON-массив строк.\n\n"
+            "Стратегия планирования:\n"
+            "1. Для аналитики (подсчёты, агрегаты, выборки):\n"
+            "   - Первый шаг: укажи нужные таблицы в формате schema.table\n"
+            "   - Система автоматически подгрузит структуру и 10 строк данных\n"
+            "   - SQL пиши только ПОСЛЕ изучения структуры\n"
+            "2. Для вопросов по схеме: если ответ есть в каталоге — один шаг без инструментов\n"
+            "3. Для выгрузок: определи таблицу → SQL → export_query\n"
+            "4. Если таблица неизвестна — используй search_tables / search_by_description\n\n"
+            "Примеры:\n\n"
+            'Аналитика: "Сколько клиентов в регионе X?"\n'
+            '["Определить таблицы — dm.clients (подгрузится структура)", '
+            '"Написать SQL с учётом гранулярности таблицы"]\n\n'
+            'Вопрос по схеме: "Какие таблицы содержат данные о продажах?"\n'
+            '["Ответить на основе контекста (без вызова инструментов)"]\n\n'
+            'Поиск таблицы: "Есть ли данные по оттоку?"\n'
+            '["Найти таблицы через search_by_description по теме оттока"]\n\n'
+            'Выгрузка: "Выгрузи клиентов за 2024 в CSV"\n'
+            '["Определить таблицы — dm.clients (подгрузится структура)", '
+            '"Написать SQL с фильтром по дате", "Экспортировать через export_query в CSV"]\n\n'
+            'DDL: "Создай таблицу для отчётов"\n'
+            '["Спроектировать структуру таблицы", "Создать через execute_ddl"]'
         )
 
         if self.debug_prompt:
-            print(f"\n{'='*80}\n[DEBUG PROMPT — planner]\n{'='*80}\n{prompt}\n{'='*80}\n")
+            print(f"\n{'='*80}\n[DEBUG PROMPT — planner]\n{'='*80}\n"
+                  f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
 
-        response = self.llm.invoke(prompt)
+        response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.3)
 
         # Парсинг плана
         plan = self._parse_plan(response)
@@ -363,16 +407,18 @@ class GraphNodes:
 
     def _parse_plan(self, response: str) -> list[str]:
         """Извлечь план из ответа LLM."""
+        cleaned = self._clean_llm_json(response)
+
         # Пробуем JSON
-        try:
-            # Ищем JSON-массив в ответе
-            match = re.search(r'\[.*\]', response, re.DOTALL)
-            if match:
-                plan = json.loads(match.group())
-                if isinstance(plan, list) and all(isinstance(s, str) for s in plan):
-                    return plan
-        except (json.JSONDecodeError, ValueError):
-            pass
+        for text in (cleaned, response):
+            try:
+                match = re.search(r'\[.*\]', text, re.DOTALL)
+                if match:
+                    plan = json.loads(match.group())
+                    if isinstance(plan, list) and all(isinstance(s, str) for s in plan):
+                        return plan
+            except (json.JSONDecodeError, ValueError):
+                continue
 
         # Fallback: парсим нумерованный список
         lines = response.strip().split("\n")
@@ -404,11 +450,11 @@ class GraphNodes:
         current_step = plan[step_idx]
         logger.info("Executor: шаг %d/%d: %s", step_idx + 1, len(plan), current_step[:100])
 
-        recent_calls = state.get("tool_calls", [])[-5:]
+        recent_calls = state.get("tool_calls", [])[-3:]
         if recent_calls:
             *old_calls, last_call = recent_calls
             prev_context = "\n".join(
-                f"  {tc['tool']}: {tc['result'][:1000]}" for tc in old_calls
+                f"  {tc['tool']}: {tc['result'][:500]}" for tc in old_calls
             )
             prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
         else:
@@ -416,37 +462,31 @@ class GraphNodes:
 
         # Контекст разведки таблиц (от table_explorer)
         tables_context = state.get("tables_context", "")
-        tables_context_section = f"\n\n{tables_context}\n" if tables_context else ""
 
         # Дополнительно: ищем упоминания таблиц в шаге, которых нет в tables_context
         tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
-        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail and tables_detail not in tables_context else ""
+        if tables_detail and tables_detail in tables_context:
+            tables_detail = ""
 
-        prompt = (
-            f"{self._get_system_prompt()}\n\n"
-            f"{tables_context_section}"
-            f"{tables_detail_section}"
-            f"Текущий шаг плана: {current_step}\n\n"
-            f"Контекст предыдущих шагов:\n{prev_context}\n\n"
-            "Выполни этот шаг. Верни JSON с полями:\n"
-            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n'
-            "Если шаг не требует инструмента (ответ уже есть в каталоге таблиц, "
-            "контексте разведки или результатах предыдущих шагов), верни:\n"
-            '{"tool": "none", "result": "полный текстовый ответ на вопрос пользователя"}\n'
-            "Если нужно выполнить SQL, верни:\n"
-            '{"tool": "execute_query", "args": {"sql": "SELECT ... FROM schema.table"}}\n'
-            "ВАЖНО: В SQL всегда указывай схему перед таблицей (schema.table).\n"
-            "ВАЖНО: Алиасы колонок и таблиц в SQL — только на английском (AS outflow, НЕ AS \"отток\").\n"
-            "ВАЖНО: Если выше есть РАЗВЕДКА ТАБЛИЦ — обязательно изучи структуру и образцы данных.\n"
-            "Пойми гранулярность таблицы (что является одной строкой) перед написанием запроса.\n"
-            "Например, если в справочнике одна сущность представлена несколькими строками — \n"
-            "нужен SELECT COUNT(DISTINCT ...), а не простой COUNT(*)."
-        )
+        system_prompt = self._get_executor_system_prompt()
+
+        user_parts = []
+        if tables_context:
+            user_parts.append(tables_context)
+        if tables_detail:
+            user_parts.append(tables_detail)
+        user_parts.append(f"[ТЕКУЩИЙ ШАГ]\n{current_step}")
+        if prev_context:
+            user_parts.append(f"[КОНТЕКСТ ПРЕДЫДУЩИХ ШАГОВ]\n{prev_context}")
+        user_parts.append(f"[ЗАПРОС ПОЛЬЗОВАТЕЛЯ]\n{state['user_input']}")
+
+        user_prompt = "\n\n".join(user_parts)
 
         if self.debug_prompt:
-            print(f"\n{'='*80}\n[DEBUG PROMPT — executor, шаг {step_idx + 1}]\n{'='*80}\n{prompt}\n{'='*80}\n")
+            print(f"\n{'='*80}\n[DEBUG PROMPT — executor, шаг {step_idx + 1}]\n{'='*80}\n"
+                  f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
 
-        response = self.llm.invoke(prompt)
+        response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.1)
 
         # Парсим вызов инструмента
         tool_call = self._parse_tool_call(response)
@@ -509,14 +549,34 @@ class GraphNodes:
             ],
         }
 
-    def _parse_tool_call(self, response: str) -> dict[str, Any]:
+    @staticmethod
+    def _clean_llm_json(text: str) -> str:
+        """Очистить ответ LLM от markdown-обёрток и типичных ошибок GigaChat.
+
+        GigaChat часто оборачивает JSON в ```json ... ```, добавляет trailing commas,
+        или вставляет пояснения до/после JSON.
+        """
+        # Убираем markdown code block обёртки
+        text = re.sub(r'```(?:json)?\s*\n?', '', text)
+        text = re.sub(r'\n?```\s*$', '', text, flags=re.MULTILINE)
+        # Убираем trailing commas перед } или ]
+        text = re.sub(r',\s*([}\]])', r'\1', text)
+        return text.strip()
+
+    def _parse_tool_call(
+        self, response: str, retry_on_fail: bool = True, _original: str | None = None,
+    ) -> dict[str, Any]:
         """Извлечь вызов инструмента из ответа LLM.
 
         Использует парсер с подсчётом глубины скобок и учётом строковых литералов,
         чтобы корректно обрабатывать вложенные объекты (например, args с SQL внутри).
+        При неудаче — retry с уточняющим промптом.
         """
+        original_response = _original or response
+        cleaned = self._clean_llm_json(response)
+
         # Ищем все JSON-объекты верхнего уровня с учётом вложенности и строк
-        for candidate in self._extract_json_objects(response):
+        for candidate in self._extract_json_objects(cleaned):
             try:
                 parsed = json.loads(candidate)
                 if isinstance(parsed, dict) and "tool" in parsed:
@@ -524,7 +584,33 @@ class GraphNodes:
             except (json.JSONDecodeError, ValueError):
                 continue
 
-        return {"tool": "none", "result": response}
+        # Также пробуем из оригинального ответа (на случай если clean сломал что-то)
+        if cleaned != response:
+            for candidate in self._extract_json_objects(response):
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict) and "tool" in parsed:
+                        return parsed
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+        # Retry: повторный запрос к LLM с уточнением формата
+        if retry_on_fail:
+            logger.warning("JSON не найден в ответе LLM, retry с уточнением формата")
+            retry_prompt = (
+                "Твой предыдущий ответ не содержит валидный JSON.\n"
+                f"Ответ: {response[:500]}\n\n"
+                'Верни ТОЛЬКО один JSON-объект в формате:\n'
+                '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n'
+                'или {"tool": "none", "result": "текст ответа"}\n'
+                "Без пояснений, без markdown-обёрток."
+            )
+            retry_response = str(self.llm.invoke(retry_prompt, temperature=0.0))
+            return self._parse_tool_call(
+                retry_response, retry_on_fail=False, _original=original_response,
+            )
+
+        return {"tool": "none", "result": original_response}
 
     @staticmethod
     def _extract_json_objects(text: str) -> list[str]:
@@ -790,39 +876,57 @@ class GraphNodes:
         if recent_calls:
             *old_calls, last_call = recent_calls
             prev_context = "\n".join(
-                f"  {tc['tool']}: {tc['result'][:1000]}" for tc in old_calls
+                f"  {tc['tool']}: {tc['result'][:500]}" for tc in old_calls
             )
             prev_context += f"\n  {last_call['tool']} (полный результат):\n{last_call['result']}"
         else:
             prev_context = ""
 
         tables_context = state.get("tables_context", "")
-        tables_context_section = f"\n\n{tables_context}\n" if tables_context else ""
 
         tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
-        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail and tables_detail not in tables_context else ""
+        if tables_detail and tables_detail in tables_context:
+            tables_detail = ""
 
-        prompt = (
-            f"{self._get_system_prompt()}\n\n"
-            f"{tables_context_section}"
-            f"{tables_detail_section}"
-            f"Текущий шаг: {current_step}\n"
-            f"Ошибка: {error}\n\n"
-            f"Контекст предыдущих вызовов:\n{prev_context}\n\n"
-            "Исправь ошибку. Верни исправленный вызов инструмента в формате JSON:\n"
-            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n\n'
-            "ПОДСКАЗКИ для исправления:\n"
-            "- Если запрос вернул 0 строк — вызови get_sample чтобы посмотреть реальные данные\n"
-            "  и понять формат значений, после чего исправь условия WHERE.\n"
-            "- Если ошибка в имени колонки — вызови get_table_columns для проверки структуры.\n"
-            "- Если COUNT(*) дал неожиданный результат — проверь гранулярность таблицы\n"
-            "  (возможно нужен COUNT(DISTINCT ...) вместо COUNT(*))."
-        )
+        system_prompt = self._get_corrector_system_prompt()
+
+        # Эскалация стратегии в зависимости от номера попытки
+        if retry_count == 0:
+            strategy_hint = (
+                "Стратегии исправления:\n"
+                "- 0 строк → вызови get_sample, проверь формат данных, ослабь WHERE\n"
+                "- Ошибка колонки → вызови get_table_columns\n"
+                "- Синтаксическая ошибка → исправь SQL по тексту ошибки\n"
+                "- Неожиданный COUNT → проверь гранулярность (COUNT(DISTINCT ...) вместо COUNT(*))"
+            )
+        else:
+            strategy_hint = (
+                f"ВНИМАНИЕ: Это попытка {retry_count + 1} из {self.MAX_RETRIES}.\n"
+                "Предыдущий подход не сработал — СМЕНИ СТРАТЕГИЮ:\n"
+                "- Попробуй другой инструмент для диагностики (get_sample, get_table_columns)\n"
+                "- Переформулируй SQL с нуля, не патчи старый\n"
+                "- Проверь, правильная ли таблица используется"
+            )
+
+        user_parts = []
+        user_parts.append(f"[ПОПЫТКА {retry_count + 1} из {self.MAX_RETRIES}]")
+        user_parts.append(f"[ШАГ]\n{current_step}")
+        user_parts.append(f"[ОШИБКА]\n{error}")
+        user_parts.append(strategy_hint)
+        if tables_context:
+            user_parts.append(f"[КОНТЕКСТ ТАБЛИЦ]\n{tables_context}")
+        if tables_detail:
+            user_parts.append(tables_detail)
+        if prev_context:
+            user_parts.append(f"[ПРЕДЫДУЩИЕ ВЫЗОВЫ]\n{prev_context}")
+
+        user_prompt = "\n\n".join(user_parts)
 
         if self.debug_prompt:
-            print(f"\n{'='*80}\n[DEBUG PROMPT — corrector]\n{'='*80}\n{prompt}\n{'='*80}\n")
+            print(f"\n{'='*80}\n[DEBUG PROMPT — corrector]\n{'='*80}\n"
+                  f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
 
-        response = self.llm.invoke(prompt)
+        response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.4)
         tool_call = self._parse_tool_call(response)
 
         # Если исправленный вызов содержит SQL — отправить на валидацию
@@ -889,23 +993,19 @@ class GraphNodes:
 
         plan_text = "\n".join(state.get("plan", []))
 
-        schema_ctx = self._get_schema_context()
+        system_prompt = self._get_summarizer_system_prompt()
 
-        prompt = (
-            "Сформируй краткий и информативный ответ пользователю на основе результатов.\n\n"
-            f"Справочник таблиц:\n{schema_ctx}\n\n"
+        user_prompt = (
             f"Запрос пользователя: {state['user_input']}\n\n"
             f"План:\n{plan_text}\n\n"
-            f"Результаты инструментов:\n{tool_results}\n\n"
-            "Дай ответ на русском языке. Если были получены данные — включи их в ответ.\n"
-            "Если в ответе есть SQL-код — алиасы (AS) пиши только на английском.\n"
-            "Если были предупреждения — упомяни их."
+            f"Результаты инструментов:\n{tool_results}"
         )
 
         if self.debug_prompt:
-            print(f"\n{'='*80}\n[DEBUG PROMPT — summarizer]\n{'='*80}\n{prompt}\n{'='*80}\n")
+            print(f"\n{'='*80}\n[DEBUG PROMPT — summarizer]\n{'='*80}\n"
+                  f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
 
-        answer = self.llm.invoke(prompt)
+        answer = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.5)
         self.memory.add_message("assistant", answer)
 
         logger.info("Summarizer: ответ сформирован")

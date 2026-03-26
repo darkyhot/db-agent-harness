@@ -244,8 +244,20 @@ class CLIInterface:
         port = int(port_str) if port_str else 5432
         database = input("database [prom]: ").strip() or "prom"
 
+        current_debug = self.db._config.get("debug_prompt", False)
+        debug_str = input(f"debug_prompt (true/false) [{current_debug}]: ").strip().lower()
+        if debug_str in ("true", "1", "yes", "да"):
+            debug_prompt = True
+        elif debug_str in ("false", "0", "no", "нет"):
+            debug_prompt = False
+        else:
+            debug_prompt = current_debug
+
+        self.db._config["debug_prompt"] = debug_prompt
         self.db.save_config(user_id, host, port, database)
+        self.debug_prompt = debug_prompt
         print(f"\n✓ Конфигурация сохранена: {self.db.config_summary}")
+        print(f"  debug_prompt: {debug_prompt}")
 
     def _handle_reset(self) -> None:
         """Сброс контекста текущей сессии."""

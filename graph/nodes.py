@@ -16,6 +16,46 @@ from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
 
+# === Общие константы для промптов ===
+
+SQL_RULES = (
+    "Правила SQL (Greenplum / PostgreSQL):\n"
+    "- Имена таблиц ВСЕГДА в формате schema.table\n"
+    "- Алиасы СТРОГО на английском: AS outflow, AS total_cnt\n"
+    '- ЗАПРЕЩЕНО: AS "отток", AS "выручка", кириллица в алиасах и именах колонок\n'
+    "- Изучи РАЗВЕДКУ ТАБЛИЦ (если есть) перед написанием SQL\n"
+    "- Пойми гранулярность (что = одна строка) перед COUNT/агрегатами\n"
+    "- Для JOIN проверяй уникальность ключей через check_key_uniqueness\n"
+    "- GROUP BY: перечисли ВСЕ не-агрегированные колонки из SELECT\n"
+    "- Даты: используй приведение типов (::date, ::timestamp, TO_DATE()). "
+    "Проверь формат дат в образце данных перед фильтрацией\n"
+    "- NULL: используй COALESCE() или IS NOT NULL / IS NULL в WHERE. "
+    "Не сравнивай с NULL через = или !=\n"
+    "- LIMIT: добавляй LIMIT для exploration-запросов и больших таблиц\n"
+    "- Используй стандартный PostgreSQL синтаксис (Greenplum совместим)"
+)
+
+SQL_CHECKLIST = (
+    "Чеклист перед финализацией SQL:\n"
+    "1. Формат дат соответствует данным из образца (YYYY-MM-DD, DD.MM.YYYY, и т.д.)?\n"
+    "2. NULL обработан (COALESCE/IS NOT NULL) для колонок с высоким % NULL?\n"
+    "3. JOIN-ключи уникальны (проверены через check_key_uniqueness или разведку)?\n"
+    "4. GROUP BY содержит все не-агрегированные колонки?\n"
+    "5. Алиасы только на английском?\n"
+    "6. Есть LIMIT для больших выборок?\n"
+    "7. Типы данных совместимы в WHERE/JOIN (нет сравнения text с integer)?"
+)
+
+GIGACHAT_COMMON_ERRORS = (
+    "Частые ошибки (проверяй и избегай):\n"
+    "- Кириллица в алиасах → замени на английские\n"
+    "- Несуществующая колонка → проверь через get_table_columns или разведку таблиц\n"
+    "- Неправильный формат даты → проверь get_sample для реального формата\n"
+    "- Пропущен GROUP BY → добавь все не-агрегированные колонки\n"
+    "- COUNT(*) вместо COUNT(DISTINCT ...) → проверь гранулярность\n"
+    "- Сравнение с NULL через = → используй IS NULL / IS NOT NULL"
+)
+
 
 class GraphNodes:
     """Узлы графа агента."""
@@ -55,6 +95,12 @@ class GraphNodes:
             f"- {t.name}: {t.description}" for t in tools
         )
         self.tools_brief = ", ".join(t.name for t in tools)
+        # Компактное описание инструментов для planner (имя + первое предложение описания)
+        compact_lines = []
+        for t in tools:
+            first_sentence = t.description.split("\n")[0].split(". ")[0]
+            compact_lines.append(f"- {t.name}: {first_sentence}")
+        self.tools_compact = "\n".join(compact_lines)
 
     def _get_tables_detail_context(self, text: str) -> str:
         """Найти упоминания таблиц в тексте и вернуть полное описание их колонок из CSV.
@@ -180,18 +226,40 @@ class GraphNodes:
 
         return (
             "Ты — планировщик аналитического агента для Greenplum (PostgreSQL).\n"
-            "Задача: составить пошаговый план выполнения запроса пользователя.\n\n"
+            "Задача: составить пошаговый план выполнения запроса пользователя.\n"
+            "Верни ТОЛЬКО JSON-массив строк — шаги плана.\n\n"
+            f"{sessions_ctx}{lt_ctx}"
+            f"{chr(10) + chr(10) + history_ctx if history_ctx else ''}\n\n"
             f"{schema_ctx}\n\n"
             "Это твоя база знаний о таблицах. Если пользователь спрашивает что есть в базе — "
             "отвечай на основе этого каталога.\n\n"
-            f"Инструменты: {self.tools_brief}\n\n"
+            f"Доступные инструменты:\n{self.tools_compact}\n\n"
             "Правила:\n"
             "- Используй ТОЛЬКО реальные таблицы из каталога в формате schema.table\n"
-            "- Не пиши SQL в плане — только укажи нужные таблицы, SQL будет на этапе исполнения\n"
+            "- НЕ пиши SQL в плане — только укажи нужные таблицы, SQL будет на этапе исполнения\n"
+            "- НЕ выдумывай таблицы — если не знаешь таблицу, используй search_tables / search_by_description\n"
             "- Если ответ уже есть в каталоге или контексте — план из одного шага без инструментов\n"
-            "- Алиасы в SQL ТОЛЬКО на английском (AS outflow, НЕ AS \"отток\")\n\n"
-            f"{sessions_ctx}{lt_ctx}"
-            f"{chr(10) + chr(10) + history_ctx if history_ctx else ''}"
+            "- Алиасы в SQL ТОЛЬКО на английском (AS outflow, НЕ AS \"отток\")\n"
+            "- Если запрос неоднозначный — начни с search_tables/search_by_description для уточнения\n\n"
+            "=== ПРИМЕРЫ ===\n\n"
+            'Аналитика: "Сколько клиентов в регионе X?"\n'
+            '["Определить таблицы — dm.clients (подгрузится структура)", '
+            '"Написать SQL с учётом гранулярности таблицы"]\n\n'
+            'JOIN нескольких таблиц: "Покажи продажи по менеджерам за январь 2024"\n'
+            '["Определить таблицы — dm.sales, dm.managers (подгрузится структура)", '
+            '"Написать SQL с JOIN по ключу менеджера и фильтром по дате"]\n\n'
+            'Вопрос по схеме: "Какие таблицы содержат данные о продажах?"\n'
+            '["Ответить на основе каталога (без вызова инструментов)"]\n\n'
+            'Поиск таблицы: "Есть ли данные по оттоку?"\n'
+            '["Найти таблицы через search_by_description по теме оттока"]\n\n'
+            'Выгрузка: "Выгрузи клиентов за 2024 в CSV"\n'
+            '["Определить таблицы — dm.clients (подгрузится структура)", '
+            '"Написать SQL с фильтром по дате", "Экспортировать через export_query в CSV"]\n\n'
+            "=== АНТИПРИМЕРЫ (НЕ ДЕЛАЙ ТАК) ===\n\n"
+            "ПЛОХО: [\"SELECT * FROM dm.clients WHERE region = 'X'\"]\n"
+            "  → Нельзя писать SQL в плане!\n\n"
+            "ПЛОХО: [\"Найти таблицу abc.xyz\"]\n"
+            "  → Таблица abc.xyz не существует в каталоге! Используй только реальные таблицы.\n"
         )
 
     def _get_executor_system_prompt(self) -> str:
@@ -206,34 +274,47 @@ class GraphNodes:
             "Ты — исполнитель шагов аналитического агента для Greenplum.\n"
             "Получаешь шаг плана и контекст. Вызываешь один инструмент или отвечаешь напрямую.\n\n"
             f"Доступные инструменты:\n{self.tools_description}\n\n"
-            "Формат ответа — СТРОГО один JSON-объект:\n"
+            "Формат ответа — СТРОГО один JSON-объект (без пояснений, без markdown-обёрток):\n"
             '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n'
             'Если инструмент не нужен: {"tool": "none", "result": "текст ответа"}\n\n'
-            "Правила SQL:\n"
-            "- Имена таблиц в формате schema.table\n"
-            "- Алиасы СТРОГО на английском: AS outflow, AS total_cnt\n"
-            '- ЗАПРЕЩЕНО: AS "отток", AS "выручка", кириллица в алиасах\n'
-            "- Изучи РАЗВЕДКУ ТАБЛИЦ (если есть) перед написанием SQL\n"
-            "- Пойми гранулярность (что = одна строка) перед COUNT/агрегатами\n"
-            "- Для JOIN проверяй уникальность ключей\n"
+            "Примеры ответов:\n"
+            '{"tool": "execute_query", "args": {"sql": "SELECT client_id, SUM(amount) AS total_amount '
+            "FROM dm.sales WHERE sale_date >= '2024-01-01'::date GROUP BY client_id LIMIT 100\"}}\n"
+            '{"tool": "get_table_columns", "args": {"schema": "dm", "table": "clients"}}\n'
+            '{"tool": "none", "result": "В каталоге найдено 3 таблицы с данными о продажах."}\n\n'
+            f"{SQL_RULES}\n\n"
+            f"{SQL_CHECKLIST}\n\n"
+            f"{GIGACHAT_COMMON_ERRORS}\n\n"
+            "Порядок рассуждений при написании SQL:\n"
+            "1. Изучи разведку таблиц: колонки, типы данных, образцы данных\n"
+            "2. Определи гранулярность таблицы (что = одна строка)\n"
+            "3. Выбери нужные колонки и проверь их наличие в разведке\n"
+            "4. Определи условия фильтрации (WHERE) — проверь формат значений в образце\n"
+            "5. Если нужен JOIN — проверь уникальность ключей\n"
+            "6. Напиши SQL и пройди по чеклисту выше\n"
             f"{lt_ctx}"
         )
 
     def _get_corrector_system_prompt(self) -> str:
         """Системный промпт для корректора ошибок.
 
-        Компактный: роль + формат ответа + стратегии коррекции.
+        Компактный: роль + формат ответа + стратегии коррекции + паттерны ошибок.
         """
+        lt_ctx = self._get_long_term_memory_context()
+
         return (
             "Ты — корректор ошибок аналитического агента для Greenplum.\n"
             "Анализируешь ошибку предыдущего шага и выдаёшь исправленный вызов инструмента.\n\n"
+            "Порядок действий:\n"
+            "1. Прочитай текст ошибки и определи её тип\n"
+            "2. Найди причину в контексте (разведка таблиц, предыдущие вызовы)\n"
+            "3. Выдай исправленный JSON-вызов инструмента\n\n"
             f"Доступные инструменты:\n{self.tools_description}\n\n"
             "Формат ответа — СТРОГО один JSON-объект:\n"
             '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n\n'
-            "Правила SQL:\n"
-            "- Имена таблиц в формате schema.table\n"
-            "- Алиасы СТРОГО на английском: AS outflow, AS total_cnt\n"
-            '- ЗАПРЕЩЕНО: AS "отток", AS "выручка", кириллица в алиасах\n'
+            f"{SQL_RULES}\n\n"
+            f"{GIGACHAT_COMMON_ERRORS}\n"
+            f"{lt_ctx}"
         )
 
     def _get_summarizer_system_prompt(self) -> str:
@@ -248,6 +329,10 @@ class GraphNodes:
             "- Не пересказывай шаги плана — только результат\n"
             "- Не повторяй вопрос пользователя\n"
             "- Если были предупреждения — упомяни кратко в конце\n"
+            "- Если был выполнен SQL-запрос — покажи его в блоке ```sql и кратко объясни логику\n"
+            "- Интерпретируй результат в бизнес-терминах, если это возможно\n"
+            "- Если данные обрезаны — укажи это и покажи общее количество строк\n"
+            "- Если результат большой — покажи топ-10 строк и общую статистику\n"
         )
 
     def planner(self, state: AgentState) -> dict[str, Any]:
@@ -276,20 +361,8 @@ class GraphNodes:
             "   - SQL пиши только ПОСЛЕ изучения структуры\n"
             "2. Для вопросов по схеме: если ответ есть в каталоге — один шаг без инструментов\n"
             "3. Для выгрузок: определи таблицу → SQL → export_query\n"
-            "4. Если таблица неизвестна — используй search_tables / search_by_description\n\n"
-            "Примеры:\n\n"
-            'Аналитика: "Сколько клиентов в регионе X?"\n'
-            '["Определить таблицы — dm.clients (подгрузится структура)", '
-            '"Написать SQL с учётом гранулярности таблицы"]\n\n'
-            'Вопрос по схеме: "Какие таблицы содержат данные о продажах?"\n'
-            '["Ответить на основе контекста (без вызова инструментов)"]\n\n'
-            'Поиск таблицы: "Есть ли данные по оттоку?"\n'
-            '["Найти таблицы через search_by_description по теме оттока"]\n\n'
-            'Выгрузка: "Выгрузи клиентов за 2024 в CSV"\n'
-            '["Определить таблицы — dm.clients (подгрузится структура)", '
-            '"Написать SQL с фильтром по дате", "Экспортировать через export_query в CSV"]\n\n'
-            'DDL: "Создай таблицу для отчётов"\n'
-            '["Спроектировать структуру таблицы", "Создать через execute_ddl"]'
+            "4. Если таблица неизвестна — используй search_tables / search_by_description\n"
+            "5. Для DDL: спроектируй структуру → execute_ddl"
         )
 
         if self.debug_prompt:
@@ -350,7 +423,14 @@ class GraphNodes:
 
         if not found_tables:
             logger.info("TableExplorer: таблицы не найдены в плане, пропускаем")
-            return {"tables_context": ""}
+            return {
+                "tables_context": (
+                    "=== РАЗВЕДКА ТАБЛИЦ ===\n\n"
+                    "Таблицы не были определены на этапе планирования.\n"
+                    "Используй get_table_columns или search_tables для получения "
+                    "структуры нужных таблиц перед написанием SQL."
+                )
+            }
 
         logger.info("TableExplorer: найдено %d таблиц для разведки: %s",
                      len(found_tables),
@@ -470,15 +550,22 @@ class GraphNodes:
 
         system_prompt = self._get_executor_system_prompt()
 
+        # Краткий контекст полного плана
+        plan_summary = " → ".join(
+            f"{'[✓] ' if i < step_idx else '[→] ' if i == step_idx else ''}{s[:60]}"
+            for i, s in enumerate(plan)
+        )
+
         user_parts = []
+        user_parts.append(f"[ЗАПРОС ПОЛЬЗОВАТЕЛЯ]\n{state['user_input']}")
+        user_parts.append(f"[ПЛАН] {plan_summary}")
         if tables_context:
             user_parts.append(tables_context)
         if tables_detail:
             user_parts.append(tables_detail)
-        user_parts.append(f"[ТЕКУЩИЙ ШАГ]\n{current_step}")
+        user_parts.append(f"[ТЕКУЩИЙ ШАГ {step_idx + 1}/{len(plan)}]\n{current_step}")
         if prev_context:
             user_parts.append(f"[КОНТЕКСТ ПРЕДЫДУЩИХ ШАГОВ]\n{prev_context}")
-        user_parts.append(f"[ЗАПРОС ПОЛЬЗОВАТЕЛЯ]\n{state['user_input']}")
 
         user_prompt = "\n\n".join(user_parts)
 
@@ -597,15 +684,21 @@ class GraphNodes:
         # Retry: повторный запрос к LLM с уточнением формата
         if retry_on_fail:
             logger.warning("JSON не найден в ответе LLM, retry с уточнением формата")
-            retry_prompt = (
-                "Твой предыдущий ответ не содержит валидный JSON.\n"
-                f"Ответ: {response[:500]}\n\n"
-                'Верни ТОЛЬКО один JSON-объект в формате:\n'
-                '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n'
-                'или {"tool": "none", "result": "текст ответа"}\n'
-                "Без пояснений, без markdown-обёрток."
+            retry_system = (
+                "Ты — форматировщик ответов. Преобразуй текст в JSON-объект.\n"
+                "Верни ТОЛЬКО один JSON-объект, без пояснений, без markdown-обёрток."
             )
-            retry_response = str(self.llm.invoke(retry_prompt, temperature=0.0))
+            retry_user = (
+                "Предыдущий ответ не содержит валидный JSON.\n"
+                f"Ответ: {response[:1500]}\n\n"
+                "Верни ТОЛЬКО один JSON-объект в одном из форматов:\n"
+                '{"tool": "execute_query", "args": {"sql": "SELECT ..."}}\n'
+                '{"tool": "get_table_columns", "args": {"schema": "dm", "table": "clients"}}\n'
+                '{"tool": "none", "result": "текстовый ответ"}'
+            )
+            retry_response = str(self.llm.invoke_with_system(
+                retry_system, retry_user, temperature=0.0,
+            ))
             return self._parse_tool_call(
                 retry_response, retry_on_fail=False, _original=original_response,
             )
@@ -909,6 +1002,7 @@ class GraphNodes:
             )
 
         user_parts = []
+        user_parts.append(f"[ЗАПРОС ПОЛЬЗОВАТЕЛЯ]\n{state['user_input']}")
         user_parts.append(f"[ПОПЫТКА {retry_count + 1} из {self.MAX_RETRIES}]")
         user_parts.append(f"[ШАГ]\n{current_step}")
         user_parts.append(f"[ОШИБКА]\n{error}")
@@ -926,7 +1020,7 @@ class GraphNodes:
             print(f"\n{'='*80}\n[DEBUG PROMPT — corrector]\n{'='*80}\n"
                   f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
 
-        response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.4)
+        response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.2)
         tool_call = self._parse_tool_call(response)
 
         # Если исправленный вызов содержит SQL — отправить на валидацию

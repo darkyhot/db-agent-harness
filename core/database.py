@@ -82,6 +82,7 @@ class DatabaseManager:
             "host": host,
             "port": port,
             "database": database,
+            "debug_prompt": self._config.get("debug_prompt", False),
         }
         with open(self._config_path, "w", encoding="utf-8") as f:
             json.dump(self._config, f, indent=4, ensure_ascii=False)

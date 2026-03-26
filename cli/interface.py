@@ -100,9 +100,13 @@ class CLIInterface:
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
 
+        # Флаг отладки промптов из конфига
+        self.debug_prompt = self.db._config.get("debug_prompt", False)
+
         # Сборка графа
         self.graph = build_graph(
-            self.llm, self.db, self.schema, self.memory, self.validator, all_tools
+            self.llm, self.db, self.schema, self.memory, self.validator, all_tools,
+            debug_prompt=self.debug_prompt,
         )
 
         # Периодическая очистка старых сессий (старше 90 дней)
@@ -110,11 +114,98 @@ class CLIInterface:
         if cleaned:
             logger.info("Очищено %d старых сессий при старте", cleaned)
 
+        # Восстановление долгосрочной памяти из предыдущих незавершённых сессий
+        self._recover_unsaved_memory()
+
         # Стартуем сессию
         user_id = self.db._config.get("user_id", "")
         self.memory.start_session(user_id)
 
         logger.info("CLIInterface инициализирован")
+
+    def _recover_unsaved_memory(self) -> None:
+        """Восстановить долгосрочную память из предыдущих сессий без резюме.
+
+        Если агент был закрыт без корректного exit/reset (например, перезапуск ядра),
+        резюме и долгосрочная память не были сохранены. Эта функция находит такие сессии
+        и извлекает из них факты.
+        """
+        try:
+            unsaved = self.memory.get_unsummarized_sessions()
+            if not unsaved:
+                return
+            logger.info("Найдено %d незавершённых сессий, восстанавливаю память", len(unsaved))
+            for session_id in unsaved:
+                messages = self.memory.get_session_messages(session_id)
+                if not messages:
+                    continue
+                # Временно переключаемся на старую сессию для сохранения резюме
+                old_session = self.memory._session_id
+                self.memory._session_id = session_id
+                self._save_session_summary()
+                self._extract_long_term_memory_from_messages(messages)
+                self.memory._session_id = old_session
+            logger.info("Восстановление памяти завершено")
+        except Exception as e:
+            logger.warning("Ошибка восстановления памяти из незавершённых сессий: %s", e)
+
+    def _extract_long_term_memory_from_messages(self, messages: list[dict]) -> None:
+        """Извлечь долгосрочную память из произвольного списка сообщений."""
+        if not messages:
+            return
+
+        dialog = "\n".join(
+            f"{m['role']}: {m['content'][:200]}" for m in messages[-20:]
+        )
+
+        existing_facts = self.memory.get_memory("user_facts") or "[]"
+        existing_patterns = self.memory.get_memory("behavior_patterns") or "[]"
+        existing_instructions = self.memory.get_memory("user_instructions") or "[]"
+
+        prompt = (
+            "Проанализируй диалог и извлеки информацию о пользователе в три категории.\n"
+            "Учитывай уже накопленную информацию — не дублируй, обновляй если изменилось, "
+            "добавляй только новое.\n\n"
+            f"Существующие данные:\n"
+            f"  Факты о пользователе: {existing_facts}\n"
+            f"  Паттерны поведения: {existing_patterns}\n"
+            f"  Инструкции пользователя: {existing_instructions}\n\n"
+            f"Диалог:\n{dialog}\n\n"
+            "Верни СТРОГО JSON без пояснений в формате:\n"
+            "{\n"
+            '  "user_facts": ["факт1", "факт2"],\n'
+            '  "behavior_patterns": ["паттерн1", "паттерн2"],\n'
+            '  "user_instructions": ["инструкция1", "инструкция2"]\n'
+            "}\n\n"
+            "Правила:\n"
+            "- user_facts: технологический стек, предпочтения, контекст работы, роль, имя "
+            "(например: 'пользователя зовут Влад', 'использует PostgreSQL')\n"
+            "- behavior_patterns: наблюдения о стиле взаимодействия\n"
+            "- user_instructions: явные указания пользователя агенту\n"
+            "- Каждый элемент — короткая строка (одно предложение)\n"
+            "- Объедини существующие данные с новыми, убери дубли и устаревшее\n"
+            "- Если ничего не найдено — верни существующий список без изменений\n"
+            "- Не более 20 элементов в каждой категории"
+        )
+
+        try:
+            response = self.llm.invoke(prompt)
+        except Exception as e:
+            logger.warning("Ошибка LLM при извлечении долгосрочной памяти: %s", e)
+            return
+
+        try:
+            match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not match:
+                return
+            data = json.loads(match.group())
+        except (json.JSONDecodeError, ValueError):
+            return
+
+        for key in ("user_facts", "behavior_patterns", "user_instructions"):
+            value = data.get(key)
+            if isinstance(value, list):
+                self.memory.set_memory(key, json.dumps(value, ensure_ascii=False))
 
     def _print_banner(self) -> None:
         """Показать приветственное сообщение."""
@@ -132,6 +223,7 @@ class CLIInterface:
 Текущая конфигурация: {config_str}
 Загружено таблиц: {tables_count} | Загружено атрибутов: {attrs_count}
 Память: загружено {sessions} предыдущих сессий
+Отладка промптов: {"ВКЛ" if self.debug_prompt else "ВЫКЛ"} (debug_prompt в config.json)
 
 Введите запрос или команду. help — список команд.
 """
@@ -219,8 +311,8 @@ class CLIInterface:
             '  "user_instructions": ["инструкция1", "инструкция2"]\n'
             "}\n\n"
             "Правила:\n"
-            "- user_facts: технологический стек, предпочтения, контекст работы, роль "
-            "(например: 'использует PostgreSQL', 'работает в отделе аналитики')\n"
+            "- user_facts: имя пользователя, технологический стек, предпочтения, контекст работы, роль "
+            "(например: 'пользователя зовут Влад', 'использует PostgreSQL', 'работает в отделе аналитики')\n"
             "- behavior_patterns: наблюдения о стиле взаимодействия "
             "(например: 'предпочитает краткие ответы', 'не любит альтернативные варианты без запроса')\n"
             "- user_instructions: явные указания пользователя агенту "

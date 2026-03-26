@@ -205,6 +205,25 @@ class MemoryManager:
             for r in rows
         ]
 
+    def get_unsummarized_sessions(self) -> list[str]:
+        """Получить ID сессий, у которых есть сообщения, но нет резюме.
+
+        Используется для восстановления памяти после аварийного завершения.
+
+        Returns:
+            Список ID незавершённых сессий (исключая текущую).
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT s.id FROM sessions s "
+                "WHERE (s.summary IS NULL OR s.summary = '') "
+                "AND s.id != ? "
+                "AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id) "
+                "ORDER BY s.timestamp DESC LIMIT 5",
+                (self._session_id or "",),
+            )
+            return [row[0] for row in cursor.fetchall()]
+
     # --- Long-term memory ---
 
     def set_memory(self, key: str, value: str) -> None:

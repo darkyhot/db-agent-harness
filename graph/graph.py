@@ -101,6 +101,7 @@ def build_graph(
     memory: MemoryManager,
     sql_validator: SQLValidator,
     tools: list,
+    debug_prompt: bool = False,
 ) -> StateGraph:
     """Собрать граф агента.
 
@@ -111,11 +112,12 @@ def build_graph(
         memory: Менеджер памяти.
         sql_validator: Валидатор SQL.
         tools: Список LangChain tools.
+        debug_prompt: Если True, выводить полный промпт в консоль.
 
     Returns:
         Скомпилированный граф LangGraph.
     """
-    nodes = GraphNodes(llm, db_manager, schema_loader, memory, sql_validator, tools)
+    nodes = GraphNodes(llm, db_manager, schema_loader, memory, sql_validator, tools, debug_prompt=debug_prompt)
 
     graph = StateGraph(AgentState)
 

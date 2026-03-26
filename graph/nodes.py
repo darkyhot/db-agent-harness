@@ -30,6 +30,7 @@ class GraphNodes:
         memory: MemoryManager,
         sql_validator: SQLValidator,
         tools: list,
+        debug_prompt: bool = False,
     ) -> None:
         """Инициализация узлов графа.
 
@@ -40,6 +41,7 @@ class GraphNodes:
             memory: Менеджер памяти.
             sql_validator: Валидатор SQL.
             tools: Список LangChain tools для агента.
+            debug_prompt: Если True, выводить полный промпт в консоль.
         """
         self.llm = llm
         self.db = db_manager
@@ -47,6 +49,7 @@ class GraphNodes:
         self.memory = memory
         self.validator = sql_validator
         self.tools = tools
+        self.debug_prompt = debug_prompt
         self.tool_map: dict[str, Any] = {t.name: t for t in tools}
         self.tools_description = "\n".join(
             f"- {t.name}: {t.description}" for t in tools
@@ -178,6 +181,10 @@ class GraphNodes:
             "Ты помогаешь аналитикам: отвечаешь на вопросы по структуре БД, пишешь и валидируешь SQL,\n"
             "делаешь выгрузки, проектируешь модели данных.\n\n"
             f"{schema_ctx}\n\n"
+            "ВАЖНО: Каталог таблиц выше — это твои знания о структуре БД. "
+            "Если пользователь спрашивает какие таблицы ты знаешь, какие данные доступны, "
+            "что есть в базе — отвечай на основе этого каталога. "
+            "Ты ЗНАЕШЬ эти таблицы, это твоя база знаний.\n\n"
             "Доступные инструменты:\n"
             f"{self.tools_description}\n\n"
             "Правила:\n"
@@ -190,7 +197,10 @@ class GraphNodes:
             "5. Сохраняй результаты выгрузок в workspace/.\n"
             "6. Если пользователь просит сгенерировать или сохранить SQL-запрос, текст или отчёт — "
             "используй create_file для сохранения в workspace/ (например, query.sql, report.txt).\n"
-            "7. Отвечай на русском языке.\n\n"
+            "7. Отвечай на русском языке.\n"
+            "8. В SQL-запросах ВСЕГДА используй алиасы (AS) только на английском языке. "
+            "НИКОГДА не используй русские алиасы. Например: AS outflow (правильно), "
+            'AS "отток" (НЕПРАВИЛЬНО). Это касается всех алиасов колонок и таблиц.\n\n'
             f"{sessions_ctx}{lt_ctx}{history_section}"
         )
 
@@ -218,6 +228,9 @@ class GraphNodes:
             "\"Шаг 2: Получить колонки через get_table_columns('hr', 'salary')\"]\n\n"
             f"Запрос пользователя: {user_input}"
         )
+
+        if self.debug_prompt:
+            print(f"\n{'='*80}\n[DEBUG PROMPT — planner]\n{'='*80}\n{prompt}\n{'='*80}\n")
 
         response = self.llm.invoke(prompt)
 
@@ -306,6 +319,9 @@ class GraphNodes:
             '{"tool": "execute_query", "args": {"sql": "SELECT ... FROM schema.table"}}\n'
             "ВАЖНО: В SQL всегда указывай схему перед таблицей (schema.table)."
         )
+
+        if self.debug_prompt:
+            print(f"\n{'='*80}\n[DEBUG PROMPT — executor, шаг {step_idx + 1}]\n{'='*80}\n{prompt}\n{'='*80}\n")
 
         response = self.llm.invoke(prompt)
 
@@ -570,12 +586,43 @@ class GraphNodes:
 
         exec_result = self._call_tool(tool_name, {"sql": sql})
 
+        # Проверка на пустой результат (0 строк) для SELECT-запросов
+        empty_result = False
+        if tool_name == "execute_query" and (
+            exec_result == "Запрос выполнен. Результат пуст."
+            or exec_result.strip() == ""
+        ):
+            empty_result = True
+            logger.warning("Validator: запрос вернул 0 строк: %s", sql[:200])
+
         # Предупреждения
         warnings_text = ""
         if result.warnings:
             warnings_text = "\nПредупреждения:\n" + "\n".join(f"  ⚠ {w}" for w in result.warnings)
 
+        if empty_result:
+            warnings_text += "\n⚠ Запрос вернул 0 строк. Возможно, условия фильтрации слишком строгие " \
+                             "или данные отсутствуют. Проверь условия WHERE, значения фильтров и формат дат."
+
         self.memory.add_message("tool", f"[{tool_name}] {exec_result[:500]}")
+
+        # Если пустой результат — отправляем на коррекцию, чтобы LLM пересмотрел запрос
+        if empty_result:
+            return {
+                "sql_to_validate": None,
+                "last_error": (
+                    f"SQL-запрос выполнен успешно, но вернул 0 строк. SQL: {sql}\n"
+                    "Проверь условия WHERE, формат дат, значения фильтров. "
+                    "Попробуй ослабить условия или проверить наличие данных в таблице."
+                ),
+                "retry_count": state.get("retry_count", 0),
+                "tool_calls": tool_calls[:-1] + [
+                    {**last_tool, "result": exec_result}
+                ],
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": f"SQL выполнен, но вернул 0 строк.{warnings_text}"}
+                ],
+            }
 
         return {
             "sql_to_validate": None,
@@ -638,6 +685,9 @@ class GraphNodes:
             "Исправь ошибку. Верни исправленный вызов инструмента в формате JSON:\n"
             '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}'
         )
+
+        if self.debug_prompt:
+            print(f"\n{'='*80}\n[DEBUG PROMPT — corrector]\n{'='*80}\n{prompt}\n{'='*80}\n")
 
         response = self.llm.invoke(prompt)
         tool_call = self._parse_tool_call(response)
@@ -714,6 +764,9 @@ class GraphNodes:
             "Дай ответ на русском языке. Если были получены данные — включи их в ответ.\n"
             "Если были предупреждения — упомяни их."
         )
+
+        if self.debug_prompt:
+            print(f"\n{'='*80}\n[DEBUG PROMPT — summarizer]\n{'='*80}\n{prompt}\n{'='*80}\n")
 
         answer = self.llm.invoke(prompt)
         self.memory.add_message("assistant", answer)

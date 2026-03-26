@@ -33,3 +33,4 @@ class AgentState(TypedDict):
     confirmation_message: str
     needs_disambiguation: bool
     disambiguation_options: list
+    tables_context: str

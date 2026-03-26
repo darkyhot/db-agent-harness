@@ -223,14 +223,28 @@ class GraphNodes:
             f"{self._get_system_prompt()}\n\n"
             "Задача: составь пронумерованный план шагов для выполнения запроса пользователя.\n"
             "Для каждого шага укажи какой инструмент нужно вызвать и с какими параметрами.\n"
-            "Если задача простая — план может состоять из 1-2 шагов.\n"
+            "Если задача простая — план может состоять из 1-2 шагов.\n\n"
+            "ОБЯЗАТЕЛЬНАЯ СТРАТЕГИЯ ДЛЯ АНАЛИТИЧЕСКИХ ВОПРОСОВ (подсчёты, агрегаты, выборки):\n"
+            "1. ПЕРВЫЙ ШАГ — определи какие таблицы нужны. Укажи их явно в формате schema.table.\n"
+            "   Если не уверен в таблице — используй search_tables или search_by_description.\n"
+            "2. НЕ ПИШИ SQL сразу. После определения таблиц система автоматически подгрузит\n"
+            "   структуру колонок и образец 10 строк данных. Ты увидишь их перед выполнением.\n"
+            "3. Только ПОСЛЕ изучения структуры и данных — строй SQL-запрос.\n\n"
+            "ПОЧЕМУ ЭТО ВАЖНО:\n"
+            "- Таблица-справочник может содержать неуникальные строки (например, одна сущность\n"
+            "  представлена несколькими строками с разными атрибутами). COUNT(*) без понимания\n"
+            "  гранулярности даст неверный результат.\n"
+            "- Без знания колонок и типов данных ты не сможешь написать корректный SQL.\n"
+            "- Образец данных покажет формат значений, NULL'ы, дубликаты.\n\n"
             "ВАЖНО: Если ответ на вопрос пользователя уже содержится в каталоге таблиц, "
             "долгосрочной памяти или контексте выше — НЕ вызывай инструменты. "
             "Вместо этого верни план из одного шага: "
             '[\"Ответить на основе контекста (без вызова инструментов)\"]\n'
             "Верни ТОЛЬКО JSON-массив строк, без пояснений.\n"
-            "Пример с инструментом: [\"Шаг 1: Найти таблицы с помощью search_tables('зарплата')\", "
-            "\"Шаг 2: Получить колонки через get_table_columns('hr', 'salary')\"]\n"
+            "Пример аналитического запроса:\n"
+            "[\"Шаг 1: Определить нужные таблицы — schema.table_name (система подгрузит структуру и семпл)\",\n"
+            " \"Шаг 2: Проанализировать структуру и данные, определить гранулярность таблицы\",\n"
+            " \"Шаг 3: Написать SQL-запрос с учётом структуры данных\"]\n"
             "Пример без инструмента: [\"Ответить на основе контекста (без вызова инструментов)\"]\n\n"
             f"Запрос пользователя: {user_input}"
         )
@@ -252,6 +266,98 @@ class GraphNodes:
             "messages": state["messages"] + [
                 {"role": "user", "content": user_input},
                 {"role": "assistant", "content": "План:\n" + "\n".join(plan)},
+            ],
+        }
+
+    def table_explorer(self, state: AgentState) -> dict[str, Any]:
+        """Узел автоматической разведки таблиц: подгружает структуру и семплы.
+
+        Извлекает упоминания schema.table из плана, загружает описание колонок
+        из CSV-справочника и семпл 10 строк из БД для каждой таблицы.
+
+        Args:
+            state: Текущее состояние графа.
+
+        Returns:
+            Обновления состояния с обогащённым контекстом таблиц.
+        """
+        plan_text = "\n".join(state.get("plan", []))
+        user_input = state.get("user_input", "")
+        scan_text = f"{plan_text}\n{user_input}"
+
+        # Извлекаем schema.table из плана и пользовательского запроса
+        df = self.schema.tables_df
+        if df.empty:
+            logger.info("TableExplorer: каталог таблиц пуст, пропускаем")
+            return {"tables_context": ""}
+
+        pattern = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b')
+        found_tables: set[tuple[str, str]] = set()
+        for m in pattern.finditer(scan_text):
+            schema_name, table_name = m.group(1).lower(), m.group(2).lower()
+            mask = (
+                df["schema_name"].str.lower() == schema_name
+            ) & (
+                df["table_name"].str.lower() == table_name
+            )
+            if not df[mask].empty:
+                row = df[mask].iloc[0]
+                found_tables.add((row["schema_name"], row["table_name"]))
+
+        if not found_tables:
+            logger.info("TableExplorer: таблицы не найдены в плане, пропускаем")
+            return {"tables_context": ""}
+
+        logger.info("TableExplorer: найдено %d таблиц для разведки: %s",
+                     len(found_tables),
+                     ", ".join(f"{s}.{t}" for s, t in found_tables))
+
+        sections = []
+        for schema_name, table_name in sorted(found_tables):
+            # 1. Описание колонок из CSV-справочника
+            table_info = self.schema.get_table_info(schema_name, table_name)
+
+            # 2. Семпл 10 строк из БД
+            try:
+                sample_df = self.db.get_sample(schema_name, table_name, 10)
+                if sample_df.empty:
+                    sample_text = "(таблица пуста)"
+                else:
+                    sample_text = sample_df.to_markdown(index=False)
+            except Exception as e:
+                logger.warning("TableExplorer: ошибка семпла %s.%s: %s",
+                               schema_name, table_name, e)
+                sample_text = f"(ошибка загрузки семпла: {e})"
+
+            sections.append(
+                f"### {schema_name}.{table_name}\n\n"
+                f"**Структура (из справочника):**\n{table_info}\n\n"
+                f"**Образец данных (10 строк):**\n{sample_text}"
+            )
+
+        tables_context = (
+            "=== РАЗВЕДКА ТАБЛИЦ (автоматически подгруженные данные) ===\n\n"
+            "Изучи структуру и образцы данных ПЕРЕД написанием SQL.\n"
+            "Обрати внимание на:\n"
+            "- Гранулярность: что является одной строкой? Есть ли дубликаты по ключевым полям?\n"
+            "- NULL'ы и пустые значения в колонках\n"
+            "- Формат дат, числовых значений, кодов\n"
+            "- Какие колонки можно использовать для фильтрации и группировки\n\n"
+            + "\n\n".join(sections)
+        )
+
+        self.memory.add_message(
+            "tool",
+            f"[table_explorer] Подгружена структура и семплы для: "
+            f"{', '.join(f'{s}.{t}' for s, t in sorted(found_tables))}"
+        )
+
+        return {
+            "tables_context": tables_context,
+            "messages": state["messages"] + [
+                {"role": "assistant",
+                 "content": f"Подгружена структура и семплы таблиц: "
+                            f"{', '.join(f'{s}.{t}' for s, t in sorted(found_tables))}"}
             ],
         }
 
@@ -308,23 +414,33 @@ class GraphNodes:
         else:
             prev_context = ""
 
-        # Ищем упоминания таблиц в шаге и контексте — добавляем полные описания колонок
+        # Контекст разведки таблиц (от table_explorer)
+        tables_context = state.get("tables_context", "")
+        tables_context_section = f"\n\n{tables_context}\n" if tables_context else ""
+
+        # Дополнительно: ищем упоминания таблиц в шаге, которых нет в tables_context
         tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
-        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail else ""
+        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail and tables_detail not in tables_context else ""
 
         prompt = (
             f"{self._get_system_prompt()}\n\n"
+            f"{tables_context_section}"
             f"{tables_detail_section}"
             f"Текущий шаг плана: {current_step}\n\n"
             f"Контекст предыдущих шагов:\n{prev_context}\n\n"
             "Выполни этот шаг. Верни JSON с полями:\n"
             '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n'
-            "Если шаг не требует инструмента (ответ уже есть в каталоге таблиц или контексте), верни:\n"
+            "Если шаг не требует инструмента (ответ уже есть в каталоге таблиц, "
+            "контексте разведки или результатах предыдущих шагов), верни:\n"
             '{"tool": "none", "result": "полный текстовый ответ на вопрос пользователя"}\n'
             "Если нужно выполнить SQL, верни:\n"
             '{"tool": "execute_query", "args": {"sql": "SELECT ... FROM schema.table"}}\n'
             "ВАЖНО: В SQL всегда указывай схему перед таблицей (schema.table).\n"
-            "ВАЖНО: Алиасы колонок и таблиц в SQL — только на английском (AS outflow, НЕ AS \"отток\")."
+            "ВАЖНО: Алиасы колонок и таблиц в SQL — только на английском (AS outflow, НЕ AS \"отток\").\n"
+            "ВАЖНО: Если выше есть РАЗВЕДКА ТАБЛИЦ — обязательно изучи структуру и образцы данных.\n"
+            "Пойми гранулярность таблицы (что является одной строкой) перед написанием запроса.\n"
+            "Например, если в справочнике одна сущность представлена несколькими строками — \n"
+            "нужен SELECT COUNT(DISTINCT ...), а не простой COUNT(*)."
         )
 
         if self.debug_prompt:
@@ -680,17 +796,27 @@ class GraphNodes:
         else:
             prev_context = ""
 
+        tables_context = state.get("tables_context", "")
+        tables_context_section = f"\n\n{tables_context}\n" if tables_context else ""
+
         tables_detail = self._get_tables_detail_context(current_step + " " + prev_context)
-        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail else ""
+        tables_detail_section = f"\n\n{tables_detail}\n" if tables_detail and tables_detail not in tables_context else ""
 
         prompt = (
             f"{self._get_system_prompt()}\n\n"
+            f"{tables_context_section}"
             f"{tables_detail_section}"
             f"Текущий шаг: {current_step}\n"
             f"Ошибка: {error}\n\n"
             f"Контекст предыдущих вызовов:\n{prev_context}\n\n"
             "Исправь ошибку. Верни исправленный вызов инструмента в формате JSON:\n"
-            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}'
+            '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n\n'
+            "ПОДСКАЗКИ для исправления:\n"
+            "- Если запрос вернул 0 строк — вызови get_sample чтобы посмотреть реальные данные\n"
+            "  и понять формат значений, после чего исправь условия WHERE.\n"
+            "- Если ошибка в имени колонки — вызови get_table_columns для проверки структуры.\n"
+            "- Если COUNT(*) дал неожиданный результат — проверь гранулярность таблицы\n"
+            "  (возможно нужен COUNT(DISTINCT ...) вместо COUNT(*))."
         )
 
         if self.debug_prompt:

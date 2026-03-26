@@ -123,6 +123,7 @@ def build_graph(
 
     # Добавляем узлы
     graph.add_node("planner", nodes.planner)
+    graph.add_node("table_explorer", nodes.table_explorer)
     graph.add_node("executor", nodes.executor)
     graph.add_node("sql_validator", nodes.sql_validator_node)
     graph.add_node("corrector", nodes.corrector)
@@ -131,8 +132,9 @@ def build_graph(
     # Точка входа
     graph.set_entry_point("planner")
 
-    # Переходы
-    graph.add_edge("planner", "executor")
+    # Переходы: planner → table_explorer → executor
+    graph.add_edge("planner", "table_explorer")
+    graph.add_edge("table_explorer", "executor")
 
     graph.add_conditional_edges("executor", _route_after_executor, {
         END: END,
@@ -185,4 +187,5 @@ def create_initial_state(user_input: str) -> AgentState:
         confirmation_message="",
         needs_disambiguation=False,
         disambiguation_options=[],
+        tables_context="",
     )

@@ -29,6 +29,8 @@ class ValidationResult:
         self.confirmation_message: str = ""
         self.explain_plan: str = ""
         self.join_checks: list[dict[str, Any]] = []
+        self.rewrite_suggestions: list[str] = []
+        self.multiplication_factor: float = 1.0
 
     def add_warning(self, msg: str) -> None:
         """Добавить предупреждение."""
@@ -64,6 +66,12 @@ class ValidationResult:
             for jc in self.join_checks:
                 status = "✓ уникален" if jc["is_unique"] else f"✗ дубли: {jc['duplicate_pct']}%"
                 lines.append(f"  {jc['table']}.({jc['columns']}): {status}")
+            if self.multiplication_factor > 1.0:
+                lines.append(f"  Multiplication factor: {self.multiplication_factor:.1f}x")
+        if self.rewrite_suggestions:
+            lines.append("Рекомендации по переписыванию:")
+            for s in self.rewrite_suggestions:
+                lines.append(f"  {s}")
         return "\n".join(lines)
 
 
@@ -167,13 +175,15 @@ def _has_where_or_limit(sql: str) -> bool:
 class SQLValidator:
     """Валидатор SQL-запросов для Greenplum."""
 
-    def __init__(self, db_manager: Any) -> None:
+    def __init__(self, db_manager: Any, schema_loader: Any = None) -> None:
         """Инициализация валидатора.
 
         Args:
             db_manager: Экземпляр DatabaseManager для выполнения EXPLAIN и проверок.
+            schema_loader: Опциональный SchemaLoader для CSV-first проверки ключей.
         """
         self._db = db_manager
+        self._schema_loader = schema_loader
 
     def validate(self, sql: str) -> ValidationResult:
         """Валидировать SQL-запрос.
@@ -198,6 +208,51 @@ class SQLValidator:
 
         return result
 
+    @staticmethod
+    def _estimate_multiplication_factor(join_checks: list[dict[str, Any]]) -> float:
+        """Оценка множителя размножения строк из-за неуникальных JOIN.
+
+        Для каждого неуникального JOIN: factor = 100 / unique_perc.
+        Общий factor — произведение по всем JOIN.
+        """
+        total = 1.0
+        for jc in join_checks:
+            if not jc["is_unique"]:
+                unique_perc = 100.0 - jc["duplicate_pct"]
+                if unique_perc > 0:
+                    total *= min(100.0 / unique_perc, 100.0)
+                else:
+                    total *= 100.0
+        return total
+
+    @staticmethod
+    def _generate_rewrite_suggestion(join: dict[str, str]) -> str:
+        """Сгенерировать конкретный шаблон переписывания JOIN."""
+        schema, table, column = join["schema"], join["table"], join["column"]
+        return (
+            f"ROW EXPLOSION: JOIN ключ {schema}.{table}.{column} не уникален.\n"
+            f"ИСПРАВЛЕНИЕ: Оберни {schema}.{table} в подзапрос с DISTINCT:\n"
+            f"  БЫЛО: JOIN {schema}.{table} alias ON ... = alias.{column}\n"
+            f"  СТАЛО: JOIN (SELECT DISTINCT {column}, <нужные_колонки> "
+            f"FROM {schema}.{table}) alias ON ... = alias.{column}\n"
+            f"Или используй предварительную агрегацию (GROUP BY + SUM/COUNT), "
+            f"если нужна агрегация.\n"
+            f"ЗАПРЕЩЕНО: добавлять DISTINCT к внешнему SELECT — это маскирует проблему."
+        )
+
+    def _check_key_uniqueness(
+        self, schema: str, table: str, columns: list[str],
+    ) -> dict[str, Any]:
+        """Проверить уникальность ключа: сначала CSV, потом DB fallback."""
+        if self._schema_loader is not None:
+            csv_result = self._schema_loader.check_key_uniqueness(schema, table, columns)
+            if csv_result.get("is_unique") is not None:
+                return {
+                    "is_unique": csv_result["is_unique"],
+                    "duplicate_pct": csv_result["duplicate_pct"],
+                }
+        return self._db.check_key_uniqueness(schema, table, columns)
+
     def _validate_read(self, sql: str, result: ValidationResult) -> None:
         """Валидация SELECT-запросов."""
         # 1. EXPLAIN — синтаксическая проверка
@@ -212,7 +267,7 @@ class SQLValidator:
         joins = _extract_join_conditions(sql)
         for join in joins:
             try:
-                check = self._db.check_key_uniqueness(
+                check = self._check_key_uniqueness(
                     join["schema"], join["table"], [join["column"]]
                 )
                 check_info = {
@@ -223,15 +278,44 @@ class SQLValidator:
                 }
                 result.join_checks.append(check_info)
                 if not check["is_unique"]:
-                    result.add_warning(
-                        f"JOIN ключ {join['schema']}.{join['table']}.{join['column']} "
-                        f"не уникален (дубли: {check['duplicate_pct']}%). "
-                        "Рассмотрите DISTINCT, агрегацию или пересмотр логики JOIN."
-                    )
+                    suggestion = self._generate_rewrite_suggestion(join)
+                    result.rewrite_suggestions.append(suggestion)
             except Exception as e:
                 logger.warning("Не удалось проверить уникальность JOIN: %s", e)
 
-        # 3. Предупреждение если нет WHERE/LIMIT для больших таблиц
+        # 3. Оценка multiplication factor и решение pass/warn/block
+        if result.join_checks:
+            factor = self._estimate_multiplication_factor(result.join_checks)
+            result.multiplication_factor = factor
+
+            non_unique = [
+                jc for jc in result.join_checks if not jc["is_unique"]
+            ]
+            if non_unique and factor > 5.0:
+                # BLOCK — row explosion очень вероятен
+                details = "; ".join(
+                    f"{jc['table']}.{jc['columns']} (дубли: {jc['duplicate_pct']}%)"
+                    for jc in non_unique
+                )
+                result.add_error(
+                    f"ROW EXPLOSION (factor={factor:.1f}x): "
+                    f"Неуникальные JOIN-ключи: {details}. "
+                    "Перепиши SQL с подзапросом (DISTINCT) или агрегацией.\n"
+                    + "\n".join(result.rewrite_suggestions)
+                )
+            elif non_unique and factor > 1.5:
+                # WARN — умеренный риск
+                details = "; ".join(
+                    f"{jc['table']}.{jc['columns']} (дубли: {jc['duplicate_pct']}%)"
+                    for jc in non_unique
+                )
+                result.add_warning(
+                    f"JOIN risk (factor={factor:.1f}x): "
+                    f"Неуникальные ключи: {details}. "
+                    "Рассмотри подзапрос с DISTINCT или агрегацию."
+                )
+
+        # 4. Предупреждение если нет WHERE/LIMIT для больших таблиц
         if not _has_where_or_limit(sql):
             result.add_warning(
                 "Запрос без WHERE/LIMIT. Для больших таблиц это может вернуть много данных."

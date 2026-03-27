@@ -9,6 +9,8 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+import pandas as pd
+
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.schema_loader import SchemaLoader
@@ -34,14 +36,22 @@ SQL_RULES = (
     "- NULL: используй COALESCE() или IS NOT NULL / IS NULL в WHERE. "
     "Не сравнивай с NULL через = или !=\n"
     "- LIMIT: добавляй LIMIT для exploration-запросов и больших таблиц\n"
-    "- Используй стандартный PostgreSQL синтаксис (Greenplum совместим)"
+    "- Используй стандартный PostgreSQL синтаксис (Greenplum совместим)\n\n"
+    "Безопасный SQL (предотвращение дублирования строк):\n"
+    "- ПЕРЕД написанием JOIN — изучи JOIN-АНАЛИЗ в разведке таблиц (если есть)\n"
+    "- Если unique_perc ключа < 50% — ОБЯЗАТЕЛЬНО подзапрос с DISTINCT\n"
+    "- Для lookup-таблиц (справочников) JOIN безопасен по PK\n"
+    "- Для fact-таблиц с дублями — предварительная агрегация в подзапросе\n"
+    "- Паттерн: JOIN (SELECT DISTINCT key, col FROM table) alias ON ...\n"
+    "- Паттерн: JOIN (SELECT key, SUM(val) FROM table GROUP BY key) alias ON ...\n"
+    "- DISTINCT на внешнем SELECT — ЗАПРЕЩЁН как маскировка проблемы"
 )
 
 SQL_CHECKLIST = (
     "Чеклист перед финализацией SQL:\n"
     "1. Формат дат соответствует данным из образца (YYYY-MM-DD, DD.MM.YYYY, и т.д.)?\n"
     "2. NULL обработан (COALESCE/IS NOT NULL) для колонок с высоким % NULL?\n"
-    "3. JOIN-ключи уникальны (проверены через check_key_uniqueness или разведку)?\n"
+    "3. JOIN-ключи уникальны? Если нет (unique_perc < 50%) — использован подзапрос с DISTINCT?\n"
     "4. GROUP BY содержит все не-агрегированные колонки?\n"
     "5. Алиасы только на английском?\n"
     "6. Есть LIMIT для больших выборок?\n"
@@ -336,6 +346,9 @@ class GraphNodes:
             'Выгрузка: "Выгрузи клиентов за 2024 в CSV"\n'
             '["Определить таблицы — dm.clients (подгрузится структура)", '
             '"Написать SQL с фильтром по дате", "Экспортировать через export_query в CSV"]\n\n'
+            'JOIN с риском дублирования: "Сумма продаж по менеджерам"\n'
+            '["Определить таблицы — dm.sales, dm.managers (подгрузится структура и JOIN-анализ)", '
+            '"Написать SQL с учётом JOIN-анализа: если ключ не уникален — подзапрос с DISTINCT"]\n\n'
             "=== АНТИПРИМЕРЫ (НЕ ДЕЛАЙ ТАК) ===\n\n"
             "ПЛОХО: [\"SELECT * FROM dm.clients WHERE region = 'X'\"]\n"
             "  → Нельзя писать SQL в плане!\n\n"
@@ -370,7 +383,8 @@ class GraphNodes:
             "2. Определи гранулярность таблицы (что = одна строка)\n"
             "3. Выбери нужные колонки и проверь их наличие в разведке\n"
             "4. Определи условия фильтрации (WHERE) — проверь формат значений в образце\n"
-            "5. Если нужен JOIN — проверь уникальность ключей\n"
+            "5. Если нужен JOIN — ОБЯЗАТЕЛЬНО изучи JOIN-АНАЛИЗ в разведке таблиц. "
+            "Если unique_perc < 50% — используй подзапрос с DISTINCT\n"
             "6. Напиши SQL и пройди по чеклисту выше\n"
             f"{lt_ctx}"
         )
@@ -404,7 +418,16 @@ class GraphNodes:
             "Формат ответа — СТРОГО один JSON-объект:\n"
             '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n\n'
             f"{SQL_RULES}\n\n"
-            f"{GIGACHAT_COMMON_ERRORS}\n"
+            f"{GIGACHAT_COMMON_ERRORS}\n\n"
+            "Исправление row explosion в JOIN:\n"
+            "Если ошибка содержит 'ROW EXPLOSION' или 'POST-EXECUTION ROW EXPLOSION':\n"
+            "1. Оберни НЕуникальную сторону JOIN в подзапрос с DISTINCT\n"
+            "2. Или используй предварительную агрегацию в подзапросе (GROUP BY + SUM/COUNT)\n"
+            "3. НИКОГДА не добавляй DISTINCT к внешнему SELECT — это маскирует проблему\n"
+            "4. Следуй шаблону из текста ошибки\n"
+            "Пример исправления:\n"
+            "БЫЛО: SELECT a.* FROM t1 a JOIN schema.t2 b ON a.key = b.key\n"
+            "СТАЛО: SELECT a.* FROM t1 a JOIN (SELECT DISTINCT key, col FROM schema.t2) b ON a.key = b.key\n"
             f"{lt_ctx}"
             f"{examples_ctx}"
         )
@@ -550,6 +573,44 @@ class GraphNodes:
                 f"**Образец данных (10 строк):**\n{sample_text}"
             )
 
+        # JOIN safety analysis: проверяем общие колонки между таблицами
+        join_analysis_lines = []
+        table_list = sorted(found_tables)
+        if len(table_list) >= 2:
+            for i, (s1, t1) in enumerate(table_list):
+                cols1 = self.schema.get_table_columns(s1, t1)
+                for s2, t2 in table_list[i + 1:]:
+                    cols2 = self.schema.get_table_columns(s2, t2)
+                    if cols1.empty or cols2.empty:
+                        continue
+                    shared = set(cols1["column_name"]) & set(cols2["column_name"])
+                    for col in sorted(shared):
+                        r1 = cols1[cols1["column_name"] == col].iloc[0]
+                        r2 = cols2[cols2["column_name"] == col].iloc[0]
+                        u1 = float(r1.get("unique_perc", 0)) if pd.notna(r1.get("unique_perc")) else 0
+                        u2 = float(r2.get("unique_perc", 0)) if pd.notna(r2.get("unique_perc")) else 0
+                        pk1 = bool(r1.get("is_primary_key", False))
+                        pk2 = bool(r2.get("is_primary_key", False))
+
+                        status1 = "PK" if pk1 else (f"unique={u1:.0f}%" if u1 >= 95 else f"ДУБЛИ unique={u1:.0f}%")
+                        status2 = "PK" if pk2 else (f"unique={u2:.0f}%" if u2 >= 95 else f"ДУБЛИ unique={u2:.0f}%")
+
+                        safe = (pk1 or u1 >= 95) and (pk2 or u2 >= 95)
+                        recommendation = "безопасен" if safe else "ОПАСНО — нужен подзапрос с DISTINCT"
+
+                        join_analysis_lines.append(
+                            f"  {s1}.{t1}.{col} ({status1}) ↔ {s2}.{t2}.{col} ({status2})"
+                            f" → {recommendation}"
+                        )
+
+        join_analysis = ""
+        if join_analysis_lines:
+            join_analysis = (
+                "\n\n=== JOIN-АНАЛИЗ (автоматическая оценка безопасности JOIN) ===\n"
+                + "\n".join(join_analysis_lines)
+                + "\n\nЕсли ключ помечен как ДУБЛИ — используй подзапрос с DISTINCT или агрегацию."
+            )
+
         tables_context = (
             "=== РАЗВЕДКА ТАБЛИЦ (автоматически подгруженные данные) ===\n\n"
             "Изучи структуру и образцы данных ПЕРЕД написанием SQL.\n"
@@ -560,6 +621,7 @@ class GraphNodes:
             "- Какие колонки можно использовать для фильтрации и группировки\n"
             "- Связь колонок с запросом пользователя: какие колонки соответствуют терминам из вопроса?\n\n"
             + "\n\n".join(sections)
+            + join_analysis
         )
 
         self.memory.add_message(
@@ -991,6 +1053,25 @@ class GraphNodes:
                 "Возможно, пропущена агрегация (COUNT, SUM) или GROUP BY."
             )
 
+        # Проверка: результат упирается в LIMIT при наличии JOIN
+        if "показано" in exec_result and "из" in exec_result:
+            limit_match = re.search(r'показано\s+\d+\s+из\s+(\d+)', exec_result)
+            if limit_match and int(limit_match.group(1)) >= 1000:
+                warnings.append(
+                    f"Результат содержит {limit_match.group(1)}+ строк (упирается в LIMIT). "
+                    "Если SQL содержит JOIN — возможен row explosion."
+                )
+
+        # Проверка: не-списочный вопрос, но очень много строк
+        listing_patterns = re.compile(
+            r'список|перечисли|все\s+(строки|записи|данные)|покажи\s+все', re.IGNORECASE,
+        )
+        if data_row_count > 100 and not listing_patterns.search(user_lower):
+            warnings.append(
+                f"Результат содержит {data_row_count} строк, хотя вопрос не предполагает список. "
+                "Проверь, нет ли дублирования из-за JOIN."
+            )
+
         return warnings
 
     def sql_validator_node(self, state: AgentState) -> dict[str, Any]:
@@ -1020,12 +1101,24 @@ class GraphNodes:
                 ],
             }
 
+        # Сохраняем информацию о рисках JOIN для post-execution проверки
+        join_risk_info = {}
+        if result.join_checks:
+            join_risk_info = {
+                "multiplication_factor": result.multiplication_factor,
+                "non_unique_joins": [
+                    jc for jc in result.join_checks if not jc["is_unique"]
+                ],
+                "rewrite_suggestions": result.rewrite_suggestions,
+            }
+
         # Есть ошибки — отправить в корректор
         if not result.is_valid:
             error_msg = result.summary()
             logger.warning("Validator: SQL невалиден: %s", error_msg[:200])
             return {
                 "last_error": error_msg,
+                "join_risk_info": join_risk_info,
                 "messages": state["messages"] + [
                     {"role": "assistant", "content": f"Ошибка валидации:\n{error_msg}"}
                 ],
@@ -1079,6 +1172,32 @@ class GraphNodes:
             for sw in sanity_warnings:
                 warnings_text += f"\n⚠ {sw}"
 
+        # Post-execution row explosion detection
+        if not empty_result and join_risk_info and tool_name == "execute_query":
+            factor = join_risk_info.get("multiplication_factor", 1.0)
+            if factor > 3.0 and row_count > 100:
+                suggestions = "\n".join(join_risk_info.get("rewrite_suggestions", []))
+                explosion_msg = (
+                    f"POST-EXECUTION ROW EXPLOSION: Результат содержит {row_count} строк "
+                    f"при multiplication_factor={factor:.1f}x. "
+                    f"Вероятно дублирование строк из-за JOIN.\n{suggestions}"
+                )
+                self.memory.log_sql_execution(
+                    state["user_input"], sql, row_count, "row_explosion", duration_ms,
+                )
+                return {
+                    "sql_to_validate": None,
+                    "last_error": explosion_msg,
+                    "retry_count": state.get("retry_count", 0),
+                    "join_risk_info": join_risk_info,
+                    "tool_calls": tool_calls[:-1] + [
+                        {**last_tool, "result": exec_result}
+                    ],
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": f"⚠ {explosion_msg}"}
+                    ],
+                }
+
         # Аудит-лог SQL
         audit_status = "empty" if empty_result else "success"
         # Подсчёт строк из markdown-таблицы
@@ -1098,6 +1217,7 @@ class GraphNodes:
                     "Попробуй ослабить условия или проверить наличие данных в таблице."
                 ),
                 "retry_count": state.get("retry_count", 0),
+                "join_risk_info": join_risk_info,
                 "tool_calls": tool_calls[:-1] + [
                     {**last_tool, "result": exec_result}
                 ],
@@ -1110,6 +1230,7 @@ class GraphNodes:
             "sql_to_validate": None,
             "last_error": None,
             "retry_count": 0,
+            "join_risk_info": join_risk_info,
             "current_step": state["current_step"] + 1,
             "tool_calls": tool_calls[:-1] + [
                 {**last_tool, "result": exec_result}
@@ -1166,13 +1287,16 @@ class GraphNodes:
         system_prompt = self._get_corrector_system_prompt()
 
         # Эскалация стратегии в зависимости от номера попытки
+        is_row_explosion = "ROW EXPLOSION" in error
         if retry_count == 0:
             strategy_hint = (
                 "Стратегии исправления:\n"
                 "- 0 строк → вызови get_sample, проверь формат данных, ослабь WHERE\n"
                 "- Ошибка колонки → вызови get_table_columns\n"
                 "- Синтаксическая ошибка → исправь SQL по тексту ошибки\n"
-                "- Неожиданный COUNT → проверь гранулярность (COUNT(DISTINCT ...) вместо COUNT(*))"
+                "- Неожиданный COUNT → проверь гранулярность (COUNT(DISTINCT ...) вместо COUNT(*))\n"
+                "- ROW EXPLOSION → используй подзапрос с DISTINCT для неуникальной таблицы. "
+                "НЕ добавляй DISTINCT к внешнему SELECT. Следуй шаблону из текста ошибки."
             )
         else:
             strategy_hint = (
@@ -1182,6 +1306,13 @@ class GraphNodes:
                 "- Переформулируй SQL с нуля, не патчи старый\n"
                 "- Проверь, правильная ли таблица используется"
             )
+            if is_row_explosion:
+                strategy_hint += (
+                    "\n- ROW EXPLOSION не исправлен! Оберни неуникальную таблицу в "
+                    "подзапрос: JOIN (SELECT DISTINCT key, col FROM table) alias ON ...\n"
+                    "- Или используй предварительную агрегацию: "
+                    "JOIN (SELECT key, SUM(val) FROM table GROUP BY key) alias ON ..."
+                )
 
         user_parts = []
         user_parts.append(f"[ЗАПРОС ПОЛЬЗОВАТЕЛЯ]\n{state['user_input']}")

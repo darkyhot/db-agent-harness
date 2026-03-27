@@ -203,4 +203,5 @@ def create_initial_state(user_input: str) -> AgentState:
         tables_context="",
         graph_iterations=0,
         correction_examples=[],
+        join_risk_info={},
     )

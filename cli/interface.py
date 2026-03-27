@@ -94,7 +94,7 @@ class CLIInterface:
         self.llm = RateLimitedLLM()
         self.memory = MemoryManager()
         self.schema = SchemaLoader()
-        self.validator = SQLValidator(self.db)
+        self.validator = SQLValidator(self.db, schema_loader=self.schema)
 
         # Создание tools через DI (замыкания)
         db_tools = create_db_tools(self.db, self.validator, self.schema)

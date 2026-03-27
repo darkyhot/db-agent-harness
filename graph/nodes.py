@@ -1175,7 +1175,7 @@ class GraphNodes:
         # Post-execution row explosion detection
         if not empty_result and join_risk_info and tool_name == "execute_query":
             factor = join_risk_info.get("multiplication_factor", 1.0)
-            if factor > 3.0 and row_count > 100:
+            if factor > 1.0 and row_count > 100:
                 suggestions = "\n".join(join_risk_info.get("rewrite_suggestions", []))
                 explosion_msg = (
                     f"POST-EXECUTION ROW EXPLOSION: Результат содержит {row_count} строк "

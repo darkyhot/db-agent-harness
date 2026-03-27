@@ -291,7 +291,7 @@ class SQLValidator:
             non_unique = [
                 jc for jc in result.join_checks if not jc["is_unique"]
             ]
-            if non_unique and factor > 5.0:
+            if non_unique and factor > 3.0:
                 # BLOCK — row explosion очень вероятен
                 details = "; ".join(
                     f"{jc['table']}.{jc['columns']} (дубли: {jc['duplicate_pct']}%)"
@@ -303,8 +303,8 @@ class SQLValidator:
                     "Перепиши SQL с подзапросом (DISTINCT) или агрегацией.\n"
                     + "\n".join(result.rewrite_suggestions)
                 )
-            elif non_unique and factor > 1.5:
-                # WARN — умеренный риск
+            elif non_unique:
+                # WARN — любые дубли в JOIN-ключах
                 details = "; ".join(
                     f"{jc['table']}.{jc['columns']} (дубли: {jc['duplicate_pct']}%)"
                     for jc in non_unique

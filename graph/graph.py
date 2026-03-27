@@ -16,12 +16,20 @@ from graph.state import AgentState
 logger = logging.getLogger(__name__)
 
 
+MAX_GRAPH_ITERATIONS = 15
+
+
 def _route_after_executor(state: AgentState) -> str:
     """Маршрутизация после узла executor.
 
     Returns:
         Имя следующего узла.
     """
+    # Лимит итераций графа — защита от бесконечных циклов
+    if state.get("graph_iterations", 0) >= MAX_GRAPH_ITERATIONS:
+        logger.warning("Достигнут лимит итераций графа (%d)", MAX_GRAPH_ITERATIONS)
+        return "summarizer"
+
     # Нужна disambiguation — выходим для уточнения у пользователя
     if state.get("needs_disambiguation"):
         return END
@@ -74,6 +82,11 @@ def _route_after_corrector(state: AgentState) -> str:
     Returns:
         Имя следующего узла.
     """
+    # Лимит итераций графа — защита от бесконечных циклов
+    if state.get("graph_iterations", 0) >= MAX_GRAPH_ITERATIONS:
+        logger.warning("Достигнут лимит итераций графа (%d)", MAX_GRAPH_ITERATIONS)
+        return "summarizer"
+
     # Есть SQL для валидации после коррекции
     if state.get("sql_to_validate"):
         return "sql_validator"
@@ -188,4 +201,6 @@ def create_initial_state(user_input: str) -> AgentState:
         needs_disambiguation=False,
         disambiguation_options=[],
         tables_context="",
+        graph_iterations=0,
+        correction_examples=[],
     )

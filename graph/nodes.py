@@ -3,6 +3,8 @@
 import json
 import logging
 import re
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -55,6 +57,17 @@ GIGACHAT_COMMON_ERRORS = (
     "- COUNT(*) вместо COUNT(DISTINCT ...) → проверь гранулярность\n"
     "- Сравнение с NULL через = → используй IS NULL / IS NOT NULL"
 )
+
+
+@dataclass
+class ToolResult:
+    """Структурированный результат вызова инструмента."""
+    success: bool
+    data: str
+    error: str | None = None
+
+    def __str__(self) -> str:
+        return self.data if self.success else (self.error or self.data)
 
 
 class GraphNodes:
@@ -141,15 +154,78 @@ class GraphNodes:
             + "\n\n".join(details)
         )
 
-    def _get_schema_context(self) -> str:
-        """Сформировать краткий каталог таблиц из SchemaLoader."""
+    # Стоп-слова для предфильтрации каталога (не несут семантики для поиска таблиц)
+    _STOP_WORDS = frozenset({
+        "в", "на", "по", "за", "из", "с", "к", "о", "у", "и", "а", "но", "что",
+        "как", "все", "это", "так", "уже", "или", "не", "да", "нет", "мне", "мой",
+        "ты", "он", "она", "мы", "они", "их", "его", "её", "для", "от", "до",
+        "при", "без", "через", "между", "после", "перед", "под", "над", "про",
+        "сколько", "какие", "какой", "какая", "какое", "где", "кто", "когда",
+        "покажи", "найди", "выведи", "дай", "скажи", "сделай", "можешь",
+        "the", "a", "an", "in", "on", "at", "to", "for", "of", "with", "by",
+        "is", "are", "was", "were", "be", "been", "have", "has", "had",
+        "show", "get", "find", "give", "tell", "make", "how", "many",
+    })
+
+    _MAX_TABLES_FOR_FULL_CATALOG = 50
+
+    def _get_schema_context(self, user_input: str = "") -> str:
+        """Сформировать краткий каталог таблиц из SchemaLoader.
+
+        При большом каталоге (>50 таблиц) выполняет предфильтрацию по ключевым
+        словам из запроса пользователя, чтобы не перегружать контекст LLM.
+        """
         df = self.schema.tables_df
         if df.empty:
             return "Каталог таблиц пуст. Используй search_tables для поиска."
-        lines = ["Доступные таблицы (schema.table — описание):"]
-        for _, row in df.iterrows():
+
+        # Маленький каталог — отдаём целиком
+        if len(df) <= self._MAX_TABLES_FOR_FULL_CATALOG or not user_input:
+            lines = ["Доступные таблицы (schema.table — описание):"]
+            for _, row in df.iterrows():
+                desc = row.get("description", "")
+                lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
+            return "\n".join(lines)
+
+        # Большой каталог — предфильтрация по ключевым словам запроса
+        words = re.findall(r'[a-zA-Zа-яА-ЯёЁ]{3,}', user_input.lower())
+        keywords = [w for w in words if w not in self._STOP_WORDS]
+
+        if not keywords:
+            # Нет значимых слов — отдаём весь каталог
+            lines = ["Доступные таблицы (schema.table — описание):"]
+            for _, row in df.iterrows():
+                desc = row.get("description", "")
+                lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
+            return "\n".join(lines)
+
+        # Ищем таблицы по каждому ключевому слову
+        found_indices = set()
+        for kw in keywords:
+            mask = (
+                df["table_name"].str.lower().str.contains(kw, na=False)
+                | df["schema_name"].str.lower().str.contains(kw, na=False)
+                | df["description"].str.lower().str.contains(kw, na=False)
+            )
+            found_indices.update(df[mask].index.tolist())
+
+        if not found_indices:
+            return (
+                f"В каталоге {len(df)} таблиц, но по запросу не найдено прямых совпадений.\n"
+                "Используй search_tables или search_by_description для поиска нужных таблиц."
+            )
+
+        filtered = df.loc[sorted(found_indices)]
+        lines = [
+            f"Релевантные таблицы (найдено {len(filtered)} из {len(df)} по запросу):"
+        ]
+        for _, row in filtered.iterrows():
             desc = row.get("description", "")
             lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
+        lines.append(
+            f"\nВсего в каталоге {len(df)} таблиц. "
+            "Если нужная таблица не в списке — используй search_tables / search_by_description."
+        )
         return "\n".join(lines)
 
     def _get_session_history_context(self) -> str:
@@ -214,14 +290,15 @@ class GraphNodes:
             return ""
         return "\n\n" + "\n\n".join(sections)
 
-    def _get_planner_system_prompt(self) -> str:
+    def _get_planner_system_prompt(self, user_input: str = "") -> str:
         """Системный промпт для планировщика.
 
-        Включает полный каталог таблиц и инструменты — planner должен знать всё.
+        Включает каталог таблиц (с предфильтрацией при большом каталоге)
+        и инструменты — planner должен знать всё.
         """
         lt_ctx = self._get_long_term_memory_context()
         history_ctx = self._get_session_history_context()
-        schema_ctx = self._get_schema_context()
+        schema_ctx = self._get_schema_context(user_input)
         sessions_ctx = self.memory.get_sessions_context()
 
         return (
@@ -302,8 +379,19 @@ class GraphNodes:
         """Системный промпт для корректора ошибок.
 
         Компактный: роль + формат ответа + стратегии коррекции + паттерны ошибок.
+        Включает примеры прошлых исправлений из долгосрочной памяти.
         """
         lt_ctx = self._get_long_term_memory_context()
+
+        # Примеры прошлых исправлений из долгосрочной памяти
+        examples_ctx = ""
+        examples = self.memory.get_memory_list("correction_examples")
+        if examples:
+            recent = examples[-5:]  # последние 5 примеров
+            examples_ctx = (
+                "\n\nПримеры прошлых исправлений (учитывай эти паттерны):\n"
+                + "\n".join(f"  - {ex}" for ex in recent)
+            )
 
         return (
             "Ты — корректор ошибок аналитического агента для Greenplum.\n"
@@ -318,6 +406,7 @@ class GraphNodes:
             f"{SQL_RULES}\n\n"
             f"{GIGACHAT_COMMON_ERRORS}\n"
             f"{lt_ctx}"
+            f"{examples_ctx}"
         )
 
     def _get_summarizer_system_prompt(self) -> str:
@@ -352,7 +441,7 @@ class GraphNodes:
 
         self.memory.add_message("user", user_input)
 
-        system_prompt = self._get_planner_system_prompt()
+        system_prompt = self._get_planner_system_prompt(user_input)
 
         user_prompt = (
             f"Запрос пользователя: {user_input}\n\n"
@@ -523,12 +612,13 @@ class GraphNodes:
         Returns:
             Обновления состояния.
         """
+        iterations = state.get("graph_iterations", 0) + 1
         plan = state["plan"]
         step_idx = state["current_step"]
 
         if step_idx >= len(plan):
             logger.info("Executor: все шаги выполнены")
-            return {}
+            return {"graph_iterations": iterations}
 
         current_step = plan[step_idx]
         logger.info("Executor: шаг %d/%d: %s", step_idx + 1, len(plan), current_step[:100])
@@ -583,13 +673,14 @@ class GraphNodes:
         tool_call = self._parse_tool_call(response)
 
         if tool_call["tool"] == "none":
-            result = tool_call.get("result", response)
+            result_str = tool_call.get("result", response)
         else:
             # Проверяем, порождает ли шаг SQL для валидации
             sql = tool_call.get("args", {}).get("sql")
             if sql and tool_call["tool"] in ("execute_query", "execute_write", "execute_ddl"):
                 return {
                     "sql_to_validate": sql,
+                    "graph_iterations": iterations,
                     "tool_calls": state.get("tool_calls", []) + [
                         {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": "awaiting_validation"}
                     ],
@@ -599,11 +690,25 @@ class GraphNodes:
                 }
 
             # Вызов инструмента
-            result = self._call_tool(tool_call["tool"], tool_call.get("args", {}))
+            tool_result = self._call_tool(tool_call["tool"], tool_call.get("args", {}))
+            result_str = str(tool_result)
+
+            # Ошибка инструмента — отправить в корректор
+            if not tool_result.success:
+                return {
+                    "last_error": tool_result.error,
+                    "graph_iterations": iterations,
+                    "tool_calls": state.get("tool_calls", []) + [
+                        {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": result_str}
+                    ],
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": f"Ошибка на шаге {step_idx + 1}: {result_str}"}
+                    ],
+                }
 
         # Проверяем, нужна ли disambiguation (несколько таблиц найдено)
         options = self._check_disambiguation_needed(
-            tool_call["tool"], str(result), state["user_input"],
+            tool_call["tool"], result_str, state["user_input"],
         )
         if options is not None:
             display_lines = ["Найдено несколько подходящих витрин данных:", ""]
@@ -617,26 +722,28 @@ class GraphNodes:
                 "needs_disambiguation": True,
                 "disambiguation_options": options,
                 "confirmation_message": display_msg,
+                "graph_iterations": iterations,
                 "tool_calls": state.get("tool_calls", []) + [
-                    {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": str(result)}
+                    {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": result_str}
                 ],
                 "messages": state["messages"] + [
                     {"role": "assistant", "content": display_msg}
                 ],
             }
 
-        self.memory.add_message("tool", f"[{tool_call['tool']}] {str(result)[:500]}")
+        self.memory.add_message("tool", f"[{tool_call['tool']}] {result_str[:500]}")
 
         return {
             "tool_calls": state.get("tool_calls", []) + [
-                {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": str(result)}
+                {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": result_str}
             ],
             "current_step": step_idx + 1,
             "last_error": None,
             "retry_count": 0,
             "sql_to_validate": None,
+            "graph_iterations": iterations,
             "messages": state["messages"] + [
-                {"role": "assistant", "content": f"Шаг {step_idx + 1}: {str(result)[:1000]}"}
+                {"role": "assistant", "content": f"Шаг {step_idx + 1}: {result_str[:1000]}"}
             ],
         }
 
@@ -805,7 +912,7 @@ class GraphNodes:
 
         return options
 
-    def _call_tool(self, tool_name: str, args: dict[str, Any]) -> str:
+    def _call_tool(self, tool_name: str, args: dict[str, Any]) -> ToolResult:
         """Вызвать инструмент по имени с валидацией аргументов.
 
         Args:
@@ -813,10 +920,10 @@ class GraphNodes:
             args: Аргументы.
 
         Returns:
-            Результат выполнения.
+            ToolResult с результатом выполнения.
         """
         if tool_name not in self.tool_map:
-            return f"Инструмент '{tool_name}' не найден."
+            return ToolResult(success=False, data="", error=f"Инструмент '{tool_name}' не найден.")
 
         tool_fn = self.tool_map[tool_name]
 
@@ -833,9 +940,10 @@ class GraphNodes:
                 provided_fields = set(args.keys())
                 missing = required_fields - provided_fields
                 if missing:
-                    return (
-                        f"Ошибка инструмента {tool_name}: "
-                        f"отсутствуют обязательные параметры: {', '.join(sorted(missing))}"
+                    return ToolResult(
+                        success=False, data="",
+                        error=f"Ошибка инструмента {tool_name}: "
+                              f"отсутствуют обязательные параметры: {', '.join(sorted(missing))}",
                     )
                 extra = provided_fields - expected_fields
                 if extra:
@@ -847,19 +955,43 @@ class GraphNodes:
 
         try:
             result = tool_fn.invoke(args)
+            data = str(result)
             logger.info("Tool %s выполнен успешно", tool_name)
-            return str(result)
+            # Проверяем ошибки, возвращённые самим инструментом как строки
+            if data.startswith("Ошибка инструмента ") or data.startswith("Ошибка выполнения запроса:"):
+                return ToolResult(success=False, data=data, error=data)
+            return ToolResult(success=True, data=data)
         except Exception as e:
+            error_msg = f"Ошибка инструмента {tool_name}: {e}"
             logger.error("Tool %s ошибка: %s", tool_name, e)
-            return f"Ошибка инструмента {tool_name}: {e}"
+            return ToolResult(success=False, data="", error=error_msg)
 
-    def _is_tool_error(self, result: str) -> bool:
-        """Проверить, является ли результат ошибкой инструмента.
+    @staticmethod
+    def _check_result_sanity(user_input: str, exec_result: str) -> list[str]:
+        """Эвристические проверки осмысленности результата SQL-запроса.
 
-        Проверяет по префиксу 'Ошибка инструмента' вместо поиска слова 'Ошибка'
-        в произвольном месте строки, чтобы избежать ложных срабатываний на данных.
+        Возвращает список предупреждений (пустой если всё ок).
         """
-        return result.startswith("Ошибка инструмента ") or result.startswith("Ошибка выполнения запроса:")
+        warnings = []
+        user_lower = user_input.lower()
+
+        # Считаем строки в markdown-таблице (строки с | в начале, кроме заголовка и разделителя)
+        result_lines = [
+            line for line in exec_result.split("\n")
+            if line.strip().startswith("|") and not line.strip().startswith("|---") and not line.strip().startswith("| ---")
+        ]
+        # Первая строка — заголовок, вторая — разделитель, остальные — данные
+        data_row_count = max(0, len(result_lines) - 1)  # -1 для заголовка
+
+        # Проверка: вопрос «сколько/количество» но результат — несколько строк (вероятно забыли агрегацию)
+        count_patterns = re.compile(r'сколько|количество|общее\s+число|итого|всего', re.IGNORECASE)
+        if count_patterns.search(user_lower) and data_row_count > 5:
+            warnings.append(
+                f"Вопрос содержит 'сколько/количество', но результат содержит {data_row_count} строк. "
+                "Возможно, пропущена агрегация (COUNT, SUM) или GROUP BY."
+            )
+
+        return warnings
 
     def sql_validator_node(self, state: AgentState) -> dict[str, Any]:
         """Узел валидации SQL: проверяет SQL перед выполнением.
@@ -904,7 +1036,24 @@ class GraphNodes:
         last_tool = tool_calls[-1] if tool_calls else {}
         tool_name = last_tool.get("tool", "execute_query")
 
-        exec_result = self._call_tool(tool_name, {"sql": sql})
+        t0 = time.monotonic()
+        tool_result = self._call_tool(tool_name, {"sql": sql})
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        exec_result = str(tool_result)
+
+        # Ошибка выполнения — отправляем в корректор
+        if not tool_result.success:
+            self.memory.log_sql_execution(state["user_input"], sql, 0, "error", duration_ms)
+            return {
+                "sql_to_validate": None,
+                "last_error": tool_result.error,
+                "tool_calls": tool_calls[:-1] + [
+                    {**last_tool, "result": exec_result}
+                ],
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": f"Ошибка выполнения SQL:\n{exec_result}"}
+                ],
+            }
 
         # Проверка на пустой результат (0 строк) для SELECT-запросов
         empty_result = False
@@ -915,7 +1064,7 @@ class GraphNodes:
             empty_result = True
             logger.warning("Validator: запрос вернул 0 строк: %s", sql[:200])
 
-        # Предупреждения
+        # Предупреждения из валидатора
         warnings_text = ""
         if result.warnings:
             warnings_text = "\nПредупреждения:\n" + "\n".join(f"  ⚠ {w}" for w in result.warnings)
@@ -923,6 +1072,19 @@ class GraphNodes:
         if empty_result:
             warnings_text += "\n⚠ Запрос вернул 0 строк. Возможно, условия фильтрации слишком строгие " \
                              "или данные отсутствуют. Проверь условия WHERE, значения фильтров и формат дат."
+
+        # Sanity checks результата (бизнес-уровень)
+        if not empty_result and tool_name == "execute_query":
+            sanity_warnings = self._check_result_sanity(state["user_input"], exec_result)
+            for sw in sanity_warnings:
+                warnings_text += f"\n⚠ {sw}"
+
+        # Аудит-лог SQL
+        audit_status = "empty" if empty_result else "success"
+        # Подсчёт строк из markdown-таблицы
+        data_lines = [l for l in exec_result.split("\n") if l.strip().startswith("|")]
+        row_count = max(0, len(data_lines) - 2) if data_lines else 0  # -2: заголовок + разделитель
+        self.memory.log_sql_execution(state["user_input"], sql, row_count, audit_status, duration_ms)
 
         self.memory.add_message("tool", f"[{tool_name}] {exec_result[:500]}")
 
@@ -971,6 +1133,7 @@ class GraphNodes:
         step_idx = state["current_step"]
         plan = state["plan"]
         current_step = plan[step_idx] if step_idx < len(plan) else "неизвестный шаг"
+        iterations = state.get("graph_iterations", 0) + 1
 
         logger.info("Corrector: попытка %d/%d, ошибка: %s", retry_count + 1, self.MAX_RETRIES, error[:200])
 
@@ -979,6 +1142,7 @@ class GraphNodes:
                 "last_error": None,
                 "current_step": step_idx + 1,
                 "retry_count": 0,
+                "graph_iterations": iterations,
                 "final_answer": f"Не удалось выполнить шаг '{current_step}' после {self.MAX_RETRIES} попыток. "
                                 f"Последняя ошибка: {error}",
             }
@@ -1044,39 +1208,47 @@ class GraphNodes:
         # Если исправленный вызов содержит SQL — отправить на валидацию
         sql = tool_call.get("args", {}).get("sql")
         if sql and tool_call["tool"] in ("execute_query", "execute_write", "execute_ddl"):
+            # Сохраняем пример исправления для обучения
+            example = f"Ошибка: {error[:100]} → Исправление: {sql[:150]}"
+            correction_examples = state.get("correction_examples", []) + [example]
             return {
                 "sql_to_validate": sql,
                 "retry_count": retry_count + 1,
                 "last_error": None,
+                "graph_iterations": iterations,
+                "correction_examples": correction_examples,
                 "tool_calls": state.get("tool_calls", []) + [
                     {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": "awaiting_validation"}
                 ],
             }
 
         # Вызов исправленного инструмента
-        result = self._call_tool(tool_call["tool"], tool_call.get("args", {}))
+        tool_result = self._call_tool(tool_call["tool"], tool_call.get("args", {}))
+        result_str = str(tool_result)
 
-        if self._is_tool_error(result):
+        if not tool_result.success:
             return {
-                "last_error": str(result),
+                "last_error": tool_result.error,
                 "retry_count": retry_count + 1,
+                "graph_iterations": iterations,
                 "messages": state["messages"] + [
-                    {"role": "assistant", "content": f"Повторная ошибка (попытка {retry_count + 1}): {result}"}
+                    {"role": "assistant", "content": f"Повторная ошибка (попытка {retry_count + 1}): {result_str}"}
                 ],
             }
 
-        self.memory.add_message("tool", f"[corrector:{tool_call['tool']}] {str(result)[:500]}")
+        self.memory.add_message("tool", f"[corrector:{tool_call['tool']}] {result_str[:500]}")
 
         return {
             "tool_calls": state.get("tool_calls", []) + [
-                {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": str(result)}
+                {"tool": tool_call["tool"], "args": tool_call.get("args", {}), "result": result_str}
             ],
             "current_step": step_idx + 1,
             "last_error": None,
             "retry_count": 0,
             "sql_to_validate": None,
+            "graph_iterations": iterations,
             "messages": state["messages"] + [
-                {"role": "assistant", "content": f"Исправлено. Шаг {step_idx + 1}: {str(result)[:1000]}"}
+                {"role": "assistant", "content": f"Исправлено. Шаг {step_idx + 1}: {result_str[:1000]}"}
             ],
         }
 
@@ -1089,6 +1261,13 @@ class GraphNodes:
         Returns:
             Обновления состояния с final_answer.
         """
+        # Сохраняем примеры исправлений в долгосрочную память
+        new_examples = state.get("correction_examples", [])
+        if new_examples:
+            existing = self.memory.get_memory_list("correction_examples")
+            combined = (existing + new_examples)[-20:]  # храним последние 20
+            self.memory.set_memory("correction_examples", json.dumps(combined, ensure_ascii=False))
+
         # Если уже есть финальный ответ (например, от corrector при исчерпании попыток)
         if state.get("final_answer"):
             self.memory.add_message("assistant", state["final_answer"])

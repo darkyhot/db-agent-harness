@@ -34,3 +34,5 @@ class AgentState(TypedDict):
     needs_disambiguation: bool
     disambiguation_options: list
     tables_context: str
+    graph_iterations: int
+    correction_examples: list

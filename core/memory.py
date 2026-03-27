@@ -78,6 +78,18 @@ class MemoryManager:
                     updated_at TEXT
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sql_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    timestamp TEXT,
+                    user_input TEXT,
+                    sql TEXT,
+                    row_count INTEGER,
+                    status TEXT,
+                    duration_ms INTEGER
+                )
+            """)
         logger.info("SQLite память инициализирована: %s", self._db_path)
 
     def start_session(self, user_id: str = "") -> str:
@@ -223,6 +235,37 @@ class MemoryManager:
                 (self._session_id or "",),
             )
             return [row[0] for row in cursor.fetchall()]
+
+    # --- SQL audit ---
+
+    def log_sql_execution(
+        self,
+        user_input: str,
+        sql: str,
+        row_count: int,
+        status: str,
+        duration_ms: int,
+    ) -> None:
+        """Записать выполненный SQL в аудит-лог.
+
+        Args:
+            user_input: Исходный запрос пользователя.
+            sql: Выполненный SQL-запрос.
+            row_count: Количество строк в результате.
+            status: Статус выполнения ('success', 'empty', 'error').
+            duration_ms: Время выполнения в миллисекундах.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO sql_audit "
+                    "(session_id, timestamp, user_input, sql, row_count, status, duration_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (self._session_id or "", now, user_input, sql, row_count, status, duration_ms),
+                )
+        except Exception as e:
+            logger.warning("Ошибка записи SQL-аудита: %s", e)
 
     # --- Long-term memory ---
 

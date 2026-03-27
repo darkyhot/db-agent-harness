@@ -239,8 +239,8 @@ class GraphNodes:
             "- НЕ пиши SQL в плане — только укажи нужные таблицы, SQL будет на этапе исполнения\n"
             "- НЕ выдумывай таблицы — если не знаешь таблицу, используй search_tables / search_by_description\n"
             "- Если ответ уже есть в каталоге или контексте — план из одного шага без инструментов\n"
-            "- Алиасы в SQL ТОЛЬКО на английском (AS outflow, НЕ AS \"отток\")\n"
-            "- Если запрос неоднозначный — начни с search_tables/search_by_description для уточнения\n\n"
+            "- Если запрос неоднозначный — начни с search_tables/search_by_description для уточнения\n"
+            "- Если search_by_description не нашёл результат — попробуй синонимы или search_tables с английскими ключевыми словами\n\n"
             "=== ПРИМЕРЫ ===\n\n"
             'Аналитика: "Сколько клиентов в регионе X?"\n'
             '["Определить таблицы — dm.clients (подгрузится структура)", '
@@ -283,7 +283,6 @@ class GraphNodes:
             '{"tool": "get_table_columns", "args": {"schema": "dm", "table": "clients"}}\n'
             '{"tool": "none", "result": "В каталоге найдено 3 таблицы с данными о продажах."}\n\n'
             f"{SQL_RULES}\n\n"
-            f"{SQL_CHECKLIST}\n\n"
             f"{GIGACHAT_COMMON_ERRORS}\n\n"
             "Порядок рассуждений при написании SQL:\n"
             "1. Изучи разведку таблиц: колонки, типы данных, образцы данных\n"
@@ -353,7 +352,6 @@ class GraphNodes:
 
         user_prompt = (
             f"Запрос пользователя: {user_input}\n\n"
-            "Составь план шагов. Верни ТОЛЬКО JSON-массив строк.\n\n"
             "Стратегия планирования:\n"
             "1. Для аналитики (подсчёты, агрегаты, выборки):\n"
             "   - Первый шаг: укажи нужные таблицы в формате schema.table\n"
@@ -466,7 +464,8 @@ class GraphNodes:
             "- Гранулярность: что является одной строкой? Есть ли дубликаты по ключевым полям?\n"
             "- NULL'ы и пустые значения в колонках\n"
             "- Формат дат, числовых значений, кодов\n"
-            "- Какие колонки можно использовать для фильтрации и группировки\n\n"
+            "- Какие колонки можно использовать для фильтрации и группировки\n"
+            "- Связь колонок с запросом пользователя: какие колонки соответствуют терминам из вопроса?\n\n"
             + "\n\n".join(sections)
         )
 
@@ -563,6 +562,7 @@ class GraphNodes:
             user_parts.append(tables_context)
         if tables_detail:
             user_parts.append(tables_detail)
+        user_parts.append(f"{SQL_CHECKLIST}")
         user_parts.append(f"[ТЕКУЩИЙ ШАГ {step_idx + 1}/{len(plan)}]\n{current_step}")
         if prev_context:
             user_parts.append(f"[КОНТЕКСТ ПРЕДЫДУЩИХ ШАГОВ]\n{prev_context}")
@@ -1089,11 +1089,30 @@ class GraphNodes:
 
         system_prompt = self._get_summarizer_system_prompt()
 
-        user_prompt = (
-            f"Запрос пользователя: {state['user_input']}\n\n"
-            f"План:\n{plan_text}\n\n"
-            f"Результаты инструментов:\n{tool_results}"
-        )
+        # Краткий контекст таблиц (описания колонок без семплов)
+        tables_ctx = state.get("tables_context", "")
+        tables_summary = ""
+        if tables_ctx:
+            # Извлекаем только строки с описаниями колонок (без семплов данных)
+            ctx_lines = tables_ctx.split("\n")
+            summary_lines = []
+            skip_sample = False
+            for line in ctx_lines:
+                if "Образец данных" in line or "Sample" in line:
+                    skip_sample = True
+                    continue
+                if skip_sample and (line.strip() == "" or line.startswith("[")):
+                    skip_sample = False
+                if not skip_sample:
+                    summary_lines.append(line)
+            tables_summary = "\n".join(summary_lines).strip()
+
+        user_parts_sum = [f"Запрос пользователя: {state['user_input']}"]
+        user_parts_sum.append(f"План:\n{plan_text}")
+        if tables_summary:
+            user_parts_sum.append(f"Контекст таблиц (для интерпретации колонок):\n{tables_summary}")
+        user_parts_sum.append(f"Результаты инструментов:\n{tool_results}")
+        user_prompt = "\n\n".join(user_parts_sum)
 
         if self.debug_prompt:
             print(f"\n{'='*80}\n[DEBUG PROMPT — summarizer]\n{'='*80}\n"

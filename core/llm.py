@@ -29,10 +29,14 @@ class RateLimitedLLM:
             timeout=120,
         )
         self._last_call_time: float = 0.0
+        self._llm_cache: dict[float, GigaChat] = {}
         logger.info("RateLimitedLLM инициализирован (model=%s)", self._model)
 
     def _get_llm(self, temperature: float | None = None) -> GigaChat:
         """Получить экземпляр GigaChat с указанной temperature.
+
+        Кеширует экземпляры по temperature, чтобы не создавать
+        новое соединение на каждый вызов.
 
         Args:
             temperature: Температура генерации (0.0-1.0). None — default модели.
@@ -42,13 +46,15 @@ class RateLimitedLLM:
         """
         if temperature is None:
             return self._llm
-        return GigaChat(
-            base_url=self._base_url,
-            access_token=self._access_token,
-            model=self._model,
-            timeout=120,
-            temperature=temperature,
-        )
+        if temperature not in self._llm_cache:
+            self._llm_cache[temperature] = GigaChat(
+                base_url=self._base_url,
+                access_token=self._access_token,
+                model=self._model,
+                timeout=120,
+                temperature=temperature,
+            )
+        return self._llm_cache[temperature]
 
     def _wait_for_rate_limit(self) -> None:
         """Ожидание до следующего разрешённого времени запроса."""

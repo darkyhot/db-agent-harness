@@ -1,4 +1,4 @@
-"""Валидация SQL-запросов: синтаксис, EXPLAIN, проверка JOIN-ов."""
+﻿"""Р’Р°Р»РёРґР°С†РёСЏ SQL-Р·Р°РїСЂРѕСЃРѕРІ: СЃРёРЅС‚Р°РєСЃРёСЃ, EXPLAIN, РїСЂРѕРІРµСЂРєР° JOIN-РѕРІ."""
 
 import logging
 import re
@@ -11,14 +11,14 @@ logger = logging.getLogger(__name__)
 
 
 class SQLMode(Enum):
-    """Режим SQL-запроса."""
+    """Р РµР¶РёРј SQL-Р·Р°РїСЂРѕСЃР°."""
     READ = "READ"
     WRITE = "WRITE"
     DDL = "DDL"
 
 
 class ValidationResult:
-    """Результат валидации SQL-запроса."""
+    """Р РµР·СѓР»СЊС‚Р°С‚ РІР°Р»РёРґР°С†РёРё SQL-Р·Р°РїСЂРѕСЃР°."""
 
     def __init__(self, is_valid: bool, mode: SQLMode) -> None:
         self.is_valid: bool = is_valid
@@ -33,74 +33,74 @@ class ValidationResult:
         self.multiplication_factor: float = 1.0
 
     def add_warning(self, msg: str) -> None:
-        """Добавить предупреждение."""
+        """Р”РѕР±Р°РІРёС‚СЊ РїСЂРµРґСѓРїСЂРµР¶РґРµРЅРёРµ."""
         self.warnings.append(msg)
         logger.warning("SQL validation warning: %s", msg)
 
     def add_error(self, msg: str) -> None:
-        """Добавить ошибку и пометить как невалидный."""
+        """Р”РѕР±Р°РІРёС‚СЊ РѕС€РёР±РєСѓ Рё РїРѕРјРµС‚РёС‚СЊ РєР°Рє РЅРµРІР°Р»РёРґРЅС‹Р№."""
         self.errors.append(msg)
         self.is_valid = False
         logger.error("SQL validation error: %s", msg)
 
     def require_confirmation(self, msg: str) -> None:
-        """Запросить подтверждение пользователя."""
+        """Р—Р°РїСЂРѕСЃРёС‚СЊ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ."""
         self.needs_confirmation = True
         self.confirmation_message = msg
 
     def summary(self) -> str:
-        """Текстовое резюме валидации."""
-        lines = [f"Режим: {self.mode.value}", f"Валидно: {'да' if self.is_valid else 'нет'}"]
+        """РўРµРєСЃС‚РѕРІРѕРµ СЂРµР·СЋРјРµ РІР°Р»РёРґР°С†РёРё."""
+        lines = [f"Р РµР¶РёРј: {self.mode.value}", f"Р’Р°Р»РёРґРЅРѕ: {'РґР°' if self.is_valid else 'РЅРµС‚'}"]
         if self.errors:
-            lines.append("Ошибки:")
+            lines.append("РћС€РёР±РєРё:")
             for e in self.errors:
-                lines.append(f"  ✗ {e}")
+                lines.append(f"  вњ— {e}")
         if self.warnings:
-            lines.append("Предупреждения:")
+            lines.append("РџСЂРµРґСѓРїСЂРµР¶РґРµРЅРёСЏ:")
             for w in self.warnings:
-                lines.append(f"  ⚠ {w}")
+                lines.append(f"  вљ  {w}")
         if self.needs_confirmation:
-            lines.append(f"Требуется подтверждение: {self.confirmation_message}")
+            lines.append(f"РўСЂРµР±СѓРµС‚СЃСЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ: {self.confirmation_message}")
         if self.join_checks:
-            lines.append("Проверка JOIN-ов:")
+            lines.append("РџСЂРѕРІРµСЂРєР° JOIN-РѕРІ:")
             for jc in self.join_checks:
                 cardinality = jc.get("cardinality", "unknown")
                 join_expr = jc.get("join", f"{jc.get('table', '?')}.({jc.get('columns', '?')})")
-                status = "✓ safe" if jc.get("is_safe") else "✗ risky"
+                status = "вњ“ safe" if jc.get("is_safe") else "вњ— risky"
                 lines.append(f"  {join_expr}: {cardinality} ({status})")
             if self.multiplication_factor > 1.0:
                 lines.append(f"  Multiplication factor: {self.multiplication_factor:.1f}x")
         if self.rewrite_suggestions:
-            lines.append("Рекомендации по переписыванию:")
+            lines.append("Р РµРєРѕРјРµРЅРґР°С†РёРё РїРѕ РїРµСЂРµРїРёСЃС‹РІР°РЅРёСЋ:")
             for s in self.rewrite_suggestions:
                 lines.append(f"  {s}")
         return "\n".join(lines)
 
 
 def detect_mode(sql: str) -> SQLMode:
-    """Определить режим SQL-запроса.
+    """РћРїСЂРµРґРµР»РёС‚СЊ СЂРµР¶РёРј SQL-Р·Р°РїСЂРѕСЃР°.
 
-    Поддерживает CTE: ``WITH cte AS (...) INSERT INTO ...`` определяется как WRITE,
-    а не как READ.
+    РџРѕРґРґРµСЂР¶РёРІР°РµС‚ CTE: ``WITH cte AS (...) INSERT INTO ...`` РѕРїСЂРµРґРµР»СЏРµС‚СЃСЏ РєР°Рє WRITE,
+    Р° РЅРµ РєР°Рє READ.
 
     Args:
-        sql: SQL-запрос.
+        sql: SQL-Р·Р°РїСЂРѕСЃ.
 
     Returns:
-        SQLMode (READ, WRITE или DDL).
+        SQLMode (READ, WRITE РёР»Рё DDL).
     """
     normalized = sql.strip().upper()
-    # Убираем комментарии в начале
+    # РЈР±РёСЂР°РµРј РєРѕРјРјРµРЅС‚Р°СЂРёРё РІ РЅР°С‡Р°Р»Рµ
     for line in normalized.split("\n"):
         line = line.strip()
         if line and not line.startswith("--"):
             normalized = line
             break
 
-    # Если запрос начинается с WITH (CTE), ищем основной statement после CTE
+    # Р•СЃР»Рё Р·Р°РїСЂРѕСЃ РЅР°С‡РёРЅР°РµС‚СЃСЏ СЃ WITH (CTE), РёС‰РµРј РѕСЃРЅРѕРІРЅРѕР№ statement РїРѕСЃР»Рµ CTE
     if normalized.startswith("WITH"):
-        # Найти основной statement после всех CTE-определений.
-        # Ищем последний закрывающий ')' CTE, за которым идёт ключевое слово.
+        # РќР°Р№С‚Рё РѕСЃРЅРѕРІРЅРѕР№ statement РїРѕСЃР»Рµ РІСЃРµС… CTE-РѕРїСЂРµРґРµР»РµРЅРёР№.
+        # РС‰РµРј РїРѕСЃР»РµРґРЅРёР№ Р·Р°РєСЂС‹РІР°СЋС‰РёР№ ')' CTE, Р·Р° РєРѕС‚РѕСЂС‹Рј РёРґС‘С‚ РєР»СЋС‡РµРІРѕРµ СЃР»РѕРІРѕ.
         main_stmt = re.search(
             r'\)\s*(SELECT|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE)\b',
             normalized,
@@ -121,13 +121,13 @@ def detect_mode(sql: str) -> SQLMode:
 
 
 def _build_alias_map(sql: str) -> dict[str, tuple[str, str]]:
-    """Построить маппинг alias → (schema, table) из FROM и JOIN.
+    """РџРѕСЃС‚СЂРѕРёС‚СЊ РјР°РїРїРёРЅРі alias в†’ (schema, table) РёР· FROM Рё JOIN.
 
-    Обрабатывает:
+    РћР±СЂР°Р±Р°С‚С‹РІР°РµС‚:
     - FROM schema.table alias
     - FROM schema.table AS alias
     - JOIN schema.table alias ON ...
-    - FROM schema.table (без alias → table name как alias)
+    - FROM schema.table (Р±РµР· alias в†’ table name РєР°Рє alias)
     """
     alias_map: dict[str, tuple[str, str]] = {}
 
@@ -137,7 +137,7 @@ def _build_alias_map(sql: str) -> dict[str, tuple[str, str]]:
         "HAVING", "LIMIT", "UNION", "EXCEPT", "INTERSECT",
     ))
 
-    # Паттерн: schema.table с опциональным alias (AS keyword опционален)
+    # РџР°С‚С‚РµСЂРЅ: schema.table СЃ РѕРїС†РёРѕРЅР°Р»СЊРЅС‹Рј alias (AS keyword РѕРїС†РёРѕРЅР°Р»РµРЅ)
     table_ref = re.compile(
         r'(?:FROM|JOIN)\s+'
         r'["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
@@ -152,14 +152,14 @@ def _build_alias_map(sql: str) -> dict[str, tuple[str, str]]:
             alias_map[alias.lower()] = (schema, table)
         alias_map[table.lower()] = (schema, table)
 
-    # Обработка comma-separated таблиц в FROM (implicit JOIN):
+    # РћР±СЂР°Р±РѕС‚РєР° comma-separated С‚Р°Р±Р»РёС† РІ FROM (implicit JOIN):
     # FROM hr.emp e, hr.dept d, hr.loc l
     comma_ref = re.compile(
         r',\s*["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
         r'(?:\s+(?:AS\s+)?(\w+))?',
         re.IGNORECASE,
     )
-    # Ищем только внутри FROM-клаузы (до WHERE/JOIN/GROUP и т.д.)
+    # РС‰РµРј С‚РѕР»СЊРєРѕ РІРЅСѓС‚СЂРё FROM-РєР»Р°СѓР·С‹ (РґРѕ WHERE/JOIN/GROUP Рё С‚.Рґ.)
     from_clause_pat = re.compile(
         r'\bFROM\s+(.*?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bJOIN\b|\bHAVING\b|\Z)',
         re.IGNORECASE | re.DOTALL,
@@ -178,17 +178,17 @@ def _build_alias_map(sql: str) -> dict[str, tuple[str, str]]:
 
 
 def _find_subquery_join_aliases(sql: str) -> set[str]:
-    """Найти алиасы JOIN-ов, которые используют подзапросы.
+    """РќР°Р№С‚Рё Р°Р»РёР°СЃС‹ JOIN-РѕРІ, РєРѕС‚РѕСЂС‹Рµ РёСЃРїРѕР»СЊР·СѓСЋС‚ РїРѕРґР·Р°РїСЂРѕСЃС‹.
 
-    Подзапрос в JOIN (например, JOIN (SELECT DISTINCT ...) alias ON ...)
-    считается уже безопасным — DISTINCT/GROUP BY внутри предотвращает дубли.
+    РџРѕРґР·Р°РїСЂРѕСЃ РІ JOIN (РЅР°РїСЂРёРјРµСЂ, JOIN (SELECT DISTINCT ...) alias ON ...)
+    СЃС‡РёС‚Р°РµС‚СЃСЏ СѓР¶Рµ Р±РµР·РѕРїР°СЃРЅС‹Рј вЂ” DISTINCT/GROUP BY РІРЅСѓС‚СЂРё РїСЂРµРґРѕС‚РІСЂР°С‰Р°РµС‚ РґСѓР±Р»Рё.
 
     Returns:
-        Множество алиасов (в нижнем регистре), которые являются подзапросами.
+        РњРЅРѕР¶РµСЃС‚РІРѕ Р°Р»РёР°СЃРѕРІ (РІ РЅРёР¶РЅРµРј СЂРµРіРёСЃС‚СЂРµ), РєРѕС‚РѕСЂС‹Рµ СЏРІР»СЏСЋС‚СЃСЏ РїРѕРґР·Р°РїСЂРѕСЃР°РјРё.
     """
     safe_aliases: set[str] = set()
-    # Паттерн: JOIN (SELECT ...) alias ON
-    # Ищем JOIN за которым следует открывающая скобка (подзапрос)
+    # РџР°С‚С‚РµСЂРЅ: JOIN (SELECT ...) alias ON
+    # РС‰РµРј JOIN Р·Р° РєРѕС‚РѕСЂС‹Рј СЃР»РµРґСѓРµС‚ РѕС‚РєСЂС‹РІР°СЋС‰Р°СЏ СЃРєРѕР±РєР° (РїРѕРґР·Р°РїСЂРѕСЃ)
     subq_pattern = re.compile(
         r'JOIN\s*\(\s*SELECT\b.*?\)\s+(?:AS\s+)?(\w+)\s+ON\b',
         re.IGNORECASE | re.DOTALL,
@@ -199,24 +199,24 @@ def _find_subquery_join_aliases(sql: str) -> set[str]:
 
 
 def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
-    """Извлечь таблицы и колонки из JOIN условий.
+    """РР·РІР»РµС‡СЊ С‚Р°Р±Р»РёС†С‹ Рё РєРѕР»РѕРЅРєРё РёР· JOIN СѓСЃР»РѕРІРёР№.
 
-    Поддерживает:
-    - Explicit JOINs с алиасами (JOIN schema.table alias ON alias.col = ...)
+    РџРѕРґРґРµСЂР¶РёРІР°РµС‚:
+    - Explicit JOINs СЃ Р°Р»РёР°СЃР°РјРё (JOIN schema.table alias ON alias.col = ...)
     - LEFT/RIGHT/FULL/INNER JOIN
     - Multi-column ON (AND conditions)
-    - CROSS JOIN (без ON — всегда explosion)
+    - CROSS JOIN (Р±РµР· ON вЂ” РІСЃРµРіРґР° explosion)
     - Implicit JOINs (FROM t1, t2 WHERE t1.col = t2.col)
-    - Обе стороны JOIN (left и right)
-    - Подзапросы в JOIN: JOIN (SELECT DISTINCT ...) alias — пропускаются как безопасные
+    - РћР±Рµ СЃС‚РѕСЂРѕРЅС‹ JOIN (left Рё right)
+    - РџРѕРґР·Р°РїСЂРѕСЃС‹ РІ JOIN: JOIN (SELECT DISTINCT ...) alias вЂ” РїСЂРѕРїСѓСЃРєР°СЋС‚СЃСЏ РєР°Рє Р±РµР·РѕРїР°СЃРЅС‹Рµ
 
     Returns:
-        Список словарей с schema, table, column для каждой стороны каждого JOIN.
+        РЎРїРёСЃРѕРє СЃР»РѕРІР°СЂРµР№ СЃ schema, table, column РґР»СЏ РєР°Р¶РґРѕР№ СЃС‚РѕСЂРѕРЅС‹ РєР°Р¶РґРѕРіРѕ JOIN.
     """
     joins: list[dict[str, str]] = []
     subquery_aliases = _find_subquery_join_aliases(sql)
 
-    # 0. Извлечь CTE-тела и обработать их рекурсивно
+    # 0. РР·РІР»РµС‡СЊ CTE-С‚РµР»Р° Рё РѕР±СЂР°Р±РѕС‚Р°С‚СЊ РёС… СЂРµРєСѓСЂСЃРёРІРЅРѕ
     cte_pattern = re.compile(
         r'\bWITH\b\s+(?:RECURSIVE\s+)?'
         r'(.*?)\bSELECT\b',
@@ -233,7 +233,7 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
             cte_body = body_match.group(1)
             joins.extend(_extract_join_conditions(cte_body))
 
-    # 1. Построить alias map
+    # 1. РџРѕСЃС‚СЂРѕРёС‚СЊ alias map
     alias_map = _build_alias_map(sql)
 
     def _resolve(ref: str) -> tuple[str, str] | None:
@@ -241,7 +241,7 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
         return alias_map.get(ref.lower())
 
     # 2. Explicit JOINs: extract ON conditions
-    # Найти все JOIN ... ON ... блоки
+    # РќР°Р№С‚Рё РІСЃРµ JOIN ... ON ... Р±Р»РѕРєРё
     join_on_pattern = re.compile(
         r'JOIN\s+["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
         r'\s+(?:(?:AS\s+)?(\w+)\s+)?ON\s+(.*?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|\bHAVING\b|;|\)|\Z)',
@@ -252,7 +252,7 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
         join_schema, join_table = m.group(1), m.group(2)
         on_clause = m.group(4)
 
-        # Извлечь все equality conditions из ON clause (поддержка multi-column)
+        # РР·РІР»РµС‡СЊ РІСЃРµ equality conditions РёР· ON clause (РїРѕРґРґРµСЂР¶РєР° multi-column)
         eq_pattern = re.compile(
             r'["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
             r'\s*=\s*'
@@ -262,11 +262,11 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
             left_ref, left_col = eq.group(1), eq.group(2)
             right_ref, right_col = eq.group(3), eq.group(4)
 
-            # Пропускаем стороны, которые ссылаются на подзапрос (уже безопасны)
+            # РџСЂРѕРїСѓСЃРєР°РµРј СЃС‚РѕСЂРѕРЅС‹, РєРѕС‚РѕСЂС‹Рµ СЃСЃС‹Р»Р°СЋС‚СЃСЏ РЅР° РїРѕРґР·Р°РїСЂРѕСЃ (СѓР¶Рµ Р±РµР·РѕРїР°СЃРЅС‹)
             left_is_subquery = left_ref.lower() in subquery_aliases
             right_is_subquery = right_ref.lower() in subquery_aliases
 
-            # Resolve обе стороны через alias map
+            # Resolve РѕР±Рµ СЃС‚РѕСЂРѕРЅС‹ С‡РµСЂРµР· alias map
             left_resolved = _resolve(left_ref)
             right_resolved = _resolve(right_ref)
 
@@ -283,7 +283,7 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
                     "column": right_col,
                 })
 
-    # 3. CROSS JOIN (нет ON → гарантированный explosion)
+    # 3. CROSS JOIN (РЅРµС‚ ON в†’ РіР°СЂР°РЅС‚РёСЂРѕРІР°РЅРЅС‹Р№ explosion)
     cross_pattern = re.compile(
         r'CROSS\s+JOIN\s+["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
         re.IGNORECASE,
@@ -296,7 +296,7 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
         })
 
     # 4. Implicit JOINs: FROM t1, t2 WHERE t1.col = t2.col
-    # Детектируем comma-separated tables в FROM
+    # Р”РµС‚РµРєС‚РёСЂСѓРµРј comma-separated tables РІ FROM
     from_pattern = re.compile(
         r'\bFROM\s+(.*?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bJOIN\b|\Z)',
         re.IGNORECASE | re.DOTALL,
@@ -304,10 +304,10 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
     from_match = from_pattern.search(sql)
     if from_match:
         from_clause = from_match.group(1)
-        # Ищем comma-separated tables (минимум 2 через запятую)
+        # РС‰РµРј comma-separated tables (РјРёРЅРёРјСѓРј 2 С‡РµСЂРµР· Р·Р°РїСЏС‚СѓСЋ)
         table_refs = [t.strip() for t in from_clause.split(",") if t.strip()]
         if len(table_refs) >= 2:
-            # Есть implicit join — ищем equality conditions в WHERE
+            # Р•СЃС‚СЊ implicit join вЂ” РёС‰РµРј equality conditions РІ WHERE
             where_pattern = re.compile(
                 r'\bWHERE\b\s+(.*?)(?=\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|\Z)',
                 re.IGNORECASE | re.DOTALL,
@@ -340,7 +340,7 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
                             "column": right_col,
                         })
 
-    # 5. Дедупликация (одна и та же schema.table.column может появиться из разных мест)
+    # 5. Р”РµРґСѓРїР»РёРєР°С†РёСЏ (РѕРґРЅР° Рё С‚Р° Р¶Рµ schema.table.column РјРѕР¶РµС‚ РїРѕСЏРІРёС‚СЊСЃСЏ РёР· СЂР°Р·РЅС‹С… РјРµСЃС‚)
     seen = set()
     unique_joins = []
     for j in joins:
@@ -353,7 +353,7 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
 
 
 def _extract_join_pairs(sql: str) -> list[dict[str, Any]]:
-    """Извлечь пары сторон JOIN с указанием присоединяемой стороны."""
+    """РР·РІР»РµС‡СЊ РїР°СЂС‹ СЃС‚РѕСЂРѕРЅ JOIN СЃ СѓРєР°Р·Р°РЅРёРµРј РїСЂРёСЃРѕРµРґРёРЅСЏРµРјРѕР№ СЃС‚РѕСЂРѕРЅС‹."""
     pairs: list[dict[str, Any]] = []
     subquery_aliases = _find_subquery_join_aliases(sql)
     alias_map = _build_alias_map(sql)
@@ -428,14 +428,14 @@ def _extract_join_pairs(sql: str) -> list[dict[str, Any]]:
 
 
 def _has_where_or_limit(sql: str) -> bool:
-    """Проверить наличие WHERE или LIMIT в основном запросе.
+    """РџСЂРѕРІРµСЂРёС‚СЊ РЅР°Р»РёС‡РёРµ WHERE РёР»Рё LIMIT РІ РѕСЃРЅРѕРІРЅРѕРј Р·Р°РїСЂРѕСЃРµ.
 
-    Убирает подзапросы в скобках и строковые литералы перед проверкой,
-    чтобы избежать ложных срабатываний.
+    РЈР±РёСЂР°РµС‚ РїРѕРґР·Р°РїСЂРѕСЃС‹ РІ СЃРєРѕР±РєР°С… Рё СЃС‚СЂРѕРєРѕРІС‹Рµ Р»РёС‚РµСЂР°Р»С‹ РїРµСЂРµРґ РїСЂРѕРІРµСЂРєРѕР№,
+    С‡С‚РѕР±С‹ РёР·Р±РµР¶Р°С‚СЊ Р»РѕР¶РЅС‹С… СЃСЂР°Р±Р°С‚С‹РІР°РЅРёР№.
     """
-    # Убираем строковые литералы
+    # РЈР±РёСЂР°РµРј СЃС‚СЂРѕРєРѕРІС‹Рµ Р»РёС‚РµСЂР°Р»С‹
     cleaned = re.sub(r"'[^']*'", "''", sql)
-    # Убираем содержимое подзапросов в скобках (рекурсивно, до 5 уровней)
+    # РЈР±РёСЂР°РµРј СЃРѕРґРµСЂР¶РёРјРѕРµ РїРѕРґР·Р°РїСЂРѕСЃРѕРІ РІ СЃРєРѕР±РєР°С… (СЂРµРєСѓСЂСЃРёРІРЅРѕ, РґРѕ 5 СѓСЂРѕРІРЅРµР№)
     for _ in range(5):
         prev = cleaned
         cleaned = re.sub(r'\([^()]*\)', '()', cleaned)
@@ -446,9 +446,9 @@ def _has_where_or_limit(sql: str) -> bool:
 
 
 def _has_top_level_where(sql: str) -> bool:
-    """Проверить наличие WHERE на верхнем уровне statement.
+    """РџСЂРѕРІРµСЂРёС‚СЊ РЅР°Р»РёС‡РёРµ WHERE РЅР° РІРµСЂС…РЅРµРј СѓСЂРѕРІРЅРµ statement.
 
-    Не учитывает WHERE в строковых литералах, комментариях и подзапросах.
+    РќРµ СѓС‡РёС‚С‹РІР°РµС‚ WHERE РІ СЃС‚СЂРѕРєРѕРІС‹С… Р»РёС‚РµСЂР°Р»Р°С…, РєРѕРјРјРµРЅС‚Р°СЂРёСЏС… Рё РїРѕРґР·Р°РїСЂРѕСЃР°С….
     """
     statements = sqlparse.parse(sql)
     if not statements:
@@ -461,31 +461,31 @@ def _has_top_level_where(sql: str) -> bool:
 
 
 class SQLValidator:
-    """Валидатор SQL-запросов для Greenplum."""
+    """Р’Р°Р»РёРґР°С‚РѕСЂ SQL-Р·Р°РїСЂРѕСЃРѕРІ РґР»СЏ Greenplum."""
 
     def __init__(self, db_manager: Any, schema_loader: Any = None) -> None:
-        """Инициализация валидатора.
+        """РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ РІР°Р»РёРґР°С‚РѕСЂР°.
 
         Args:
-            db_manager: Экземпляр DatabaseManager для выполнения EXPLAIN и проверок.
-            schema_loader: Опциональный SchemaLoader для CSV-first проверки ключей.
+            db_manager: Р­РєР·РµРјРїР»СЏСЂ DatabaseManager РґР»СЏ РІС‹РїРѕР»РЅРµРЅРёСЏ EXPLAIN Рё РїСЂРѕРІРµСЂРѕРє.
+            schema_loader: РћРїС†РёРѕРЅР°Р»СЊРЅС‹Р№ SchemaLoader РґР»СЏ CSV-first РїСЂРѕРІРµСЂРєРё РєР»СЋС‡РµР№.
         """
         self._db = db_manager
         self._schema_loader = schema_loader
 
     def validate(self, sql: str) -> ValidationResult:
-        """Валидировать SQL-запрос.
+        """Р’Р°Р»РёРґРёСЂРѕРІР°С‚СЊ SQL-Р·Р°РїСЂРѕСЃ.
 
         Args:
-            sql: SQL-запрос.
+            sql: SQL-Р·Р°РїСЂРѕСЃ.
 
         Returns:
-            ValidationResult с результатами проверки.
+            ValidationResult СЃ СЂРµР·СѓР»СЊС‚Р°С‚Р°РјРё РїСЂРѕРІРµСЂРєРё.
         """
         mode = detect_mode(sql)
         result = ValidationResult(is_valid=True, mode=mode)
 
-        logger.info("Валидация SQL (режим %s): %s", mode.value, sql[:200])
+        logger.info("Р’Р°Р»РёРґР°С†РёСЏ SQL (СЂРµР¶РёРј %s): %s", mode.value, sql[:200])
 
         if mode == SQLMode.READ:
             self._validate_read(sql, result)
@@ -498,10 +498,10 @@ class SQLValidator:
 
     @staticmethod
     def _estimate_multiplication_factor(join_checks: list[dict[str, Any]]) -> float:
-        """Оценка множителя размножения строк из-за неуникальных JOIN.
+        """РћС†РµРЅРєР° РјРЅРѕР¶РёС‚РµР»СЏ СЂР°Р·РјРЅРѕР¶РµРЅРёСЏ СЃС‚СЂРѕРє РёР·-Р·Р° РЅРµСѓРЅРёРєР°Р»СЊРЅС‹С… JOIN.
 
-        Для каждого неуникального JOIN: factor = 100 / unique_perc.
-        Общий factor — произведение по всем JOIN.
+        Р”Р»СЏ РєР°Р¶РґРѕРіРѕ РЅРµСѓРЅРёРєР°Р»СЊРЅРѕРіРѕ JOIN: factor = 100 / unique_perc.
+        РћР±С‰РёР№ factor вЂ” РїСЂРѕРёР·РІРµРґРµРЅРёРµ РїРѕ РІСЃРµРј JOIN.
         """
         total = 1.0
         for jc in join_checks:
@@ -518,30 +518,30 @@ class SQLValidator:
 
     @staticmethod
     def _generate_rewrite_suggestion(join: dict[str, str]) -> str:
-        """Сгенерировать конкретный шаблон переписывания JOIN с диагностикой причины дублей."""
+        """РЎРіРµРЅРµСЂРёСЂРѕРІР°С‚СЊ РєРѕРЅРєСЂРµС‚РЅС‹Р№ С€Р°Р±Р»РѕРЅ РїРµСЂРµРїРёСЃС‹РІР°РЅРёСЏ JOIN СЃ РґРёР°РіРЅРѕСЃС‚РёРєРѕР№ РїСЂРёС‡РёРЅС‹ РґСѓР±Р»РµР№."""
         schema, table, column = join["schema"], join["table"], join["column"]
         return (
-            f"ROW EXPLOSION: JOIN ключ {schema}.{table}.{column} не уникален.\n"
-            f"ОБЯЗАТЕЛЬНО: вызови get_sample для {schema}.{table} и изучи причину дублей.\n"
-            f"Затем выбери стратегию исправления:\n"
-            f"  Вариант 1 — статусы/версии (active/liquidated, актуальная/архивная запись):\n"
+            f"ROW EXPLOSION: JOIN РєР»СЋС‡ {schema}.{table}.{column} РЅРµ СѓРЅРёРєР°Р»РµРЅ.\n"
+            f"РћР‘РЇР—РђРўР•Р›Р¬РќРћ: РІС‹Р·РѕРІРё get_sample РґР»СЏ {schema}.{table} Рё РёР·СѓС‡Рё РїСЂРёС‡РёРЅСѓ РґСѓР±Р»РµР№.\n"
+            f"Р—Р°С‚РµРј РІС‹Р±РµСЂРё СЃС‚СЂР°С‚РµРіРёСЋ РёСЃРїСЂР°РІР»РµРЅРёСЏ:\n"
+            f"  Р’Р°СЂРёР°РЅС‚ 1 вЂ” СЃС‚Р°С‚СѓСЃС‹/РІРµСЂСЃРёРё (active/liquidated, Р°РєС‚СѓР°Р»СЊРЅР°СЏ/Р°СЂС…РёРІРЅР°СЏ Р·Р°РїРёСЃСЊ):\n"
             f"    JOIN {schema}.{table} alias ON ... = alias.{column} WHERE alias.status = 'active'\n"
-            f"    или: JOIN (SELECT DISTINCT ON ({column}) * FROM {schema}.{table} "
-            f"ORDER BY {column}, <дата> DESC) alias ON ...\n"
-            f"  Вариант 2 — несколько фактов на объект (транзакции, платежи, события):\n"
-            f"    JOIN (SELECT {column}, SUM(<сумма>) AS total FROM {schema}.{table} "
+            f"    РёР»Рё: JOIN (SELECT DISTINCT ON ({column}) * FROM {schema}.{table} "
+            f"ORDER BY {column}, <РґР°С‚Р°> DESC) alias ON ...\n"
+            f"  Р’Р°СЂРёР°РЅС‚ 2 вЂ” РЅРµСЃРєРѕР»СЊРєРѕ С„Р°РєС‚РѕРІ РЅР° РѕР±СЉРµРєС‚ (С‚СЂР°РЅР·Р°РєС†РёРё, РїР»Р°С‚РµР¶Рё, СЃРѕР±С‹С‚РёСЏ):\n"
+            f"    JOIN (SELECT {column}, SUM(<СЃСѓРјРјР°>) AS total FROM {schema}.{table} "
             f"GROUP BY {column}) alias ON ...\n"
-            f"  Вариант 3 — технические дубли (полностью идентичные строки, баг данных):\n"
-            f"    JOIN (SELECT DISTINCT {column}, <нужные_колонки> FROM {schema}.{table}) "
+            f"  Р’Р°СЂРёР°РЅС‚ 3 вЂ” С‚РµС…РЅРёС‡РµСЃРєРёРµ РґСѓР±Р»Рё (РїРѕР»РЅРѕСЃС‚СЊСЋ РёРґРµРЅС‚РёС‡РЅС‹Рµ СЃС‚СЂРѕРєРё, Р±Р°Рі РґР°РЅРЅС‹С…):\n"
+            f"    JOIN (SELECT DISTINCT {column}, <РЅСѓР¶РЅС‹Рµ_РєРѕР»РѕРЅРєРё> FROM {schema}.{table}) "
             f"alias ON ... = alias.{column}\n"
-            f"ЗАПРЕЩЕНО: добавлять DISTINCT к внешнему SELECT — это маскирует проблему.\n"
-            f"ЗАПРЕЩЕНО: применять DISTINCT без понимания причины дублей."
+            f"Р—РђРџР Р•Р©Р•РќРћ: РґРѕР±Р°РІР»СЏС‚СЊ DISTINCT Рє РІРЅРµС€РЅРµРјСѓ SELECT вЂ” СЌС‚Рѕ РјР°СЃРєРёСЂСѓРµС‚ РїСЂРѕР±Р»РµРјСѓ.\n"
+            f"Р—РђРџР Р•Р©Р•РќРћ: РїСЂРёРјРµРЅСЏС‚СЊ DISTINCT Р±РµР· РїРѕРЅРёРјР°РЅРёСЏ РїСЂРёС‡РёРЅС‹ РґСѓР±Р»РµР№."
         )
 
     def _check_key_uniqueness(
         self, schema: str, table: str, columns: list[str],
     ) -> dict[str, Any]:
-        """Проверить уникальность ключа: сначала CSV, потом DB fallback."""
+        """РџСЂРѕРІРµСЂРёС‚СЊ СѓРЅРёРєР°Р»СЊРЅРѕСЃС‚СЊ РєР»СЋС‡Р°: СЃРЅР°С‡Р°Р»Р° CSV, РїРѕС‚РѕРј DB fallback."""
         if self._schema_loader is not None:
             csv_result = self._schema_loader.check_key_uniqueness(schema, table, columns)
             if csv_result.get("status") in {"safe", "risky"}:
@@ -555,16 +555,16 @@ class SQLValidator:
         return db_result
 
     def _validate_read(self, sql: str, result: ValidationResult) -> None:
-        """Валидация SELECT-запросов."""
-        # 1. EXPLAIN — синтаксическая проверка
+        """Р’Р°Р»РёРґР°С†РёСЏ SELECT-Р·Р°РїСЂРѕСЃРѕРІ."""
+        # 1. EXPLAIN вЂ” СЃРёРЅС‚Р°РєСЃРёС‡РµСЃРєР°СЏ РїСЂРѕРІРµСЂРєР°
         try:
             plan = self._db.explain_query(sql)
             result.explain_plan = plan
         except Exception as e:
-            result.add_error(f"Синтаксическая ошибка (EXPLAIN): {e}")
+            result.add_error(f"РЎРёРЅС‚Р°РєСЃРёС‡РµСЃРєР°СЏ РѕС€РёР±РєР° (EXPLAIN): {e}")
             return
 
-        # 2. Проверка JOIN-ов на кардинальность
+        # 2. РџСЂРѕРІРµСЂРєР° JOIN-РѕРІ РЅР° РєР°СЂРґРёРЅР°Р»СЊРЅРѕСЃС‚СЊ
         join_pairs = _extract_join_pairs(sql)
         for pair in join_pairs:
             if pair["type"] == "cross_join":
@@ -580,8 +580,8 @@ class SQLValidator:
                     "factor": 100.0,
                 })
                 result.rewrite_suggestions.append(
-                    f"ROW EXPLOSION: CROSS JOIN с {joined['schema']}.{joined['table']} "
-                    "создаёт декартово произведение. Замени на обычный JOIN с условием."
+                    f"ROW EXPLOSION: CROSS JOIN СЃ {joined['schema']}.{joined['table']} "
+                    "СЃРѕР·РґР°С‘С‚ РґРµРєР°СЂС‚РѕРІРѕ РїСЂРѕРёР·РІРµРґРµРЅРёРµ. Р—Р°РјРµРЅРё РЅР° РѕР±С‹С‡РЅС‹Р№ JOIN СЃ СѓСЃР»РѕРІРёРµРј."
                 )
                 continue
 
@@ -599,7 +599,7 @@ class SQLValidator:
                     joined["schema"], joined["table"], [joined["column"]]
                 )
             except Exception as e:
-                logger.warning("Не удалось проверить кардинальность JOIN: %s", e)
+                logger.warning("РќРµ СѓРґР°Р»РѕСЃСЊ РїСЂРѕРІРµСЂРёС‚СЊ РєР°СЂРґРёРЅР°Р»СЊРЅРѕСЃС‚СЊ JOIN: %s", e)
                 continue
 
             existing_status = existing_check.get("status", "unknown")
@@ -654,7 +654,7 @@ class SQLValidator:
             if not is_safe:
                 result.rewrite_suggestions.append(self._generate_rewrite_suggestion(joined))
 
-        # 3. Оценка multiplication factor и решение pass/warn/block
+        # 3. РћС†РµРЅРєР° multiplication factor Рё СЂРµС€РµРЅРёРµ pass/warn/block
         if result.join_checks:
             factor = self._estimate_multiplication_factor(result.join_checks)
             result.multiplication_factor = factor
@@ -670,24 +670,24 @@ class SQLValidator:
                 details = "; ".join(f"{jc['join']} [{jc['cardinality']}]" for jc in hard_risk)
                 result.add_error(
                     f"ROW EXPLOSION (factor={factor:.1f}x): {details}. "
-                    "Обнаружен JOIN, который размножает строки результата.\n"
+                    "РћР±РЅР°СЂСѓР¶РµРЅ JOIN, РєРѕС‚РѕСЂС‹Р№ СЂР°Р·РјРЅРѕР¶Р°РµС‚ СЃС‚СЂРѕРєРё СЂРµР·СѓР»СЊС‚Р°С‚Р°.\n"
                     + "\n".join(result.rewrite_suggestions)
                 )
             elif soft_risk:
                 details = "; ".join(f"{jc['join']} [{jc['cardinality']}]" for jc in soft_risk)
                 result.add_error(
                     f"JOIN RISK (factor={factor:.1f}x): {details}. "
-                    "Присоединяемая сторона не доказана как уникальная и может размножить строки."
+                    "РџСЂРёСЃРѕРµРґРёРЅСЏРµРјР°СЏ СЃС‚РѕСЂРѕРЅР° РЅРµ РґРѕРєР°Р·Р°РЅР° РєР°Рє СѓРЅРёРєР°Р»СЊРЅР°СЏ Рё РјРѕР¶РµС‚ СЂР°Р·РјРЅРѕР¶РёС‚СЊ СЃС‚СЂРѕРєРё."
                 )
 
-        # 4. Предупреждение если нет WHERE/LIMIT для больших таблиц
+        # 4. РџСЂРµРґСѓРїСЂРµР¶РґРµРЅРёРµ РµСЃР»Рё РЅРµС‚ WHERE/LIMIT РґР»СЏ Р±РѕР»СЊС€РёС… С‚Р°Р±Р»РёС†
         if not _has_where_or_limit(sql):
             result.add_warning(
-                "Запрос без WHERE/LIMIT. Для больших таблиц это может вернуть много данных."
+                "Р—Р°РїСЂРѕСЃ Р±РµР· WHERE/LIMIT. Р”Р»СЏ Р±РѕР»СЊС€РёС… С‚Р°Р±Р»РёС† СЌС‚Рѕ РјРѕР¶РµС‚ РІРµСЂРЅСѓС‚СЊ РјРЅРѕРіРѕ РґР°РЅРЅС‹С…."
             )
 
     def _validate_write(self, sql: str, result: ValidationResult) -> None:
-        """Валидация INSERT/UPDATE/DELETE."""
+        """Р’Р°Р»РёРґР°С†РёСЏ INSERT/UPDATE/DELETE."""
         normalized = sql.strip().upper()
 
         # 1. EXPLAIN
@@ -695,40 +695,39 @@ class SQLValidator:
             plan = self._db.explain_query(sql)
             result.explain_plan = plan
         except Exception as e:
-            result.add_error(f"Синтаксическая ошибка (EXPLAIN): {e}")
+            result.add_error(f"РЎРёРЅС‚Р°РєСЃРёС‡РµСЃРєР°СЏ РѕС€РёР±РєР° (EXPLAIN): {e}")
             return
 
-        # 2. UPDATE/DELETE без WHERE — требуем подтверждение
+        # 2. UPDATE/DELETE Р±РµР· WHERE вЂ” С‚СЂРµР±СѓРµРј РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ
         is_update_or_delete = normalized.startswith(("UPDATE", "DELETE"))
         if is_update_or_delete and not _has_top_level_where(sql):
             result.require_confirmation(
-                "UPDATE/DELETE без WHERE затронет ВСЕ строки таблицы. Вы уверены?"
+                "UPDATE/DELETE Р±РµР· WHERE Р·Р°С‚СЂРѕРЅРµС‚ Р’РЎР• СЃС‚СЂРѕРєРё С‚Р°Р±Р»РёС†С‹. Р’С‹ СѓРІРµСЂРµРЅС‹?"
             )
 
-        # 3. Оценка затронутых строк
+        # 3. РћС†РµРЅРєР° Р·Р°С‚СЂРѕРЅСѓС‚С‹С… СЃС‚СЂРѕРє
         if is_update_or_delete:
             self._estimate_write_impact(sql, result)
 
     def _estimate_write_impact(self, sql: str, result: ValidationResult) -> None:
-        """Оценить количество затронутых строк для UPDATE/DELETE."""
-        # Извлекаем таблицу и WHERE
+        """Estimate write impact without executing arbitrary WHERE fragments.
+
+        Security boundary: precise row counting by dynamic WHERE is disabled.
+        """
         normalized = sql.strip()
         upper = normalized.upper()
 
         try:
             if upper.startswith("DELETE"):
-                # DELETE FROM schema.table WHERE ...
                 match = re.search(
                     r'DELETE\s+FROM\s+["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
                     normalized, re.IGNORECASE,
                 )
                 if match:
                     schema, table = match.group(1), match.group(2)
-                    where_match = re.search(r'\bWHERE\b\s+(.*)', normalized, re.IGNORECASE | re.DOTALL)
-                    if where_match:
-                        where_clause = where_match.group(1).rstrip(";")
-                        count = self._db.estimate_affected_rows(where_clause, schema, table)
-                        result.add_warning(f"Будет затронуто строк: {count}")
+                    result.add_warning(
+                        f"Оценка затронутых строк для {schema}.{table} отключена по соображениям безопасности."
+                    )
 
             elif upper.startswith("UPDATE"):
                 match = re.search(
@@ -737,26 +736,23 @@ class SQLValidator:
                 )
                 if match:
                     schema, table = match.group(1), match.group(2)
-                    where_match = re.search(r'\bWHERE\b\s+(.*)', normalized, re.IGNORECASE | re.DOTALL)
-                    if where_match:
-                        where_clause = where_match.group(1).rstrip(";")
-                        count = self._db.estimate_affected_rows(where_clause, schema, table)
-                        result.add_warning(f"Будет затронуто строк: {count}")
+                    result.add_warning(
+                        f"Оценка затронутых строк для {schema}.{table} отключена по соображениям безопасности."
+                    )
         except Exception as e:
             logger.warning("Не удалось оценить количество затронутых строк: %s", e)
-
     def _validate_ddl(self, sql: str, result: ValidationResult) -> None:
-        """Валидация DDL-запросов."""
+        """Р’Р°Р»РёРґР°С†РёСЏ DDL-Р·Р°РїСЂРѕСЃРѕРІ."""
         normalized = sql.strip().upper()
 
-        # 1. DROP / TRUNCATE — требуем подтверждение
+        # 1. DROP / TRUNCATE вЂ” С‚СЂРµР±СѓРµРј РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ
         if normalized.startswith(("DROP", "TRUNCATE")):
             result.require_confirmation(
-                "Вы собираетесь выполнить DROP/TRUNCATE. Это необратимая операция. "
-                "Введите YES для подтверждения."
+                "Р’С‹ СЃРѕР±РёСЂР°РµС‚РµСЃСЊ РІС‹РїРѕР»РЅРёС‚СЊ DROP/TRUNCATE. Р­С‚Рѕ РЅРµРѕР±СЂР°С‚РёРјР°СЏ РѕРїРµСЂР°С†РёСЏ. "
+                "Р’РІРµРґРёС‚Рµ YES РґР»СЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёСЏ."
             )
 
-        # 2. CREATE TABLE — проверка существования
+        # 2. CREATE TABLE вЂ” РїСЂРѕРІРµСЂРєР° СЃСѓС‰РµСЃС‚РІРѕРІР°РЅРёСЏ
         if normalized.startswith("CREATE TABLE"):
             match = re.search(
                 r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
@@ -767,13 +763,13 @@ class SQLValidator:
                 try:
                     if self._db.table_exists(schema, table):
                         result.add_error(
-                            f"Таблица {schema}.{table} уже существует. "
-                            "Используйте IF NOT EXISTS или DROP перед созданием."
+                            f"РўР°Р±Р»РёС†Р° {schema}.{table} СѓР¶Рµ СЃСѓС‰РµСЃС‚РІСѓРµС‚. "
+                            "РСЃРїРѕР»СЊР·СѓР№С‚Рµ IF NOT EXISTS РёР»Рё DROP РїРµСЂРµРґ СЃРѕР·РґР°РЅРёРµРј."
                         )
                 except Exception as e:
-                    logger.warning("Не удалось проверить существование таблицы: %s", e)
+                    logger.warning("РќРµ СѓРґР°Р»РѕСЃСЊ РїСЂРѕРІРµСЂРёС‚СЊ СЃСѓС‰РµСЃС‚РІРѕРІР°РЅРёРµ С‚Р°Р±Р»РёС†С‹: %s", e)
 
-        # 3. ALTER — показать текущую структуру
+        # 3. ALTER вЂ” РїРѕРєР°Р·Р°С‚СЊ С‚РµРєСѓС‰СѓСЋ СЃС‚СЂСѓРєС‚СѓСЂСѓ
         if normalized.startswith("ALTER"):
             match = re.search(
                 r'ALTER\s+TABLE\s+["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
@@ -783,6 +779,7 @@ class SQLValidator:
                 schema, table = match.group(1), match.group(2)
                 try:
                     ddl = self._db.get_table_ddl(schema, table)
-                    result.add_warning(f"Текущая структура таблицы:\n{ddl}")
+                    result.add_warning(f"РўРµРєСѓС‰Р°СЏ СЃС‚СЂСѓРєС‚СѓСЂР° С‚Р°Р±Р»РёС†С‹:\n{ddl}")
                 except Exception as e:
-                    logger.warning("Не удалось получить DDL таблицы: %s", e)
+                    logger.warning("РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ DDL С‚Р°Р±Р»РёС†С‹: %s", e)
+

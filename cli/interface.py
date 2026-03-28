@@ -280,6 +280,13 @@ class CLIInterface:
         self.db.set_debug_prompt(debug_prompt)
         self.db.save_config(user_id, host, port, database)
         self.debug_prompt = debug_prompt
+        db_tools = create_db_tools(self.db, self.validator, self.schema)
+        schema_tools = create_schema_tools(self.schema)
+        all_tools = FS_TOOLS + db_tools + schema_tools
+        self.graph = build_graph(
+            self.llm, self.db, self.schema, self.memory, self.validator, all_tools,
+            debug_prompt=self.debug_prompt,
+        )
         print(f"\n✓ Конфигурация сохранена: {self.db.config_summary}")
         print(f"  debug_prompt: {debug_prompt}")
 

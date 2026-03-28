@@ -9,6 +9,7 @@ from core.sql_validator import (
     detect_mode,
     _build_alias_map,
     _extract_join_conditions,
+    _find_subquery_join_aliases,
     _has_where_or_limit,
 )
 
@@ -40,6 +41,24 @@ class TestDetectMode:
 
     def test_alter(self):
         assert detect_mode("ALTER TABLE s.t ADD COLUMN x INT") == SQLMode.DDL
+
+    def test_cte_select(self):
+        assert detect_mode("WITH cte AS (SELECT 1) SELECT * FROM cte") == SQLMode.READ
+
+    def test_cte_insert(self):
+        assert detect_mode(
+            "WITH cte AS (SELECT id FROM s.t) INSERT INTO s.target SELECT * FROM cte"
+        ) == SQLMode.WRITE
+
+    def test_cte_delete(self):
+        assert detect_mode(
+            "WITH ids AS (SELECT id FROM s.t WHERE x > 10) DELETE FROM s.t WHERE id IN (SELECT id FROM ids)"
+        ) == SQLMode.WRITE
+
+    def test_cte_update(self):
+        assert detect_mode(
+            "WITH src AS (SELECT id, val FROM s.src) UPDATE s.target SET val = src.val FROM src WHERE s.target.id = src.id"
+        ) == SQLMode.WRITE
 
 
 class TestHasWhereOrLimit:
@@ -252,6 +271,48 @@ class TestExtractJoinConditions:
         joins = _extract_join_conditions(sql)
         # No schema prefix → alias map empty → no joins resolved
         assert joins == []
+
+    def test_subquery_join_skipped(self):
+        """JOIN with subquery (SELECT DISTINCT) should be treated as safe — entire ON skipped."""
+        sql = (
+            "SELECT a.id, sub.name "
+            "FROM hr.emp a "
+            "JOIN (SELECT DISTINCT dept_id, name FROM hr.dept) sub "
+            "ON a.dept_id = sub.dept_id"
+        )
+        joins = _extract_join_conditions(sql)
+        # Subquery JOIN is not matched by the explicit JOIN regex,
+        # so neither side of the ON clause is checked — this is safe.
+        assert joins == []
+
+    def test_mixed_subquery_and_direct_join(self):
+        """Mix of subquery JOIN (safe) and direct JOIN (checked)."""
+        sql = (
+            "SELECT a.id, sub.name, r.region_name "
+            "FROM hr.emp a "
+            "JOIN (SELECT DISTINCT dept_id, name FROM hr.dept) sub "
+            "ON a.dept_id = sub.dept_id "
+            "JOIN hr.regions r ON a.region_id = r.region_id"
+        )
+        joins = _extract_join_conditions(sql)
+        # Direct JOIN hr.regions should be checked
+        resolved_tables = {j["table"] for j in joins}
+        assert "regions" in resolved_tables
+        # Subquery JOIN should NOT produce dept entries
+        assert "dept" not in resolved_tables
+
+    def test_subquery_join_alias_detected(self):
+        """_find_subquery_join_aliases correctly extracts aliases."""
+        sql = (
+            "SELECT * FROM hr.emp a "
+            "JOIN (SELECT DISTINCT dept_id, name FROM hr.dept) sub ON a.dept_id = sub.dept_id "
+            "LEFT JOIN (SELECT region_id, SUM(val) AS total FROM hr.regions GROUP BY region_id) reg "
+            "ON a.region_id = reg.region_id"
+        )
+        aliases = _find_subquery_join_aliases(sql)
+        assert "sub" in aliases
+        assert "reg" in aliases
+        assert "a" not in aliases
 
 
 # ---------------------------------------------------------------------------

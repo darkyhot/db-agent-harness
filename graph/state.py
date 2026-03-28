@@ -37,3 +37,4 @@ class AgentState(TypedDict):
     graph_iterations: int
     correction_examples: list
     join_risk_info: dict
+    start_time: float

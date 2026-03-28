@@ -75,6 +75,7 @@ HELP_TEXT = """
 Доступные команды:
   help   — показать этот список
   config — настроить подключение к БД (user, host, port)
+  memory — просмотр и управление долгосрочной памятью
   reset  — сбросить контекст текущей сессии
   clear  — очистить вывод ячейки
   exit   — завершить работу (сохранить резюме сессии)
@@ -289,6 +290,47 @@ class CLIInterface:
         self.memory.start_session(user_id)
         print("✓ Контекст сброшен. Новая сессия начата.")
 
+    def _handle_memory(self) -> None:
+        """Просмотр и управление долгосрочной памятью."""
+        all_memory = self.memory.get_all_memory()
+        layer_keys = {"user_facts", "behavior_patterns", "user_instructions", "correction_examples"}
+
+        if not all_memory:
+            print("Долгосрочная память пуста.")
+            return
+
+        print("\n=== Долгосрочная память ===\n")
+        for key in sorted(all_memory.keys()):
+            value = all_memory[key]
+            # Пытаемся распарсить JSON-списки для красивого вывода
+            try:
+                items = json.loads(value)
+                if isinstance(items, list):
+                    print(f"[{key}]")
+                    for i, item in enumerate(items, 1):
+                        print(f"  {i}. {item}")
+                    print()
+                    continue
+            except (json.JSONDecodeError, TypeError):
+                pass
+            print(f"[{key}]: {value}\n")
+
+        # Предлагаем удаление
+        print("Для удаления записи введите: delete <ключ>")
+        print("Для выхода нажмите Enter.")
+        try:
+            choice = input(">>> ").strip()
+        except EOFError:
+            return
+
+        if choice.startswith("delete "):
+            key_to_delete = choice[7:].strip()
+            if key_to_delete in all_memory:
+                self.memory.delete_memory(key_to_delete)
+                print(f"✓ Ключ '{key_to_delete}' удалён из долгосрочной памяти.")
+            else:
+                print(f"✗ Ключ '{key_to_delete}' не найден.")
+
     def _handle_exit(self) -> None:
         """Завершение работы с сохранением резюме."""
         _status_print("Сохранение резюме сессии...")
@@ -446,6 +488,8 @@ class CLIInterface:
                 print(HELP_TEXT)
             elif command == "config":
                 self._handle_config()
+            elif command == "memory":
+                self._handle_memory()
             elif command == "reset":
                 self._handle_reset()
             elif command == "clear":

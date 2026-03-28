@@ -87,9 +87,20 @@ class MemoryManager:
                     sql TEXT,
                     row_count INTEGER,
                     status TEXT,
-                    duration_ms INTEGER
+                    duration_ms INTEGER,
+                    retry_count INTEGER DEFAULT 0,
+                    error_type TEXT DEFAULT ''
                 )
             """)
+            # Миграция: добавить новые колонки для существующих БД
+            try:
+                conn.execute("ALTER TABLE sql_audit ADD COLUMN retry_count INTEGER DEFAULT 0")
+            except Exception:
+                pass  # колонка уже существует
+            try:
+                conn.execute("ALTER TABLE sql_audit ADD COLUMN error_type TEXT DEFAULT ''")
+            except Exception:
+                pass  # колонка уже существует
         logger.info("SQLite память инициализирована: %s", self._db_path)
 
     def start_session(self, user_id: str = "") -> str:
@@ -245,6 +256,8 @@ class MemoryManager:
         row_count: int,
         status: str,
         duration_ms: int,
+        retry_count: int = 0,
+        error_type: str = "",
     ) -> None:
         """Записать выполненный SQL в аудит-лог.
 
@@ -252,17 +265,21 @@ class MemoryManager:
             user_input: Исходный запрос пользователя.
             sql: Выполненный SQL-запрос.
             row_count: Количество строк в результате.
-            status: Статус выполнения ('success', 'empty', 'error').
+            status: Статус выполнения ('success', 'empty', 'error', 'row_explosion').
             duration_ms: Время выполнения в миллисекундах.
+            retry_count: Количество попыток коррекции до успешного выполнения.
+            error_type: Тип ошибки (например, 'syntax', 'join_explosion', 'missing_column').
         """
         now = datetime.now(timezone.utc).isoformat()
         try:
             with self._connect() as conn:
                 conn.execute(
                     "INSERT INTO sql_audit "
-                    "(session_id, timestamp, user_input, sql, row_count, status, duration_ms) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (self._session_id or "", now, user_input, sql, row_count, status, duration_ms),
+                    "(session_id, timestamp, user_input, sql, row_count, status, "
+                    "duration_ms, retry_count, error_type) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (self._session_id or "", now, user_input, sql, row_count, status,
+                     duration_ms, retry_count, error_type),
                 )
         except Exception as e:
             logger.warning("Ошибка записи SQL-аудита: %s", e)

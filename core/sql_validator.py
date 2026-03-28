@@ -78,6 +78,9 @@ class ValidationResult:
 def detect_mode(sql: str) -> SQLMode:
     """Определить режим SQL-запроса.
 
+    Поддерживает CTE: ``WITH cte AS (...) INSERT INTO ...`` определяется как WRITE,
+    а не как READ.
+
     Args:
         sql: SQL-запрос.
 
@@ -91,6 +94,22 @@ def detect_mode(sql: str) -> SQLMode:
         if line and not line.startswith("--"):
             normalized = line
             break
+
+    # Если запрос начинается с WITH (CTE), ищем основной statement после CTE
+    if normalized.startswith("WITH"):
+        # Найти основной statement после всех CTE-определений.
+        # Ищем последний закрывающий ')' CTE, за которым идёт ключевое слово.
+        main_stmt = re.search(
+            r'\)\s*(SELECT|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE)\b',
+            normalized,
+        )
+        if main_stmt:
+            keyword = main_stmt.group(1)
+            if keyword in ("CREATE", "ALTER", "DROP", "TRUNCATE"):
+                return SQLMode.DDL
+            if keyword in ("INSERT", "UPDATE", "DELETE", "MERGE"):
+                return SQLMode.WRITE
+            return SQLMode.READ
 
     if normalized.startswith(("CREATE", "ALTER", "DROP", "TRUNCATE")):
         return SQLMode.DDL
@@ -156,6 +175,27 @@ def _build_alias_map(sql: str) -> dict[str, tuple[str, str]]:
     return alias_map
 
 
+def _find_subquery_join_aliases(sql: str) -> set[str]:
+    """Найти алиасы JOIN-ов, которые используют подзапросы.
+
+    Подзапрос в JOIN (например, JOIN (SELECT DISTINCT ...) alias ON ...)
+    считается уже безопасным — DISTINCT/GROUP BY внутри предотвращает дубли.
+
+    Returns:
+        Множество алиасов (в нижнем регистре), которые являются подзапросами.
+    """
+    safe_aliases: set[str] = set()
+    # Паттерн: JOIN (SELECT ...) alias ON
+    # Ищем JOIN за которым следует открывающая скобка (подзапрос)
+    subq_pattern = re.compile(
+        r'JOIN\s*\(\s*SELECT\b.*?\)\s+(?:AS\s+)?(\w+)\s+ON\b',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for m in subq_pattern.finditer(sql):
+        safe_aliases.add(m.group(1).lower())
+    return safe_aliases
+
+
 def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
     """Извлечь таблицы и колонки из JOIN условий.
 
@@ -166,11 +206,13 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
     - CROSS JOIN (без ON — всегда explosion)
     - Implicit JOINs (FROM t1, t2 WHERE t1.col = t2.col)
     - Обе стороны JOIN (left и right)
+    - Подзапросы в JOIN: JOIN (SELECT DISTINCT ...) alias — пропускаются как безопасные
 
     Returns:
         Список словарей с schema, table, column для каждой стороны каждого JOIN.
     """
     joins: list[dict[str, str]] = []
+    subquery_aliases = _find_subquery_join_aliases(sql)
 
     # 0. Извлечь CTE-тела и обработать их рекурсивно
     cte_pattern = re.compile(
@@ -218,17 +260,21 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
             left_ref, left_col = eq.group(1), eq.group(2)
             right_ref, right_col = eq.group(3), eq.group(4)
 
+            # Пропускаем стороны, которые ссылаются на подзапрос (уже безопасны)
+            left_is_subquery = left_ref.lower() in subquery_aliases
+            right_is_subquery = right_ref.lower() in subquery_aliases
+
             # Resolve обе стороны через alias map
             left_resolved = _resolve(left_ref)
             right_resolved = _resolve(right_ref)
 
-            if left_resolved:
+            if left_resolved and not left_is_subquery:
                 joins.append({
                     "schema": left_resolved[0],
                     "table": left_resolved[1],
                     "column": left_col,
                 })
-            if right_resolved:
+            if right_resolved and not right_is_subquery:
                 joins.append({
                     "schema": right_resolved[0],
                     "table": right_resolved[1],
@@ -279,13 +325,13 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
                     left_resolved = _resolve(left_ref)
                     right_resolved = _resolve(right_ref)
 
-                    if left_resolved:
+                    if left_resolved and left_ref.lower() not in subquery_aliases:
                         joins.append({
                             "schema": left_resolved[0],
                             "table": left_resolved[1],
                             "column": left_col,
                         })
-                    if right_resolved:
+                    if right_resolved and right_ref.lower() not in subquery_aliases:
                         joins.append({
                             "schema": right_resolved[0],
                             "table": right_resolved[1],

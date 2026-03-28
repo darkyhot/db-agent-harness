@@ -39,8 +39,9 @@ SQL_RULES = (
     "- Используй стандартный PostgreSQL синтаксис (Greenplum совместим)\n\n"
     "Безопасный SQL (предотвращение дублирования строк):\n"
     "- ПЕРЕД написанием JOIN — изучи JOIN-АНАЛИЗ в разведке таблиц (если есть)\n"
-    "- Если unique_perc ключа < 50% — ОБЯЗАТЕЛЬНО подзапрос с DISTINCT\n"
-    "- Для lookup-таблиц (справочников) JOIN безопасен по PK\n"
+    "- Если ключ НЕ является PK и unique_perc < 100% — ОБЯЗАТЕЛЬНО подзапрос с DISTINCT\n"
+    "- Даже минимальные дубли (unique_perc=95%) искажают SUM/COUNT — используй подзапрос\n"
+    "- Для lookup-таблиц (справочников) JOIN безопасен ТОЛЬКО по PK\n"
     "- Для fact-таблиц с дублями — предварительная агрегация в подзапросе\n"
     "- Паттерн: JOIN (SELECT DISTINCT key, col FROM table) alias ON ...\n"
     "- Паттерн: JOIN (SELECT key, SUM(val) FROM table GROUP BY key) alias ON ...\n"
@@ -51,7 +52,7 @@ SQL_CHECKLIST = (
     "Чеклист перед финализацией SQL:\n"
     "1. Формат дат соответствует данным из образца (YYYY-MM-DD, DD.MM.YYYY, и т.д.)?\n"
     "2. NULL обработан (COALESCE/IS NOT NULL) для колонок с высоким % NULL?\n"
-    "3. JOIN-ключи уникальны? Если нет (unique_perc < 50%) — использован подзапрос с DISTINCT?\n"
+    "3. JOIN-ключи уникальны (PK или unique_perc=100%)? Если нет — использован подзапрос с DISTINCT?\n"
     "4. GROUP BY содержит все не-агрегированные колонки?\n"
     "5. Алиасы только на английском?\n"
     "6. Есть LIMIT для больших выборок?\n"
@@ -84,6 +85,10 @@ class GraphNodes:
     """Узлы графа агента."""
 
     MAX_RETRIES = 3
+    # Примерный лимит токенов для системного + пользовательского промпта.
+    # GigaChat-2-Max поддерживает ~32k токенов; оставляем запас на ответ.
+    MAX_PROMPT_CHARS = 100_000  # ~25k токенов (4 символа ≈ 1 токен)
+    SAMPLE_CACHE_TTL = 600  # 10 минут TTL для кэша sample data
 
     def __init__(
         self,
@@ -114,6 +119,8 @@ class GraphNodes:
         self.tools = tools
         self.debug_prompt = debug_prompt
         self.tool_map: dict[str, Any] = {t.name: t for t in tools}
+        # TTL-кэш для sample data: {(schema, table): (timestamp, markdown_text)}
+        self._sample_cache: dict[tuple[str, str], tuple[float, str]] = {}
         self.tools_description = "\n".join(
             f"- {t.name}: {t.description}" for t in tools
         )
@@ -124,6 +131,44 @@ class GraphNodes:
             first_sentence = t.description.split("\n")[0].split(". ")[0]
             compact_lines.append(f"- {t.name}: {first_sentence}")
         self.tools_compact = "\n".join(compact_lines)
+
+    @staticmethod
+    def _trim_to_budget(
+        system_prompt: str,
+        user_prompt: str,
+        max_chars: int | None = None,
+    ) -> tuple[str, str]:
+        """Обрезать промпты при превышении бюджета символов.
+
+        Стратегия обрезки (от наименее к наиболее важному):
+        1. Обрезка user_prompt с конца (старый контекст) до 70% бюджета
+        2. Обрезка system_prompt с конца до 30% бюджета
+
+        Returns:
+            (system_prompt, user_prompt) — возможно обрезанные.
+        """
+        if max_chars is None:
+            max_chars = GraphNodes.MAX_PROMPT_CHARS
+
+        total = len(system_prompt) + len(user_prompt)
+        if total <= max_chars:
+            return system_prompt, user_prompt
+
+        logger.warning(
+            "Промпт превышает бюджет: %d символов (лимит %d), обрезаю",
+            total, max_chars,
+        )
+
+        # Распределяем бюджет: 40% system, 60% user
+        sys_budget = int(max_chars * 0.4)
+        usr_budget = max_chars - sys_budget
+
+        if len(user_prompt) > usr_budget:
+            user_prompt = user_prompt[:usr_budget] + "\n\n[...контекст обрезан из-за лимита токенов]"
+        if len(system_prompt) > sys_budget:
+            system_prompt = system_prompt[:sys_budget] + "\n\n[...системный промпт обрезан из-за лимита токенов]"
+
+        return system_prompt, user_prompt
 
     def _get_tables_detail_context(self, text: str) -> str:
         """Найти упоминания таблиц в тексте и вернуть полное описание их колонок из CSV.
@@ -384,7 +429,7 @@ class GraphNodes:
             "3. Выбери нужные колонки и проверь их наличие в разведке\n"
             "4. Определи условия фильтрации (WHERE) — проверь формат значений в образце\n"
             "5. Если нужен JOIN — ОБЯЗАТЕЛЬНО изучи JOIN-АНАЛИЗ в разведке таблиц. "
-            "Если unique_perc < 50% — используй подзапрос с DISTINCT\n"
+            "Если ключ не PK и unique_perc < 100% — используй подзапрос с DISTINCT\n"
             "6. Напиши SQL и пройди по чеклисту выше\n"
             f"{lt_ctx}"
         )
@@ -479,6 +524,8 @@ class GraphNodes:
             "5. Для DDL: спроектируй структуру → execute_ddl"
         )
 
+        system_prompt, user_prompt = self._trim_to_budget(system_prompt, user_prompt)
+
         if self.debug_prompt:
             print(f"\n{'='*80}\n[DEBUG PROMPT — planner]\n{'='*80}\n"
                   f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
@@ -555,17 +602,24 @@ class GraphNodes:
             # 1. Описание колонок из CSV-справочника
             table_info = self.schema.get_table_info(schema_name, table_name)
 
-            # 2. Семпл 10 строк из БД
-            try:
-                sample_df = self.db.get_sample(schema_name, table_name, 10)
-                if sample_df.empty:
-                    sample_text = "(таблица пуста)"
-                else:
-                    sample_text = sample_df.to_markdown(index=False)
-            except Exception as e:
-                logger.warning("TableExplorer: ошибка семпла %s.%s: %s",
-                               schema_name, table_name, e)
-                sample_text = f"(ошибка загрузки семпла: {e})"
+            # 2. Семпл 10 строк из БД (с TTL-кэшем)
+            cache_key = (schema_name, table_name)
+            cached = self._sample_cache.get(cache_key)
+            if cached and (time.monotonic() - cached[0]) < self.SAMPLE_CACHE_TTL:
+                sample_text = cached[1]
+                logger.debug("TableExplorer: семпл %s.%s из кэша", schema_name, table_name)
+            else:
+                try:
+                    sample_df = self.db.get_sample(schema_name, table_name, 10)
+                    if sample_df.empty:
+                        sample_text = "(таблица пуста)"
+                    else:
+                        sample_text = sample_df.to_markdown(index=False)
+                    self._sample_cache[cache_key] = (time.monotonic(), sample_text)
+                except Exception as e:
+                    logger.warning("TableExplorer: ошибка семпла %s.%s: %s",
+                                   schema_name, table_name, e)
+                    sample_text = f"(ошибка загрузки семпла: {e})"
 
             sections.append(
                 f"### {schema_name}.{table_name}\n\n"
@@ -724,6 +778,8 @@ class GraphNodes:
             user_parts.append(f"[КОНТЕКСТ ПРЕДЫДУЩИХ ШАГОВ]\n{prev_context}")
 
         user_prompt = "\n\n".join(user_parts)
+
+        system_prompt, user_prompt = self._trim_to_budget(system_prompt, user_prompt)
 
         if self.debug_prompt:
             print(f"\n{'='*80}\n[DEBUG PROMPT — executor, шаг {step_idx + 1}]\n{'='*80}\n"
@@ -1136,7 +1192,10 @@ class GraphNodes:
 
         # Ошибка выполнения — отправляем в корректор
         if not tool_result.success:
-            self.memory.log_sql_execution(state["user_input"], sql, 0, "error", duration_ms)
+            self.memory.log_sql_execution(
+                state["user_input"], sql, 0, "error", duration_ms,
+                retry_count=state.get("retry_count", 0), error_type="execution",
+            )
             return {
                 "sql_to_validate": None,
                 "last_error": tool_result.error,
@@ -1188,6 +1247,7 @@ class GraphNodes:
                 )
                 self.memory.log_sql_execution(
                     state["user_input"], sql, row_count, "row_explosion", duration_ms,
+                    retry_count=state.get("retry_count", 0), error_type="join_explosion",
                 )
                 return {
                     "sql_to_validate": None,
@@ -1204,7 +1264,10 @@ class GraphNodes:
 
         # Аудит-лог SQL
         audit_status = "empty" if empty_result else "success"
-        self.memory.log_sql_execution(state["user_input"], sql, row_count, audit_status, duration_ms)
+        self.memory.log_sql_execution(
+            state["user_input"], sql, row_count, audit_status, duration_ms,
+            retry_count=state.get("retry_count", 0),
+        )
 
         self.memory.add_message("tool", f"[{tool_name}] {exec_result[:500]}")
 
@@ -1315,10 +1378,19 @@ class GraphNodes:
                     "JOIN (SELECT key, SUM(val) FROM table GROUP BY key) alias ON ..."
                 )
 
+        # Извлекаем полный SQL из последнего tool_call (если есть)
+        last_sql = ""
+        if recent_calls:
+            last_args = recent_calls[-1].get("args", {})
+            if isinstance(last_args, dict):
+                last_sql = last_args.get("sql", "")
+
         user_parts = []
         user_parts.append(f"[ЗАПРОС ПОЛЬЗОВАТЕЛЯ]\n{state['user_input']}")
         user_parts.append(f"[ПОПЫТКА {retry_count + 1} из {self.MAX_RETRIES}]")
         user_parts.append(f"[ШАГ]\n{current_step}")
+        if last_sql:
+            user_parts.append(f"[SQL КОТОРЫЙ ВЫЗВАЛ ОШИБКУ]\n{last_sql}")
         user_parts.append(f"[ОШИБКА]\n{error}")
         user_parts.append(strategy_hint)
         # Передаём join_risk_info для row explosion ошибок
@@ -1342,6 +1414,8 @@ class GraphNodes:
             user_parts.append(f"[ПРЕДЫДУЩИЕ ВЫЗОВЫ]\n{prev_context}")
 
         user_prompt = "\n\n".join(user_parts)
+
+        system_prompt, user_prompt = self._trim_to_budget(system_prompt, user_prompt)
 
         if self.debug_prompt:
             print(f"\n{'='*80}\n[DEBUG PROMPT — corrector]\n{'='*80}\n"
@@ -1455,6 +1529,8 @@ class GraphNodes:
             user_parts_sum.append(f"Контекст таблиц (для интерпретации колонок):\n{tables_summary}")
         user_parts_sum.append(f"Результаты инструментов:\n{tool_results}")
         user_prompt = "\n\n".join(user_parts_sum)
+
+        system_prompt, user_prompt = self._trim_to_budget(system_prompt, user_prompt)
 
         if self.debug_prompt:
             print(f"\n{'='*80}\n[DEBUG PROMPT — summarizer]\n{'='*80}\n"

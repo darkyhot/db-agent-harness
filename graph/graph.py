@@ -1,6 +1,7 @@
 """Сборка графа LangGraph с логикой переходов."""
 
 import logging
+import time
 from typing import Any
 
 from langgraph.graph import END, StateGraph
@@ -17,6 +18,18 @@ logger = logging.getLogger(__name__)
 
 
 MAX_GRAPH_ITERATIONS = 15
+MAX_WALL_CLOCK_SECONDS = 300  # 5 минут на весь граф
+
+
+def _is_timed_out(state: AgentState) -> bool:
+    """Проверить, превышен ли wall-clock timeout."""
+    start = state.get("start_time", 0)
+    if start and (time.monotonic() - start) >= MAX_WALL_CLOCK_SECONDS:
+        logger.warning(
+            "Превышен wall-clock timeout (%d секунд)", MAX_WALL_CLOCK_SECONDS,
+        )
+        return True
+    return False
 
 
 def _route_after_executor(state: AgentState) -> str:
@@ -28,6 +41,9 @@ def _route_after_executor(state: AgentState) -> str:
     # Лимит итераций графа — защита от бесконечных циклов
     if state.get("graph_iterations", 0) >= MAX_GRAPH_ITERATIONS:
         logger.warning("Достигнут лимит итераций графа (%d)", MAX_GRAPH_ITERATIONS)
+        return "summarizer"
+
+    if _is_timed_out(state):
         return "summarizer"
 
     # Нужна disambiguation — выходим для уточнения у пользователя
@@ -64,6 +80,9 @@ def _route_after_validator(state: AgentState) -> str:
     if state.get("needs_confirmation"):
         return END
 
+    if _is_timed_out(state):
+        return "summarizer"
+
     # Есть ошибка — идём в корректор
     if state.get("last_error"):
         return "corrector"
@@ -85,6 +104,9 @@ def _route_after_corrector(state: AgentState) -> str:
     # Лимит итераций графа — защита от бесконечных циклов
     if state.get("graph_iterations", 0) >= MAX_GRAPH_ITERATIONS:
         logger.warning("Достигнут лимит итераций графа (%d)", MAX_GRAPH_ITERATIONS)
+        return "summarizer"
+
+    if _is_timed_out(state):
         return "summarizer"
 
     # Есть SQL для валидации после коррекции
@@ -204,4 +226,5 @@ def create_initial_state(user_input: str) -> AgentState:
         graph_iterations=0,
         correction_examples=[],
         join_risk_info={},
+        start_time=time.monotonic(),
     )

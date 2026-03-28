@@ -99,59 +99,209 @@ def detect_mode(sql: str) -> SQLMode:
     return SQLMode.READ
 
 
+def _build_alias_map(sql: str) -> dict[str, tuple[str, str]]:
+    """Построить маппинг alias → (schema, table) из FROM и JOIN.
+
+    Обрабатывает:
+    - FROM schema.table alias
+    - FROM schema.table AS alias
+    - JOIN schema.table alias ON ...
+    - FROM schema.table (без alias → table name как alias)
+    """
+    alias_map: dict[str, tuple[str, str]] = {}
+
+    _SQL_KEYWORDS = frozenset((
+        "ON", "WHERE", "SET", "LEFT", "RIGHT", "INNER", "OUTER",
+        "FULL", "CROSS", "NATURAL", "JOIN", "GROUP", "ORDER",
+        "HAVING", "LIMIT", "UNION", "EXCEPT", "INTERSECT",
+    ))
+
+    # Паттерн: schema.table с опциональным alias (AS keyword опционален)
+    table_ref = re.compile(
+        r'(?:FROM|JOIN)\s+'
+        r'["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
+        r'(?:\s+(?:AS\s+)?(\w+))?',
+        re.IGNORECASE,
+    )
+
+    for m in table_ref.finditer(sql):
+        schema, table = m.group(1), m.group(2)
+        alias = m.group(3)
+        if alias and alias.upper() not in _SQL_KEYWORDS:
+            alias_map[alias.lower()] = (schema, table)
+        alias_map[table.lower()] = (schema, table)
+
+    # Обработка comma-separated таблиц в FROM (implicit JOIN):
+    # FROM hr.emp e, hr.dept d, hr.loc l
+    comma_ref = re.compile(
+        r',\s*["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
+        r'(?:\s+(?:AS\s+)?(\w+))?',
+        re.IGNORECASE,
+    )
+    # Ищем только внутри FROM-клаузы (до WHERE/JOIN/GROUP и т.д.)
+    from_clause_pat = re.compile(
+        r'\bFROM\s+(.*?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bJOIN\b|\bHAVING\b|\Z)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    from_m = from_clause_pat.search(sql)
+    if from_m:
+        from_text = from_m.group(1)
+        for cm in comma_ref.finditer(from_text):
+            schema, table = cm.group(1), cm.group(2)
+            alias = cm.group(3)
+            if alias and alias.upper() not in _SQL_KEYWORDS:
+                alias_map[alias.lower()] = (schema, table)
+            alias_map[table.lower()] = (schema, table)
+
+    return alias_map
+
+
 def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
     """Извлечь таблицы и колонки из JOIN условий.
 
-    Args:
-        sql: SQL-запрос.
+    Поддерживает:
+    - Explicit JOINs с алиасами (JOIN schema.table alias ON alias.col = ...)
+    - LEFT/RIGHT/FULL/INNER JOIN
+    - Multi-column ON (AND conditions)
+    - CROSS JOIN (без ON — всегда explosion)
+    - Implicit JOINs (FROM t1, t2 WHERE t1.col = t2.col)
+    - Обе стороны JOIN (left и right)
 
     Returns:
-        Список словарей с table, schema, column для каждого JOIN.
+        Список словарей с schema, table, column для каждой стороны каждого JOIN.
     """
-    joins = []
-    parsed = sqlparse.parse(sql)
-    if not parsed:
-        return joins
+    joins: list[dict[str, str]] = []
 
-    sql_upper = sql.upper()
-    # Находим паттерны JOIN ... ON ... = ...
-    join_pattern = re.compile(
+    # 0. Извлечь CTE-тела и обработать их рекурсивно
+    cte_pattern = re.compile(
+        r'\bWITH\b\s+(?:RECURSIVE\s+)?'
+        r'(.*?)\bSELECT\b',
+        re.IGNORECASE | re.DOTALL,
+    )
+    cte_body_pattern = re.compile(
+        r'\w+\s+AS\s*\(\s*(.*?)\s*\)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    cte_match = cte_pattern.match(sql.strip())
+    if cte_match:
+        cte_defs = cte_match.group(1)
+        for body_match in cte_body_pattern.finditer(cte_defs):
+            cte_body = body_match.group(1)
+            joins.extend(_extract_join_conditions(cte_body))
+
+    # 1. Построить alias map
+    alias_map = _build_alias_map(sql)
+
+    def _resolve(ref: str) -> tuple[str, str] | None:
+        """Resolve alias/table name to (schema, table)."""
+        return alias_map.get(ref.lower())
+
+    # 2. Explicit JOINs: extract ON conditions
+    # Найти все JOIN ... ON ... блоки
+    join_on_pattern = re.compile(
         r'JOIN\s+["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
-        r'\s+(?:\w+\s+)?ON\s+.*?["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
-        r'\s*=\s*["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
+        r'\s+(?:(?:AS\s+)?(\w+)\s+)?ON\s+(.*?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|\bHAVING\b|;|\)|\Z)',
         re.IGNORECASE | re.DOTALL,
     )
 
-    for match in join_pattern.finditer(sql):
-        join_schema = match.group(1)
-        join_table = match.group(2)
-        # Определяем какая сторона относится к join-таблице
-        left_table = match.group(3)
-        left_col = match.group(4)
-        right_table = match.group(5)
-        right_col = match.group(6)
+    for m in join_on_pattern.finditer(sql):
+        join_schema, join_table = m.group(1), m.group(2)
+        on_clause = m.group(4)
 
-        if left_table.lower() == join_table.lower():
-            joins.append({
-                "schema": join_schema,
-                "table": join_table,
-                "column": left_col,
-            })
-        elif right_table.lower() == join_table.lower():
-            joins.append({
-                "schema": join_schema,
-                "table": join_table,
-                "column": right_col,
-            })
-        else:
-            # Fallback — проверяем обе стороны
-            joins.append({
-                "schema": join_schema,
-                "table": join_table,
-                "column": left_col,
-            })
+        # Извлечь все equality conditions из ON clause (поддержка multi-column)
+        eq_pattern = re.compile(
+            r'["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
+            r'\s*=\s*'
+            r'["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
+        )
+        for eq in eq_pattern.finditer(on_clause):
+            left_ref, left_col = eq.group(1), eq.group(2)
+            right_ref, right_col = eq.group(3), eq.group(4)
 
-    return joins
+            # Resolve обе стороны через alias map
+            left_resolved = _resolve(left_ref)
+            right_resolved = _resolve(right_ref)
+
+            if left_resolved:
+                joins.append({
+                    "schema": left_resolved[0],
+                    "table": left_resolved[1],
+                    "column": left_col,
+                })
+            if right_resolved:
+                joins.append({
+                    "schema": right_resolved[0],
+                    "table": right_resolved[1],
+                    "column": right_col,
+                })
+
+    # 3. CROSS JOIN (нет ON → гарантированный explosion)
+    cross_pattern = re.compile(
+        r'CROSS\s+JOIN\s+["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
+        re.IGNORECASE,
+    )
+    for m in cross_pattern.finditer(sql):
+        joins.append({
+            "schema": m.group(1),
+            "table": m.group(2),
+            "column": "__CROSS_JOIN__",
+        })
+
+    # 4. Implicit JOINs: FROM t1, t2 WHERE t1.col = t2.col
+    # Детектируем comma-separated tables в FROM
+    from_pattern = re.compile(
+        r'\bFROM\s+(.*?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bJOIN\b|\Z)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    from_match = from_pattern.search(sql)
+    if from_match:
+        from_clause = from_match.group(1)
+        # Ищем comma-separated tables (минимум 2 через запятую)
+        table_refs = [t.strip() for t in from_clause.split(",") if t.strip()]
+        if len(table_refs) >= 2:
+            # Есть implicit join — ищем equality conditions в WHERE
+            where_pattern = re.compile(
+                r'\bWHERE\b\s+(.*?)(?=\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|\Z)',
+                re.IGNORECASE | re.DOTALL,
+            )
+            where_match = where_pattern.search(sql)
+            if where_match:
+                where_clause = where_match.group(1)
+                eq_pattern = re.compile(
+                    r'["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
+                    r'\s*=\s*'
+                    r'["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
+                )
+                for eq in eq_pattern.finditer(where_clause):
+                    left_ref, left_col = eq.group(1), eq.group(2)
+                    right_ref, right_col = eq.group(3), eq.group(4)
+
+                    left_resolved = _resolve(left_ref)
+                    right_resolved = _resolve(right_ref)
+
+                    if left_resolved:
+                        joins.append({
+                            "schema": left_resolved[0],
+                            "table": left_resolved[1],
+                            "column": left_col,
+                        })
+                    if right_resolved:
+                        joins.append({
+                            "schema": right_resolved[0],
+                            "table": right_resolved[1],
+                            "column": right_col,
+                        })
+
+    # 5. Дедупликация (одна и та же schema.table.column может появиться из разных мест)
+    seen = set()
+    unique_joins = []
+    for j in joins:
+        key = (j["schema"].lower(), j["table"].lower(), j["column"].lower())
+        if key not in seen:
+            seen.add(key)
+            unique_joins.append(j)
+
+    return unique_joins
 
 
 def _has_where_or_limit(sql: str) -> bool:
@@ -266,6 +416,20 @@ class SQLValidator:
         # 2. Проверка JOIN-ов на уникальность ключей
         joins = _extract_join_conditions(sql)
         for join in joins:
+            # CROSS JOIN — гарантированный explosion, не нужна проверка ключа
+            if join["column"] == "__CROSS_JOIN__":
+                result.join_checks.append({
+                    "table": f"{join['schema']}.{join['table']}",
+                    "columns": "CROSS JOIN",
+                    "is_unique": False,
+                    "duplicate_pct": 100.0,
+                })
+                result.rewrite_suggestions.append(
+                    f"ROW EXPLOSION: CROSS JOIN с {join['schema']}.{join['table']} "
+                    f"создаёт декартово произведение. Замени на обычный JOIN с условием."
+                )
+                continue
+
             try:
                 check = self._check_key_uniqueness(
                     join["schema"], join["table"], [join["column"]]

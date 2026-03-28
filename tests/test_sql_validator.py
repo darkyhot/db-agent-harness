@@ -7,6 +7,7 @@ from core.sql_validator import (
     SQLValidator,
     ValidationResult,
     detect_mode,
+    _build_alias_map,
     _extract_join_conditions,
     _has_where_or_limit,
 )
@@ -61,6 +62,59 @@ class TestHasWhereOrLimit:
         assert _has_where_or_limit(sql) is False
 
 
+# ---------------------------------------------------------------------------
+# _build_alias_map
+# ---------------------------------------------------------------------------
+class TestBuildAliasMap:
+    def test_simple_alias(self):
+        sql = "SELECT * FROM hr.emp e JOIN hr.dept d ON d.id = e.dept_id"
+        m = _build_alias_map(sql)
+        assert m["e"] == ("hr", "emp")
+        assert m["d"] == ("hr", "dept")
+
+    def test_as_keyword(self):
+        sql = "SELECT * FROM hr.emp AS e"
+        m = _build_alias_map(sql)
+        assert m["e"] == ("hr", "emp")
+        assert m["emp"] == ("hr", "emp")
+
+    def test_no_alias_uses_table_name(self):
+        sql = "SELECT * FROM hr.emp"
+        m = _build_alias_map(sql)
+        assert m["emp"] == ("hr", "emp")
+
+    def test_keyword_not_treated_as_alias(self):
+        """SQL keywords after table ref should not become aliases."""
+        sql = "SELECT * FROM hr.emp WHERE id = 1"
+        m = _build_alias_map(sql)
+        assert "where" not in m
+        assert "emp" in m
+
+    def test_multiple_joins(self):
+        sql = """
+            SELECT * FROM hr.emp e
+            JOIN hr.dept d ON d.id = e.dept_id
+            JOIN hr.loc l ON l.id = d.loc_id
+        """
+        m = _build_alias_map(sql)
+        assert m["e"] == ("hr", "emp")
+        assert m["d"] == ("hr", "dept")
+        assert m["l"] == ("hr", "loc")
+
+    def test_left_right_join(self):
+        sql = "SELECT * FROM hr.emp e LEFT JOIN hr.dept d ON d.id = e.dept_id"
+        m = _build_alias_map(sql)
+        assert m["d"] == ("hr", "dept")
+
+    def test_quoted_identifiers(self):
+        sql = 'SELECT * FROM "hr"."emp" e'
+        m = _build_alias_map(sql)
+        assert m["e"] == ("hr", "emp")
+
+
+# ---------------------------------------------------------------------------
+# _extract_join_conditions — comprehensive
+# ---------------------------------------------------------------------------
 class TestExtractJoinConditions:
     def test_simple_join(self):
         sql = """
@@ -77,7 +131,132 @@ class TestExtractJoinConditions:
         joins = _extract_join_conditions(sql)
         assert joins == []
 
+    def test_join_with_alias_resolves_both_sides(self):
+        """Both sides of ON should be resolved via alias map."""
+        sql = """
+            SELECT * FROM hr.emp e
+            JOIN hr.dept d ON d.id = e.dept_id
+        """
+        joins = _extract_join_conditions(sql)
+        schemas_tables = [(j["schema"], j["table"], j["column"]) for j in joins]
+        assert ("hr", "dept", "id") in schemas_tables
+        assert ("hr", "emp", "dept_id") in schemas_tables
 
+    def test_left_join(self):
+        sql = """
+            SELECT * FROM hr.emp e
+            LEFT JOIN hr.dept d ON d.id = e.dept_id
+        """
+        joins = _extract_join_conditions(sql)
+        tables = {j["table"] for j in joins}
+        assert "dept" in tables
+        assert "emp" in tables
+
+    def test_right_join(self):
+        sql = """
+            SELECT * FROM hr.emp e
+            RIGHT JOIN hr.dept d ON d.id = e.dept_id
+        """
+        joins = _extract_join_conditions(sql)
+        tables = {j["table"] for j in joins}
+        assert "dept" in tables
+
+    def test_multi_column_on(self):
+        """Multi-column ON should extract all columns."""
+        sql = """
+            SELECT * FROM hr.emp e
+            JOIN hr.dept d ON d.id = e.dept_id AND d.code = e.dept_code
+        """
+        joins = _extract_join_conditions(sql)
+        columns = {(j["table"], j["column"]) for j in joins}
+        assert ("dept", "id") in columns
+        assert ("dept", "code") in columns
+        assert ("emp", "dept_id") in columns
+        assert ("emp", "dept_code") in columns
+
+    def test_cross_join(self):
+        """CROSS JOIN should produce __CROSS_JOIN__ sentinel."""
+        sql = "SELECT * FROM hr.emp e CROSS JOIN hr.dept"
+        joins = _extract_join_conditions(sql)
+        cross = [j for j in joins if j["column"] == "__CROSS_JOIN__"]
+        assert len(cross) == 1
+        assert cross[0]["schema"] == "hr"
+        assert cross[0]["table"] == "dept"
+
+    def test_implicit_join(self):
+        """FROM t1, t2 WHERE t1.a = t2.a should be detected."""
+        sql = """
+            SELECT * FROM hr.emp e, hr.dept d
+            WHERE e.dept_id = d.id
+        """
+        joins = _extract_join_conditions(sql)
+        tables = {j["table"] for j in joins}
+        assert "emp" in tables
+        assert "dept" in tables
+
+    def test_self_join(self):
+        """Self-join: same table with different aliases."""
+        sql = """
+            SELECT * FROM hr.emp e1
+            JOIN hr.emp e2 ON e2.manager_id = e1.id
+        """
+        joins = _extract_join_conditions(sql)
+        # Both sides should resolve to hr.emp
+        assert all(j["schema"] == "hr" and j["table"] == "emp" for j in joins)
+        columns = {j["column"] for j in joins}
+        assert "manager_id" in columns
+        assert "id" in columns
+
+    def test_deduplication(self):
+        """Same schema.table.column should appear only once."""
+        sql = """
+            SELECT * FROM hr.emp e
+            JOIN hr.dept d ON d.id = e.dept_id AND d.id = e.dept_id
+        """
+        joins = _extract_join_conditions(sql)
+        keys = [(j["schema"], j["table"], j["column"]) for j in joins]
+        assert len(keys) == len(set(keys))
+
+    def test_multiple_joins_chain(self):
+        """Chain of JOINs: emp → dept → loc."""
+        sql = """
+            SELECT * FROM hr.emp e
+            JOIN hr.dept d ON d.id = e.dept_id
+            JOIN hr.loc l ON l.id = d.loc_id
+        """
+        joins = _extract_join_conditions(sql)
+        tables = {j["table"] for j in joins}
+        assert "emp" in tables
+        assert "dept" in tables
+        assert "loc" in tables
+
+    def test_cte_with_join(self):
+        """CTE body containing a JOIN should be extracted."""
+        sql = """
+            WITH active_emp AS (
+                SELECT e.id, e.dept_id
+                FROM hr.emp e
+                JOIN hr.dept d ON d.id = e.dept_id
+                WHERE e.active = 1
+            )
+            SELECT * FROM active_emp
+        """
+        joins = _extract_join_conditions(sql)
+        # The JOIN inside CTE should be found
+        tables = {j["table"] for j in joins}
+        assert "dept" in tables
+
+    def test_sql_without_schema_prefix_returns_empty(self):
+        """Tables without schema.table pattern are not extracted."""
+        sql = "SELECT * FROM emp e JOIN dept d ON d.id = e.dept_id"
+        joins = _extract_join_conditions(sql)
+        # No schema prefix → alias map empty → no joins resolved
+        assert joins == []
+
+
+# ---------------------------------------------------------------------------
+# Multiplication factor
+# ---------------------------------------------------------------------------
 class TestMultiplicationFactor:
     """Тесты оценки multiplication factor для row explosion."""
 
@@ -126,6 +305,9 @@ class TestMultiplicationFactor:
         assert SQLValidator._estimate_multiplication_factor([]) == 1.0
 
 
+# ---------------------------------------------------------------------------
+# Rewrite suggestion
+# ---------------------------------------------------------------------------
 class TestRewriteSuggestion:
     """Тесты генерации шаблонов переписывания."""
 
@@ -145,6 +327,9 @@ class TestRewriteSuggestion:
         assert "подзапрос" in suggestion
 
 
+# ---------------------------------------------------------------------------
+# ValidationResult
+# ---------------------------------------------------------------------------
 class TestValidationResultExplosion:
     """Тесты ValidationResult с данными row explosion."""
 

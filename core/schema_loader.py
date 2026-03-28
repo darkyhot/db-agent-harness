@@ -233,7 +233,13 @@ class SchemaLoader:
                 any_fully_unique = True
             min_unique_perc = min(min_unique_perc, u_perc)
 
-        is_unique = all_pk or any_fully_unique
+        # Для single column: одна полностью уникальная колонка достаточна.
+        # Для composite key: any_fully_unique недостаточно — другая колонка
+        # может создавать дубли внутри уникальных значений первой.
+        if len(columns) == 1:
+            is_unique = all_pk or any_fully_unique
+        else:
+            is_unique = all_pk or min_unique_perc >= 95.0
         duplicate_pct = round(100.0 - min_unique_perc, 2)
 
         return {

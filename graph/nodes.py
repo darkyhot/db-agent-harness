@@ -739,7 +739,7 @@ class GraphNodes:
         else:
             # Проверяем, порождает ли шаг SQL для валидации
             sql = tool_call.get("args", {}).get("sql")
-            if sql and tool_call["tool"] in ("execute_query", "execute_write", "execute_ddl"):
+            if sql and tool_call["tool"] in ("execute_query", "execute_write", "execute_ddl", "export_query"):
                 return {
                     "sql_to_validate": sql,
                     "graph_iterations": iterations,
@@ -1166,6 +1166,10 @@ class GraphNodes:
             warnings_text += "\n⚠ Запрос вернул 0 строк. Возможно, условия фильтрации слишком строгие " \
                              "или данные отсутствуют. Проверь условия WHERE, значения фильтров и формат дат."
 
+        # Подсчёт строк из markdown-таблицы (нужен для sanity checks и post-exec detection)
+        data_lines = [l for l in exec_result.split("\n") if l.strip().startswith("|")]
+        row_count = max(0, len(data_lines) - 2) if data_lines else 0  # -2: заголовок + разделитель
+
         # Sanity checks результата (бизнес-уровень)
         if not empty_result and tool_name == "execute_query":
             sanity_warnings = self._check_result_sanity(state["user_input"], exec_result)
@@ -1200,9 +1204,6 @@ class GraphNodes:
 
         # Аудит-лог SQL
         audit_status = "empty" if empty_result else "success"
-        # Подсчёт строк из markdown-таблицы
-        data_lines = [l for l in exec_result.split("\n") if l.strip().startswith("|")]
-        row_count = max(0, len(data_lines) - 2) if data_lines else 0  # -2: заголовок + разделитель
         self.memory.log_sql_execution(state["user_input"], sql, row_count, audit_status, duration_ms)
 
         self.memory.add_message("tool", f"[{tool_name}] {exec_result[:500]}")
@@ -1320,6 +1321,19 @@ class GraphNodes:
         user_parts.append(f"[ШАГ]\n{current_step}")
         user_parts.append(f"[ОШИБКА]\n{error}")
         user_parts.append(strategy_hint)
+        # Передаём join_risk_info для row explosion ошибок
+        risk = state.get("join_risk_info", {})
+        if risk and is_row_explosion:
+            non_unique = risk.get("non_unique_joins", [])
+            risk_details = "\n".join(
+                f"  {jc.get('table', '?')}.{jc.get('columns', '?')} — дубли: {jc.get('duplicate_pct', '?')}%"
+                for jc in non_unique
+            )
+            user_parts.append(
+                f"[JOIN RISK INFO]\n"
+                f"Multiplication factor: {risk.get('multiplication_factor', '?')}x\n"
+                f"Проблемные ключи:\n{risk_details}"
+            )
         if tables_context:
             user_parts.append(f"[КОНТЕКСТ ТАБЛИЦ]\n{tables_context}")
         if tables_detail:

@@ -29,7 +29,6 @@ SQL_RULES = (
     '- ЗАПРЕЩЕНО: AS "отток", AS "выручка", кириллица в алиасах и именах колонок\n'
     "- Изучи РАЗВЕДКУ ТАБЛИЦ (если есть) перед написанием SQL\n"
     "- Пойми гранулярность (что = одна строка) перед COUNT/агрегатами\n"
-    "- Для JOIN проверяй уникальность ключей через check_key_uniqueness\n"
     "- GROUP BY: перечисли ВСЕ не-агрегированные колонки из SELECT\n"
     "- Даты: используй приведение типов (::date, ::timestamp, TO_DATE()). "
     "Проверь формат дат в образце данных перед фильтрацией\n"
@@ -37,22 +36,31 @@ SQL_RULES = (
     "Не сравнивай с NULL через = или !=\n"
     "- LIMIT: добавляй LIMIT для exploration-запросов и больших таблиц\n"
     "- Используй стандартный PostgreSQL синтаксис (Greenplum совместим)\n\n"
-    "Безопасный SQL (предотвращение дублирования строк):\n"
-    "- ПЕРЕД написанием JOIN — изучи JOIN-АНАЛИЗ в разведке таблиц (если есть)\n"
-    "- Если ключ НЕ является PK и unique_perc < 100% — ОБЯЗАТЕЛЬНО подзапрос с DISTINCT\n"
-    "- Даже минимальные дубли (unique_perc=95%) искажают SUM/COUNT — используй подзапрос\n"
-    "- Для lookup-таблиц (справочников) JOIN безопасен ТОЛЬКО по PK\n"
-    "- Для fact-таблиц с дублями — предварительная агрегация в подзапросе\n"
-    "- Паттерн: JOIN (SELECT DISTINCT key, col FROM table) alias ON ...\n"
-    "- Паттерн: JOIN (SELECT key, SUM(val) FROM table GROUP BY key) alias ON ...\n"
-    "- DISTINCT на внешнем SELECT — ЗАПРЕЩЁН как маскировка проблемы"
+    "Безопасный SQL — исправление дублей в JOIN (ВАЖНО: сначала диагностика):\n"
+    "- ПЕРЕД написанием JOIN — изучи JOIN-АНАЛИЗ и образец таблицы (get_sample)\n"
+    "- Если ключ НЕ является PK и unique_perc < 100% — дубли есть. "
+    "СНАЧАЛА выясни ПРИЧИНУ дублей из образца данных, ЗАТЕМ выбери стратегию:\n"
+    "  1. Дубли из-за бизнес-логики (несколько статусов/версий одной записи) →\n"
+    "     Используй WHERE-фильтр или ROW_NUMBER():\n"
+    "     WHERE status = 'active'\n"
+    "     или: JOIN (SELECT DISTINCT ON (key) * FROM table ORDER BY key, date DESC) alias\n"
+    "  2. Дубли из-за фактов (несколько событий на один объект) →\n"
+    "     Используй предварительную агрегацию:\n"
+    "     JOIN (SELECT key, SUM(val) AS total FROM table GROUP BY key) alias ON ...\n"
+    "  3. Технические дубли (полностью идентичные строки, баг данных) →\n"
+    "     Только в этом случае DISTINCT оправдан:\n"
+    "     JOIN (SELECT DISTINCT key, col FROM table) alias ON ...\n"
+    "- DISTINCT на внешнем SELECT — ЗАПРЕЩЁН: маскирует проблему, не решает её\n"
+    "- DISTINCT как ПЕРВОЕ решение — ЗАПРЕЩЁН без понимания природы дублей"
 )
 
 SQL_CHECKLIST = (
     "Чеклист перед финализацией SQL:\n"
     "1. Формат дат соответствует данным из образца (YYYY-MM-DD, DD.MM.YYYY, и т.д.)?\n"
     "2. NULL обработан (COALESCE/IS NOT NULL) для колонок с высоким % NULL?\n"
-    "3. JOIN-ключи уникальны (PK или unique_perc=100%)? Если нет — использован подзапрос с DISTINCT?\n"
+    "3. JOIN-ключи уникальны (PK или unique_perc=100%)?\n"
+    "   Если нет — изучен образец данных, понята ПРИЧИНА дублей и выбрана правильная стратегия:\n"
+    "   WHERE-фильтр (статусы/версии) / агрегация (факты) / DISTINCT (только технические дубли)?\n"
     "4. GROUP BY содержит все не-агрегированные колонки?\n"
     "5. Алиасы только на английском?\n"
     "6. Есть LIMIT для больших выборок?\n"
@@ -66,7 +74,9 @@ GIGACHAT_COMMON_ERRORS = (
     "- Неправильный формат даты → проверь get_sample для реального формата\n"
     "- Пропущен GROUP BY → добавь все не-агрегированные колонки\n"
     "- COUNT(*) вместо COUNT(DISTINCT ...) → проверь гранулярность\n"
-    "- Сравнение с NULL через = → используй IS NULL / IS NOT NULL"
+    "- Сравнение с NULL через = → используй IS NULL / IS NOT NULL\n"
+    "- DISTINCT как первое решение для дублей → НЕВЕРНО: сначала изучи образец и пойми причину дублей;\n"
+    "  справочник с двумя статусами — это WHERE, факты — это GROUP BY, только идентичные строки — DISTINCT"
 )
 
 
@@ -140,9 +150,16 @@ class GraphNodes:
     ) -> tuple[str, str]:
         """Обрезать промпты при превышении бюджета символов.
 
-        Стратегия обрезки (от наименее к наиболее важному):
-        1. Обрезка user_prompt с конца (старый контекст) до 70% бюджета
-        2. Обрезка system_prompt с конца до 30% бюджета
+        Стратегия обрезки (от менее важного к более важному):
+        1. Обрезать секцию РАЗВЕДКИ ТАБЛИЦ внутри user_prompt — самая большая,
+           но не критичная (LLM может запросить структуру через инструменты).
+        2. Если всё ещё не вмещается — обрезать хвост user_prompt (старый контекст).
+        3. В крайнем случае — обрезать system_prompt.
+
+        Критические секции, которые НИКОГДА не обрезаются:
+        - [ТЕКУЩИЙ ШАГ ...] — задача для текущего вызова LLM
+        - [ОШИБКА] — описание ошибки для corrector
+        - SQL_CHECKLIST — правила финализации SQL
 
         Returns:
             (system_prompt, user_prompt) — возможно обрезанные.
@@ -163,10 +180,52 @@ class GraphNodes:
         sys_budget = int(max_chars * 0.4)
         usr_budget = max_chars - sys_budget
 
+        # --- Шаг 1: обрезать секцию РАЗВЕДКИ ТАБЛИЦ (самую большую) ---
         if len(user_prompt) > usr_budget:
-            user_prompt = user_prompt[:usr_budget] + "\n\n[...контекст обрезан из-за лимита токенов]"
+            tables_marker = "=== РАЗВЕДКА ТАБЛИЦ"
+            if tables_marker in user_prompt:
+                start_idx = user_prompt.index(tables_marker)
+                # Конец секции разведки — начало следующей ключевой секции
+                end_markers = ["Чеклист перед финализацией", "[ТЕКУЩИЙ ШАГ", "[ШАГ]", "[ОШИБКА]"]
+                end_idx = len(user_prompt)
+                for marker in end_markers:
+                    pos = user_prompt.find(marker, start_idx + len(tables_marker))
+                    if pos != -1:
+                        end_idx = min(end_idx, pos)
+
+                tables_section = user_prompt[start_idx:end_idx]
+                # Сколько символов доступно для секции разведки
+                other_len = len(user_prompt) - len(tables_section)
+                available = usr_budget - other_len
+
+                if available >= 500:
+                    # Обрезаем саму секцию разведки, оставляем минимум
+                    trimmed = (
+                        tables_section[:available]
+                        + "\n\n[...разведка таблиц обрезана из-за лимита токенов"
+                        " — используй get_table_columns для деталей]\n\n"
+                    )
+                else:
+                    # Места совсем нет — убираем разведку полностью
+                    trimmed = (
+                        "[РАЗВЕДКА ТАБЛИЦ ПРОПУЩЕНА из-за лимита токенов"
+                        " — используй get_table_columns]\n\n"
+                    )
+                user_prompt = user_prompt[:start_idx] + trimmed + user_prompt[end_idx:]
+
+        # --- Шаг 2: если всё ещё превышает — обрезать хвост user_prompt ---
+        if len(user_prompt) > usr_budget:
+            user_prompt = (
+                user_prompt[:usr_budget]
+                + "\n\n[...контекст обрезан из-за лимита токенов]"
+            )
+
+        # --- Шаг 3: обрезать system_prompt ---
         if len(system_prompt) > sys_budget:
-            system_prompt = system_prompt[:sys_budget] + "\n\n[...системный промпт обрезан из-за лимита токенов]"
+            system_prompt = (
+                system_prompt[:sys_budget]
+                + "\n\n[...системный промпт обрезан из-за лимита токенов]"
+            )
 
         return system_prompt, user_prompt
 
@@ -464,15 +523,21 @@ class GraphNodes:
             '{"tool": "имя_инструмента", "args": {"параметр": "значение"}}\n\n'
             f"{SQL_RULES}\n\n"
             f"{GIGACHAT_COMMON_ERRORS}\n\n"
-            "Исправление row explosion в JOIN:\n"
+            "Исправление row explosion в JOIN (ОБЯЗАТЕЛЬНЫЙ ПОРЯДОК ДЕЙСТВИЙ):\n"
             "Если ошибка содержит 'ROW EXPLOSION' или 'POST-EXECUTION ROW EXPLOSION':\n"
-            "1. Оберни НЕуникальную сторону JOIN в подзапрос с DISTINCT\n"
-            "2. Или используй предварительную агрегацию в подзапросе (GROUP BY + SUM/COUNT)\n"
-            "3. НИКОГДА не добавляй DISTINCT к внешнему SELECT — это маскирует проблему\n"
-            "4. Следуй шаблону из текста ошибки\n"
-            "Пример исправления:\n"
-            "БЫЛО: SELECT a.* FROM t1 a JOIN schema.t2 b ON a.key = b.key\n"
-            "СТАЛО: SELECT a.* FROM t1 a JOIN (SELECT DISTINCT key, col FROM schema.t2) b ON a.key = b.key\n"
+            "ШАГ 1: Вызови get_sample для таблицы с дублями — изучи образец данных.\n"
+            "ШАГ 2: Определи ПРИЧИНУ дублей и выбери стратегию:\n"
+            "  Причина А — разные статусы/версии одной записи (active/liquidated, old/new):\n"
+            "    → Используй WHERE-фильтр или DISTINCT ON:\n"
+            "    WHERE status = 'active'\n"
+            "    или JOIN (SELECT DISTINCT ON (key) * FROM schema.t2 ORDER BY key, date DESC) b\n"
+            "  Причина Б — несколько фактических событий на один объект (транзакции, платежи):\n"
+            "    → Используй предварительную агрегацию:\n"
+            "    JOIN (SELECT key, SUM(amount) AS total FROM schema.t2 GROUP BY key) b ON ...\n"
+            "  Причина В — технические дубли (полностью идентичные строки, баг данных):\n"
+            "    → Только в этом случае DISTINCT оправдан:\n"
+            "    JOIN (SELECT DISTINCT key, col FROM schema.t2) b ON ...\n"
+            "ШАГ 3: НИКОГДА не добавляй DISTINCT к внешнему SELECT — это маскирует проблему\n"
             f"{lt_ctx}"
             f"{examples_ctx}"
         )
@@ -627,42 +692,145 @@ class GraphNodes:
                 f"**Образец данных (10 строк):**\n{sample_text}"
             )
 
-        # JOIN safety analysis: проверяем общие колонки между таблицами
+        # JOIN safety analysis: проверяем колонки между таблицами
+        # Два вида обнаружения:
+        # 1. Совпадающие имена колонок (классический случай)
+        # 2. FK-паттерн: PK одной таблицы ↔ {table}_id в другой (разные имена)
         join_analysis_lines = []
+        # seen_pairs: набор (s1,t1,col1,s2,t2,col2) уже добавленных пар — избегаем дублей
+        seen_pairs: set[tuple[str, ...]] = set()
+
         table_list = sorted(found_tables)
+        # Кэш DataFrames колонок, чтобы не запрашивать дважды
+        cols_cache: dict[tuple[str, str], Any] = {}
+
+        def _get_cols(s: str, t: str) -> Any:
+            key = (s, t)
+            if key not in cols_cache:
+                cols_cache[key] = self.schema.get_table_columns(s, t)
+            return cols_cache[key]
+
+        def _col_status(row: Any, unique_col: str = "unique_perc") -> tuple[bool, float, str]:
+            """Вернуть (is_pk, unique_perc, status_str) для строки DataFrame."""
+            is_pk = bool(row.get("is_primary_key", False))
+            u = float(row.get(unique_col, 0)) if pd.notna(row.get(unique_col)) else 0.0
+            if is_pk:
+                status = "PK"
+            elif u >= 95:
+                status = f"unique={u:.0f}%"
+            else:
+                status = f"ДУБЛИ unique={u:.0f}%"
+            return is_pk, u, status
+
+        def _safe_recommendation(pk1: bool, u1: float, pk2: bool, u2: float) -> str:
+            safe = (pk1 or u1 >= 95) and (pk2 or u2 >= 95)
+            if safe:
+                return "безопасен"
+            # Определяем, у какой стороны дубли, чтобы дать конкретный совет
+            problem_sides = []
+            if not pk1 and u1 < 95:
+                problem_sides.append("левая сторона")
+            if not pk2 and u2 < 95:
+                problem_sides.append("правая сторона")
+            sides_str = ", ".join(problem_sides)
+            return (
+                f"ОПАСНО ({sides_str} имеет дубли) — "
+                "изучи образец (get_sample), выясни причину: "
+                "WHERE-фильтр (статусы) / GROUP BY (факты) / DISTINCT (технические дубли)"
+            )
+
         if len(table_list) >= 2:
             for i, (s1, t1) in enumerate(table_list):
-                cols1 = self.schema.get_table_columns(s1, t1)
+                cols1 = _get_cols(s1, t1)
                 for s2, t2 in table_list[i + 1:]:
-                    cols2 = self.schema.get_table_columns(s2, t2)
+                    cols2 = _get_cols(s2, t2)
                     if cols1.empty or cols2.empty:
                         continue
+
+                    # --- 1. Совпадающие имена колонок ---
                     shared = set(cols1["column_name"]) & set(cols2["column_name"])
                     for col in sorted(shared):
                         r1 = cols1[cols1["column_name"] == col].iloc[0]
                         r2 = cols2[cols2["column_name"] == col].iloc[0]
-                        u1 = float(r1.get("unique_perc", 0)) if pd.notna(r1.get("unique_perc")) else 0
-                        u2 = float(r2.get("unique_perc", 0)) if pd.notna(r2.get("unique_perc")) else 0
-                        pk1 = bool(r1.get("is_primary_key", False))
-                        pk2 = bool(r2.get("is_primary_key", False))
-
-                        status1 = "PK" if pk1 else (f"unique={u1:.0f}%" if u1 >= 95 else f"ДУБЛИ unique={u1:.0f}%")
-                        status2 = "PK" if pk2 else (f"unique={u2:.0f}%" if u2 >= 95 else f"ДУБЛИ unique={u2:.0f}%")
-
-                        safe = (pk1 or u1 >= 95) and (pk2 or u2 >= 95)
-                        recommendation = "безопасен" if safe else "ОПАСНО — нужен подзапрос с DISTINCT"
-
+                        pk1, u1, st1 = _col_status(r1)
+                        pk2, u2, st2 = _col_status(r2)
+                        recommendation = _safe_recommendation(pk1, u1, pk2, u2)
+                        pair_key = (s1, t1, col, s2, t2, col)
+                        seen_pairs.add(pair_key)
                         join_analysis_lines.append(
-                            f"  {s1}.{t1}.{col} ({status1}) ↔ {s2}.{t2}.{col} ({status2})"
+                            f"  {s1}.{t1}.{col} ({st1}) ↔ {s2}.{t2}.{col} ({st2})"
                             f" → {recommendation}"
                         )
+
+                    # --- 2. FK-паттерн: PK одной таблицы → {table}_id в другой ---
+                    # Проверяем оба направления: PK t1 → FK в t2, и PK t2 → FK в t1
+                    for (pk_s, pk_t, pk_cols_df, fk_s, fk_t, fk_cols_df) in [
+                        (s1, t1, cols1, s2, t2, cols2),
+                        (s2, t2, cols2, s1, t1, cols1),
+                    ]:
+                        if "is_primary_key" not in pk_cols_df.columns:
+                            continue
+                        pk_rows = pk_cols_df[pk_cols_df["is_primary_key"].astype(bool) == True]
+                        if pk_rows.empty:
+                            continue
+
+                        # Карта имён колонок FK-таблицы (lower → original)
+                        fk_col_map: dict[str, str] = {
+                            r["column_name"].lower(): r["column_name"]
+                            for _, r in fk_cols_df.iterrows()
+                        }
+
+                        for _, pk_row in pk_rows.iterrows():
+                            pk_col = pk_row["column_name"]
+                            pk_lower = pk_col.lower()
+                            t_lower = pk_t.lower()
+
+                            # Кандидаты FK-имён: {table}_id, {table}_{pk_col},
+                            # {table_singular}_id (убираем trailing 's')
+                            fk_candidates = {
+                                f"{t_lower}_id",
+                                f"{t_lower}_{pk_lower}",
+                            }
+                            if t_lower.endswith("s") and len(t_lower) > 2:
+                                fk_candidates.add(f"{t_lower[:-1]}_id")
+                                fk_candidates.add(f"{t_lower[:-1]}_{pk_lower}")
+
+                            for fk_cand in fk_candidates:
+                                # Пропускаем если это то же имя (уже в shared-анализе)
+                                if fk_cand == pk_lower:
+                                    continue
+                                if fk_cand not in fk_col_map:
+                                    continue
+
+                                fk_col_actual = fk_col_map[fk_cand]
+                                # Не добавляем дубль
+                                pair_key = (pk_s, pk_t, pk_col, fk_s, fk_t, fk_col_actual)
+                                reverse_key = (fk_s, fk_t, fk_col_actual, pk_s, pk_t, pk_col)
+                                if pair_key in seen_pairs or reverse_key in seen_pairs:
+                                    continue
+                                seen_pairs.add(pair_key)
+
+                                fk_match = fk_cols_df[fk_cols_df["column_name"] == fk_col_actual]
+                                if fk_match.empty:
+                                    continue
+                                fk_row = fk_match.iloc[0]
+                                pk1, u1, st1 = _col_status(pk_row)
+                                pk2, u2, st2 = _col_status(fk_row)
+                                recommendation = _safe_recommendation(pk1, u1, pk2, u2)
+                                join_analysis_lines.append(
+                                    f"  {pk_s}.{pk_t}.{pk_col} ({st1}) ↔ "
+                                    f"{fk_s}.{fk_t}.{fk_col_actual} ({st2})"
+                                    f" [FK-паттерн] → {recommendation}"
+                                )
 
         join_analysis = ""
         if join_analysis_lines:
             join_analysis = (
                 "\n\n=== JOIN-АНАЛИЗ (автоматическая оценка безопасности JOIN) ===\n"
                 + "\n".join(join_analysis_lines)
-                + "\n\nЕсли ключ помечен как ДУБЛИ — используй подзапрос с DISTINCT или агрегацию."
+                + "\n\nЕсли ключ помечен как ДУБЛИ — сначала изучи get_sample, "
+                "выясни причину дублей, затем выбери стратегию: "
+                "WHERE (статусы/версии) / GROUP BY (факты) / DISTINCT (только технические дубли)."
             )
 
         tables_context = (
@@ -1236,9 +1404,11 @@ class GraphNodes:
                 warnings_text += f"\n⚠ {sw}"
 
         # Post-execution row explosion detection
+        # Порог: factor > 1.5 (значимое умножение) И row_count > 50 (не просто тест-запрос).
+        # factor=1.01 при 10 строках — шум, не explosion.
         if not empty_result and join_risk_info and tool_name == "execute_query":
             factor = join_risk_info.get("multiplication_factor", 1.0)
-            if factor > 1.0:
+            if factor > 1.5 and row_count > 50:
                 suggestions = "\n".join(join_risk_info.get("rewrite_suggestions", []))
                 explosion_msg = (
                     f"POST-EXECUTION ROW EXPLOSION: Результат содержит {row_count} строк "
@@ -1359,8 +1529,10 @@ class GraphNodes:
                 "- Ошибка колонки → вызови get_table_columns\n"
                 "- Синтаксическая ошибка → исправь SQL по тексту ошибки\n"
                 "- Неожиданный COUNT → проверь гранулярность (COUNT(DISTINCT ...) вместо COUNT(*))\n"
-                "- ROW EXPLOSION → используй подзапрос с DISTINCT для неуникальной таблицы. "
-                "НЕ добавляй DISTINCT к внешнему SELECT. Следуй шаблону из текста ошибки."
+                "- ROW EXPLOSION → СНАЧАЛА вызови get_sample для таблицы с дублями, "
+                "изучи причину дублей (статусы? факты? технические дубли?), "
+                "затем выбери стратегию: WHERE-фильтр / GROUP BY агрегация / DISTINCT. "
+                "НЕ применяй DISTINCT без понимания причины."
             )
         else:
             strategy_hint = (
@@ -1372,10 +1544,12 @@ class GraphNodes:
             )
             if is_row_explosion:
                 strategy_hint += (
-                    "\n- ROW EXPLOSION не исправлен! Оберни неуникальную таблицу в "
-                    "подзапрос: JOIN (SELECT DISTINCT key, col FROM table) alias ON ...\n"
-                    "- Или используй предварительную агрегацию: "
-                    "JOIN (SELECT key, SUM(val) FROM table GROUP BY key) alias ON ..."
+                    "\n- ROW EXPLOSION не исправлен! Обязательный порядок:\n"
+                    "  1. Вызови get_sample для таблицы с дублями — узнай причину\n"
+                    "  2. Статусы/версии → WHERE status='active' или DISTINCT ON (key)\n"
+                    "  3. Факты (транзакции, события) → GROUP BY + агрегация\n"
+                    "  4. Технические дубли → DISTINCT как последнее средство\n"
+                    "  DISTINCT без понимания причины — ЗАПРЕЩЁН"
                 )
 
         # Извлекаем полный SQL из последнего tool_call (если есть)

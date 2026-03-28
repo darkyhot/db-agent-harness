@@ -101,6 +101,24 @@ class MemoryManager:
                 conn.execute("ALTER TABLE sql_audit ADD COLUMN error_type TEXT DEFAULT ''")
             except Exception:
                 pass  # колонка уже существует
+
+            # Индексы для ускорения частых запросов
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                "ON messages(session_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sql_audit_session "
+                "ON sql_audit(session_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sql_audit_timestamp "
+                "ON sql_audit(timestamp)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_timestamp "
+                "ON sessions(timestamp)"
+            )
         logger.info("SQLite память инициализирована: %s", self._db_path)
 
     def start_session(self, user_id: str = "") -> str:
@@ -384,6 +402,12 @@ class MemoryManager:
                 # Удаляем сообщения старых сессий
                 conn.execute(
                     "DELETE FROM messages WHERE session_id IN "
+                    "(SELECT id FROM sessions WHERE timestamp < ?)",
+                    (cutoff,),
+                )
+                # Удаляем записи аудита старых сессий
+                conn.execute(
+                    "DELETE FROM sql_audit WHERE session_id IN "
                     "(SELECT id FROM sessions WHERE timestamp < ?)",
                     (cutoff,),
                 )

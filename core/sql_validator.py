@@ -423,17 +423,24 @@ class SQLValidator:
 
     @staticmethod
     def _generate_rewrite_suggestion(join: dict[str, str]) -> str:
-        """Сгенерировать конкретный шаблон переписывания JOIN."""
+        """Сгенерировать конкретный шаблон переписывания JOIN с диагностикой причины дублей."""
         schema, table, column = join["schema"], join["table"], join["column"]
         return (
             f"ROW EXPLOSION: JOIN ключ {schema}.{table}.{column} не уникален.\n"
-            f"ИСПРАВЛЕНИЕ: Оберни {schema}.{table} в подзапрос с DISTINCT:\n"
-            f"  БЫЛО: JOIN {schema}.{table} alias ON ... = alias.{column}\n"
-            f"  СТАЛО: JOIN (SELECT DISTINCT {column}, <нужные_колонки> "
-            f"FROM {schema}.{table}) alias ON ... = alias.{column}\n"
-            f"Или используй предварительную агрегацию (GROUP BY + SUM/COUNT), "
-            f"если нужна агрегация.\n"
-            f"ЗАПРЕЩЕНО: добавлять DISTINCT к внешнему SELECT — это маскирует проблему."
+            f"ОБЯЗАТЕЛЬНО: вызови get_sample для {schema}.{table} и изучи причину дублей.\n"
+            f"Затем выбери стратегию исправления:\n"
+            f"  Вариант 1 — статусы/версии (active/liquidated, актуальная/архивная запись):\n"
+            f"    JOIN {schema}.{table} alias ON ... = alias.{column} WHERE alias.status = 'active'\n"
+            f"    или: JOIN (SELECT DISTINCT ON ({column}) * FROM {schema}.{table} "
+            f"ORDER BY {column}, <дата> DESC) alias ON ...\n"
+            f"  Вариант 2 — несколько фактов на объект (транзакции, платежи, события):\n"
+            f"    JOIN (SELECT {column}, SUM(<сумма>) AS total FROM {schema}.{table} "
+            f"GROUP BY {column}) alias ON ...\n"
+            f"  Вариант 3 — технические дубли (полностью идентичные строки, баг данных):\n"
+            f"    JOIN (SELECT DISTINCT {column}, <нужные_колонки> FROM {schema}.{table}) "
+            f"alias ON ... = alias.{column}\n"
+            f"ЗАПРЕЩЕНО: добавлять DISTINCT к внешнему SELECT — это маскирует проблему.\n"
+            f"ЗАПРЕЩЕНО: применять DISTINCT без понимания причины дублей."
         )
 
     def _check_key_uniqueness(

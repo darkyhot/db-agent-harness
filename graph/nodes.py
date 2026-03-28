@@ -1,4 +1,4 @@
-﻿"""Узлы графа LangGraph: planner, executor, validator, corrector, summarizer."""
+"""Узлы графа LangGraph: planner, executor, validator, corrector, summarizer."""
 
 import json
 import logging

@@ -23,7 +23,7 @@ def test_sibling_prefix_attack_blocked(tmp_path: Path):
         resolve_workspace_path(tmp_path, sibling)
 
 
-def test_windows_absolute_path_blocked(tmp_path: Path):
-    outside = Path("C:/Windows/System32/drivers/etc/hosts")
+def test_absolute_path_blocked(tmp_path: Path):
+    outside = Path("/etc/hosts")
     with pytest.raises(ValueError):
         resolve_workspace_path(tmp_path, outside)

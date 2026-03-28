@@ -1,4 +1,4 @@
-﻿"""Tools for Greenplum database access with DI factory."""
+"""Tools for Greenplum database access with DI factory."""
 
 import json
 import logging

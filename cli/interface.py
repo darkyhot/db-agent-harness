@@ -17,6 +17,7 @@ from core.sql_validator import SQLValidator, detect_mode, SQLMode
 from graph.graph import build_graph, create_initial_state
 from tools.db_tools import create_db_tools
 from tools.fs_tools import FS_TOOLS
+from tools.path_safety import resolve_workspace_path
 from tools.schema_tools import create_schema_tools
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,7 @@ class CLIInterface:
         all_tools = FS_TOOLS + db_tools + schema_tools
 
         # Флаг отладки промптов из конфига
-        self.debug_prompt = self.db._config.get("debug_prompt", False)
+        self.debug_prompt = self.db.runtime_config.get("debug_prompt", False)
 
         # Сборка графа
         self.graph = build_graph(
@@ -120,7 +121,7 @@ class CLIInterface:
         self._recover_unsaved_memory()
 
         # Стартуем сессию
-        user_id = self.db._config.get("user_id", "")
+        user_id = self.db.runtime_config.get("user_id", "")
         self.memory.start_session(user_id)
 
         logger.info("CLIInterface инициализирован")
@@ -267,7 +268,7 @@ class CLIInterface:
         port = int(port_str) if port_str else 5432
         database = input("database [prom]: ").strip() or "prom"
 
-        current_debug = self.db._config.get("debug_prompt", False)
+        current_debug = self.db.runtime_config.get("debug_prompt", False)
         debug_str = input(f"debug_prompt (true/false) [{current_debug}]: ").strip().lower()
         if debug_str in ("true", "1", "yes", "да"):
             debug_prompt = True
@@ -276,7 +277,7 @@ class CLIInterface:
         else:
             debug_prompt = current_debug
 
-        self.db._config["debug_prompt"] = debug_prompt
+        self.db.set_debug_prompt(debug_prompt)
         self.db.save_config(user_id, host, port, database)
         self.debug_prompt = debug_prompt
         print(f"\n✓ Конфигурация сохранена: {self.db.config_summary}")
@@ -286,7 +287,7 @@ class CLIInterface:
         """Сброс контекста текущей сессии."""
         self._save_session_summary()
         self._extract_long_term_memory()
-        user_id = self.db._config.get("user_id", "")
+        user_id = self.db.runtime_config.get("user_id", "")
         self.memory.start_session(user_id)
         print("✓ Контекст сброшен. Новая сессия начата.")
 
@@ -436,15 +437,29 @@ class CLIInterface:
                 print(f"\n⚠️  {msg}")
                 confirm = input("Введите YES для подтверждения: ").strip()
                 if confirm.upper() == "YES":
+                    pending_call = result.get("pending_sql_tool_call") or {}
+                    tool_name = pending_call.get("tool")
+                    tool_args = pending_call.get("args", {})
                     sql = result.get("sql_to_validate", "")
                     if sql:
                         mode = detect_mode(sql)
-                        if mode == SQLMode.WRITE:
+                        if tool_name == "execute_write" or mode == SQLMode.WRITE:
                             res = self.db.execute_write(sql)
                             print(f"\n✓ Выполнено. Затронуто строк: {res}")
-                        elif mode == SQLMode.DDL:
+                        elif tool_name == "execute_ddl" or mode == SQLMode.DDL:
                             res = self.db.execute_ddl(sql)
                             print(f"\n✓ {res}")
+                        elif tool_name == "export_query":
+                            filename = tool_args.get("filename", "export.csv")
+                            output_format = tool_args.get("output_format", "csv")
+                            file_path, row_count = self.db.export_query_to_file(
+                                sql=sql,
+                                filename=filename,
+                                output_format=output_format,
+                                workspace_dir=WORKSPACE_DIR,
+                            )
+                            safe_rel_name = resolve_workspace_path(WORKSPACE_DIR, file_path).relative_to(WORKSPACE_DIR)
+                            print(f"\n✓ Сохранено в {safe_rel_name} ({row_count} строк)")
                         else:
                             df = self.db.execute_query(sql)
                             print(f"\n{df.to_markdown(index=False)}")

@@ -64,8 +64,10 @@ class ValidationResult:
         if self.join_checks:
             lines.append("Проверка JOIN-ов:")
             for jc in self.join_checks:
-                status = "✓ уникален" if jc["is_unique"] else f"✗ дубли: {jc['duplicate_pct']}%"
-                lines.append(f"  {jc['table']}.({jc['columns']}): {status}")
+                cardinality = jc.get("cardinality", "unknown")
+                join_expr = jc.get("join", f"{jc.get('table', '?')}.({jc.get('columns', '?')})")
+                status = "✓ safe" if jc.get("is_safe") else "✗ risky"
+                lines.append(f"  {join_expr}: {cardinality} ({status})")
             if self.multiplication_factor > 1.0:
                 lines.append(f"  Multiplication factor: {self.multiplication_factor:.1f}x")
         if self.rewrite_suggestions:
@@ -350,6 +352,81 @@ def _extract_join_conditions(sql: str) -> list[dict[str, str]]:
     return unique_joins
 
 
+def _extract_join_pairs(sql: str) -> list[dict[str, Any]]:
+    """Извлечь пары сторон JOIN с указанием присоединяемой стороны."""
+    pairs: list[dict[str, Any]] = []
+    subquery_aliases = _find_subquery_join_aliases(sql)
+    alias_map = _build_alias_map(sql)
+
+    def _resolve(ref: str) -> tuple[str, str] | None:
+        return alias_map.get(ref.lower())
+
+    join_on_pattern = re.compile(
+        r'JOIN\s+["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
+        r'\s+(?:(?:AS\s+)?(\w+)\s+)?ON\s+(.*?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|\bHAVING\b|;|\)|\Z)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    eq_pattern = re.compile(
+        r'["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?'
+        r'\s*=\s*'
+        r'["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
+    )
+
+    for match in join_on_pattern.finditer(sql):
+        join_table = match.group(2)
+        join_alias = (match.group(3) or join_table).lower()
+        on_clause = match.group(4)
+
+        for eq in eq_pattern.finditer(on_clause):
+            left_ref, left_col = eq.group(1), eq.group(2)
+            right_ref, right_col = eq.group(3), eq.group(4)
+
+            if left_ref.lower() in subquery_aliases or right_ref.lower() in subquery_aliases:
+                continue
+
+            left_resolved = _resolve(left_ref)
+            right_resolved = _resolve(right_ref)
+            if not left_resolved or not right_resolved:
+                continue
+
+            joined_side = "left" if left_ref.lower() == join_alias else "right"
+            if left_ref.lower() != join_alias and right_ref.lower() != join_alias:
+                joined_side = "right"
+
+            pairs.append({
+                "type": "join",
+                "joined_side": joined_side,
+                "left": {
+                    "schema": left_resolved[0],
+                    "table": left_resolved[1],
+                    "column": left_col,
+                },
+                "right": {
+                    "schema": right_resolved[0],
+                    "table": right_resolved[1],
+                    "column": right_col,
+                },
+            })
+
+    cross_pattern = re.compile(
+        r'CROSS\s+JOIN\s+["\']?(\w+)["\']?\s*\.\s*["\']?(\w+)["\']?',
+        re.IGNORECASE,
+    )
+    for match in cross_pattern.finditer(sql):
+        pairs.append({
+            "type": "cross_join",
+            "joined_side": "right",
+            "left": None,
+            "right": {
+                "schema": match.group(1),
+                "table": match.group(2),
+                "column": "__CROSS_JOIN__",
+            },
+        })
+
+    return pairs
+
+
 def _has_where_or_limit(sql: str) -> bool:
     """Проверить наличие WHERE или LIMIT в основном запросе.
 
@@ -366,6 +443,21 @@ def _has_where_or_limit(sql: str) -> bool:
             break
     upper = cleaned.upper()
     return "WHERE" in upper or "LIMIT" in upper
+
+
+def _has_top_level_where(sql: str) -> bool:
+    """Проверить наличие WHERE на верхнем уровне statement.
+
+    Не учитывает WHERE в строковых литералах, комментариях и подзапросах.
+    """
+    statements = sqlparse.parse(sql)
+    if not statements:
+        return False
+
+    for token in statements[0].tokens:
+        if isinstance(token, sqlparse.sql.Where):
+            return True
+    return False
 
 
 class SQLValidator:
@@ -413,6 +505,9 @@ class SQLValidator:
         """
         total = 1.0
         for jc in join_checks:
+            if "factor" in jc:
+                total *= jc["factor"]
+                continue
             if not jc["is_unique"]:
                 unique_perc = 100.0 - jc["duplicate_pct"]
                 if unique_perc > 0:
@@ -449,12 +544,15 @@ class SQLValidator:
         """Проверить уникальность ключа: сначала CSV, потом DB fallback."""
         if self._schema_loader is not None:
             csv_result = self._schema_loader.check_key_uniqueness(schema, table, columns)
-            if csv_result.get("is_unique") is not None:
+            if csv_result.get("status") in {"safe", "risky"}:
                 return {
                     "is_unique": csv_result["is_unique"],
                     "duplicate_pct": csv_result["duplicate_pct"],
+                    "status": csv_result["status"],
                 }
-        return self._db.check_key_uniqueness(schema, table, columns)
+        db_result = self._db.check_key_uniqueness(schema, table, columns)
+        db_result["status"] = "safe" if db_result["is_unique"] else "risky"
+        return db_result
 
     def _validate_read(self, sql: str, result: ValidationResult) -> None:
         """Валидация SELECT-запросов."""
@@ -466,72 +564,120 @@ class SQLValidator:
             result.add_error(f"Синтаксическая ошибка (EXPLAIN): {e}")
             return
 
-        # 2. Проверка JOIN-ов на уникальность ключей
-        joins = _extract_join_conditions(sql)
-        for join in joins:
-            # CROSS JOIN — гарантированный explosion, не нужна проверка ключа
-            if join["column"] == "__CROSS_JOIN__":
+        # 2. Проверка JOIN-ов на кардинальность
+        join_pairs = _extract_join_pairs(sql)
+        for pair in join_pairs:
+            if pair["type"] == "cross_join":
+                joined = pair["right"]
                 result.join_checks.append({
-                    "table": f"{join['schema']}.{join['table']}",
+                    "join": f"CROSS JOIN {joined['schema']}.{joined['table']}",
+                    "table": f"{joined['schema']}.{joined['table']}",
                     "columns": "CROSS JOIN",
+                    "cardinality": "cross-join",
                     "is_unique": False,
+                    "is_safe": False,
                     "duplicate_pct": 100.0,
+                    "factor": 100.0,
                 })
                 result.rewrite_suggestions.append(
-                    f"ROW EXPLOSION: CROSS JOIN с {join['schema']}.{join['table']} "
-                    f"создаёт декартово произведение. Замени на обычный JOIN с условием."
+                    f"ROW EXPLOSION: CROSS JOIN с {joined['schema']}.{joined['table']} "
+                    "создаёт декартово произведение. Замени на обычный JOIN с условием."
                 )
                 continue
 
+            left = pair["left"]
+            right = pair["right"]
+            joined_side = pair["joined_side"]
+            joined = left if joined_side == "left" else right
+            existing = right if joined_side == "left" else left
+
             try:
-                check = self._check_key_uniqueness(
-                    join["schema"], join["table"], [join["column"]]
+                existing_check = self._check_key_uniqueness(
+                    existing["schema"], existing["table"], [existing["column"]]
                 )
-                check_info = {
-                    "table": f"{join['schema']}.{join['table']}",
-                    "columns": join["column"],
-                    "is_unique": check["is_unique"],
-                    "duplicate_pct": check["duplicate_pct"],
-                }
-                result.join_checks.append(check_info)
-                if not check["is_unique"]:
-                    suggestion = self._generate_rewrite_suggestion(join)
-                    result.rewrite_suggestions.append(suggestion)
+                joined_check = self._check_key_uniqueness(
+                    joined["schema"], joined["table"], [joined["column"]]
+                )
             except Exception as e:
-                logger.warning("Не удалось проверить уникальность JOIN: %s", e)
+                logger.warning("Не удалось проверить кардинальность JOIN: %s", e)
+                continue
+
+            existing_status = existing_check.get("status", "unknown")
+            joined_status = joined_check.get("status", "unknown")
+            existing_unique = existing_status == "safe"
+            joined_unique = joined_status == "safe"
+            joined_dup = joined_check.get("duplicate_pct")
+            joined_factor = 2.0
+            if joined_dup is not None:
+                joined_unique_perc = max(0.01, 100.0 - float(joined_dup))
+                joined_factor = min(100.0 / joined_unique_perc, 100.0)
+
+            if existing_unique and joined_unique:
+                cardinality = "one-to-one"
+                is_safe = True
+                factor = 1.0
+            elif joined_unique:
+                cardinality = "many-to-one"
+                is_safe = True
+                factor = 1.0
+            elif existing_unique and joined_status == "risky":
+                cardinality = "one-to-many"
+                is_safe = False
+                factor = joined_factor
+            elif existing_status == "risky" and joined_status == "risky":
+                cardinality = "many-to-many"
+                is_safe = False
+                existing_dup = existing_check.get("duplicate_pct", 50.0)
+                existing_unique_perc = max(0.01, 100.0 - float(existing_dup))
+                factor = min((100.0 / existing_unique_perc) * joined_factor, 100.0)
+            else:
+                cardinality = "unknown"
+                is_safe = False
+                factor = max(joined_factor, 2.0)
+
+            join_label = (
+                f"{left['schema']}.{left['table']}.{left['column']} = "
+                f"{right['schema']}.{right['table']}.{right['column']}"
+            )
+            check_info = {
+                "join": join_label,
+                "table": f"{joined['schema']}.{joined['table']}",
+                "columns": joined["column"],
+                "cardinality": cardinality,
+                "is_unique": joined_unique,
+                "is_safe": is_safe,
+                "duplicate_pct": joined_check.get("duplicate_pct"),
+                "factor": factor,
+            }
+            result.join_checks.append(check_info)
+
+            if not is_safe:
+                result.rewrite_suggestions.append(self._generate_rewrite_suggestion(joined))
 
         # 3. Оценка multiplication factor и решение pass/warn/block
         if result.join_checks:
             factor = self._estimate_multiplication_factor(result.join_checks)
             result.multiplication_factor = factor
 
-            non_unique = [
-                jc for jc in result.join_checks if not jc["is_unique"]
+            hard_risk = [
+                jc for jc in result.join_checks if jc.get("cardinality") in {"many-to-many", "cross-join"}
             ]
-            if non_unique and factor > 2.0:
-                # HARD BLOCK — высокий риск row explosion
-                details = "; ".join(
-                    f"{jc['table']}.{jc['columns']} (дубли: {jc['duplicate_pct']}%)"
-                    for jc in non_unique
-                )
+            soft_risk = [
+                jc for jc in result.join_checks if jc.get("cardinality") in {"one-to-many", "unknown"}
+            ]
+
+            if hard_risk:
+                details = "; ".join(f"{jc['join']} [{jc['cardinality']}]" for jc in hard_risk)
                 result.add_error(
-                    f"ROW EXPLOSION (factor={factor:.1f}x): "
-                    f"Неуникальные JOIN-ключи: {details}. "
-                    "Перепиши SQL с подзапросом (DISTINCT) или агрегацией.\n"
+                    f"ROW EXPLOSION (factor={factor:.1f}x): {details}. "
+                    "Обнаружен JOIN, который размножает строки результата.\n"
                     + "\n".join(result.rewrite_suggestions)
                 )
-            elif non_unique:
-                # SOFT BLOCK — любые дубли в JOIN-ключах, даже минимальные
-                details = "; ".join(
-                    f"{jc['table']}.{jc['columns']} (дубли: {jc['duplicate_pct']}%)"
-                    for jc in non_unique
-                )
+            elif soft_risk:
+                details = "; ".join(f"{jc['join']} [{jc['cardinality']}]" for jc in soft_risk)
                 result.add_error(
-                    f"JOIN RISK (factor={factor:.1f}x): "
-                    f"Неуникальные ключи: {details}. "
-                    "Даже минимальные дубли искажают агрегации (SUM, COUNT). "
-                    "Перепиши запрос: оберни таблицу в подзапрос с DISTINCT "
-                    "или используй предварительную агрегацию."
+                    f"JOIN RISK (factor={factor:.1f}x): {details}. "
+                    "Присоединяемая сторона не доказана как уникальная и может размножить строки."
                 )
 
         # 4. Предупреждение если нет WHERE/LIMIT для больших таблиц
@@ -554,7 +700,7 @@ class SQLValidator:
 
         # 2. UPDATE/DELETE без WHERE — требуем подтверждение
         is_update_or_delete = normalized.startswith(("UPDATE", "DELETE"))
-        if is_update_or_delete and "WHERE" not in normalized:
+        if is_update_or_delete and not _has_top_level_where(sql):
             result.require_confirmation(
                 "UPDATE/DELETE без WHERE затронет ВСЕ строки таблицы. Вы уверены?"
             )

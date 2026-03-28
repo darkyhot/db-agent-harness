@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import sqlparse
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.engine import Engine
+
+from tools.path_safety import resolve_workspace_path
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,21 @@ _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
 # Таймаут на SQL-запросы (мс)
 STATEMENT_TIMEOUT_MS = 300_000  # 5 минут
+
+
+def _has_top_level_limit(sql: str) -> bool:
+    """Проверить наличие LIMIT на верхнем уровне SQL statement."""
+    statements = sqlparse.parse(sql)
+    if not statements:
+        return False
+
+    statement = statements[0]
+    for token in statement.tokens:
+        if token.is_whitespace:
+            continue
+        if token.ttype in sqlparse.tokens.Keyword and token.normalized == "LIMIT":
+            return True
+    return False
 
 
 def _validate_identifier(name: str, kind: str = "identifier") -> str:
@@ -90,6 +108,15 @@ class DatabaseManager:
         logger.info("Конфигурация сохранена: %s@%s:%d/%s", user_id, host, port, database)
 
     @property
+    def runtime_config(self) -> dict[str, Any]:
+        """Текущая конфигурация runtime (копия)."""
+        return dict(self._config)
+
+    def set_debug_prompt(self, enabled: bool) -> None:
+        """Обновить флаг debug_prompt в конфигурации."""
+        self._config["debug_prompt"] = bool(enabled)
+
+    @property
     def is_configured(self) -> bool:
         """Проверка наличия минимальной конфигурации."""
         return bool(self._config.get("user_id") and self._config.get("host"))
@@ -133,8 +160,8 @@ class DatabaseManager:
         logger.info("Engine создан: %s@%s:%d/%s (timeout=%dms)", user, host, port, database, STATEMENT_TIMEOUT_MS)
         return self._engine
 
-    def execute_query(self, sql: str, limit: int = 1000) -> pd.DataFrame:
-        """Выполнить SELECT-запрос и вернуть результат как DataFrame.
+    def preview_query(self, sql: str, limit: int = 1000) -> pd.DataFrame:
+        """Выполнить SELECT-запрос в режиме preview (с авто-LIMIT).
 
         Args:
             sql: SQL-запрос (SELECT).
@@ -143,24 +170,53 @@ class DatabaseManager:
         Returns:
             DataFrame с результатами.
         """
-        engine = self.get_engine()
         sql_stripped = sql.strip().rstrip(";")
-
-        # Проверяем LIMIT через sqlparse-подобный подход: убираем все комментарии
-        sql_no_comments = re.sub(r'--[^\n]*', '', sql_stripped)
-        sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
-        if "limit" not in sql_no_comments.lower():
+        if not _has_top_level_limit(sql_stripped):
             sql_stripped = f"SELECT * FROM ({sql_stripped}) _sub LIMIT :_limit"
             logger.info("Выполнение SELECT (с авто-LIMIT): %s", sql_stripped[:200])
-            with engine.connect() as conn:
+            with self.get_engine().connect() as conn:
                 df = pd.read_sql(text(sql_stripped), conn, params={"_limit": limit})
         else:
             logger.info("Выполнение SELECT: %s", sql_stripped[:200])
-            with engine.connect() as conn:
+            with self.get_engine().connect() as conn:
                 df = pd.read_sql(text(sql_stripped), conn)
 
         logger.info("Получено строк: %d", len(df))
         return df
+
+    def run_read_query(self, sql: str) -> pd.DataFrame:
+        """Выполнить SELECT без авто-LIMIT (full read/export mode)."""
+        sql_stripped = sql.strip().rstrip(";")
+        logger.info("Выполнение SELECT без авто-LIMIT: %s", sql_stripped[:200])
+        with self.get_engine().connect() as conn:
+            df = pd.read_sql(text(sql_stripped), conn)
+        logger.info("Получено строк (full): %d", len(df))
+        return df
+
+    def execute_query(self, sql: str, limit: int = 1000) -> pd.DataFrame:
+        """Совместимость: execute_query = preview_query."""
+        return self.preview_query(sql, limit=limit)
+
+    def export_query(self, sql: str) -> pd.DataFrame:
+        """Выполнить SELECT для полной выгрузки без авто-LIMIT."""
+        return self.run_read_query(sql)
+
+    def export_query_to_file(
+        self,
+        sql: str,
+        filename: str,
+        output_format: str,
+        workspace_dir: Path,
+    ) -> tuple[Path, int]:
+        """Выгрузить результат SELECT в файл внутри workspace."""
+        file_path = resolve_workspace_path(workspace_dir, filename)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        df = self.export_query(sql)
+        if output_format == "excel":
+            df.to_excel(file_path, index=False)
+        else:
+            df.to_csv(file_path, index=False, encoding="utf-8")
+        return file_path, len(df)
 
     def execute_write(self, sql: str) -> int:
         """Выполнить INSERT/UPDATE/DELETE и вернуть количество затронутых строк.
@@ -352,13 +408,13 @@ class DatabaseManager:
         lines.append(");")
         return "\n".join(lines)
 
-    def estimate_affected_rows(
+    def count_affected_rows_readonly(
         self, where_clause: str, schema: str, table: str
     ) -> int:
-        """Оценить количество строк, затронутых WHERE-условием.
+        """Точно посчитать количество строк, затронутых WHERE-условием.
 
-        Использует EXPLAIN для оценки вместо прямого выполнения COUNT,
-        чтобы избежать SQL injection через where_clause.
+        Выполняет `COUNT(*)` в read-only транзакции: это точное значение,
+        а не приблизительная оценка.
 
         Args:
             where_clause: Условие WHERE (без ключевого слова WHERE).
@@ -366,7 +422,7 @@ class DatabaseManager:
             table: Имя таблицы.
 
         Returns:
-            Оценочное количество строк.
+            Точное количество строк.
         """
         schema = _validate_identifier(schema, "schema")
         table = _validate_identifier(table, "table")
@@ -383,5 +439,9 @@ class DatabaseManager:
                 conn.rollback()  # завершаем read-only транзакцию без commit
                 return count
         except Exception as e:
-            logger.error("estimate_affected_rows ошибка: %s", e)
+            logger.error("count_affected_rows_readonly ошибка: %s", e)
             raise
+
+    def estimate_affected_rows(self, where_clause: str, schema: str, table: str) -> int:
+        """Совместимость: устаревший алиас для count_affected_rows_readonly."""
+        return self.count_affected_rows_readonly(where_clause, schema, table)

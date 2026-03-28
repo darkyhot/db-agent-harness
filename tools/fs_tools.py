@@ -2,10 +2,11 @@
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 from langchain_core.tools import tool
+
+from tools.path_safety import resolve_workspace_path
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +26,7 @@ def _safe_path(path: str) -> Path:
     Raises:
         ValueError: Если путь выходит за пределы workspace.
     """
-    resolved = (WORKSPACE_DIR / path).resolve()
-    if not str(resolved).startswith(str(WORKSPACE_DIR.resolve())):
-        raise ValueError(f"Путь выходит за пределы workspace: {path}")
-    return resolved
+    return resolve_workspace_path(WORKSPACE_DIR, path)
 
 
 @tool
@@ -55,7 +53,7 @@ def create_file(path: str, content: str) -> str:
         return f"Файл создан: {path}"
     except Exception as e:
         logger.error("Ошибка создания файла %s: %s", path, e)
-        return f"Ошибка: {e}"
+        raise
 
 
 @tool
@@ -71,13 +69,13 @@ def read_file(path: str) -> str:
     try:
         file_path = _safe_path(path)
         if not file_path.exists():
-            return f"Файл не найден: {path}"
+            raise FileNotFoundError(f"Файл не найден: {path}")
         content = file_path.read_text(encoding="utf-8")
         logger.info("Прочитан файл: %s (%d символов)", file_path, len(content))
         return content
     except Exception as e:
         logger.error("Ошибка чтения файла %s: %s", path, e)
-        return f"Ошибка: {e}"
+        raise
 
 
 @tool
@@ -94,13 +92,13 @@ def edit_file(path: str, content: str) -> str:
     try:
         file_path = _safe_path(path)
         if not file_path.exists():
-            return f"Файл не найден: {path}. Используйте create_file для создания."
+            raise FileNotFoundError(f"Файл не найден: {path}. Используйте create_file для создания.")
         file_path.write_text(content, encoding="utf-8")
         logger.info("Файл перезаписан: %s", file_path)
         return f"Файл обновлён: {path}"
     except Exception as e:
         logger.error("Ошибка редактирования файла %s: %s", path, e)
-        return f"Ошибка: {e}"
+        raise
 
 
 @tool
@@ -116,13 +114,13 @@ def delete_file(path: str) -> str:
     try:
         file_path = _safe_path(path)
         if not file_path.exists():
-            return f"Файл не найден: {path}"
+            raise FileNotFoundError(f"Файл не найден: {path}")
         file_path.unlink()
         logger.info("Удалён файл: %s", file_path)
         return f"Файл удалён: {path}"
     except Exception as e:
         logger.error("Ошибка удаления файла %s: %s", path, e)
-        return f"Ошибка: {e}"
+        raise
 
 
 @tool
@@ -138,7 +136,7 @@ def list_files(subdir: str = "") -> str:
     try:
         dir_path = _safe_path(subdir) if subdir else WORKSPACE_DIR
         if not dir_path.exists():
-            return f"Директория не найдена: {subdir}"
+            raise FileNotFoundError(f"Директория не найдена: {subdir}")
 
         items = sorted(dir_path.iterdir())
         if not items:
@@ -155,7 +153,7 @@ def list_files(subdir: str = "") -> str:
         return "\n".join(lines)
     except Exception as e:
         logger.error("Ошибка листинга %s: %s", subdir, e)
-        return f"Ошибка: {e}"
+        raise
 
 
 @tool
@@ -175,7 +173,7 @@ def create_directory(path: str) -> str:
         return f"Директория создана: {path}"
     except Exception as e:
         logger.error("Ошибка создания директории %s: %s", path, e)
-        return f"Ошибка: {e}"
+        raise
 
 
 @tool
@@ -205,7 +203,7 @@ def save_dataframe(data_json: str, filename: str, output_format: str = "csv") ->
         return f"Данные сохранены в {filename} ({len(df)} строк)"
     except Exception as e:
         logger.error("Ошибка сохранения DataFrame %s: %s", filename, e)
-        return f"Ошибка: {e}"
+        raise
 
 
 # Список всех инструментов для регистрации в агенте

@@ -10,6 +10,7 @@ from core.sql_validator import (
     _build_alias_map,
     _extract_join_conditions,
     _find_subquery_join_aliases,
+    _has_top_level_where,
     _has_where_or_limit,
 )
 
@@ -79,6 +80,22 @@ class TestHasWhereOrLimit:
     def test_where_in_string_literal(self):
         sql = "SELECT 'WHERE is a keyword' FROM t"
         assert _has_where_or_limit(sql) is False
+
+
+class TestHasTopLevelWhere:
+    def test_update_with_where(self):
+        assert _has_top_level_where("UPDATE hr.emp SET name = 'x' WHERE id = 1") is True
+
+    def test_update_with_where_in_string_only(self):
+        sql = "UPDATE hr.emp SET note = 'WHERE id = 1'"
+        assert _has_top_level_where(sql) is False
+
+    def test_cte_update_with_top_level_where(self):
+        sql = (
+            "WITH src AS (SELECT id FROM hr.emp WHERE active = 1) "
+            "UPDATE hr.emp e SET flag = 1 FROM src WHERE e.id = src.id"
+        )
+        assert _has_top_level_where(sql) is True
 
 
 # ---------------------------------------------------------------------------
@@ -420,10 +437,12 @@ class _MockDB:
         return "Seq Scan"
 
     def check_key_uniqueness(self, schema, table, columns):
-        return {"is_unique": False, "duplicate_pct": self._dup_pct}
+        result = self._by_table.get(table, {"is_unique": False, "duplicate_pct": self._dup_pct})
+        return dict(result)
 
-    def __init__(self, dup_pct: float = 50.0):
+    def __init__(self, dup_pct: float = 50.0, by_table=None):
         self._dup_pct = dup_pct
+        self._by_table = by_table or {}
 
 
 class TestValidateReadThresholds:
@@ -445,31 +464,37 @@ class TestValidateReadThresholds:
         assert result.is_valid is True
 
     def test_hard_block_factor_above_2(self):
-        """factor > 2.0 → ROW EXPLOSION error, is_valid=False."""
-        # dup_pct=80 → unique_perc=20 → factor=5.0 per side, but both sides same table
-        db = _MockDB(dup_pct=80.0)
+        """many-to-many join должен блокироваться как ROW EXPLOSION."""
+        db = _MockDB(by_table={
+            "emp": {"is_unique": False, "duplicate_pct": 80.0},
+            "dept": {"is_unique": False, "duplicate_pct": 80.0},
+        })
         v = SQLValidator(db)
         result = v.validate("SELECT * FROM hr.emp e JOIN hr.dept d ON d.id = e.dept_id WHERE 1=1")
         assert result.is_valid is False
         assert any("ROW EXPLOSION" in e for e in result.errors)
 
-    def test_soft_block_factor_between_1_and_2(self):
-        """1.0 < factor <= 2.0 → JOIN RISK error, is_valid=False."""
-        # dup_pct=10 → unique_perc=90 → factor per column = 100/90 ≈ 1.11
-        # Both sides checked → product depends on dedup, but each ~1.11
-        db = _MockDB(dup_pct=10.0)
+    def test_many_to_one_passes(self):
+        """many-to-one join не должен блокироваться."""
+        db = _MockDB(by_table={
+            "emp": {"is_unique": False, "duplicate_pct": 10.0},
+            "dept": {"is_unique": True, "duplicate_pct": 0.0},
+        })
+        v = SQLValidator(db)
+        result = v.validate("SELECT * FROM hr.emp e JOIN hr.dept d ON d.id = e.dept_id WHERE 1=1")
+        assert result.is_valid is True
+        assert result.errors == []
+
+    def test_one_to_many_is_join_risk(self):
+        """one-to-many join должен идти в JOIN RISK."""
+        db = _MockDB(by_table={
+            "emp": {"is_unique": True, "duplicate_pct": 0.0},
+            "dept": {"is_unique": False, "duplicate_pct": 10.0},
+        })
         v = SQLValidator(db)
         result = v.validate("SELECT * FROM hr.emp e JOIN hr.dept d ON d.id = e.dept_id WHERE 1=1")
         assert result.is_valid is False
         assert any("JOIN RISK" in e for e in result.errors)
-
-    def test_soft_block_tiny_duplication(self):
-        """Even 1% duplication (factor≈1.01) → still blocked."""
-        db = _MockDB(dup_pct=1.0)
-        v = SQLValidator(db)
-        result = v.validate("SELECT * FROM hr.emp e JOIN hr.dept d ON d.id = e.dept_id WHERE 1=1")
-        assert result.is_valid is False
-        assert any("JOIN RISK" in e or "ROW EXPLOSION" in e for e in result.errors)
 
     def test_cross_join_always_blocks(self):
         """CROSS JOIN → always blocked regardless of DB uniqueness."""

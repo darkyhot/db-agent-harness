@@ -12,6 +12,7 @@ from langchain_core.tools import tool
 from core.database import DatabaseManager
 from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
+from tools.path_safety import resolve_workspace_path
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
 
@@ -54,7 +55,7 @@ def create_db_tools(
             Результат или превью с путём к файлу.
         """
         try:
-            df = db_manager.execute_query(sql, limit=limit)
+            df = db_manager.preview_query(sql, limit=limit)
             if df.empty:
                 return "Запрос выполнен. Результат пуст."
 
@@ -64,7 +65,7 @@ def create_db_tools(
 
             # Большой результат — превью + автосохранение
             preview = df.head(PREVIEW_ROWS).to_markdown(index=False)
-            auto_file = WORKSPACE_DIR / "last_query_result.csv"
+            auto_file = resolve_workspace_path(WORKSPACE_DIR, "last_query_result.csv")
             df.to_csv(auto_file, index=False, encoding="utf-8")
             return (
                 f"{preview}\n\n"
@@ -73,7 +74,7 @@ def create_db_tools(
             )
         except Exception as e:
             logger.error("execute_query error: %s", e)
-            return f"Ошибка выполнения запроса: {e}"
+            raise RuntimeError(f"Ошибка выполнения запроса: {e}") from e
 
     @tool
     def get_row_count(schema: str, table: str) -> str:
@@ -91,7 +92,7 @@ def create_db_tools(
             return f"Таблица {schema}.{table}: {count:,} строк"
         except Exception as e:
             logger.error("get_row_count error: %s", e)
-            return f"Ошибка: {e}"
+            raise RuntimeError(f"Ошибка: {e}") from e
 
     @tool
     def check_key_uniqueness(schema: str, table: str, columns: str) -> str:
@@ -109,11 +110,20 @@ def create_db_tools(
         if schema_loader is not None:
             result = schema_loader.check_key_uniqueness(schema, table, cols)
             if result.get("error"):
-                return result["error"]
+                raise ValueError(result["error"])
             if result["is_unique"]:
                 reason = "все колонки являются PK" if result["all_pk"] else "одна из колонок уникальна на 100%"
                 return (
                     f"Ключ ({columns}) в {schema}.{table} уникален ({reason}).\n"
+                    + "\n".join(
+                        f"  {c}: unique_perc={d.get('unique_perc', '?')}%, is_pk={d.get('is_primary_key', False)}"
+                        for c, d in result["columns"].items()
+                        if d.get("found")
+                    )
+                )
+            if result.get("status") == "unknown":
+                return (
+                    f"Ключ ({columns}) в {schema}.{table} не получил надёжного подтверждения из CSV.\n"
                     + "\n".join(
                         f"  {c}: unique_perc={d.get('unique_perc', '?')}%, is_pk={d.get('is_primary_key', False)}"
                         for c, d in result["columns"].items()
@@ -143,7 +153,7 @@ def create_db_tools(
             )
         except Exception as e:
             logger.error("check_key_uniqueness error: %s", e)
-            return f"Ошибка: {e}"
+            raise RuntimeError(f"Ошибка: {e}") from e
 
     @tool
     def get_sample(schema: str, table: str, n: int = 10) -> str:
@@ -167,7 +177,7 @@ def create_db_tools(
                 return df.to_markdown(index=False)
 
             preview = df.head(PREVIEW_ROWS).to_markdown(index=False)
-            auto_file = WORKSPACE_DIR / f"sample_{schema}_{table}.csv"
+            auto_file = resolve_workspace_path(WORKSPACE_DIR, f"sample_{schema}_{table}.csv")
             df.to_csv(auto_file, index=False, encoding="utf-8")
             return (
                 f"{preview}\n\n"
@@ -176,7 +186,7 @@ def create_db_tools(
             )
         except Exception as e:
             logger.error("get_sample error: %s", e)
-            return f"Ошибка: {e}"
+            raise RuntimeError(f"Ошибка: {e}") from e
 
     @tool
     def explain_query(sql: str) -> str:
@@ -193,7 +203,7 @@ def create_db_tools(
             return f"План выполнения:\n{plan}"
         except Exception as e:
             logger.error("explain_query error: %s", e)
-            return f"Ошибка: {e}"
+            raise RuntimeError(f"Ошибка: {e}") from e
 
     @tool
     def table_exists(schema: str, table: str) -> str:
@@ -213,7 +223,7 @@ def create_db_tools(
             return f"Таблица {schema}.{table} НЕ найдена."
         except Exception as e:
             logger.error("table_exists error: %s", e)
-            return f"Ошибка: {e}"
+            raise RuntimeError(f"Ошибка: {e}") from e
 
     @tool
     def get_table_ddl(schema: str, table: str) -> str:
@@ -233,7 +243,7 @@ def create_db_tools(
             return db_manager.get_table_ddl(schema, table)
         except Exception as e:
             logger.error("get_table_ddl error: %s", e)
-            return f"Ошибка: {e}"
+            raise RuntimeError(f"Ошибка: {e}") from e
 
     # === WRITE ===
 
@@ -252,7 +262,7 @@ def create_db_tools(
             return f"Запрос выполнен. Затронуто строк: {affected}"
         except Exception as e:
             logger.error("execute_write error: %s", e)
-            return f"Ошибка: {e}"
+            raise RuntimeError(f"Ошибка: {e}") from e
 
     @tool
     def estimate_affected_rows(where_clause: str, schema: str, table: str) -> str:
@@ -267,11 +277,11 @@ def create_db_tools(
             Количество строк, подходящих под условие.
         """
         try:
-            count = db_manager.estimate_affected_rows(where_clause, schema, table)
-            return f"Оценка: {count:,} строк будет затронуто в {schema}.{table}"
+            count = db_manager.count_affected_rows_readonly(where_clause, schema, table)
+            return f"Точное значение: {count:,} строк будет затронуто в {schema}.{table}"
         except Exception as e:
             logger.error("estimate_affected_rows error: %s", e)
-            return f"Ошибка: {e}"
+            raise RuntimeError(f"Ошибка: {e}") from e
 
     # === DDL ===
 
@@ -293,16 +303,16 @@ def create_db_tools(
             if sql_validator is not None:
                 validation = sql_validator.validate(sql)
                 if not validation.is_valid:
-                    return f"DDL отклонён валидатором:\n{validation.summary()}"
+                    raise ValueError(f"DDL отклонён валидатором:\n{validation.summary()}")
                 if validation.needs_confirmation:
-                    return (
+                    raise PermissionError(
                         f"DDL требует подтверждения: {validation.confirmation_message}\n"
                         "Используйте команду подтверждения перед выполнением."
                     )
             return db_manager.execute_ddl(sql)
         except Exception as e:
             logger.error("execute_ddl error: %s", e)
-            return f"Ошибка: {e}"
+            raise RuntimeError(f"Ошибка: {e}") from e
 
     @tool
     def export_query(sql: str, filename: str, output_format: str = "csv") -> str:
@@ -321,20 +331,18 @@ def create_db_tools(
             Сообщение об успехе с количеством строк или ошибка.
         """
         try:
-            df = db_manager.execute_query(sql)
-            file_path = WORKSPACE_DIR / filename
-            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path, row_count = db_manager.export_query_to_file(
+                sql=sql,
+                filename=filename,
+                output_format=output_format,
+                workspace_dir=WORKSPACE_DIR,
+            )
 
-            if output_format == "excel":
-                df.to_excel(file_path, index=False)
-            else:
-                df.to_csv(file_path, index=False, encoding="utf-8")
-
-            logger.info("Экспорт: %s (%d строк)", file_path, len(df))
-            return f"Сохранено в {filename} ({len(df)} строк)"
+            logger.info("Экспорт: %s (%d строк)", file_path, row_count)
+            return f"Сохранено в {file_path.relative_to(WORKSPACE_DIR)} ({row_count} строк)"
         except Exception as e:
             logger.error("export_query error: %s", e)
-            return f"Ошибка экспорта: {e}"
+            raise RuntimeError(f"Ошибка экспорта: {e}") from e
 
     tools_list = [
         execute_query,

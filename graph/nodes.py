@@ -18,9 +18,49 @@ from core.sql_validator import SQLValidator
 from core.database import DatabaseManager
 from graph.state import AgentState
 
+try:
+    from json_repair import repair_json
+except ImportError:
+    repair_json = None
+
+try:
+    from core.synonym_map import expand_with_synonyms
+except ImportError:
+    expand_with_synonyms = None
+
 logger = logging.getLogger(__name__)
 
 # === РћР±С‰РёРµ РєРѕРЅСЃС‚Р°РЅС‚С‹ РґР»СЏ РїСЂРѕРјРїС‚РѕРІ ===
+
+SQL_FEW_SHOT_EXAMPLES = (
+    "=== ПРИМЕРЫ SQL (используй как образец стиля) ===\n\n"
+    "1. Агрегация + фильтр по дате:\n"
+    "   SELECT region, COUNT(DISTINCT client_id) AS unique_clients\n"
+    "   FROM dm.sales\n"
+    "   WHERE sale_date >= '2024-01-01'::date AND sale_date < '2024-02-01'::date\n"
+    "   GROUP BY region\n"
+    "   ORDER BY unique_clients DESC;\n\n"
+    "2. JOIN с дедупликацией через DISTINCT ON:\n"
+    "   SELECT c.client_id, c.name, s.total_amount\n"
+    "   FROM dm.clients c\n"
+    "   JOIN (\n"
+    "       SELECT DISTINCT ON (client_id) client_id, amount AS total_amount\n"
+    "       FROM dm.sales ORDER BY client_id, sale_date DESC\n"
+    "   ) s ON s.client_id = c.client_id;\n\n"
+    "3. Подзапрос с агрегацией (избегаем row explosion):\n"
+    "   SELECT c.client_id, c.name, agg.total_sales\n"
+    "   FROM dm.clients c\n"
+    "   JOIN (\n"
+    "       SELECT client_id, SUM(amount) AS total_sales\n"
+    "       FROM dm.sales GROUP BY client_id\n"
+    "   ) agg ON agg.client_id = c.client_id;\n\n"
+    "4. NULL-обработка и COALESCE:\n"
+    "   SELECT client_id, COALESCE(phone, email, 'нет контакта') AS contact\n"
+    "   FROM dm.clients\n"
+    "   WHERE status IS NOT NULL AND region = 'Москва';\n\n"
+    "5. Поиск через search_by_description (диагностика):\n"
+    '   {"tool": "search_by_description", "args": {"query": "отток клиентов"}}\n'
+)
 
 SQL_RULES = (
     "РџСЂР°РІРёР»Р° SQL (Greenplum / PostgreSQL):\n"
@@ -181,6 +221,32 @@ class GraphNodes:
         sys_budget = int(max_chars * 0.4)
         usr_budget = max_chars - sys_budget
 
+        
+        # --- Step 0: trim markdown table samples (10->3 rows) ---
+        def _trim_md_tables(text: str, max_data_rows: int = 3) -> str:
+            lines_out = []
+            in_table = False
+            data_row_count = 0
+            for line in text.split('\n'):
+                if line.strip().startswith('|'):
+                    if not in_table:
+                        in_table = True
+                        data_row_count = 0
+                    data_row_count += 1
+                    # header(1) + separator(2) + max_data_rows
+                    if data_row_count <= max_data_rows + 2:
+                        lines_out.append(line)
+                    elif data_row_count == max_data_rows + 3:
+                        lines_out.append('| ... (rows trimmed) |')
+                else:
+                    in_table = False
+                    data_row_count = 0
+                    lines_out.append(line)
+            return '\n'.join(lines_out)
+
+        if len(system_prompt) + len(user_prompt) > max_chars:
+            user_prompt = _trim_md_tables(user_prompt)
+
         # --- РЁР°Рі 1: РѕР±СЂРµР·Р°С‚СЊ СЃРµРєС†РёСЋ Р РђР—Р’Р•Р”РљР РўРђР‘Р›РР¦ (СЃР°РјСѓСЋ Р±РѕР»СЊС€СѓСЋ) ---
         if len(user_prompt) > usr_budget:
             tables_marker = "=== Р РђР—Р’Р•Р”РљРђ РўРђР‘Р›РР¦"
@@ -305,6 +371,14 @@ class GraphNodes:
         # Р‘РѕР»СЊС€РѕР№ РєР°С‚Р°Р»РѕРі вЂ” РїСЂРµРґС„РёР»СЊС‚СЂР°С†РёСЏ РїРѕ РєР»СЋС‡РµРІС‹Рј СЃР»РѕРІР°Рј Р·Р°РїСЂРѕСЃР°
         words = re.findall(r'[a-zA-ZР°-СЏРђ-РЇС‘РЃ]{3,}', user_input.lower())
         keywords = [w for w in words if w not in self._STOP_WORDS]
+
+        # Расширяем ключевые слова синонимами (русский↔английский бизнес-термины)
+        if expand_with_synonyms is not None and keywords:
+            expanded = expand_with_synonyms(" ".join(keywords))
+            extra_words = re.findall(r'[a-zA-ZА-Яа-яёЁ]{3,}', expanded.lower())
+            for ew in extra_words:
+                if ew not in keywords and ew not in self._STOP_WORDS:
+                    keywords.append(ew)
 
         if not keywords:
             # РќРµС‚ Р·РЅР°С‡РёРјС‹С… СЃР»РѕРІ вЂ” РѕС‚РґР°С‘Рј РІРµСЃСЊ РєР°С‚Р°Р»РѕРі
@@ -481,6 +555,7 @@ class GraphNodes:
             "FROM dm.sales WHERE sale_date >= '2024-01-01'::date GROUP BY client_id LIMIT 100\"}}\n"
             '{"tool": "get_table_columns", "args": {"schema": "dm", "table": "clients"}}\n'
             '{"tool": "none", "result": "Р’ РєР°С‚Р°Р»РѕРіРµ РЅР°Р№РґРµРЅРѕ 3 С‚Р°Р±Р»РёС†С‹ СЃ РґР°РЅРЅС‹РјРё Рѕ РїСЂРѕРґР°Р¶Р°С…."}\n\n'
+            f"{SQL_FEW_SHOT_EXAMPLES}\n\n"
             f"{SQL_RULES}\n\n"
             f"{GIGACHAT_COMMON_ERRORS}\n\n"
             "РџРѕСЂСЏРґРѕРє СЂР°СЃСЃСѓР¶РґРµРЅРёР№ РїСЂРё РЅР°РїРёСЃР°РЅРёРё SQL:\n"
@@ -590,6 +665,12 @@ class GraphNodes:
             "5. Р”Р»СЏ DDL: СЃРїСЂРѕРµРєС‚РёСЂСѓР№ СЃС‚СЂСѓРєС‚СѓСЂСѓ в†’ execute_ddl"
         )
 
+
+        # Добавляем контекст replanning если есть
+        replan_ctx = state.get("replan_context", "")
+        if replan_ctx:
+            user_prompt += f"\n\n⚠ REPLANNING: предыдущий план не удался.\n{replan_ctx}\nСоставь НОВЫЙ план с другим подходом."
+
         system_prompt, user_prompt = self._trim_to_budget(system_prompt, user_prompt)
 
         if self.debug_prompt:
@@ -607,6 +688,8 @@ class GraphNodes:
             "current_step": 0,
             "retry_count": 0,
             "last_error": None,
+            "needs_replan": False,
+            "replan_context": "",
             "messages": state["messages"] + [
                 {"role": "user", "content": user_input},
                 {"role": "assistant", "content": "РџР»Р°РЅ:\n" + "\n".join(plan)},
@@ -1085,6 +1168,17 @@ class GraphNodes:
                 except (json.JSONDecodeError, ValueError):
                     continue
 
+        # Попытка восстановления через json_repair
+        if repair_json is not None:
+            try:
+                repaired = repair_json(cleaned)
+                parsed = json.loads(repaired)
+                if isinstance(parsed, dict) and "tool" in parsed:
+                    logger.info("json_repair recovered valid tool call")
+                    return parsed
+            except (json.JSONDecodeError, ValueError, Exception):
+                pass
+
         # Retry: РїРѕРІС‚РѕСЂРЅС‹Р№ Р·Р°РїСЂРѕСЃ Рє LLM СЃ СѓС‚РѕС‡РЅРµРЅРёРµРј С„РѕСЂРјР°С‚Р°
         if retry_on_fail:
             logger.warning("JSON РЅРµ РЅР°Р№РґРµРЅ РІ РѕС‚РІРµС‚Рµ LLM, retry СЃ СѓС‚РѕС‡РЅРµРЅРёРµРј С„РѕСЂРјР°С‚Р°")
@@ -1347,6 +1441,50 @@ class GraphNodes:
 
         return warnings
 
+    def _semantic_sql_check(self, user_input: str, sql: str) -> list[str]:
+        """Проверить семантическое соответствие SQL запросу пользователя.
+
+        Lightweight LLM-вызов для обнаружения типичных семантических ошибок:
+        - Пропущенные фильтры дат (запрос за январь, но SQL без верхней границы)
+        - COUNT(*) вместо COUNT(DISTINCT ...)
+        - Неправильная гранулярность агрегации
+
+        Args:
+            user_input: Запрос пользователя.
+            sql: Сгенерированный SQL.
+
+        Returns:
+            Список предупреждений (пустой если всё корректно).
+        """
+        system = (
+            "Ты — валидатор SQL-запросов. Проверь, соответствует ли SQL запросу пользователя.\n"
+            "Проверяй ТОЛЬКО:\n"
+            "1. Фильтры дат: если запрос за конкретный период — есть ли ОБЕ границы (>= и <)?\n"
+            "2. Агрегация: если спрашивают 'сколько уникальных' — используется ли COUNT(DISTINCT)?\n"
+            "3. Гранулярность: если спрашивают итог — нет ли лишней детализации?\n"
+            "4. GROUP BY: все ли не-агрегированные колонки перечислены?\n\n"
+            "Верни JSON-массив строк с предупреждениями. Если всё корректно — верни [].\n"
+            "Пример: [\"Пропущена верхняя граница даты: добавь AND date < '2024-02-01'\"]\n"
+            "Верни ТОЛЬКО JSON-массив, без пояснений."
+        )
+        user = f"Запрос: {user_input}\n\nSQL:\n{sql}"
+
+        try:
+            response = self.llm.invoke_with_system(system, user, temperature=0.0)
+            # Parse response
+            cleaned = self._clean_llm_json(response)
+            import re as _re
+            match = _re.search(r'\[.*\]', cleaned, _re.DOTALL)
+            if match:
+                import json as _json
+                warnings = _json.loads(match.group())
+                if isinstance(warnings, list):
+                    return [str(w) for w in warnings if w]
+        except Exception as e:
+            logger.warning("Semantic SQL check failed: %s", e)
+
+        return []
+
     def sql_validator_node(self, state: AgentState) -> dict[str, Any]:
         """РЈР·РµР» РІР°Р»РёРґР°С†РёРё SQL: РїСЂРѕРІРµСЂСЏРµС‚ SQL РїРµСЂРµРґ РІС‹РїРѕР»РЅРµРЅРёРµРј.
 
@@ -1457,6 +1595,14 @@ class GraphNodes:
         if empty_result:
             warnings_text += "\nвљ  Р—Р°РїСЂРѕСЃ РІРµСЂРЅСѓР» 0 СЃС‚СЂРѕРє. Р’РѕР·РјРѕР¶РЅРѕ, СѓСЃР»РѕРІРёСЏ С„РёР»СЊС‚СЂР°С†РёРё СЃР»РёС€РєРѕРј СЃС‚СЂРѕРіРёРµ " \
                              "РёР»Рё РґР°РЅРЅС‹Рµ РѕС‚СЃСѓС‚СЃС‚РІСѓСЋС‚. РџСЂРѕРІРµСЂСЊ СѓСЃР»РѕРІРёСЏ WHERE, Р·РЅР°С‡РµРЅРёСЏ С„РёР»СЊС‚СЂРѕРІ Рё С„РѕСЂРјР°С‚ РґР°С‚."
+
+
+        # Семантическая проверка SQL (lightweight LLM call)
+        semantic_warnings = self._semantic_sql_check(state["user_input"], sql)
+        if semantic_warnings:
+            semantic_text = "\n".join(f"\u26a0 Семантика: {w}" for w in semantic_warnings)
+            warnings_text += "\n" + semantic_text
+            logger.info("Semantic SQL warnings: %s", semantic_warnings)
 
         # РџРѕРґСЃС‡С‘С‚ СЃС‚СЂРѕРє РёР· markdown-С‚Р°Р±Р»РёС†С‹ (РЅСѓР¶РµРЅ РґР»СЏ sanity checks Рё post-exec detection)
         if structured_payload is not None:
@@ -1569,13 +1715,27 @@ class GraphNodes:
         logger.info("Corrector: РїРѕРїС‹С‚РєР° %d/%d, РѕС€РёР±РєР°: %s", retry_count + 1, self.MAX_RETRIES, error[:200])
 
         if retry_count >= self.MAX_RETRIES:
+            replan_count = state.get("replan_count", 0)
+            # Попробовать replanning один раз перед сдачей
+            if replan_count < 1:
+                logger.info("Corrector: попытки исчерпаны, запрашиваю replanning")
+                return {
+                    "last_error": None,
+                    "retry_count": 0,
+                    "replan_count": replan_count + 1,
+                    "needs_replan": True,
+                    "replan_context": f"Шаг '{current_step}' не удался после {self.MAX_RETRIES} попыток. "
+                                      f"Последняя ошибка: {error}",
+                    "graph_iterations": iterations,
+                }
+            # Replanning уже был — сдаёмся
             return {
                 "last_error": None,
                 "current_step": step_idx + 1,
                 "retry_count": 0,
                 "graph_iterations": iterations,
-                "final_answer": f"РќРµ СѓРґР°Р»РѕСЃСЊ РІС‹РїРѕР»РЅРёС‚СЊ С€Р°Рі '{current_step}' РїРѕСЃР»Рµ {self.MAX_RETRIES} РїРѕРїС‹С‚РѕРє. "
-                                f"РџРѕСЃР»РµРґРЅСЏСЏ РѕС€РёР±РєР°: {error}",
+                "final_answer": f"Не удалось выполнить шаг '{current_step}' после {self.MAX_RETRIES} попыток. "
+                                f"Последняя ошибка: {error}",
             }
 
         recent_calls = state.get("tool_calls", [])[-3:]
@@ -1792,7 +1952,7 @@ class GraphNodes:
             print(f"\n{'='*80}\n[DEBUG PROMPT вЂ” summarizer]\n{'='*80}\n"
                   f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
 
-        answer = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.5)
+        answer = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.2)
         self.memory.add_message("assistant", answer)
 
         logger.info("Summarizer: РѕС‚РІРµС‚ СЃС„РѕСЂРјРёСЂРѕРІР°РЅ")

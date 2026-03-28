@@ -109,6 +109,10 @@ def _route_after_corrector(state: AgentState) -> str:
     if _is_timed_out(state):
         return "summarizer"
 
+    # Нужен replanning — возвращаемся к planner
+    if state.get("needs_replan"):
+        return "planner"
+
     # Есть SQL для валидации после коррекции
     if state.get("sql_to_validate"):
         return "sql_validator"
@@ -187,6 +191,7 @@ def build_graph(
     })
 
     graph.add_conditional_edges("corrector", _route_after_corrector, {
+        "planner": "planner",
         "sql_validator": "sql_validator",
         "corrector": "corrector",
         "summarizer": "summarizer",
@@ -227,4 +232,7 @@ def create_initial_state(user_input: str) -> AgentState:
         correction_examples=[],
         join_risk_info={},
         start_time=time.monotonic(),
+        replan_count=0,
+        needs_replan=False,
+        replan_context="",
     )

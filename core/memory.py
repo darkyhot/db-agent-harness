@@ -417,6 +417,80 @@ class MemoryManager:
 
         return count
 
+    def get_sql_quality_metrics(self, days: int = 30) -> dict[str, Any]:
+        """Получить метрики качества генерации SQL за указанный период.
+
+        Args:
+            days: Период в днях для анализа.
+
+        Returns:
+            Словарь с метриками качества.
+        """
+        from datetime import timedelta
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff = cutoff_dt.isoformat()
+
+        with self._connect() as conn:
+            # Общее количество SQL-запросов
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM sql_audit WHERE timestamp >= ?", (cutoff,)
+            )
+            total = cursor.fetchone()[0]
+
+            if total == 0:
+                return {"total_queries": 0, "period_days": days}
+
+            # Распределение по статусам
+            cursor = conn.execute(
+                "SELECT status, COUNT(*) FROM sql_audit WHERE timestamp >= ? GROUP BY status",
+                (cutoff,),
+            )
+            status_dist = dict(cursor.fetchall())
+
+            # Успешность с первой попытки (retry_count = 0 и status = 'success')
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM sql_audit "
+                "WHERE timestamp >= ? AND status = 'success' AND retry_count = 0",
+                (cutoff,),
+            )
+            first_try_success = cursor.fetchone()[0]
+
+            # Среднее количество retry
+            cursor = conn.execute(
+                "SELECT AVG(retry_count), MAX(retry_count) FROM sql_audit WHERE timestamp >= ?",
+                (cutoff,),
+            )
+            avg_retry, max_retry = cursor.fetchone()
+
+            # Среднее время выполнения
+            cursor = conn.execute(
+                "SELECT AVG(duration_ms), MAX(duration_ms) FROM sql_audit WHERE timestamp >= ?",
+                (cutoff,),
+            )
+            avg_duration, max_duration = cursor.fetchone()
+
+            # Распределение типов ошибок
+            cursor = conn.execute(
+                "SELECT error_type, COUNT(*) FROM sql_audit "
+                "WHERE timestamp >= ? AND error_type != '' GROUP BY error_type",
+                (cutoff,),
+            )
+            error_dist = dict(cursor.fetchall())
+
+            success_count = status_dist.get("success", 0)
+            return {
+                "total_queries": total,
+                "period_days": days,
+                "success_rate": round(success_count / total * 100, 1) if total > 0 else 0,
+                "first_try_success_rate": round(first_try_success / total * 100, 1) if total > 0 else 0,
+                "status_distribution": status_dist,
+                "avg_retries": round(float(avg_retry or 0), 2),
+                "max_retries": int(max_retry or 0),
+                "avg_duration_ms": round(float(avg_duration or 0), 0),
+                "max_duration_ms": int(max_duration or 0),
+                "error_distribution": error_dist,
+            }
+
     @property
     def session_count(self) -> int:
         """Количество сессий с резюме."""

@@ -38,3 +38,6 @@ class AgentState(TypedDict):
     correction_examples: list
     join_risk_info: dict
     start_time: float
+    replan_count: int
+    needs_replan: bool
+    replan_context: str

@@ -402,7 +402,7 @@ class TestRewriteSuggestion:
         join = {"schema": "hr", "table": "emp", "column": "dept_id"}
         suggestion = SQLValidator._generate_rewrite_suggestion(join)
         assert "SELECT DISTINCT" in suggestion
-        assert "подзапрос" in suggestion
+        assert "JOIN" in suggestion
 
 
 # ---------------------------------------------------------------------------

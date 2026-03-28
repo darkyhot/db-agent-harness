@@ -1,4 +1,4 @@
-﻿"""РџРѕРґРєР»СЋС‡РµРЅРёРµ Рє Greenplum (PostgreSQL-СЃРѕРІРјРµСЃС‚РёРјС‹Р№) Рё РІС‹РїРѕР»РЅРµРЅРёРµ Р·Р°РїСЂРѕСЃРѕРІ."""
+"""Подключение к Greenplum (PostgreSQL-совместимый) и выполнение запросов."""
 
 import json
 import logging
@@ -17,15 +17,15 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
-# Regex РґР»СЏ РІР°Р»РёРґР°С†РёРё РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂРѕРІ (СЃС…РµРјР°, С‚Р°Р±Р»РёС†Р°, РєРѕР»РѕРЅРєР°)
+# Regex для валидации идентификаторов (схема, таблица, колонка)
 _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
-# РўР°Р№РјР°СѓС‚ РЅР° SQL-Р·Р°РїСЂРѕСЃС‹ (РјСЃ)
-STATEMENT_TIMEOUT_MS = 300_000  # 5 РјРёРЅСѓС‚
+# Таймаут на SQL-запросы (мс)
+STATEMENT_TIMEOUT_MS = 300_000  # 5 минут
 
 
 def _has_top_level_limit(sql: str) -> bool:
-    """РџСЂРѕРІРµСЂРёС‚СЊ РЅР°Р»РёС‡РёРµ LIMIT РЅР° РІРµСЂС…РЅРµРј СѓСЂРѕРІРЅРµ SQL statement."""
+    """Проверить наличие LIMIT на верхнем уровне SQL statement."""
     statements = sqlparse.parse(sql)
     if not statements:
         return False
@@ -40,34 +40,34 @@ def _has_top_level_limit(sql: str) -> bool:
 
 
 def _validate_identifier(name: str, kind: str = "identifier") -> str:
-    """РџСЂРѕРІРµСЂРёС‚СЊ С‡С‚Рѕ СЃС‚СЂРѕРєР° вЂ” РґРѕРїСѓСЃС‚РёРјС‹Р№ SQL-РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂ.
+    """Проверить что строка — допустимый SQL-идентификатор.
 
     Args:
-        name: РРјСЏ РґР»СЏ РїСЂРѕРІРµСЂРєРё.
-        kind: РўРёРї РёРґРµРЅС‚РёС„РёРєР°С‚РѕСЂР° (РґР»СЏ СЃРѕРѕР±С‰РµРЅРёСЏ РѕР± РѕС€РёР±РєРµ).
+        name: Имя для проверки.
+        kind: Тип идентификатора (для сообщения об ошибке).
 
     Returns:
-        РџСЂРѕРІРµСЂРµРЅРЅРѕРµ РёРјСЏ.
+        Проверенное имя.
 
     Raises:
-        ValueError: Р•СЃР»Рё РёРјСЏ СЃРѕРґРµСЂР¶РёС‚ РЅРµРґРѕРїСѓСЃС‚РёРјС‹Рµ СЃРёРјРІРѕР»С‹.
+        ValueError: Если имя содержит недопустимые символы.
     """
     if not _IDENTIFIER_RE.match(name):
         raise ValueError(
-            f"РќРµРґРѕРїСѓСЃС‚РёРјС‹Р№ {kind}: '{name}'. "
-            "Р”РѕРїСѓСЃС‚РёРјС‹ С‚РѕР»СЊРєРѕ Р»Р°С‚РёРЅСЃРєРёРµ Р±СѓРєРІС‹, С†РёС„СЂС‹ Рё РїРѕРґС‡С‘СЂРєРёРІР°РЅРёРµ."
+            f"Недопустимый {kind}: '{name}'. "
+            "Допустимы только латинские буквы, цифры и подчёркивание."
         )
     return name
 
 
 class DatabaseManager:
-    """РњРµРЅРµРґР¶РµСЂ РїРѕРґРєР»СЋС‡РµРЅРёСЏ Рє Greenplum С‡РµСЂРµР· SQLAlchemy."""
+    """Менеджер подключения к Greenplum через SQLAlchemy."""
 
     def __init__(self, config_path: Path | None = None) -> None:
-        """РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ РёР· config.json.
+        """Инициализация из config.json.
 
         Args:
-            config_path: РџСѓС‚СЊ Рє С„Р°Р№Р»Сѓ РєРѕРЅС„РёРіСѓСЂР°С†РёРё. РџРѕ СѓРјРѕР»С‡Р°РЅРёСЋ вЂ” config.json РІ РєРѕСЂРЅРµ РїСЂРѕРµРєС‚Р°.
+            config_path: Путь к файлу конфигурации. По умолчанию — config.json в корне проекта.
         """
         self._config_path = config_path or CONFIG_PATH
         self._engine: Engine | None = None
@@ -75,25 +75,25 @@ class DatabaseManager:
         self._load_config()
 
     def _load_config(self) -> None:
-        """Р—Р°РіСЂСѓР·РєР° РєРѕРЅС„РёРіСѓСЂР°С†РёРё РёР· JSON-С„Р°Р№Р»Р°."""
+        """Загрузка конфигурации из JSON-файла."""
         try:
             with open(self._config_path, encoding="utf-8") as f:
                 self._config = json.load(f)
-            logger.info("РљРѕРЅС„РёРіСѓСЂР°С†РёСЏ Р·Р°РіСЂСѓР¶РµРЅР° РёР· %s", self._config_path)
+            logger.info("Конфигурация загружена из %s", self._config_path)
         except FileNotFoundError:
-            logger.warning("Р¤Р°Р№Р» РєРѕРЅС„РёРіСѓСЂР°С†РёРё РЅРµ РЅР°Р№РґРµРЅ: %s", self._config_path)
+            logger.warning("Файл конфигурации не найден: %s", self._config_path)
             self._config = {}
 
     def save_config(
         self, user_id: str, host: str, port: int = 5432, database: str = "prom"
     ) -> None:
-        """РЎРѕС…СЂР°РЅРёС‚СЊ РєРѕРЅС„РёРіСѓСЂР°С†РёСЋ РїРѕРґРєР»СЋС‡РµРЅРёСЏ РІ config.json.
+        """Сохранить конфигурацию подключения в config.json.
 
         Args:
-            user_id: РРјСЏ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ Р‘Р”.
-            host: РҐРѕСЃС‚ СЃРµСЂРІРµСЂР°.
-            port: РџРѕСЂС‚ РїРѕРґРєР»СЋС‡РµРЅРёСЏ.
-            database: РРјСЏ Р±Р°Р·С‹ РґР°РЅРЅС‹С….
+            user_id: Имя пользователя БД.
+            host: Хост сервера.
+            port: Порт подключения.
+            database: Имя базы данных.
         """
         self._config = {
             "user_id": user_id,
@@ -105,45 +105,45 @@ class DatabaseManager:
         with open(self._config_path, "w", encoding="utf-8") as f:
             json.dump(self._config, f, indent=4, ensure_ascii=False)
         self._engine = None
-        logger.info("РљРѕРЅС„РёРіСѓСЂР°С†РёСЏ СЃРѕС…СЂР°РЅРµРЅР°: %s@%s:%d/%s", user_id, host, port, database)
+        logger.info("Конфигурация сохранена: %s@%s:%d/%s", user_id, host, port, database)
 
     @property
     def runtime_config(self) -> dict[str, Any]:
-        """РўРµРєСѓС‰Р°СЏ РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ runtime (РєРѕРїРёСЏ)."""
+        """Текущая конфигурация runtime (копия)."""
         return dict(self._config)
 
     def set_debug_prompt(self, enabled: bool) -> None:
-        """РћР±РЅРѕРІРёС‚СЊ С„Р»Р°Рі debug_prompt РІ РєРѕРЅС„РёРіСѓСЂР°С†РёРё."""
+        """Обновить флаг debug_prompt в конфигурации."""
         self._config["debug_prompt"] = bool(enabled)
 
     @property
     def is_configured(self) -> bool:
-        """РџСЂРѕРІРµСЂРєР° РЅР°Р»РёС‡РёСЏ РјРёРЅРёРјР°Р»СЊРЅРѕР№ РєРѕРЅС„РёРіСѓСЂР°С†РёРё."""
+        """Проверка наличия минимальной конфигурации."""
         return bool(self._config.get("user_id") and self._config.get("host"))
 
     @property
     def config_summary(self) -> str:
-        """РЎС‚СЂРѕРєР° СЃ С‚РµРєСѓС‰РµР№ РєРѕРЅС„РёРіСѓСЂР°С†РёРµР№ РґР»СЏ РѕС‚РѕР±СЂР°Р¶РµРЅРёСЏ."""
+        """Строка с текущей конфигурацией для отображения."""
         if not self.is_configured:
-            return "РЅРµ РЅР°СЃС‚СЂРѕРµРЅРѕ"
+            return "не настроено"
         c = self._config
         return f"{c['user_id']}@{c['host']}:{c.get('port', 5432)}/{c.get('database', 'prom')}"
 
     def get_engine(self) -> Engine:
-        """РџРѕР»СѓС‡РёС‚СЊ РёР»Рё СЃРѕР·РґР°С‚СЊ SQLAlchemy engine.
+        """Получить или создать SQLAlchemy engine.
 
         Returns:
-            Р­РєР·РµРјРїР»СЏСЂ Engine.
+            Экземпляр Engine.
 
         Raises:
-            RuntimeError: Р•СЃР»Рё РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ РЅРµ Р·Р°РґР°РЅР°.
+            RuntimeError: Если конфигурация не задана.
         """
         if self._engine is not None:
             return self._engine
 
         if not self.is_configured:
             raise RuntimeError(
-                "Р‘Р” РЅРµ РЅР°СЃС‚СЂРѕРµРЅР°. РСЃРїРѕР»СЊР·СѓР№С‚Рµ РєРѕРјР°РЅРґСѓ 'config' РґР»СЏ РЅР°СЃС‚СЂРѕР№РєРё РїРѕРґРєР»СЋС‡РµРЅРёСЏ."
+                "БД не настроена. Используйте команду 'config' для настройки подключения."
             )
 
         user = self._config["user_id"]
@@ -157,48 +157,48 @@ class DatabaseManager:
             pool_pre_ping=True,
             connect_args={"options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"},
         )
-        logger.info("Engine СЃРѕР·РґР°РЅ: %s@%s:%d/%s (timeout=%dms)", user, host, port, database, STATEMENT_TIMEOUT_MS)
+        logger.info("Engine создан: %s@%s:%d/%s (timeout=%dms)", user, host, port, database, STATEMENT_TIMEOUT_MS)
         return self._engine
 
     def preview_query(self, sql: str, limit: int = 1000) -> pd.DataFrame:
-        """Р’С‹РїРѕР»РЅРёС‚СЊ SELECT-Р·Р°РїСЂРѕСЃ РІ СЂРµР¶РёРјРµ preview (СЃ Р°РІС‚Рѕ-LIMIT).
+        """Выполнить SELECT-запрос в режиме preview (с авто-LIMIT).
 
         Args:
-            sql: SQL-Р·Р°РїСЂРѕСЃ (SELECT).
-            limit: РњР°РєСЃРёРјР°Р»СЊРЅРѕРµ РєРѕР»РёС‡РµСЃС‚РІРѕ СЃС‚СЂРѕРє.
+            sql: SQL-запрос (SELECT).
+            limit: Максимальное количество строк.
 
         Returns:
-            DataFrame СЃ СЂРµР·СѓР»СЊС‚Р°С‚Р°РјРё.
+            DataFrame с результатами.
         """
         sql_stripped = sql.strip().rstrip(";")
         if not _has_top_level_limit(sql_stripped):
             sql_stripped = f"SELECT * FROM ({sql_stripped}) _sub LIMIT :_limit"
-            logger.info("Р’С‹РїРѕР»РЅРµРЅРёРµ SELECT (СЃ Р°РІС‚Рѕ-LIMIT): %s", sql_stripped[:200])
+            logger.info("Выполнение SELECT (с авто-LIMIT): %s", sql_stripped[:200])
             with self.get_engine().connect() as conn:
                 df = pd.read_sql(text(sql_stripped), conn, params={"_limit": limit})
         else:
-            logger.info("Р’С‹РїРѕР»РЅРµРЅРёРµ SELECT: %s", sql_stripped[:200])
+            logger.info("Выполнение SELECT: %s", sql_stripped[:200])
             with self.get_engine().connect() as conn:
                 df = pd.read_sql(text(sql_stripped), conn)
 
-        logger.info("РџРѕР»СѓС‡РµРЅРѕ СЃС‚СЂРѕРє: %d", len(df))
+        logger.info("Получено строк: %d", len(df))
         return df
 
     def run_read_query(self, sql: str) -> pd.DataFrame:
-        """Р’С‹РїРѕР»РЅРёС‚СЊ SELECT Р±РµР· Р°РІС‚Рѕ-LIMIT (full read/export mode)."""
+        """Выполнить SELECT без авто-LIMIT (full read/export mode)."""
         sql_stripped = sql.strip().rstrip(";")
-        logger.info("Р’С‹РїРѕР»РЅРµРЅРёРµ SELECT Р±РµР· Р°РІС‚Рѕ-LIMIT: %s", sql_stripped[:200])
+        logger.info("Выполнение SELECT без авто-LIMIT: %s", sql_stripped[:200])
         with self.get_engine().connect() as conn:
             df = pd.read_sql(text(sql_stripped), conn)
-        logger.info("РџРѕР»СѓС‡РµРЅРѕ СЃС‚СЂРѕРє (full): %d", len(df))
+        logger.info("Получено строк (full): %d", len(df))
         return df
 
     def execute_query(self, sql: str, limit: int = 1000) -> pd.DataFrame:
-        """РЎРѕРІРјРµСЃС‚РёРјРѕСЃС‚СЊ: execute_query = preview_query."""
+        """Совместимость: execute_query = preview_query."""
         return self.preview_query(sql, limit=limit)
 
     def export_query(self, sql: str) -> pd.DataFrame:
-        """Р’С‹РїРѕР»РЅРёС‚СЊ SELECT РґР»СЏ РїРѕР»РЅРѕР№ РІС‹РіСЂСѓР·РєРё Р±РµР· Р°РІС‚Рѕ-LIMIT."""
+        """Выполнить SELECT для полной выгрузки без авто-LIMIT."""
         return self.run_read_query(sql)
 
     def export_query_to_file(
@@ -208,7 +208,7 @@ class DatabaseManager:
         output_format: str,
         workspace_dir: Path,
     ) -> tuple[Path, int]:
-        """Р’С‹РіСЂСѓР·РёС‚СЊ СЂРµР·СѓР»СЊС‚Р°С‚ SELECT РІ С„Р°Р№Р» РІРЅСѓС‚СЂРё workspace."""
+        """Выгрузить результат SELECT в файл внутри workspace."""
         file_path = resolve_workspace_path(workspace_dir, filename)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         df = self.export_query(sql)
@@ -219,48 +219,48 @@ class DatabaseManager:
         return file_path, len(df)
 
     def execute_write(self, sql: str) -> int:
-        """Р’С‹РїРѕР»РЅРёС‚СЊ INSERT/UPDATE/DELETE Рё РІРµСЂРЅСѓС‚СЊ РєРѕР»РёС‡РµСЃС‚РІРѕ Р·Р°С‚СЂРѕРЅСѓС‚С‹С… СЃС‚СЂРѕРє.
+        """Выполнить INSERT/UPDATE/DELETE и вернуть количество затронутых строк.
 
         Args:
-            sql: SQL-Р·Р°РїСЂРѕСЃ (INSERT/UPDATE/DELETE).
+            sql: SQL-запрос (INSERT/UPDATE/DELETE).
 
         Returns:
-            РљРѕР»РёС‡РµСЃС‚РІРѕ Р·Р°С‚СЂРѕРЅСѓС‚С‹С… СЃС‚СЂРѕРє.
+            Количество затронутых строк.
         """
         engine = self.get_engine()
-        logger.info("Р’С‹РїРѕР»РЅРµРЅРёРµ WRITE: %s", sql[:200])
+        logger.info("Выполнение WRITE: %s", sql[:200])
         with engine.connect() as conn:
             result = conn.execute(text(sql))
             conn.commit()
             affected = result.rowcount
-        logger.info("Р—Р°С‚СЂРѕРЅСѓС‚Рѕ СЃС‚СЂРѕРє: %d", affected)
+        logger.info("Затронуто строк: %d", affected)
         return affected
 
     def execute_ddl(self, sql: str) -> str:
-        """Р’С‹РїРѕР»РЅРёС‚СЊ DDL-Р·Р°РїСЂРѕСЃ (CREATE/ALTER/DROP/TRUNCATE).
+        """Выполнить DDL-запрос (CREATE/ALTER/DROP/TRUNCATE).
 
         Args:
-            sql: DDL-Р·Р°РїСЂРѕСЃ.
+            sql: DDL-запрос.
 
         Returns:
-            РЎРѕРѕР±С‰РµРЅРёРµ РѕР± СѓСЃРїРµС€РЅРѕРј РІС‹РїРѕР»РЅРµРЅРёРё.
+            Сообщение об успешном выполнении.
         """
         engine = self.get_engine()
-        logger.info("Р’С‹РїРѕР»РЅРµРЅРёРµ DDL: %s", sql[:200])
+        logger.info("Выполнение DDL: %s", sql[:200])
         with engine.connect() as conn:
             conn.execute(text(sql))
             conn.commit()
-        logger.info("DDL РІС‹РїРѕР»РЅРµРЅ СѓСЃРїРµС€РЅРѕ")
-        return "DDL РІС‹РїРѕР»РЅРµРЅ СѓСЃРїРµС€РЅРѕ."
+        logger.info("DDL выполнен успешно")
+        return "DDL выполнен успешно."
 
     def explain_query(self, sql: str) -> str:
-        """Р’С‹РїРѕР»РЅРёС‚СЊ EXPLAIN РґР»СЏ SQL-Р·Р°РїСЂРѕСЃР° (Р±РµР· СЂРµР°Р»СЊРЅРѕРіРѕ РІС‹РїРѕР»РЅРµРЅРёСЏ).
+        """Выполнить EXPLAIN для SQL-запроса (без реального выполнения).
 
         Args:
-            sql: SQL-Р·Р°РїСЂРѕСЃ РґР»СЏ Р°РЅР°Р»РёР·Р°.
+            sql: SQL-запрос для анализа.
 
         Returns:
-            РџР»Р°РЅ РІС‹РїРѕР»РЅРµРЅРёСЏ Р·Р°РїСЂРѕСЃР°.
+            План выполнения запроса.
         """
         engine = self.get_engine()
         explain_sql = f"EXPLAIN {sql.strip().rstrip(';')}"
@@ -271,14 +271,14 @@ class DatabaseManager:
         return plan
 
     def get_row_count(self, schema: str, table: str) -> int:
-        """РџРѕР»СѓС‡РёС‚СЊ РєРѕР»РёС‡РµСЃС‚РІРѕ СЃС‚СЂРѕРє РІ С‚Р°Р±Р»РёС†Рµ.
+        """Получить количество строк в таблице.
 
         Args:
-            schema: РРјСЏ СЃС…РµРјС‹.
-            table: РРјСЏ С‚Р°Р±Р»РёС†С‹.
+            schema: Имя схемы.
+            table: Имя таблицы.
 
         Returns:
-            РљРѕР»РёС‡РµСЃС‚РІРѕ СЃС‚СЂРѕРє.
+            Количество строк.
         """
         schema = _validate_identifier(schema, "schema")
         table = _validate_identifier(table, "table")
@@ -289,21 +289,21 @@ class DatabaseManager:
         with engine.connect() as conn:
             result = conn.execute(sql)
             count = result.scalar()
-        logger.info("РЎС‚СЂРѕРє РІ %s.%s: %d", schema, table, count)
+        logger.info("Строк в %s.%s: %d", schema, table, count)
         return count
 
     def check_key_uniqueness(
         self, schema: str, table: str, columns: list[str]
     ) -> dict[str, Any]:
-        """РџСЂРѕРІРµСЂРёС‚СЊ СѓРЅРёРєР°Р»СЊРЅРѕСЃС‚СЊ РєРѕРјР±РёРЅР°С†РёРё РєРѕР»РѕРЅРѕРє (РґР»СЏ РІР°Р»РёРґР°С†РёРё JOIN).
+        """Проверить уникальность комбинации колонок (для валидации JOIN).
 
         Args:
-            schema: РРјСЏ СЃС…РµРјС‹.
-            table: РРјСЏ С‚Р°Р±Р»РёС†С‹.
-            columns: РЎРїРёСЃРѕРє РєРѕР»РѕРЅРѕРє РґР»СЏ РїСЂРѕРІРµСЂРєРё.
+            schema: Имя схемы.
+            table: Имя таблицы.
+            columns: Список колонок для проверки.
 
         Returns:
-            РЎР»РѕРІР°СЂСЊ СЃ total_rows, unique_keys, duplicate_pct.
+            Словарь с total_rows, unique_keys, duplicate_pct.
         """
         schema = _validate_identifier(schema, "schema")
         table = _validate_identifier(table, "table")
@@ -331,24 +331,24 @@ class DatabaseManager:
             "duplicate_pct": dup_pct,
             "is_unique": dup_pct == 0.0,
         }
-        logger.info("РЈРЅРёРєР°Р»СЊРЅРѕСЃС‚СЊ %s.%s(%s): %s", schema, table, cols, result)
+        logger.info("Уникальность %s.%s(%s): %s", schema, table, cols, result)
         return result
 
     def get_sample(self, schema: str, table: str, n: int = 10) -> pd.DataFrame:
-        """РџРѕР»СѓС‡РёС‚СЊ РІС‹Р±РѕСЂРєСѓ СЃС‚СЂРѕРє РёР· С‚Р°Р±Р»РёС†С‹.
+        """Получить выборку строк из таблицы.
 
         Args:
-            schema: РРјСЏ СЃС…РµРјС‹.
-            table: РРјСЏ С‚Р°Р±Р»РёС†С‹.
-            n: РљРѕР»РёС‡РµСЃС‚РІРѕ СЃС‚СЂРѕРє.
+            schema: Имя схемы.
+            table: Имя таблицы.
+            n: Количество строк.
 
         Returns:
-            DataFrame СЃ РѕР±СЂР°Р·С†РѕРј РґР°РЅРЅС‹С….
+            DataFrame с образцом данных.
         """
         schema = _validate_identifier(schema, "schema")
         table = _validate_identifier(table, "table")
         if not isinstance(n, int) or n < 1:
-            raise ValueError(f"РќРµРґРѕРїСѓСЃС‚РёРјРѕРµ Р·РЅР°С‡РµРЅРёРµ n: {n}")
+            raise ValueError(f"Недопустимое значение n: {n}")
         sql = text(f'SELECT * FROM "{schema}"."{table}" LIMIT :n')
         engine = self.get_engine()
         with engine.connect() as conn:
@@ -356,14 +356,14 @@ class DatabaseManager:
         return df
 
     def table_exists(self, schema: str, table: str) -> bool:
-        """РџСЂРѕРІРµСЂРёС‚СЊ СЃСѓС‰РµСЃС‚РІРѕРІР°РЅРёРµ С‚Р°Р±Р»РёС†С‹.
+        """Проверить существование таблицы.
 
         Args:
-            schema: РРјСЏ СЃС…РµРјС‹.
-            table: РРјСЏ С‚Р°Р±Р»РёС†С‹.
+            schema: Имя схемы.
+            table: Имя таблицы.
 
         Returns:
-            True РµСЃР»Рё С‚Р°Р±Р»РёС†Р° СЃСѓС‰РµСЃС‚РІСѓРµС‚.
+            True если таблица существует.
         """
         sql = """
             SELECT EXISTS (
@@ -377,14 +377,14 @@ class DatabaseManager:
             return result.scalar()
 
     def get_table_ddl(self, schema: str, table: str) -> str:
-        """РџРѕР»СѓС‡РёС‚СЊ DDL (СЃС‚СЂСѓРєС‚СѓСЂСѓ) С‚Р°Р±Р»РёС†С‹ С‡РµСЂРµР· information_schema.
+        """Получить DDL (структуру) таблицы через information_schema.
 
         Args:
-            schema: РРјСЏ СЃС…РµРјС‹.
-            table: РРјСЏ С‚Р°Р±Р»РёС†С‹.
+            schema: Имя схемы.
+            table: Имя таблицы.
 
         Returns:
-            РўРµРєСЃС‚РѕРІРѕРµ РїСЂРµРґСЃС‚Р°РІР»РµРЅРёРµ DDL.
+            Текстовое представление DDL.
         """
         sql = """
             SELECT column_name, data_type, is_nullable, column_default
@@ -397,7 +397,7 @@ class DatabaseManager:
             df = pd.read_sql(text(sql), conn, params={"schema": schema, "table": table})
 
         if df.empty:
-            return f"РўР°Р±Р»РёС†Р° {schema}.{table} РЅРµ РЅР°Р№РґРµРЅР°."
+            return f"Таблица {schema}.{table} не найдена."
 
         lines = [f'CREATE TABLE "{schema}"."{table}" (']
         for _, row in df.iterrows():

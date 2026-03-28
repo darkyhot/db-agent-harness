@@ -455,8 +455,8 @@ class SQLValidator:
             non_unique = [
                 jc for jc in result.join_checks if not jc["is_unique"]
             ]
-            if non_unique and factor > 3.0:
-                # BLOCK — row explosion очень вероятен
+            if non_unique and factor > 2.0:
+                # HARD BLOCK — высокий риск row explosion
                 details = "; ".join(
                     f"{jc['table']}.{jc['columns']} (дубли: {jc['duplicate_pct']}%)"
                     for jc in non_unique
@@ -468,15 +468,17 @@ class SQLValidator:
                     + "\n".join(result.rewrite_suggestions)
                 )
             elif non_unique:
-                # WARN — любые дубли в JOIN-ключах
+                # SOFT BLOCK — любые дубли в JOIN-ключах, даже минимальные
                 details = "; ".join(
                     f"{jc['table']}.{jc['columns']} (дубли: {jc['duplicate_pct']}%)"
                     for jc in non_unique
                 )
-                result.add_warning(
-                    f"JOIN risk (factor={factor:.1f}x): "
+                result.add_error(
+                    f"JOIN RISK (factor={factor:.1f}x): "
                     f"Неуникальные ключи: {details}. "
-                    "Рассмотри подзапрос с DISTINCT или агрегацию."
+                    "Даже минимальные дубли искажают агрегации (SUM, COUNT). "
+                    "Перепиши запрос: оберни таблицу в подзапрос с DISTINCT "
+                    "или используй предварительную агрегацию."
                 )
 
         # 4. Предупреждение если нет WHERE/LIMIT для больших таблиц

@@ -347,3 +347,73 @@ class TestValidationResultExplosion:
         result.rewrite_suggestions = ["Use DISTINCT subquery"]
         summary = result.summary()
         assert "Use DISTINCT subquery" in summary
+
+
+# ---------------------------------------------------------------------------
+# End-to-end _validate_read() with mock DB — threshold tests
+# ---------------------------------------------------------------------------
+class _MockDB:
+    """Minimal mock for DatabaseManager used by SQLValidator."""
+
+    def explain_query(self, sql: str) -> str:
+        return "Seq Scan"
+
+    def check_key_uniqueness(self, schema, table, columns):
+        return {"is_unique": False, "duplicate_pct": self._dup_pct}
+
+    def __init__(self, dup_pct: float = 50.0):
+        self._dup_pct = dup_pct
+
+
+class TestValidateReadThresholds:
+    """Тесты порогов BLOCK/SOFT BLOCK в _validate_read()."""
+
+    def test_unique_join_passes(self):
+        """All unique keys → is_valid=True, no errors."""
+        db = _MockDB(dup_pct=0.0)
+        db.check_key_uniqueness = lambda s, t, c: {"is_unique": True, "duplicate_pct": 0.0}
+        v = SQLValidator(db)
+        result = v.validate("SELECT * FROM hr.emp e JOIN hr.dept d ON d.id = e.dept_id WHERE 1=1")
+        assert result.is_valid is True
+        assert result.errors == []
+
+    def test_no_join_passes(self):
+        """SQL without JOIN → is_valid=True."""
+        v = SQLValidator(_MockDB())
+        result = v.validate("SELECT * FROM hr.emp WHERE id = 1")
+        assert result.is_valid is True
+
+    def test_hard_block_factor_above_2(self):
+        """factor > 2.0 → ROW EXPLOSION error, is_valid=False."""
+        # dup_pct=80 → unique_perc=20 → factor=5.0 per side, but both sides same table
+        db = _MockDB(dup_pct=80.0)
+        v = SQLValidator(db)
+        result = v.validate("SELECT * FROM hr.emp e JOIN hr.dept d ON d.id = e.dept_id WHERE 1=1")
+        assert result.is_valid is False
+        assert any("ROW EXPLOSION" in e for e in result.errors)
+
+    def test_soft_block_factor_between_1_and_2(self):
+        """1.0 < factor <= 2.0 → JOIN RISK error, is_valid=False."""
+        # dup_pct=10 → unique_perc=90 → factor per column = 100/90 ≈ 1.11
+        # Both sides checked → product depends on dedup, but each ~1.11
+        db = _MockDB(dup_pct=10.0)
+        v = SQLValidator(db)
+        result = v.validate("SELECT * FROM hr.emp e JOIN hr.dept d ON d.id = e.dept_id WHERE 1=1")
+        assert result.is_valid is False
+        assert any("JOIN RISK" in e for e in result.errors)
+
+    def test_soft_block_tiny_duplication(self):
+        """Even 1% duplication (factor≈1.01) → still blocked."""
+        db = _MockDB(dup_pct=1.0)
+        v = SQLValidator(db)
+        result = v.validate("SELECT * FROM hr.emp e JOIN hr.dept d ON d.id = e.dept_id WHERE 1=1")
+        assert result.is_valid is False
+        assert any("JOIN RISK" in e or "ROW EXPLOSION" in e for e in result.errors)
+
+    def test_cross_join_always_blocks(self):
+        """CROSS JOIN → always blocked regardless of DB uniqueness."""
+        db = _MockDB(dup_pct=0.0)
+        db.check_key_uniqueness = lambda s, t, c: {"is_unique": True, "duplicate_pct": 0.0}
+        v = SQLValidator(db)
+        result = v.validate("SELECT * FROM hr.emp e CROSS JOIN hr.dept WHERE 1=1")
+        assert result.is_valid is False

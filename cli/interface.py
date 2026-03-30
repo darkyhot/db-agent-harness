@@ -133,24 +133,25 @@ class CLIInterface:
         резюме и долгосрочная память не были сохранены. Эта функция находит такие сессии
         и извлекает из них факты.
         """
-        try:
-            unsaved = self.memory.get_unsummarized_sessions()
-            if not unsaved:
-                return
-            logger.info("Найдено %d незавершённых сессий, восстанавливаю память", len(unsaved))
-            for session_id in unsaved:
+        unsaved = self.memory.get_unsummarized_sessions()
+        if not unsaved:
+            return
+        logger.info("Найдено %d незавершённых сессий, восстанавливаю память", len(unsaved))
+        for session_id in unsaved:
+            old_session = self.memory._session_id
+            try:
                 messages = self.memory.get_session_messages(session_id)
                 if not messages:
                     continue
                 # Временно переключаемся на старую сессию для сохранения резюме
-                old_session = self.memory._session_id
                 self.memory._session_id = session_id
                 self._save_session_summary()
                 self._extract_long_term_memory_from_messages(messages)
                 self.memory._session_id = old_session
-            logger.info("Восстановление памяти завершено")
-        except Exception as e:
-            logger.warning("Ошибка восстановления памяти из незавершённых сессий: %s", e)
+            except Exception as e:
+                logger.warning("Ошибка восстановления сессии %s: %s", session_id, e)
+                self.memory._session_id = old_session
+        logger.info("Восстановление памяти завершено")
 
     def _build_memory_extraction_prompt(self, dialog: str) -> tuple[str, str]:
         """Единый промпт для извлечения долгосрочной памяти.

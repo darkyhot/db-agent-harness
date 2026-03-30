@@ -37,6 +37,7 @@ class MemoryManager:
             timeout=30,
             check_same_thread=False,
         )
+        conn.execute("PRAGMA busy_timeout=30000")
         try:
             yield conn
             conn.commit()

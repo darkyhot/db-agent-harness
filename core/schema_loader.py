@@ -252,14 +252,34 @@ class SchemaLoader:
                 any_fully_unique = True
             min_unique_perc = min(min_unique_perc, u_perc)
 
+        # Количество PK-колонок в таблице — для определения составного PK
+        pk_count = (
+            int(cols_df["is_primary_key"].astype(bool).sum())
+            if "is_primary_key" in cols_df.columns
+            else 0
+        )
+
         # Для single column: одна полностью уникальная колонка достаточна.
+        # НО: если колонка — часть составного PK (pk_count > 1) и имеет
+        # низкий unique_perc, она НЕ уникальна сама по себе.
         # Для composite key: any_fully_unique недостаточно — другая колонка
         # может создавать дубли внутри уникальных значений первой.
         if len(columns) == 1:
-            is_unique = all_pk or any_fully_unique
+            col_detail = list(details.values())[0]
+            is_composite_pk_member = (
+                col_detail.get("found")
+                and col_detail.get("is_primary_key")
+                and pk_count > 1
+                and col_detail.get("unique_perc", 0) < 90.0
+            )
+            if is_composite_pk_member:
+                is_unique = any_fully_unique
+            else:
+                is_unique = all_pk or any_fully_unique
         else:
             is_unique = all_pk or min_unique_perc >= 95.0
         duplicate_pct = round(100.0 - min_unique_perc, 2)
+        status = "safe" if is_unique else "risky"
 
         return {
             "is_unique": is_unique,
@@ -267,6 +287,7 @@ class SchemaLoader:
             "min_unique_perc": min_unique_perc,
             "duplicate_pct": duplicate_pct,
             "columns": details,
+            "status": status,
         }
 
     def generate_ddl(self, schema: str, table: str) -> str:

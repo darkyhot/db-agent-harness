@@ -564,7 +564,8 @@ class GraphNodes:
             "3. Выбери нужные колонки и проверь их наличие в разведке\n"
             "4. Определи условия фильтрации (WHERE) — проверь формат значений в образце\n"
             "5. Если нужен JOIN — ОБЯЗАТЕЛЬНО изучи JOIN-АНАЛИЗ в разведке таблиц. "
-            "Если ключ не PK и unique_perc < 100% — используй подзапрос с DISTINCT\n"
+            "Если ключ помечен как composite-PK, ДУБЛИ, или unique_perc < 90% — "
+            "это НЕ безопасный ключ. Используй подзапрос с GROUP BY или DISTINCT\n"
             "6. Напиши SQL и пройди по чеклисту выше\n"
             f"{lt_ctx}"
         )
@@ -794,11 +795,32 @@ class GraphNodes:
                 cols_cache[key] = self.schema.get_table_columns(s, t)
             return cols_cache[key]
 
-        def _col_status(row: Any, unique_col: str = "unique_perc") -> tuple[bool, float, str]:
-            """Вернуть (is_pk, unique_perc, status_str) для строки DataFrame."""
+        # Кэш количества PK-колонок в таблице (для определения составного PK)
+        pk_count_cache: dict[tuple[str, str], int] = {}
+
+        def _get_pk_count(s: str, t: str) -> int:
+            key = (s, t)
+            if key not in pk_count_cache:
+                cols = _get_cols(s, t)
+                if not cols.empty and "is_primary_key" in cols.columns:
+                    pk_count_cache[key] = int(cols["is_primary_key"].astype(bool).sum())
+                else:
+                    pk_count_cache[key] = 1
+            return pk_count_cache[key]
+
+        def _col_status(row: Any, unique_col: str = "unique_perc", pk_count: int = 1) -> tuple[bool, float, str]:
+            """Вернуть (is_pk, unique_perc, status_str) для строки DataFrame.
+
+            Если колонка — часть составного PK (pk_count > 1) с низким unique_perc,
+            она НЕ считается уникальной (is_pk возвращается как False).
+            """
             is_pk = bool(row.get("is_primary_key", False))
             u = float(row.get(unique_col, 0)) if pd.notna(row.get(unique_col)) else 0.0
-            if is_pk:
+            if is_pk and pk_count > 1 and u < 90.0:
+                # Часть составного PK — не уникальна сама по себе
+                status = f"composite-PK unique={u:.0f}%"
+                is_pk = False
+            elif is_pk:
                 status = "PK"
             elif u >= 100:
                 status = f"unique={u:.0f}%"
@@ -833,11 +855,13 @@ class GraphNodes:
 
                     # --- 1. Совпадающие имена колонок ---
                     shared = set(cols1["column_name"]) & set(cols2["column_name"])
+                    pkc1 = _get_pk_count(s1, t1)
+                    pkc2 = _get_pk_count(s2, t2)
                     for col in sorted(shared):
                         r1 = cols1[cols1["column_name"] == col].iloc[0]
                         r2 = cols2[cols2["column_name"] == col].iloc[0]
-                        pk1, u1, st1 = _col_status(r1)
-                        pk2, u2, st2 = _col_status(r2)
+                        pk1, u1, st1 = _col_status(r1, pk_count=pkc1)
+                        pk2, u2, st2 = _col_status(r2, pk_count=pkc2)
                         recommendation = _safe_recommendation(pk1, u1, pk2, u2)
                         pair_key = (s1, t1, col, s2, t2, col)
                         seen_pairs.add(pair_key)
@@ -898,8 +922,8 @@ class GraphNodes:
                                 if fk_match.empty:
                                     continue
                                 fk_row = fk_match.iloc[0]
-                                pk1, u1, st1 = _col_status(pk_row)
-                                pk2, u2, st2 = _col_status(fk_row)
+                                pk1, u1, st1 = _col_status(pk_row, pk_count=_get_pk_count(pk_s, pk_t))
+                                pk2, u2, st2 = _col_status(fk_row, pk_count=_get_pk_count(fk_s, fk_t))
                                 recommendation = _safe_recommendation(pk1, u1, pk2, u2)
                                 join_analysis_lines.append(
                                     f"  {pk_s}.{pk_t}.{pk_col} ({st1}) в†” "
@@ -907,13 +931,41 @@ class GraphNodes:
                                     f" [FK-паттерн] → {recommendation}"
                                 )
 
+                    # --- 3. Suffix-matching: колонки с общим _id суффиксом ---
+                    # Обнаруживает пары вроде gosb_id ↔ new_gosb_id, old_gosb_id
+                    id_cols1 = [c for c in cols1["column_name"] if c.endswith("_id")]
+                    id_cols2 = [c for c in cols2["column_name"] if c.endswith("_id")]
+                    for c1 in id_cols1:
+                        for c2 in id_cols2:
+                            if c1 == c2:
+                                continue  # уже в shared-анализе
+                            # Проверяем: одно имя является суффиксом другого
+                            # new_gosb_id.endswith("_gosb_id") или gosb_id == gosb_id
+                            if not (c2.endswith(f"_{c1}") or c1.endswith(f"_{c2}")):
+                                continue
+                            pair_key = (s1, t1, c1, s2, t2, c2)
+                            reverse_key = (s2, t2, c2, s1, t1, c1)
+                            if pair_key in seen_pairs or reverse_key in seen_pairs:
+                                continue
+                            seen_pairs.add(pair_key)
+                            r1 = cols1[cols1["column_name"] == c1].iloc[0]
+                            r2 = cols2[cols2["column_name"] == c2].iloc[0]
+                            p1, u1, st1 = _col_status(r1, pk_count=pkc1)
+                            p2, u2, st2 = _col_status(r2, pk_count=pkc2)
+                            recommendation = _safe_recommendation(p1, u1, p2, u2)
+                            join_analysis_lines.append(
+                                f"  {s1}.{t1}.{c1} ({st1}) ↔ "
+                                f"{s2}.{t2}.{c2} ({st2})"
+                                f" [suffix-паттерн] → {recommendation}"
+                            )
+
         join_analysis = ""
         if join_analysis_lines:
             join_analysis = (
                 "\n\n=== JOIN-АНАЛИЗ (автоматическая оценка безопасности JOIN) ===\n"
                 + "\n".join(join_analysis_lines)
-                + "\n\nЕсли ключ помечен как ДУБЛИ — сначала изучи get_sample, "
-                "выясни причину дублей, затем выбери стратегию: "
+                + "\n\nЕсли ключ помечен как ДУБЛИ или composite-PK — он НЕ уникален, "
+                "сначала изучи get_sample, выясни причину дублей, затем выбери стратегию: "
                 "WHERE (статусы/версии) / GROUP BY (факты) / DISTINCT (только технические дубли)."
             )
 

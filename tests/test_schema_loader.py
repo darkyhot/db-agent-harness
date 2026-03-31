@@ -79,6 +79,33 @@ class TestCheckKeyUniqueness:
         result = loader_with_data.check_key_uniqueness("hr", "emp_dept", ["emp_id", "role"])
         assert result["is_unique"] is False
 
+    def test_single_composite_pk_member_not_unique(self, loader_with_data):
+        """Single column that is PK but part of composite key with low unique_perc.
+
+        emp_dept.emp_id: is_primary_key=True, unique_perc=80%, but table has 2 PKs.
+        As a composite PK member with unique_perc < 90%, it is NOT unique alone.
+        """
+        result = loader_with_data.check_key_uniqueness("hr", "emp_dept", ["emp_id"])
+        assert result["is_unique"] is False
+        assert result["status"] == "risky"
+
+    def test_single_sole_pk_is_unique(self, loader_with_data):
+        """Single PK column in a table with only 1 PK → unique (not composite).
+
+        emp.id: is_primary_key=True, unique_perc=100%, only PK in table.
+        """
+        result = loader_with_data.check_key_uniqueness("hr", "emp", ["id"])
+        assert result["is_unique"] is True
+        assert result["status"] == "safe"
+
+    def test_status_field_present(self, loader_with_data):
+        """check_key_uniqueness should always return 'status' field."""
+        result = loader_with_data.check_key_uniqueness("hr", "emp", ["id"])
+        assert result["status"] == "safe"
+
+        result = loader_with_data.check_key_uniqueness("hr", "emp", ["dept_id"])
+        assert result["status"] == "risky"
+
     def test_table_not_found(self, loader_with_data):
         result = loader_with_data.check_key_uniqueness("hr", "nonexistent", ["id"])
         assert result["is_unique"] is None

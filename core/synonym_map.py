@@ -68,6 +68,8 @@ SYNONYM_MAP: dict[str, list[str]] = {
     "отчет": ["report", "rep", "summary"],
     "витрина": ["mart", "dm", "datamart", "showcase"],
     "витрины": ["mart", "dm", "datamart", "showcase"],
+    "таблица": ["table", "mart", "dm", "datamart", "showcase", "fact", "dim", "ref"],
+    "таблицы": ["table", "mart", "dm", "datamart", "showcase", "fact", "dim", "ref"],
     "справочник": ["dict", "ref", "reference", "lookup", "directory"],
 }
 

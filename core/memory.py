@@ -37,7 +37,6 @@ class MemoryManager:
             timeout=30,
             check_same_thread=False,
         )
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         try:
             yield conn
@@ -53,9 +52,20 @@ class MemoryManager:
 
     def _init_db(self) -> None:
         """Создать таблицы если не существуют."""
+        # WAL mode персистентен в файле — ставим один раз при инициализации.
+        # Используем отдельное короткое соединение, чтобы не блокировать надолго.
+        try:
+            wal_conn = sqlite3.connect(str(self._db_path), timeout=5)
+            wal_conn.execute("PRAGMA busy_timeout=5000")
+            mode = wal_conn.execute("PRAGMA journal_mode").fetchone()
+            if mode and mode[0].lower() != "wal":
+                wal_conn.execute("PRAGMA journal_mode=WAL")
+                logger.info("SQLite journal_mode переключён на WAL")
+            wal_conn.close()
+        except Exception as e:
+            logger.warning("Не удалось установить WAL mode: %s (продолжаем)", e)
+
         with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,

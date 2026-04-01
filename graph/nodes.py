@@ -796,8 +796,8 @@ class GraphNodes:
             key = (s, t)
             if key not in pk_count_cache:
                 cols = _get_cols(s, t)
-                if not cols.empty and “is_primary_key” in cols.columns:
-                    pk_count_cache[key] = int(cols[“is_primary_key”].astype(bool).sum())
+                if not cols.empty and "is_primary_key" in cols.columns:
+                    pk_count_cache[key] = int(cols["is_primary_key"].astype(bool).sum())
                 else:
                     pk_count_cache[key] = 1
             return pk_count_cache[key]
@@ -816,11 +816,11 @@ class GraphNodes:
                     if block:
                         join_analysis_parts.append(block)
 
-        join_analysis = “”
+        join_analysis = ""
         if join_analysis_parts:
             join_analysis = (
-                “\n\n=== JOIN-АНАЛИЗ (ранжированные кандидаты) ===\n”
-                + “\n”.join(join_analysis_parts)
+                "\n\n=== JOIN-АНАЛИЗ (ранжированные кандидаты) ===\n"
+                + "\n".join(join_analysis_parts)
             )
 
         tables_context = (
@@ -919,7 +919,7 @@ class GraphNodes:
 
         # Краткий контекст полного плана
         plan_summary = " → ".join(
-            f"{'[вњ“] ' if i < step_idx else '[→] ' if i == step_idx else ''}{s[:60]}"
+            f"{'[✓] ' if i < step_idx else '[→] ' if i == step_idx else ''}{s[:60]}"
             for i, s in enumerate(plan)
         )
 

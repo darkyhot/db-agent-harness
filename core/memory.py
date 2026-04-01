@@ -50,10 +50,54 @@ class MemoryManager:
     def close(self) -> None:
         """Совместимость с прежним API (соединения теперь закрываются автоматически)."""
 
+    def _break_stale_lock(self) -> None:
+        """Сбросить зависшие блокировки SQLite от мёртвых процессов (Jupyter kernel).
+
+        SQLite WAL хранит shared-memory lock в файле .db-shm.
+        Если процесс-владелец упал, файл остаётся и блокирует новые соединения.
+        Удаление -shm безопасно: SQLite пересоздаст его и восстановит WAL автоматически.
+        """
+        shm_path = Path(str(self._db_path) + "-shm")
+        wal_path = Path(str(self._db_path) + "-wal")
+
+        # Быстрая проверка: пробуем подключиться с коротким таймаутом
+        try:
+            test_conn = sqlite3.connect(str(self._db_path), timeout=2)
+            test_conn.execute("PRAGMA busy_timeout=2000")
+            # Пробуем записать — это проверяет write lock
+            test_conn.execute("SELECT 1")
+            test_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            test_conn.close()
+            return  # Всё ок, блокировок нет
+        except sqlite3.OperationalError as e:
+            logger.warning("SQLite заблокирована: %s — пробуем сбросить stale lock", e)
+
+        # Удаляем -shm (shared memory lock). WAL-файл сохраняем — в нём данные.
+        if shm_path.exists():
+            try:
+                shm_path.unlink()
+                logger.info("Удалён stale lock-файл: %s", shm_path)
+            except OSError as e:
+                logger.warning("Не удалось удалить %s: %s", shm_path, e)
+
+        # Пробуем переоткрыть и сделать checkpoint для восстановления WAL
+        try:
+            recover_conn = sqlite3.connect(str(self._db_path), timeout=5)
+            recover_conn.execute("PRAGMA busy_timeout=5000")
+            if wal_path.exists():
+                recover_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                logger.info("WAL checkpoint выполнен после сброса lock")
+            recover_conn.close()
+        except Exception as e:
+            logger.warning("Восстановление после сброса lock: %s", e)
+
     def _init_db(self) -> None:
         """Создать таблицы если не существуют."""
+        # Сбросить stale locks от мёртвых Jupyter kernels
+        if self._db_path.exists():
+            self._break_stale_lock()
+
         # WAL mode персистентен в файле — ставим один раз при инициализации.
-        # Используем отдельное короткое соединение, чтобы не блокировать надолго.
         try:
             wal_conn = sqlite3.connect(str(self._db_path), timeout=5)
             wal_conn.execute("PRAGMA busy_timeout=5000")

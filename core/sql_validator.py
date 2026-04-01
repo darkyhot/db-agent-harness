@@ -654,6 +654,42 @@ class SQLValidator:
             if not is_safe:
                 result.rewrite_suggestions.append(self._generate_rewrite_suggestion(joined))
 
+        # 2b. Composite key re-check: если несколько колонок между одними таблицами,
+        #     проверяем их как составной ключ (вместе могут быть уникальными)
+        from core.join_analysis import group_composite_keys
+        composite_groups = group_composite_keys(join_pairs)
+        for group in composite_groups:
+            if len(group.columns) < 2:
+                continue
+            # Проверяем составной ключ для joined-стороны
+            joined_cols = [col_pair[1] for col_pair in group.columns]
+            existing_cols = [col_pair[0] for col_pair in group.columns]
+            try:
+                composite_check = self._check_key_uniqueness(
+                    group.right_schema, group.right_table, joined_cols,
+                )
+                if composite_check.get("status") == "safe":
+                    # Составной ключ уникален → обновляем risky checks на safe
+                    composite_label = ", ".join(
+                        f"{group.left_schema}.{group.left_table}.{ec} = "
+                        f"{group.right_schema}.{group.right_table}.{jc}"
+                        for ec, jc in group.columns
+                    )
+                    for jc_info in result.join_checks:
+                        if (jc_info.get("table") == f"{group.right_schema}.{group.right_table}"
+                                and jc_info.get("columns") in joined_cols
+                                and not jc_info.get("is_safe")):
+                            jc_info["is_safe"] = True
+                            jc_info["cardinality"] = "composite-key-safe"
+                            jc_info["factor"] = 1.0
+                    logger.info(
+                        "Composite key %s safe: %s",
+                        f"{group.right_schema}.{group.right_table}",
+                        joined_cols,
+                    )
+            except Exception as e:
+                logger.warning("Composite key check failed: %s", e)
+
         # 3. Оценка multiplication factor и решение pass/warn/block
         if result.join_checks:
             factor = self._estimate_multiplication_factor(result.join_checks)

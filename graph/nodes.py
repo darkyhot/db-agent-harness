@@ -564,8 +564,8 @@ class GraphNodes:
             "3. Выбери нужные колонки и проверь их наличие в разведке\n"
             "4. Определи условия фильтрации (WHERE) — проверь формат значений в образце\n"
             "5. Если нужен JOIN — ОБЯЗАТЕЛЬНО изучи JOIN-АНАЛИЗ в разведке таблиц. "
-            "Если ключ помечен как composite-PK, ДУБЛИ, или unique_perc < 90% — "
-            "это НЕ безопасный ключ. Используй подзапрос с GROUP BY или DISTINCT\n"
+            "Выбирай кандидаты с наивысшим score. Если кандидат помечен как ОПАСНО — "
+            "изучи get_sample, выясни причину дублей, используй подзапрос с GROUP BY / WHERE / DISTINCT\n"
             "6. Напиши SQL и пройди по чеклисту выше\n"
             f"{lt_ctx}"
         )
@@ -777,17 +777,14 @@ class GraphNodes:
                 f"**Образец данных (10 строк):**\n{sample_text}"
             )
 
-        # JOIN safety analysis: проверяем колонки между таблицами
-        # Два вида обнаружения:
-        # 1. Совпадающие имена колонок (классический случай)
-        # 2. FK-паттерн: PK одной таблицы в†” {table}_id в другой (разные имена)
-        join_analysis_lines = []
-        # seen_pairs: набор (s1,t1,col1,s2,t2,col2) уже добавленных пар — избегаем дублей
-        seen_pairs: set[tuple[str, ...]] = set()
+        # JOIN safety analysis: scoring и ranking через join_analysis модуль
+        from core.join_analysis import format_join_analysis as _fmt_join
 
+        join_analysis_parts = []
         table_list = sorted(found_tables)
-        # Кэш DataFrames колонок, чтобы не запрашивать дважды
+        # Кэш DataFrames колонок и PK-count
         cols_cache: dict[tuple[str, str], Any] = {}
+        pk_count_cache: dict[tuple[str, str], int] = {}
 
         def _get_cols(s: str, t: str) -> Any:
             key = (s, t)
@@ -795,55 +792,15 @@ class GraphNodes:
                 cols_cache[key] = self.schema.get_table_columns(s, t)
             return cols_cache[key]
 
-        # Кэш количества PK-колонок в таблице (для определения составного PK)
-        pk_count_cache: dict[tuple[str, str], int] = {}
-
         def _get_pk_count(s: str, t: str) -> int:
             key = (s, t)
             if key not in pk_count_cache:
                 cols = _get_cols(s, t)
-                if not cols.empty and "is_primary_key" in cols.columns:
-                    pk_count_cache[key] = int(cols["is_primary_key"].astype(bool).sum())
+                if not cols.empty and “is_primary_key” in cols.columns:
+                    pk_count_cache[key] = int(cols[“is_primary_key”].astype(bool).sum())
                 else:
                     pk_count_cache[key] = 1
             return pk_count_cache[key]
-
-        def _col_status(row: Any, unique_col: str = "unique_perc", pk_count: int = 1) -> tuple[bool, float, str]:
-            """Вернуть (is_pk, unique_perc, status_str) для строки DataFrame.
-
-            Если колонка — часть составного PK (pk_count > 1) с низким unique_perc,
-            она НЕ считается уникальной (is_pk возвращается как False).
-            """
-            is_pk = bool(row.get("is_primary_key", False))
-            u = float(row.get(unique_col, 0)) if pd.notna(row.get(unique_col)) else 0.0
-            if is_pk and pk_count > 1 and u < 90.0:
-                # Часть составного PK — не уникальна сама по себе
-                status = f"composite-PK unique={u:.0f}%"
-                is_pk = False
-            elif is_pk:
-                status = "PK"
-            elif u >= 100:
-                status = f"unique={u:.0f}%"
-            else:
-                status = f"ДУБЛИ unique={u:.0f}%"
-            return is_pk, u, status
-
-        def _safe_recommendation(pk1: bool, u1: float, pk2: bool, u2: float) -> str:
-            safe = (pk1 or u1 >= 100) and (pk2 or u2 >= 100)
-            if safe:
-                return "безопасен"
-            # Определяем, у какой стороны дубли, чтобы дать конкретный совет
-            problem_sides = []
-            if not pk1 and u1 < 100:
-                problem_sides.append("левая сторона")
-            if not pk2 and u2 < 100:
-                problem_sides.append("правая сторона")
-            sides_str = ", ".join(problem_sides)
-            return (
-                f"ОПАСНО ({sides_str} имеет дубли) — "
-                "изучи образец (get_sample), выясни причину: "
-                "WHERE-фильтр (статусы) / GROUP BY (факты) / DISTINCT (технические дубли)"
-            )
 
         if len(table_list) >= 2:
             for i, (s1, t1) in enumerate(table_list):
@@ -852,121 +809,18 @@ class GraphNodes:
                     cols2 = _get_cols(s2, t2)
                     if cols1.empty or cols2.empty:
                         continue
+                    block = _fmt_join(
+                        s1, t1, cols1, s2, t2, cols2,
+                        _get_pk_count(s1, t1), _get_pk_count(s2, t2),
+                    )
+                    if block:
+                        join_analysis_parts.append(block)
 
-                    # --- 1. Совпадающие имена колонок ---
-                    shared = set(cols1["column_name"]) & set(cols2["column_name"])
-                    pkc1 = _get_pk_count(s1, t1)
-                    pkc2 = _get_pk_count(s2, t2)
-                    for col in sorted(shared):
-                        r1 = cols1[cols1["column_name"] == col].iloc[0]
-                        r2 = cols2[cols2["column_name"] == col].iloc[0]
-                        pk1, u1, st1 = _col_status(r1, pk_count=pkc1)
-                        pk2, u2, st2 = _col_status(r2, pk_count=pkc2)
-                        recommendation = _safe_recommendation(pk1, u1, pk2, u2)
-                        pair_key = (s1, t1, col, s2, t2, col)
-                        seen_pairs.add(pair_key)
-                        join_analysis_lines.append(
-                            f"  {s1}.{t1}.{col} ({st1}) в†” {s2}.{t2}.{col} ({st2})"
-                            f" → {recommendation}"
-                        )
-
-                    # --- 2. FK-паттерн: PK одной таблицы → {table}_id в другой ---
-                    # Проверяем оба направления: PK t1 → FK в t2, и PK t2 → FK в t1
-                    for (pk_s, pk_t, pk_cols_df, fk_s, fk_t, fk_cols_df) in [
-                        (s1, t1, cols1, s2, t2, cols2),
-                        (s2, t2, cols2, s1, t1, cols1),
-                    ]:
-                        if "is_primary_key" not in pk_cols_df.columns:
-                            continue
-                        pk_rows = pk_cols_df[pk_cols_df["is_primary_key"].astype(bool) == True]
-                        if pk_rows.empty:
-                            continue
-
-                        # Карта имён колонок FK-таблицы (lower → original)
-                        fk_col_map: dict[str, str] = {
-                            r["column_name"].lower(): r["column_name"]
-                            for _, r in fk_cols_df.iterrows()
-                        }
-
-                        for _, pk_row in pk_rows.iterrows():
-                            pk_col = pk_row["column_name"]
-                            pk_lower = pk_col.lower()
-                            t_lower = pk_t.lower()
-
-                            # Кандидаты FK-имён: {table}_id, {table}_{pk_col},
-                            # {table_singular}_id (убираем trailing 's')
-                            fk_candidates = {
-                                f"{t_lower}_id",
-                                f"{t_lower}_{pk_lower}",
-                            }
-                            if t_lower.endswith("s") and len(t_lower) > 2:
-                                fk_candidates.add(f"{t_lower[:-1]}_id")
-                                fk_candidates.add(f"{t_lower[:-1]}_{pk_lower}")
-
-                            for fk_cand in fk_candidates:
-                                # Пропускаем если это то же имя (уже в shared-анализе)
-                                if fk_cand == pk_lower:
-                                    continue
-                                if fk_cand not in fk_col_map:
-                                    continue
-
-                                fk_col_actual = fk_col_map[fk_cand]
-                                # Не добавляем дубль
-                                pair_key = (pk_s, pk_t, pk_col, fk_s, fk_t, fk_col_actual)
-                                reverse_key = (fk_s, fk_t, fk_col_actual, pk_s, pk_t, pk_col)
-                                if pair_key in seen_pairs or reverse_key in seen_pairs:
-                                    continue
-                                seen_pairs.add(pair_key)
-
-                                fk_match = fk_cols_df[fk_cols_df["column_name"] == fk_col_actual]
-                                if fk_match.empty:
-                                    continue
-                                fk_row = fk_match.iloc[0]
-                                pk1, u1, st1 = _col_status(pk_row, pk_count=_get_pk_count(pk_s, pk_t))
-                                pk2, u2, st2 = _col_status(fk_row, pk_count=_get_pk_count(fk_s, fk_t))
-                                recommendation = _safe_recommendation(pk1, u1, pk2, u2)
-                                join_analysis_lines.append(
-                                    f"  {pk_s}.{pk_t}.{pk_col} ({st1}) в†” "
-                                    f"{fk_s}.{fk_t}.{fk_col_actual} ({st2})"
-                                    f" [FK-паттерн] → {recommendation}"
-                                )
-
-                    # --- 3. Suffix-matching: колонки с общим _id суффиксом ---
-                    # Обнаруживает пары вроде gosb_id ↔ new_gosb_id, old_gosb_id
-                    id_cols1 = [c for c in cols1["column_name"] if c.endswith("_id")]
-                    id_cols2 = [c for c in cols2["column_name"] if c.endswith("_id")]
-                    for c1 in id_cols1:
-                        for c2 in id_cols2:
-                            if c1 == c2:
-                                continue  # уже в shared-анализе
-                            # Проверяем: одно имя является суффиксом другого
-                            # new_gosb_id.endswith("_gosb_id") или gosb_id == gosb_id
-                            if not (c2.endswith(f"_{c1}") or c1.endswith(f"_{c2}")):
-                                continue
-                            pair_key = (s1, t1, c1, s2, t2, c2)
-                            reverse_key = (s2, t2, c2, s1, t1, c1)
-                            if pair_key in seen_pairs or reverse_key in seen_pairs:
-                                continue
-                            seen_pairs.add(pair_key)
-                            r1 = cols1[cols1["column_name"] == c1].iloc[0]
-                            r2 = cols2[cols2["column_name"] == c2].iloc[0]
-                            p1, u1, st1 = _col_status(r1, pk_count=pkc1)
-                            p2, u2, st2 = _col_status(r2, pk_count=pkc2)
-                            recommendation = _safe_recommendation(p1, u1, p2, u2)
-                            join_analysis_lines.append(
-                                f"  {s1}.{t1}.{c1} ({st1}) ↔ "
-                                f"{s2}.{t2}.{c2} ({st2})"
-                                f" [suffix-паттерн] → {recommendation}"
-                            )
-
-        join_analysis = ""
-        if join_analysis_lines:
+        join_analysis = “”
+        if join_analysis_parts:
             join_analysis = (
-                "\n\n=== JOIN-АНАЛИЗ (автоматическая оценка безопасности JOIN) ===\n"
-                + "\n".join(join_analysis_lines)
-                + "\n\nЕсли ключ помечен как ДУБЛИ или composite-PK — он НЕ уникален, "
-                "сначала изучи get_sample, выясни причину дублей, затем выбери стратегию: "
-                "WHERE (статусы/версии) / GROUP BY (факты) / DISTINCT (только технические дубли)."
+                “\n\n=== JOIN-АНАЛИЗ (ранжированные кандидаты) ===\n”
+                + “\n”.join(join_analysis_parts)
             )
 
         tables_context = (

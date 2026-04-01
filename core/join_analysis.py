@@ -184,6 +184,11 @@ def _compute_score(
     if col1_class == "attribute" or col2_class == "attribute":
         score *= 0.4
 
+    # Штраф за неуникальность: чем ниже unique_perc, тем ниже score
+    min_u = min(u1, u2)
+    if min_u < 100:
+        score *= max(min_u / 100.0, 0.1)  # floor 0.1 чтобы не обнулять
+
     return round(score, 2)
 
 
@@ -358,14 +363,20 @@ def rank_join_candidates(
                         _add(fk_actual, pk_col, "fk_pattern")
 
     # --- 3. Suffix matching (_id колонки) ---
+    # Только если хотя бы одна сторона — key/business_key (не оба attribute)
     id_cols1 = [n for n in info1_map if n.endswith("_id")]
     id_cols2 = [n for n in info2_map if n.endswith("_id")]
     for c1 in id_cols1:
         for c2 in id_cols2:
             if c1 == c2:
                 continue
-            if c2.endswith(f"_{c1}") or c1.endswith(f"_{c2}"):
-                _add(c1, c2, "suffix")
+            if not (c2.endswith(f"_{c1}") or c1.endswith(f"_{c2}")):
+                continue
+            i1 = info1_map.get(c1)
+            i2 = info2_map.get(c2)
+            if i1 and i2 and i1["col_class"] == "attribute" and i2["col_class"] == "attribute":
+                continue  # Оба attribute — шум, пропускаем
+            _add(c1, c2, "suffix")
 
     # Сортировка по score desc
     candidates.sort(key=lambda c: -c.score)
@@ -438,6 +449,8 @@ def format_join_analysis(
 
     Возвращает компактный текст с ранжированными кандидатами и рекомендациями.
     """
+    MAX_DISPLAY_CANDIDATES = 5
+
     candidates = rank_join_candidates(
         s1, t1, cols1_df, s2, t2, cols2_df, pk_count1, pk_count2,
     )
@@ -455,16 +468,36 @@ def format_join_analysis(
         "Наиболее вероятные join keys:",
     ]
 
-    for c in candidates:
+    shown = candidates[:MAX_DISPLAY_CANDIDATES]
+    has_unsafe = False
+    for c in shown:
         safety = "безопасен" if c.safe else f"ОПАСНО: {c.risk_detail}"
         lines.append(
             f"  [{c.score:.2f}] {c.col1} ({c.col1_status}) ↔ "
             f"{c.col2} ({c.col2_status}) — {c.reason} → {safety}"
         )
+        # Для ОПАСНО — конкретный безопасный SQL-паттерн
+        if not c.safe:
+            has_unsafe = True
+            # Определяем сторону с дублями
+            if "ДУБЛИ" in c.col2_status or "composite-PK" in c.col2_status:
+                prob_tbl, prob_col = c.table2, c.col2
+            else:
+                prob_tbl, prob_col = c.table1, c.col1
+            lines.append(
+                f"    → Безопасный паттерн: JOIN (SELECT DISTINCT ON ({prob_col}) * "
+                f"FROM {prob_tbl} ORDER BY {prob_col}) sub ON sub.{prob_col} = ..."
+            )
 
-    lines.append("")
-    lines.append(
-        "Если join помечен как ОПАСНО — изучи get_sample, определи причину дублей, "
-        "выбери стратегию: WHERE (статусы/версии) / GROUP BY (факты) / DISTINCT (только технические дубли)."
-    )
+    if len(candidates) > MAX_DISPLAY_CANDIDATES:
+        lines.append(
+            f"  (ещё {len(candidates) - MAX_DISPLAY_CANDIDATES} менее вероятных опущено)"
+        )
+
+    if has_unsafe:
+        lines.append("")
+        lines.append(
+            "ЗАПРЕЩЕНО использовать прямой JOIN по ключу помеченному ОПАСНО. "
+            "Используй подзапрос из 'Безопасный паттерн' выше или предварительную агрегацию."
+        )
     return "\n".join(lines)

@@ -118,8 +118,25 @@ def _make_cols_df(cols: list[dict]) -> pd.DataFrame:
 class TestRankJoinCandidates:
     """Тесты scoring и ранжирования."""
 
-    def test_exact_name_key_columns_high_score(self):
-        """client_id ↔ client_id (оба key) → высокий score."""
+    def test_exact_name_key_columns_both_unique(self):
+        """client_id ↔ client_id (оба key, оба 100% unique) → высокий score."""
+        df1 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        candidates = rank_join_candidates("s", "t1", df1, "s", "t2", df2, 1, 1)
+        assert len(candidates) >= 1
+        top = candidates[0]
+        assert top.col1 == "client_id"
+        assert top.col2 == "client_id"
+        assert top.score >= 0.9
+
+    def test_low_unique_penalizes_score(self):
+        """client_id ↔ client_id, одна сторона 50% unique → score ниже из-за штрафа."""
         df1 = _make_cols_df([
             {"column_name": "client_id", "dType": "int8", "is_primary_key": True,
              "unique_perc": 100.0, "description": ""},
@@ -131,9 +148,8 @@ class TestRankJoinCandidates:
         candidates = rank_join_candidates("s", "t1", df1, "s", "t2", df2, 1, 1)
         assert len(candidates) >= 1
         top = candidates[0]
-        assert top.col1 == "client_id"
-        assert top.col2 == "client_id"
-        assert top.score >= 0.9
+        assert top.score < 0.7, "50% unique should penalize score significantly"
+        assert not top.safe, "50% unique should be unsafe"
 
     def test_attribute_columns_filtered_out(self):
         """status ↔ status (оба attribute) → score 0, отфильтровано."""
@@ -156,7 +172,7 @@ class TestRankJoinCandidates:
         ])
         df2 = _make_cols_df([
             {"column_name": "t1_id", "dType": "int8", "is_primary_key": False,
-             "unique_perc": 30.0, "description": ""},
+             "unique_perc": 50.0, "description": ""},
         ])
         candidates = rank_join_candidates("s", "t1", df1, "s", "t2", df2, 1, 1)
         assert len(candidates) >= 1
@@ -306,8 +322,23 @@ class TestFormatJoinAnalysis:
         ])
         df2 = _make_cols_df([
             {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
-             "unique_perc": 30.0, "description": ""},
+             "unique_perc": 50.0, "description": ""},
         ])
         output = format_join_analysis("s", "t1", df1, "s", "t2", df2, 1, 1)
-        assert "безопасен" in output or "ОПАСНО" in output
+        assert "ОПАСНО" in output
         assert "[" in output  # score в квадратных скобках
+        assert "Безопасный паттерн" in output  # конкретная рекомендация для ОПАСНО
+
+    def test_safe_join_no_pattern(self):
+        """Безопасный join (100% unique обе стороны) — нет паттерна."""
+        df1 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        output = format_join_analysis("s", "t1", df1, "s", "t2", df2, 1, 1)
+        assert "безопасен" in output
+        assert "Безопасный паттерн" not in output

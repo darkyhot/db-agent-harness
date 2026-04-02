@@ -288,13 +288,17 @@ class GraphNodes:
         if len(system_prompt) + len(user_prompt) > max_chars:
             user_prompt = _trim_md_tables(user_prompt)
 
-        # --- Шаг 1: обрезать секцию РАЗВЕДКИ ТАБЛИЦ (самую большую) ---
+        # --- Шаг 1: обрезать секцию РАЗВЕДКИ ТАБЛИЦ (умный trimming) ---
+        # Приоритет сохранения: структура колонок > JOIN-анализ > образцы данных
         if len(user_prompt) > usr_budget:
             tables_marker = "=== РАЗВЕДКА ТАБЛИЦ"
             if tables_marker in user_prompt:
                 start_idx = user_prompt.index(tables_marker)
                 # Конец секции разведки — начало следующей ключевой секции
-                end_markers = ["Чеклист перед финализацией", "[ТЕКУЩИЙ ШАГ", "[ШАГ]", "[ОШИБКА]"]
+                end_markers = [
+                    "Чеклист перед финализацией", "[ТЕКУЩИЙ ШАГ", "[ШАГ]",
+                    "[ОШИБКА]", "[КОНТЕКСТ ТАБЛИЦ]", "[РЕАЛЬНЫЕ КОЛОНКИ",
+                ]
                 end_idx = len(user_prompt)
                 for marker in end_markers:
                     pos = user_prompt.find(marker, start_idx + len(tables_marker))
@@ -307,12 +311,7 @@ class GraphNodes:
                 available = usr_budget - other_len
 
                 if available >= 500:
-                    # Обрезаем саму секцию разведки, оставляем минимум
-                    trimmed = (
-                        tables_section[:available]
-                        + "\n\n[...разведка таблиц обрезана из-за лимита токенов"
-                        " — используй get_table_columns для деталей]\n\n"
-                    )
+                    trimmed = self._smart_trim_recon(tables_section, available)
                 else:
                     # Места совсем нет — убираем разведку полностью
                     trimmed = (
@@ -336,6 +335,42 @@ class GraphNodes:
             )
 
         return system_prompt, user_prompt
+
+    @staticmethod
+    def _smart_trim_recon(section: str, max_chars: int) -> str:
+        """Умная обрезка секции разведки таблиц.
+
+        Приоритет сохранения (от высшего к низшему):
+        1. Структура колонок (**Структура**) — КРИТИЧНО для генерации SQL
+        2. JOIN-анализ (=== JOIN-АНАЛИЗ) — важно для безопасности
+        3. Образцы данных (**Образец данных**) — наименее критично
+
+        Обрезаем от наименее важного к наиболее важному.
+        """
+        # Шаг 1: убираем образцы данных (markdown-таблицы после **Образец**)
+        trimmed = re.sub(
+            r'(\*\*Образец данных[^*]*\*\*:?\s*\n)(\|.*\n)+',
+            r'\1[...образцы обрезаны — используй get_sample]\n',
+            section,
+        )
+        if len(trimmed) <= max_chars:
+            return trimmed
+
+        # Шаг 2: убираем JOIN-анализ
+        trimmed = re.sub(
+            r'\n*=== JOIN-АНАЛИЗ.*',
+            '\n[...JOIN-анализ обрезан]\n',
+            trimmed,
+            flags=re.DOTALL,
+        )
+        if len(trimmed) <= max_chars:
+            return trimmed
+
+        # Шаг 3: обрезаем по лимиту (структура колонок — последнее что режем)
+        return (
+            trimmed[:max_chars]
+            + "\n\n[...структура таблиц обрезана — используй get_table_columns]\n\n"
+        )
 
     def _get_tables_detail_context(self, text: str) -> str:
         """Найти упоминания таблиц в тексте и вернуть полное описание их колонок из CSV.
@@ -543,6 +578,10 @@ class GraphNodes:
             f"Доступные инструменты:\n{self.tools_compact}\n\n"
             "Правила:\n"
             "- Используй ТОЛЬКО реальные таблицы из каталога в формате schema.table\n"
+            "- КРИТИЧНО: КАЖДЫЙ шаг плана ДОЛЖЕН содержать ВСЕ задействованные таблицы в формате schema.table.\n"
+            "  БЕЗ schema.table система НЕ подгрузит структуру колонок и SQL будет с ошибками!\n"
+            "  ПЛОХО: 'Написать SQL для подсчёта клиентов'\n"
+            "  ХОРОШО: 'Написать SQL по dm.clients для подсчёта клиентов'\n"
             "- НЕ пиши SQL в плане — только укажи нужные таблицы, SQL будет на этапе исполнения\n"
             "- НЕ выдумывай таблицы — если не знаешь таблицу, используй search_tables / search_by_description\n"
             "- Если ответ уже есть в каталоге или контексте — план из одного шага без инструментов\n"
@@ -702,7 +741,8 @@ class GraphNodes:
             f"Запрос пользователя: {user_input}\n\n"
             "Стратегия планирования:\n"
             "1. Для аналитики (подсчёты, агрегаты, выборки):\n"
-            "   - Первый шаг: укажи нужные таблицы в формате schema.table\n"
+            "   - Первый шаг: ОБЯЗАТЕЛЬНО укажи нужные таблицы в формате schema.table "
+            "(без этого система НЕ подгрузит структуру и SQL будет с ошибками!)\n"
             "   - Система автоматически подгрузит структуру и 10 строк данных\n"
             "   - SQL пиши только ПОСЛЕ изучения структуры\n"
             "2. Для вопросов по схеме: если ответ есть в каталоге — один шаг без инструментов\n"
@@ -776,6 +816,33 @@ class GraphNodes:
             if not df[mask].empty:
                 row = df[mask].iloc[0]
                 found_tables.add((row["schema_name"], row["table_name"]))
+
+        # === Изменение 5: Fallback — поиск таблиц по ключевым словам если schema.table не найден ===
+        if not found_tables:
+            keywords = set()
+            for word in re.findall(r'[a-zA-Zа-яА-ЯёЁ_]{3,}', scan_text.lower()):
+                if word not in self._STOP_WORDS:
+                    keywords.add(word)
+            if keywords:
+                search_q = " ".join(list(keywords)[:5])
+                try:
+                    search_df = self.schema.search_by_description(search_q)
+                    if not search_df.empty:
+                        for _, row in search_df.drop_duplicates(
+                            subset=["schema_name", "table_name"],
+                        ).head(3).iterrows():
+                            s = row.get("schema_name", "")
+                            t = row.get("table_name", "")
+                            if s and t:
+                                found_tables.add((s, t))
+                        if found_tables:
+                            logger.info(
+                                "TableExplorer fallback: найдено %d таблиц через search_by_description: %s",
+                                len(found_tables),
+                                ", ".join(f"{s}.{t}" for s, t in found_tables),
+                            )
+                except Exception as e:
+                    logger.warning("TableExplorer fallback search failed: %s", e)
 
         if not found_tables:
             logger.info("TableExplorer: таблицы не найдены в плане, пропускаем")
@@ -1707,6 +1774,42 @@ class GraphNodes:
 
         system_prompt = self._get_corrector_system_prompt()
 
+        # Извлекаем полный SQL из последнего tool_call (если есть)
+        last_sql = ""
+        if recent_calls:
+            last_args = recent_calls[-1].get("args", {})
+            if isinstance(last_args, dict):
+                last_sql = last_args.get("sql", "")
+
+        # === Изменение 1: Auto-load column info on column-not-found errors ===
+        column_fix_context = ""
+        error_lower = error.lower()
+        is_column_error = any(kw in error_lower for kw in [
+            "column", "does not exist", "не существует", "колонк",
+        ])
+        if is_column_error:
+            scan = (last_sql or "") + " " + error
+            tbl_pattern = re.compile(r'\b(\w+)\.(\w+)\b')
+            error_tables: set[tuple[str, str]] = set()
+            for m in tbl_pattern.finditer(scan):
+                s, t = m.group(1).lower(), m.group(2).lower()
+                cols_df = self.schema.get_table_columns(s, t)
+                if not cols_df.empty:
+                    error_tables.add((s, t))
+            if error_tables:
+                parts = []
+                for s, t in sorted(error_tables):
+                    info = self.schema.get_table_info(s, t)
+                    parts.append(f"### {s}.{t}\n{info}")
+                column_fix_context = (
+                    "[РЕАЛЬНЫЕ КОЛОНКИ ТАБЛИЦ — используй ТОЛЬКО эти колонки!]\n"
+                    + "\n\n".join(parts)
+                )
+                logger.info(
+                    "Corrector: auto-loaded columns for %s",
+                    ", ".join(f"{s}.{t}" for s, t in sorted(error_tables)),
+                )
+
         # Эскалация стратегии в зависимости от номера попытки
         is_row_explosion = "ROW EXPLOSION" in error
         if retry_count == 0:
@@ -1739,17 +1842,28 @@ class GraphNodes:
                     "  DISTINCT без понимания причины — ЗАПРЕЩЁН"
                 )
 
-        # Извлекаем полный SQL из последнего tool_call (если есть)
-        last_sql = ""
-        if recent_calls:
-            last_args = recent_calls[-1].get("args", {})
-            if isinstance(last_args, dict):
-                last_sql = last_args.get("sql", "")
+        # === Изменение 3: Усилить strategy_hint для ошибок колонок ===
+        if is_column_error:
+            strategy_hint += (
+                "\n\nОШИБКА КОЛОНКИ: Используй ТОЛЬКО колонки из секции [РЕАЛЬНЫЕ КОЛОНКИ] "
+                "или [КОНТЕКСТ ТАБЛИЦ].\n"
+                "ЗАПРЕЩЕНО угадывать имена колонок. Если нужной колонки нет в списке — "
+                "проверь правильность таблицы через get_table_columns или search_by_description."
+            )
 
+        # === Изменение 2: Переупорядочить user_prompt — колонки ближе к началу ===
         user_parts = []
         user_parts.append(f"[ЗАПРОС ПОЛЬЗОВАТЕЛЯ]\n{state['user_input']}")
         user_parts.append(f"[ПОПЫТКА {retry_count + 1} из {self.MAX_RETRIES}]")
         user_parts.append(f"[ШАГ]\n{current_step}")
+        # Колонки — высший приоритет, ставим в начало
+        if column_fix_context:
+            user_parts.append(column_fix_context)
+        if tables_context:
+            user_parts.append(f"[КОНТЕКСТ ТАБЛИЦ]\n{tables_context}")
+        if tables_detail:
+            user_parts.append(tables_detail)
+        # SQL и ошибка — после колонок
         if last_sql:
             user_parts.append(f"[SQL КОТОРЫЙ ВЫЗВАЛ ОШИБКУ]\n{last_sql}")
         user_parts.append(f"[ОШИБКА]\n{error}")
@@ -1767,10 +1881,7 @@ class GraphNodes:
                 f"Multiplication factor: {risk.get('multiplication_factor', '?')}x\n"
                 f"Проблемные ключи:\n{risk_details}"
             )
-        if tables_context:
-            user_parts.append(f"[КОНТЕКСТ ТАБЛИЦ]\n{tables_context}")
-        if tables_detail:
-            user_parts.append(tables_detail)
+        # Предыдущие вызовы — в конце, самое расходное при trim
         if prev_context:
             user_parts.append(f"[ПРЕДЫДУЩИЕ ВЫЗОВЫ]\n{prev_context}")
 

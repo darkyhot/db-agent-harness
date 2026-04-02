@@ -200,15 +200,17 @@ def _col_info(row: Any, pk_count: int) -> dict:
     desc = str(row.get("description", row.get("column_description", "")))
     name = str(row.get("column_name", ""))
 
-    # Composite PK detection
+    # Composite PK detection: член составного PK НИКОГДА не уникален сам по себе.
+    # Уникальность гарантируется только комбинацией всех PK-колонок.
+    # Безопасность одиночной колонки определяется только через unique_perc.
     effective_pk = is_pk
-    if is_pk and pk_count > 1 and u < 90.0:
-        effective_pk = False  # Часть составного PK, не уникальна сама по себе
+    if is_pk and pk_count > 1:
+        effective_pk = False  # Часть составного PK — не уникальна сама по себе
 
     col_class = classify_column(name, dtype, u, effective_pk, desc)
 
     # Status string
-    if is_pk and pk_count > 1 and u < 90.0:
+    if is_pk and pk_count > 1:
         status = f"composite-PK unique={u:.0f}%"
     elif is_pk:
         status = "PK"
@@ -440,6 +442,113 @@ def group_composite_keys(
 # 5. Форматирование для LLM
 # ---------------------------------------------------------------------------
 
+def _is_fact_type(ttype: str) -> bool:
+    """Является ли тип таблицы фактовым (fact или unknown — по умолчанию факт)."""
+    return ttype in ("fact", "unknown")
+
+
+def _is_dim_type(ttype: str) -> bool:
+    """Является ли тип таблицы справочником (dim, ref)."""
+    return ttype in ("dim", "ref")
+
+
+def _safe_join_strategy(
+    type1: str, type2: str,
+    tbl1: str, tbl2: str,
+    col1: str, col2: str,
+    col1_status: str, col2_status: str,
+) -> list[str]:
+    """Сгенерировать конкретную стратегию безопасного JOIN на основе типов таблиц.
+
+    Правила:
+    1. fact + fact → CTE с GROUP BY для обеих сторон по ключу джойна
+    2. fact + dim/ref → уникальная выборка из справочника по ключу джойна
+    3. dim/ref + fact → CTE с GROUP BY для таблицы фактов по ключу джойна
+    4. dim/ref + dim/ref → уникальные выборки из обоих справочников по ключу джойна
+    """
+    lines: list[str] = []
+    is_fact1 = _is_fact_type(type1)
+    is_fact2 = _is_fact_type(type2)
+    is_dim1 = _is_dim_type(type1)
+    is_dim2 = _is_dim_type(type2)
+
+    # Определяем стороны с дублями
+    side1_has_dupes = "ДУБЛИ" in col1_status or "composite-PK" in col1_status
+    side2_has_dupes = "ДУБЛИ" in col2_status or "composite-PK" in col2_status
+
+    if is_fact1 and is_fact2:
+        # fact + fact: обе стороны — агрегация в CTE, потом соединяем
+        lines.append("    → Стратегия: ФАКТ + ФАКТ — предварительная агрегация ОБЕИХ сторон в CTE")
+        lines.append(f"    → Паттерн:")
+        lines.append(f"      WITH cte1 AS (")
+        lines.append(f"        SELECT {col1}, SUM(<метрика1>) AS val1 FROM {tbl1} GROUP BY {col1}")
+        lines.append(f"      ), cte2 AS (")
+        lines.append(f"        SELECT {col2}, SUM(<метрика2>) AS val2 FROM {tbl2} GROUP BY {col2}")
+        lines.append(f"      )")
+        lines.append(f"      SELECT * FROM cte1 JOIN cte2 ON cte1.{col1} = cte2.{col2}")
+
+    elif is_fact1 and is_dim2:
+        # fact + dim: уникальная выборка из справочника
+        lines.append("    → Стратегия: ФАКТ + СПРАВОЧНИК — уникальная выборка из справочника")
+        if side2_has_dupes:
+            lines.append(f"    → Паттерн:")
+            lines.append(f"      SELECT f.*, d.<нужные_колонки>")
+            lines.append(f"      FROM {tbl1} f")
+            lines.append(f"      JOIN (")
+            lines.append(f"        SELECT DISTINCT ON ({col2}) {col2}, <нужные_колонки>")
+            lines.append(f"        FROM {tbl2} ORDER BY {col2}, <дата_актуальности> DESC")
+            lines.append(f"      ) d ON d.{col2} = f.{col1}")
+        else:
+            lines.append(f"    → JOIN {tbl2} безопасен по {col2} — прямой JOIN допустим")
+
+    elif is_dim1 and is_fact2:
+        # dim + fact: агрегация фактов в CTE/подзапросе
+        lines.append("    → Стратегия: СПРАВОЧНИК + ФАКТ — агрегация фактов в CTE/подзапросе")
+        if side2_has_dupes:
+            lines.append(f"    → Паттерн:")
+            lines.append(f"      SELECT d.*, agg.val")
+            lines.append(f"      FROM {tbl1} d")
+            lines.append(f"      JOIN (")
+            lines.append(f"        SELECT {col2}, SUM(<метрика>) AS val FROM {tbl2} GROUP BY {col2}")
+            lines.append(f"      ) agg ON agg.{col2} = d.{col1}")
+        else:
+            lines.append(f"    → JOIN {tbl2} безопасен по {col2} — прямой JOIN допустим")
+
+    elif is_dim1 and is_dim2:
+        # dim + dim: уникальные выборки из обоих справочников
+        lines.append("    → Стратегия: СПРАВОЧНИК + СПРАВОЧНИК — уникальные выборки из обеих сторон")
+        parts: list[str] = []
+        if side1_has_dupes:
+            parts.append(f"      WITH d1 AS (")
+            parts.append(f"        SELECT DISTINCT ON ({col1}) {col1}, <нужные_колонки>")
+            parts.append(f"        FROM {tbl1} ORDER BY {col1}, <дата_актуальности> DESC")
+            parts.append(f"      )")
+        if side2_has_dupes:
+            prefix = "      , d2 AS (" if side1_has_dupes else "      WITH d2 AS ("
+            parts.append(prefix)
+            parts.append(f"        SELECT DISTINCT ON ({col2}) {col2}, <нужные_колонки>")
+            parts.append(f"        FROM {tbl2} ORDER BY {col2}, <дата_актуальности> DESC")
+            parts.append(f"      )")
+        if parts:
+            lines.append(f"    → Паттерн:")
+            lines.extend(parts)
+            a1 = "d1" if side1_has_dupes else tbl1
+            a2 = "d2" if side2_has_dupes else tbl2
+            lines.append(f"      SELECT * FROM {a1} JOIN {a2} ON {a1}.{col1} = {a2}.{col2}")
+    else:
+        # Fallback для неизвестных комбинаций
+        if side2_has_dupes:
+            prob_tbl, prob_col = tbl2, col2
+        elif side1_has_dupes:
+            prob_tbl, prob_col = tbl1, col1
+        else:
+            prob_tbl, prob_col = tbl2, col2
+        lines.append(f"    → Паттерн: JOIN (SELECT DISTINCT ON ({prob_col}) * "
+                      f"FROM {prob_tbl} ORDER BY {prob_col}) sub ON sub.{prob_col} = ...")
+
+    return lines
+
+
 def format_join_analysis(
     s1: str, t1: str, cols1_df: pd.DataFrame,
     s2: str, t2: str, cols2_df: pd.DataFrame,
@@ -448,6 +557,7 @@ def format_join_analysis(
     """Сформировать блок JOIN-анализа для LLM-контекста.
 
     Возвращает компактный текст с ранжированными кандидатами и рекомендациями.
+    Включает конкретную стратегию безопасного JOIN на основе типов таблиц.
     """
     MAX_DISPLAY_CANDIDATES = 5
 
@@ -476,18 +586,16 @@ def format_join_analysis(
             f"  [{c.score:.2f}] {c.col1} ({c.col1_status}) ↔ "
             f"{c.col2} ({c.col2_status}) — {c.reason} → {safety}"
         )
-        # Для ОПАСНО — конкретный безопасный SQL-паттерн
+        # Для ОПАСНО — конкретный безопасный SQL-паттерн по типам таблиц
         if not c.safe:
             has_unsafe = True
-            # Определяем сторону с дублями
-            if "ДУБЛИ" in c.col2_status or "composite-PK" in c.col2_status:
-                prob_tbl, prob_col = c.table2, c.col2
-            else:
-                prob_tbl, prob_col = c.table1, c.col1
-            lines.append(
-                f"    → Безопасный паттерн: JOIN (SELECT DISTINCT ON ({prob_col}) * "
-                f"FROM {prob_tbl} ORDER BY {prob_col}) sub ON sub.{prob_col} = ..."
+            strategy_lines = _safe_join_strategy(
+                type1, type2,
+                c.table1, c.table2,
+                c.col1, c.col2,
+                c.col1_status, c.col2_status,
             )
+            lines.extend(strategy_lines)
 
     if len(candidates) > MAX_DISPLAY_CANDIDATES:
         lines.append(
@@ -497,7 +605,9 @@ def format_join_analysis(
     if has_unsafe:
         lines.append("")
         lines.append(
-            "ЗАПРЕЩЕНО использовать прямой JOIN по ключу помеченному ОПАСНО. "
-            "Используй подзапрос из 'Безопасный паттерн' выше или предварительную агрегацию."
+            "КРИТИЧЕСКОЕ ПРАВИЛО: SQL запрос НИКОГДА не должен множить данные.\n"
+            "ЗАПРЕЩЕНО использовать прямой JOIN по ключу помеченному ОПАСНО.\n"
+            "Используй стратегию из паттерна выше (CTE с GROUP BY или DISTINCT ON в подзапросе).\n"
+            "ЗАПРЕЩЕНО добавлять DISTINCT к внешнему SELECT — это маскирует проблему."
         )
     return "\n".join(lines)

@@ -327,7 +327,7 @@ class TestFormatJoinAnalysis:
         output = format_join_analysis("s", "t1", df1, "s", "t2", df2, 1, 1)
         assert "ОПАСНО" in output
         assert "[" in output  # score в квадратных скобках
-        assert "Безопасный паттерн" in output  # конкретная рекомендация для ОПАСНО
+        assert "Стратегия" in output  # конкретная стратегия для ОПАСНО
 
     def test_safe_join_no_pattern(self):
         """Безопасный join (100% unique обе стороны) — нет паттерна."""
@@ -341,4 +341,87 @@ class TestFormatJoinAnalysis:
         ])
         output = format_join_analysis("s", "t1", df1, "s", "t2", df2, 1, 1)
         assert "безопасен" in output
-        assert "Безопасный паттерн" not in output
+        assert "Стратегия" not in output
+
+    def test_fact_fact_strategy(self):
+        """fact + fact → стратегия с агрегацией обеих сторон в CTE."""
+        df1 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 60.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 60.0, "description": ""},
+        ])
+        output = format_join_analysis("s", "fact_sales", df1, "s", "fact_payments", df2, 0, 0)
+        assert "ФАКТ + ФАКТ" in output
+        assert "CTE" in output or "cte" in output.lower()
+        assert "GROUP BY" in output
+
+    def test_fact_dim_strategy(self):
+        """fact + dim → стратегия с уникальной выборкой из справочника."""
+        df1 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 60.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 60.0, "description": ""},
+        ])
+        output = format_join_analysis("s", "fact_sales", df1, "s", "dim_clients", df2, 0, 0)
+        assert "ФАКТ + СПРАВОЧНИК" in output
+        assert "DISTINCT ON" in output
+
+    def test_dim_fact_strategy(self):
+        """dim + fact → стратегия с агрегацией фактов."""
+        df1 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 30.0, "description": ""},
+        ])
+        output = format_join_analysis("s", "dim_clients", df1, "s", "fact_sales", df2, 1, 0)
+        assert "СПРАВОЧНИК + ФАКТ" in output
+        assert "GROUP BY" in output
+
+    def test_dim_dim_strategy(self):
+        """dim + dim → стратегия с уникальными выборками из обеих сторон."""
+        df1 = _make_cols_df([
+            {"column_name": "org_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 50.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "org_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 60.0, "description": ""},
+        ])
+        output = format_join_analysis("s", "dim_orgs", df1, "s", "ref_regions", df2, 0, 0)
+        assert "СПРАВОЧНИК + СПРАВОЧНИК" in output
+        assert "DISTINCT ON" in output
+
+    def test_composite_pk_high_unique_still_unsafe(self):
+        """Composite PK member with unique_perc=95% should still be unsafe.
+
+        Before the fix, threshold was < 90%, so 95% was treated as safe PK.
+        Now ANY composite PK member is not treated as PK for join safety.
+        """
+        df1 = _make_cols_df([
+            {"column_name": "emp_id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 95.0, "description": ""},
+            {"column_name": "dept_id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 20.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "emp_id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        candidates = rank_join_candidates("s", "t1", df1, "s", "t2", df2, 2, 1)
+        assert len(candidates) >= 1
+        emp_cand = [c for c in candidates if c.col1 == "emp_id"][0]
+        # emp_id in t1 is composite PK member (pk_count=2), so effective_pk=False.
+        # unique_perc=95% < 100%, so it's NOT safe.
+        assert not emp_cand.safe, (
+            "composite PK member with 95% unique should be unsafe "
+            "(only unique_perc=100% makes it safe)"
+        )

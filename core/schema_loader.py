@@ -270,9 +270,10 @@ class SchemaLoader:
                 col_detail.get("found")
                 and col_detail.get("is_primary_key")
                 and pk_count > 1
-                and col_detail.get("unique_perc", 0) < 90.0
             )
             if is_composite_pk_member:
+                # Член составного PK НИКОГДА не уникален сам по себе.
+                # Безопасен только если unique_perc == 100%.
                 is_unique = any_fully_unique
             else:
                 is_unique = all_pk or any_fully_unique

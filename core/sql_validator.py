@@ -516,27 +516,106 @@ class SQLValidator:
                     total *= 100.0
         return total
 
-    @staticmethod
-    def _generate_rewrite_suggestion(join: dict[str, str]) -> str:
-        """Сгенерировать конкретный шаблон переписывания JOIN с диагностикой причины дублей."""
-        schema, table, column = join["schema"], join["table"], join["column"]
-        return (
-            f"ROW EXPLOSION: JOIN ключ {schema}.{table}.{column} не уникален.\n"
-            f"ОБЯЗАТЕЛЬНО: вызови get_sample для {schema}.{table} и изучи причину дублей.\n"
-            f"Затем выбери стратегию исправления:\n"
-            f"  Вариант 1 — статусы/версии (active/liquidated, актуальная/архивная запись):\n"
-            f"    JOIN {schema}.{table} alias ON ... = alias.{column} WHERE alias.status = 'active'\n"
-            f"    или: JOIN (SELECT DISTINCT ON ({column}) * FROM {schema}.{table} "
-            f"ORDER BY {column}, <дата> DESC) alias ON ...\n"
-            f"  Вариант 2 — несколько фактов на объект (транзакции, платежи, события):\n"
-            f"    JOIN (SELECT {column}, SUM(<сумма>) AS total FROM {schema}.{table} "
-            f"GROUP BY {column}) alias ON ...\n"
-            f"  Вариант 3 — технические дубли (полностью идентичные строки, баг данных):\n"
-            f"    JOIN (SELECT DISTINCT {column}, <нужные_колонки> FROM {schema}.{table}) "
-            f"alias ON ... = alias.{column}\n"
-            f"ЗАПРЕЩЕНО: добавлять DISTINCT к внешнему SELECT — это маскирует проблему.\n"
-            f"ЗАПРЕЩЕНО: применять DISTINCT без понимания причины дублей."
+    def _generate_rewrite_suggestion(
+        self,
+        joined: dict[str, str],
+        existing: dict[str, str] | None = None,
+    ) -> str:
+        """Сгенерировать конкретный шаблон переписывания JOIN с учётом типов таблиц.
+
+        Стратегии:
+        1. fact + fact → CTE с GROUP BY для обеих сторон
+        2. fact + dim/ref → уникальная выборка из справочника
+        3. dim/ref + fact → CTE с GROUP BY для фактов
+        4. dim/ref + dim/ref → уникальные выборки из обеих сторон
+        """
+        schema, table, column = joined["schema"], joined["table"], joined["column"]
+        full_joined = f"{schema}.{table}"
+
+        # Определяем типы таблиц через schema_loader
+        joined_type = "unknown"
+        existing_type = "unknown"
+        if self._schema_loader is not None:
+            from core.join_analysis import detect_table_type
+            joined_cols_df = self._schema_loader.get_table_columns(schema, table)
+            joined_type = detect_table_type(table, joined_cols_df)
+            if existing:
+                existing_cols_df = self._schema_loader.get_table_columns(
+                    existing["schema"], existing["table"],
+                )
+                existing_type = detect_table_type(existing["table"], existing_cols_df)
+
+        full_existing = f"{existing['schema']}.{existing['table']}" if existing else "?"
+        ex_col = existing["column"] if existing else "?"
+
+        is_fact_j = joined_type in ("fact", "unknown")
+        is_dim_j = joined_type in ("dim", "ref")
+        is_fact_e = existing_type in ("fact", "unknown")
+        is_dim_e = existing_type in ("dim", "ref")
+
+        header = (
+            f"ROW EXPLOSION: JOIN ключ {full_joined}.{column} не уникален.\n"
+            f"Тип таблиц: {full_existing} ({existing_type}) ↔ {full_joined} ({joined_type})\n"
         )
+
+        if is_fact_e and is_fact_j:
+            strategy = (
+                f"СТРАТЕГИЯ: ФАКТ + ФАКТ — предварительная агрегация ОБЕИХ сторон в CTE.\n"
+                f"  WITH cte_left AS (\n"
+                f"    SELECT {ex_col}, SUM(<метрика>) AS val FROM {full_existing} GROUP BY {ex_col}\n"
+                f"  ), cte_right AS (\n"
+                f"    SELECT {column}, SUM(<метрика>) AS val FROM {full_joined} GROUP BY {column}\n"
+                f"  )\n"
+                f"  SELECT * FROM cte_left\n"
+                f"  JOIN cte_right ON cte_right.{column} = cte_left.{ex_col}"
+            )
+        elif is_fact_e and is_dim_j:
+            strategy = (
+                f"СТРАТЕГИЯ: ФАКТ + СПРАВОЧНИК — уникальная выборка из справочника.\n"
+                f"  JOIN (\n"
+                f"    SELECT DISTINCT ON ({column}) {column}, <нужные_колонки>\n"
+                f"    FROM {full_joined} ORDER BY {column}, <дата_актуальности> DESC\n"
+                f"  ) d ON d.{column} = <факт_алиас>.{ex_col}"
+            )
+        elif is_dim_e and is_fact_j:
+            strategy = (
+                f"СТРАТЕГИЯ: СПРАВОЧНИК + ФАКТ — агрегация фактов в CTE/подзапросе.\n"
+                f"  SELECT d.*, agg.val\n"
+                f"  FROM {full_existing} d\n"
+                f"  JOIN (\n"
+                f"    SELECT {column}, SUM(<метрика>) AS val FROM {full_joined} GROUP BY {column}\n"
+                f"  ) agg ON agg.{column} = d.{ex_col}"
+            )
+        elif is_dim_e and is_dim_j:
+            strategy = (
+                f"СТРАТЕГИЯ: СПРАВОЧНИК + СПРАВОЧНИК — уникальные выборки из обеих сторон.\n"
+                f"  WITH d1 AS (\n"
+                f"    SELECT DISTINCT ON ({ex_col}) {ex_col}, <колонки> FROM {full_existing}\n"
+                f"    ORDER BY {ex_col}, <дата> DESC\n"
+                f"  ), d2 AS (\n"
+                f"    SELECT DISTINCT ON ({column}) {column}, <колонки> FROM {full_joined}\n"
+                f"    ORDER BY {column}, <дата> DESC\n"
+                f"  )\n"
+                f"  SELECT * FROM d1 JOIN d2 ON d2.{column} = d1.{ex_col}"
+            )
+        else:
+            strategy = (
+                f"ОБЯЗАТЕЛЬНО: вызови get_sample для {full_joined} и изучи причину дублей.\n"
+                f"  Вариант 1 — статусы/версии:\n"
+                f"    JOIN (SELECT DISTINCT ON ({column}) * FROM {full_joined} "
+                f"ORDER BY {column}, <дата> DESC) alias ON ...\n"
+                f"  Вариант 2 — несколько фактов:\n"
+                f"    JOIN (SELECT {column}, SUM(<метрика>) AS total FROM {full_joined} "
+                f"GROUP BY {column}) alias ON ...\n"
+                f"  Вариант 3 — технические дубли:\n"
+                f"    JOIN (SELECT DISTINCT {column}, <колонки> FROM {full_joined}) alias ON ..."
+            )
+
+        footer = (
+            "\nЗАПРЕЩЕНО: добавлять DISTINCT к внешнему SELECT — это маскирует проблему.\n"
+            "ЗАПРЕЩЕНО: применять DISTINCT без понимания причины дублей."
+        )
+        return header + strategy + footer
 
     def _check_key_uniqueness(
         self, schema: str, table: str, columns: list[str],
@@ -652,7 +731,9 @@ class SQLValidator:
             result.join_checks.append(check_info)
 
             if not is_safe:
-                result.rewrite_suggestions.append(self._generate_rewrite_suggestion(joined))
+                result.rewrite_suggestions.append(
+                    self._generate_rewrite_suggestion(joined, existing)
+                )
 
         # 2b. Composite key re-check: если несколько колонок между одними таблицами,
         #     проверяем их как составной ключ (вместе могут быть уникальными)

@@ -379,6 +379,8 @@ class CorrectionNodes:
             f"Доступные инструменты:\n{self.tools_description}\n\n"
             "Формат ответа — СТРОГО один JSON-объект:\n"
             '{"tool": "имя_инструмента", "args": {"sql": "исправленный SQL"}}\n\n'
+            "ЗАПРЕЩЕНО вызывать файловые инструменты (create_file, edit_file, delete_file) "
+            "для исправления SQL — возвращай только execute_query или диагностические инструменты.\n\n"
         )
 
         # Добавляем только релевантные правила исправления
@@ -420,16 +422,26 @@ class CorrectionNodes:
         if column_context:
             user_parts.append(column_context)
 
-        # Для row_explosion — добавляем join analysis
+        # Для row_explosion — добавляем join analysis и рекомендации валидатора
         if error_type == "row_explosion":
             join_data = state.get("join_analysis_data", {})
             if join_data:
                 user_parts.append(f"[JOIN-АНАЛИЗ]\n{json.dumps(join_data, ensure_ascii=False, indent=2)}")
+            # Конкретные предложения по исправлению от валидатора (с реальными именами таблиц/колонок)
+            risk = state.get("join_risk_info", {})
+            rewrite_suggestions = risk.get("rewrite_suggestions", [])
+            if rewrite_suggestions:
+                suggestions_text = "\n".join(rewrite_suggestions)
+                user_parts.append(
+                    f"[РЕКОМЕНДАЦИИ ВАЛИДАТОРА — ИСПОЛЬЗУЙ ЭТОТ ШАБЛОН]\n{suggestions_text}"
+                )
 
-        # SQL blueprint
-        sql_blueprint = state.get("sql_blueprint", "")
-        if sql_blueprint:
-            user_parts.append(f"[SQL BLUEPRINT]\n{sql_blueprint}")
+        # SQL blueprint — пропускаем для row_explosion: он содержит cte_needed=false,
+        # что противоречит требуемому исправлению и вводит LLM в заблуждение
+        if error_type != "row_explosion":
+            sql_blueprint = state.get("sql_blueprint", "")
+            if sql_blueprint:
+                user_parts.append(f"[SQL BLUEPRINT]\n{sql_blueprint}")
 
         user_prompt = "\n\n".join(user_parts)
 
@@ -466,6 +478,27 @@ class CorrectionNodes:
             }
 
         # --- Вызов не-SQL инструмента напрямую ---
+        _FILE_TOOLS = {"create_file", "edit_file", "delete_file"}
+        if tool_call["tool"] in _FILE_TOOLS:
+            # Файловые инструменты не имеют смысла при исправлении SQL.
+            # Сохраняем оригинальный контекст ошибки и сигнализируем о повторной попытке.
+            logger.warning(
+                "SQLFixer: вызван файловый инструмент '%s' вместо SQL-инструмента — игнорируем",
+                tool_call["tool"],
+            )
+            original_error = diagnosis.get("root_cause", "row_explosion: прямой JOIN запрещён")
+            return {
+                "last_error": (
+                    f"sql_fixer вызвал недопустимый инструмент '{tool_call['tool']}'. "
+                    f"Исходная ошибка: {original_error}"
+                ),
+                "retry_count": retry_count,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": f"Ошибка: sql_fixer использовал файловый инструмент. Повтор."}
+                ],
+            }
+
         tool_result = self._call_tool(tool_call["tool"], tool_call.get("args", {}))
         result_str = str(tool_result)
 

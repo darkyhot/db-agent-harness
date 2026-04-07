@@ -286,6 +286,31 @@ class SqlPipelineNodes:
         if not relevant_examples:
             relevant_examples = _STRATEGY_EXAMPLES["simple_select"]
 
+        # Для JOIN-стратегий явно запрещаем прямой JOIN,
+        # даже если join_spec.safe=true — этот флаг выставляется статически
+        # column_selector'ом без проверки реальной уникальности ключа в данных.
+        join_subquery_warning = ""
+        if strategy == "fact_dim_join":
+            join_subquery_warning = (
+                "\nКРИТИЧЕСКОЕ ПРАВИЛО для fact_dim_join: "
+                "ВСЕГДА используй DISTINCT ON подзапрос для справочника — "
+                "прямой JOIN ЗАПРЕЩЁН даже если join_spec.safe=true.\n"
+                "safe=true в join_spec выставляется статически и НЕ гарантирует уникальность.\n"
+            )
+        elif strategy == "dim_fact_join":
+            join_subquery_warning = (
+                "\nКРИТИЧЕСКОЕ ПРАВИЛО для dim_fact_join: "
+                "ВСЕГДА агрегируй факт-таблицу в подзапросе — "
+                "прямой JOIN ЗАПРЕЩЁН даже если join_spec.safe=true.\n"
+                "safe=true в join_spec выставляется статически и НЕ гарантирует уникальность.\n"
+            )
+        elif strategy in ("fact_fact_join", "dim_dim_join"):
+            join_subquery_warning = (
+                f"\nКРИТИЧЕСКОЕ ПРАВИЛО для {strategy}: "
+                "ВСЕГДА используй CTE с агрегацией/DISTINCT ON для каждой таблицы — "
+                "прямой JOIN ЗАПРЕЩЁН даже если join_spec.safe=true.\n"
+            )
+
         system_prompt = (
             "Ты — SQL-писатель для Greenplum (PostgreSQL-совместимая).\n"
             "Пиши SQL СТРОГО по blueprint. Не меняй стратегию.\n\n"
@@ -296,7 +321,8 @@ class SqlPipelineNodes:
             "- Даты: используй ::date, ::timestamp, TO_DATE()\n"
             "- NULL: COALESCE() или IS NOT NULL\n"
             "- GROUP BY: все не-агрегированные колонки\n"
-            "- DISTINCT на внешнем SELECT — ЗАПРЕЩЁН\n\n"
+            "- DISTINCT на внешнем SELECT — ЗАПРЕЩЁН\n"
+            f"{join_subquery_warning}\n"
             f"{relevant_examples}\n\n"
             "Чеклист:\n"
             "1. Формат дат соответствует данным?\n"

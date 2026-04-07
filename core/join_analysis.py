@@ -146,8 +146,14 @@ def _compute_score(
     match_type: str,
     u1: float, u2: float,
     is_pk1: bool, is_pk2: bool,
+    raw_pk1: bool = False, raw_pk2: bool = False,
+    pk_count1: int = 1, pk_count2: int = 1,
 ) -> float:
-    """Вычислить score кандидата на JOIN."""
+    """Вычислить score кандидата на JOIN.
+
+    raw_pk1/raw_pk2 — реальная PK-пометка (до composite-коррекции).
+    pk_count1/pk_count2 — сколько PK-колонок в таблице (для composite-штрафа).
+    """
     # Обе стороны attribute → шум
     if col1_class == "attribute" and col2_class == "attribute":
         return 0.0
@@ -177,9 +183,9 @@ def _compute_score(
     elif col1_class == "business_key" or col2_class == "business_key":
         key_bonus = 0.1
 
-    # PK bonus
+    # PK bonus — только если PK одиночный (composite не гарантирует уникальность)
     pk_bonus = 0.0
-    if is_pk1 or is_pk2:
+    if (is_pk1 and pk_count1 == 1) or (is_pk2 and pk_count2 == 1):
         pk_bonus = 0.05
 
     score = min(base + key_bonus + pk_bonus, 1.0)
@@ -187,6 +193,16 @@ def _compute_score(
     # Штраф за одну attribute-сторону
     if col1_class == "attribute" or col2_class == "attribute":
         score *= 0.4
+
+    # Штраф за non-PK в стороне справочника (raw_pk=False при наличии PK в таблице)
+    # И при этом колонка не полностью уникальна (u < 100).
+    # Полностью уникальная колонка (u=100) равнозначна PK для JOIN — штраф не нужен.
+    # Снижаем приоритет не-ключевых дублирующих колонок — но не обнуляем, т.к. пользователь
+    # может явно указать соединение по такому полю.
+    if not raw_pk2 and pk_count2 > 0 and u2 < 100:
+        score *= 0.6
+    elif not raw_pk1 and pk_count1 > 0 and u1 < 100:
+        score *= 0.6
 
     # Штраф за неуникальность: чем ниже unique_perc, тем ниже score
     min_u = min(u1, u2)
@@ -248,6 +264,8 @@ def _make_candidate(
         match_type,
         info1["unique_perc"], info2["unique_perc"],
         info1["is_pk"], info2["is_pk"],
+        raw_pk1=info1["raw_pk"], raw_pk2=info2["raw_pk"],
+        pk_count1=info1["pk_count"], pk_count2=info2["pk_count"],
     )
     if score < MIN_CANDIDATE_SCORE:
         return None
@@ -556,6 +574,140 @@ def _safe_join_strategy(
     return lines
 
 
+def suggest_composite_joins(
+    candidates: list[JoinCandidate],
+    cols1_df: pd.DataFrame,
+    cols2_df: pd.DataFrame,
+    pk_count1: int,
+    pk_count2: int,
+    tbl1: str,
+    tbl2: str,
+) -> list[str]:
+    """Найти составные JOIN-ключи и вернуть готовые ON-строки для LLM.
+
+    Логика: если одна из таблиц имеет составной PK (pk_count > 1) и
+    среди кандидатов нашлись пары для ВСЕХ колонок этого PK — предлагаем
+    составной ON вместо одиночного.
+
+    Returns:
+        Список строк для добавления в блок JOIN-анализа.
+    """
+    lines: list[str] = []
+
+    # Собираем PK-колонки каждой таблицы из DataFrame
+    def _pk_cols(df: pd.DataFrame) -> list[str]:
+        if df.empty or "is_primary_key" not in df.columns:
+            return []
+        return df[df["is_primary_key"].astype(bool)]["column_name"].tolist()
+
+    pk1 = _pk_cols(cols1_df)
+    pk2 = _pk_cols(cols2_df)
+
+    # Индексы: col2 → col1 и col1 → col2 из найденных кандидатов
+    pair_map_2to1: dict[str, str] = {}  # col2 → col1
+    pair_map_1to2: dict[str, str] = {}  # col1 → col2
+    for c in candidates:
+        pair_map_2to1[c.col2] = c.col1
+        pair_map_1to2[c.col1] = c.col2
+
+    def _build_composite(pk_side: list[str], pair_map: dict[str, str],
+                         alias_pk: str, alias_other: str,
+                         pk_tbl: str, other_tbl: str) -> list[str]:
+        """Строим ON-условие: все PK-колонки pk_side нашли пару в pair_map."""
+        if len(pk_side) < 2:
+            return []
+        matched = [(pk_col, pair_map[pk_col]) for pk_col in pk_side if pk_col in pair_map]
+        if len(matched) < len(pk_side):
+            return []  # Не все PK-колонки нашли пару — не предлагаем
+
+        on_parts = [f"{alias_pk}.{pk_col} = {alias_other}.{other_col}"
+                    for pk_col, other_col in matched]
+        on_str = " AND ".join(on_parts)
+        pk_cols_str = ", ".join(pk_side)
+        result = [
+            f"  → Составной JOIN (покрывает весь PK {pk_tbl}: {pk_cols_str}):",
+            f"    ON {on_str}",
+        ]
+        return result
+
+    # Проверяем pk2 (правая таблица — чаще справочник)
+    composite2 = _build_composite(pk2, pair_map_2to1, "g", "f", tbl2, tbl1)
+    if composite2:
+        lines.append("")
+        lines.append("РЕКОМЕНДУЕМЫЙ СОСТАВНОЙ JOIN (покрывает полный PK справочника):")
+        lines.extend(composite2)
+        lines.append(
+            "  Примечание: если пользователь явно не указал иной ключ — "
+            "используй составной ON для исключения дублей."
+        )
+
+    # Проверяем pk1 (если pk2 не дал результата)
+    if not composite2:
+        composite1 = _build_composite(pk1, pair_map_1to2, "f", "g", tbl1, tbl2)
+        if composite1:
+            lines.append("")
+            lines.append("РЕКОМЕНДУЕМЫЙ СОСТАВНОЙ JOIN (покрывает полный PK):")
+            lines.extend(composite1)
+            lines.append(
+                "  Примечание: если пользователь явно не указал иной ключ — "
+                "используй составной ON для исключения дублей."
+            )
+
+    return lines
+
+
+def _non_pk_warnings(
+    candidates: list[JoinCandidate],
+    cols1_df: pd.DataFrame,
+    cols2_df: pd.DataFrame,
+    pk_count1: int,
+    pk_count2: int,
+) -> list[str]:
+    """Сформировать фактические предупреждения о non-PK join-ключах в dim-таблицах.
+
+    Не запрещает, а предоставляет факты: is_pk, unique_perc, какой PK у таблицы.
+    LLM сам принимает решение с учётом явных инструкций пользователя.
+    """
+    warnings: list[str] = []
+
+    def _pk_cols(df: pd.DataFrame) -> list[str]:
+        if df.empty or "is_primary_key" not in df.columns:
+            return []
+        return df[df["is_primary_key"].astype(bool)]["column_name"].tolist()
+
+    pk2_cols = _pk_cols(cols2_df)
+    pk1_cols = _pk_cols(cols1_df)
+
+    for c in candidates[:5]:
+        # Проверяем правую сторону (c.col2) — чаще справочник
+        if not c.col2_status.startswith("PK") and not c.col2_status.startswith("composite-PK"):
+            if pk_count2 > 0 and pk2_cols:
+                pk_str = ", ".join(pk2_cols)
+                warnings.append(
+                    f"  ИНФО: {c.col2} в {c.table2} — не PK (фактический PK: {pk_str}), "
+                    f"{c.col2_status}. "
+                    f"Если пользователь не указал иное — предпочти join по PK."
+                )
+        # Проверяем левую сторону (c.col1)
+        if not c.col1_status.startswith("PK") and not c.col1_status.startswith("composite-PK"):
+            if pk_count1 > 0 and pk1_cols:
+                pk_str = ", ".join(pk1_cols)
+                warnings.append(
+                    f"  ИНФО: {c.col1} в {c.table1} — не PK (фактический PK: {pk_str}), "
+                    f"{c.col1_status}. "
+                    f"Если пользователь не указал иное — предпочти join по PK."
+                )
+
+    # Дедупликация
+    seen: set[str] = set()
+    result = []
+    for w in warnings:
+        if w not in seen:
+            seen.add(w)
+            result.append(w)
+    return result
+
+
 def format_join_analysis(
     s1: str, t1: str, cols1_df: pd.DataFrame,
     s2: str, t2: str, cols2_df: pd.DataFrame,
@@ -564,7 +716,10 @@ def format_join_analysis(
     """Сформировать блок JOIN-анализа для LLM-контекста.
 
     Возвращает компактный текст с ранжированными кандидатами и рекомендациями.
-    Включает конкретную стратегию безопасного JOIN на основе типов таблиц.
+    Включает:
+    - ранжированные одиночные кандидаты с фактической аннотацией (PK/non-PK)
+    - составной JOIN-ключ, если PK таблицы составной и все его части нашли пару
+    - конкретную стратегию безопасного JOIN на основе типов таблиц
     """
     MAX_DISPLAY_CANDIDATES = 5
 
@@ -610,6 +765,22 @@ def format_join_analysis(
         lines.append(
             f"  (ещё {len(candidates) - MAX_DISPLAY_CANDIDATES} менее вероятных опущено)"
         )
+
+    # Фактические аннотации non-PK join-ключей (не запрет, а информация)
+    non_pk_warns = _non_pk_warnings(
+        shown, cols1_df, cols2_df, pk_count1, pk_count2,
+    )
+    if non_pk_warns:
+        lines.append("")
+        lines.extend(non_pk_warns)
+
+    # Составной JOIN (если PK составной и все части нашли пару)
+    composite_lines = suggest_composite_joins(
+        candidates, cols1_df, cols2_df,
+        pk_count1, pk_count2,
+        f"{s1}.{t1}", f"{s2}.{t2}",
+    )
+    lines.extend(composite_lines)
 
     if has_unsafe:
         lines.append("")

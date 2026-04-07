@@ -397,6 +397,27 @@ class ExplorerNodes:
             user_prompt += f"\n\n=== КОРРЕКТИРУЮЩАЯ ИНСТРУКЦИЯ ===\n{hint}"
             logger.info("ColumnSelector: применяю корректирующую подсказку от sql_planner")
 
+        # Известные ошибки из памяти — передаём чтобы агент не повторял их
+        correction_examples: list[str] = state.get("correction_examples", [])
+        if not correction_examples:
+            try:
+                correction_examples = self.memory.get_memory_list("correction_examples")
+            except Exception:
+                correction_examples = []
+        if correction_examples:
+            recent = correction_examples[-3:]
+            corrections_text = "\n".join(f"- {ex}" for ex in recent)
+            user_prompt += (
+                f"\n\n=== ИЗВЕСТНЫЕ ОШИБКИ — НЕ ПОВТОРЯТЬ ===\n"
+                f"{corrections_text}\n"
+                f"Если таблицы из этих примеров присутствуют в текущем запросе — "
+                f"учти исправление при выборе join_keys."
+            )
+            logger.info(
+                "ColumnSelector: добавлено %d correction_examples в промпт",
+                len(recent),
+            )
+
         system_prompt, user_prompt = self._trim_to_budget(system_prompt, user_prompt)
 
         if self.debug_prompt:
@@ -476,12 +497,49 @@ class ExplorerNodes:
         join_spec: list[dict[str, Any]] = []
         for jk in raw_join_keys:
             if isinstance(jk, dict) and "left" in jk and "right" in jk:
-                join_spec.append({
+                entry: dict[str, Any] = {
                     "left": str(jk["left"]),
                     "right": str(jk["right"]),
                     "safe": bool(jk.get("safe", False)),
                     "strategy": str(jk.get("strategy", "direct")),
-                })
+                }
+
+                # Post-validation: проверяем уникальность правой стороны по схеме.
+                # Если колонка не уникальна — корректируем safe=False и добавляем risk.
+                # Это информационная коррекция, не блокирующая — sql_writer учтёт её.
+                right_parts = entry["right"].rsplit(".", 2)
+                if len(right_parts) == 3:
+                    r_schema, r_table, r_col = right_parts
+                    try:
+                        uniq = self.schema.check_key_uniqueness(r_schema, r_table, [r_col])
+                        if uniq.get("is_unique") is False:
+                            if entry["safe"]:
+                                entry["safe"] = False
+                                entry["risk"] = (
+                                    f"{r_col} не уникален в {r_schema}.{r_table} "
+                                    f"(~{uniq.get('duplicate_pct', '?')}% дублей)"
+                                )
+                                logger.warning(
+                                    "ColumnSelector post-validation: %s.%s.%s "
+                                    "помечен safe=True, но не уникален — исправляем на safe=False",
+                                    r_schema, r_table, r_col,
+                                )
+                        elif uniq.get("is_unique") is True:
+                            # Подтверждаем safe=True данными схемы
+                            if not entry["safe"]:
+                                entry["safe"] = True
+                                logger.info(
+                                    "ColumnSelector post-validation: %s.%s.%s "
+                                    "уникален по схеме — исправляем на safe=True",
+                                    r_schema, r_table, r_col,
+                                )
+                    except Exception as e:
+                        logger.debug(
+                            "ColumnSelector post-validation: ошибка проверки %s — %s",
+                            entry["right"], e,
+                        )
+
+                join_spec.append(entry)
 
         logger.info(
             "ColumnSelector: выбрано колонок для %d таблиц, %d join-ключей",

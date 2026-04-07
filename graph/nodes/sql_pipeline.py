@@ -96,6 +96,89 @@ _STRATEGY_EXAMPLES: dict[str, str] = {
 }
 
 
+def _build_join_rule(strategy: str, join_spec: list[dict]) -> str:
+    """Сформировать конкретное правило JOIN для sql_writer на основе join_spec.
+
+    Учитывает:
+    - safe-флаг каждой пары (проверен post-validation в column_selector)
+    - наличие нескольких пар для одной пары таблиц → composite AND
+    - стратегию (fact_dim_join, dim_fact_join и др.)
+    """
+    if not join_spec:
+        return ""
+
+    _join_strategies = {"fact_fact_join", "fact_dim_join", "dim_fact_join", "dim_dim_join"}
+    if strategy not in _join_strategies:
+        return ""
+
+    # Группируем join_spec по парам таблиц для обнаружения composite join
+    table_pairs: dict[tuple[str, str], list[dict]] = {}
+    for jk in join_spec:
+        left_tbl = ".".join(jk.get("left", "").rsplit(".", 1)[:-1])
+        right_tbl = ".".join(jk.get("right", "").rsplit(".", 1)[:-1])
+        key = (left_tbl, right_tbl)
+        table_pairs.setdefault(key, []).append(jk)
+
+    parts: list[str] = []
+
+    for (left_tbl, right_tbl), pairs in table_pairs.items():
+        is_composite = len(pairs) > 1
+
+        if is_composite:
+            on_conditions = []
+            for p in pairs:
+                left_col = p["left"].rsplit(".", 1)[-1]
+                right_col = p["right"].rsplit(".", 1)[-1]
+                on_conditions.append(f"f.{left_col} = g.{right_col}")
+            on_str = " AND ".join(on_conditions)
+            parts.append(
+                f"JOIN по составному ключу между {left_tbl} и {right_tbl}:\n"
+                f"  ON {on_str}\n"
+                f"  Используй ВСЕ условия через AND — не бери только одно."
+            )
+        else:
+            jk = pairs[0]
+            safe = jk.get("safe", False)
+            risk = jk.get("risk", "")
+            left_col = jk["left"].rsplit(".", 1)[-1]
+            right_col = jk["right"].rsplit(".", 1)[-1]
+
+            if safe:
+                parts.append(
+                    f"JOIN {left_tbl} ↔ {right_tbl} по {left_col} = {right_col}: "
+                    f"ключ уникален (safe=True) — прямой JOIN допустим."
+                )
+            else:
+                risk_note = f" ({risk})" if risk else ""
+                if strategy == "fact_dim_join":
+                    parts.append(
+                        f"JOIN {left_tbl} ↔ {right_tbl} по {left_col} = {right_col}: "
+                        f"safe=False{risk_note}.\n"
+                        f"  Используй DISTINCT ON ({right_col}) в подзапросе для справочника "
+                        f"{right_tbl}:\n"
+                        f"  JOIN (SELECT DISTINCT ON ({right_col}) {right_col}, <нужные_колонки>\n"
+                        f"        FROM {right_tbl} ORDER BY {right_col}) g ON g.{right_col} = f.{left_col}"
+                    )
+                elif strategy == "dim_fact_join":
+                    parts.append(
+                        f"JOIN {left_tbl} ↔ {right_tbl} по {left_col} = {right_col}: "
+                        f"safe=False{risk_note}.\n"
+                        f"  Агрегируй таблицу фактов в подзапросе:\n"
+                        f"  JOIN (SELECT {right_col}, SUM(<метрика>) AS val\n"
+                        f"        FROM {right_tbl} GROUP BY {right_col}) agg ON agg.{right_col} = d.{left_col}"
+                    )
+                else:
+                    parts.append(
+                        f"JOIN {left_tbl} ↔ {right_tbl} по {left_col} = {right_col}: "
+                        f"safe=False{risk_note} — используй CTE с агрегацией/DISTINCT ON."
+                    )
+
+    if not parts:
+        return ""
+
+    return "\nПРАВИЛА JOIN (на основе проверенных ключей):\n" + "\n".join(parts) + "\n"
+
+
 class SqlPipelineNodes:
     """Миксин с узлами sql_planner, sql_writer и sql_validator_node для GraphNodes."""
 
@@ -329,30 +412,11 @@ class SqlPipelineNodes:
         if not relevant_examples:
             relevant_examples = _STRATEGY_EXAMPLES["simple_select"]
 
-        # Для JOIN-стратегий явно запрещаем прямой JOIN,
-        # даже если join_spec.safe=true — этот флаг выставляется статически
-        # column_selector'ом без проверки реальной уникальности ключа в данных.
-        join_subquery_warning = ""
-        if strategy == "fact_dim_join":
-            join_subquery_warning = (
-                "\nКРИТИЧЕСКОЕ ПРАВИЛО для fact_dim_join: "
-                "ВСЕГДА используй DISTINCT ON подзапрос для справочника — "
-                "прямой JOIN ЗАПРЕЩЁН даже если join_spec.safe=true.\n"
-                "safe=true в join_spec выставляется статически и НЕ гарантирует уникальность.\n"
-            )
-        elif strategy == "dim_fact_join":
-            join_subquery_warning = (
-                "\nКРИТИЧЕСКОЕ ПРАВИЛО для dim_fact_join: "
-                "ВСЕГДА агрегируй факт-таблицу в подзапросе — "
-                "прямой JOIN ЗАПРЕЩЁН даже если join_spec.safe=true.\n"
-                "safe=true в join_spec выставляется статически и НЕ гарантирует уникальность.\n"
-            )
-        elif strategy in ("fact_fact_join", "dim_dim_join"):
-            join_subquery_warning = (
-                f"\nКРИТИЧЕСКОЕ ПРАВИЛО для {strategy}: "
-                "ВСЕГДА используй CTE с агрегацией/DISTINCT ON для каждой таблицы — "
-                "прямой JOIN ЗАПРЕЩЁН даже если join_spec.safe=true.\n"
-            )
+        # Формируем правило JOIN на основе фактических данных join_spec:
+        # - safe=True (проверено схемой) → прямой JOIN допустим
+        # - safe=False → DISTINCT ON / агрегация по реальному ключу из join_spec
+        # - Composite JOIN: несколько записей для одной пары таблиц → AND в ON
+        join_subquery_warning = _build_join_rule(strategy, join_spec_check)
 
         system_prompt = (
             "Ты — SQL-писатель для Greenplum (PostgreSQL-совместимая).\n"
@@ -365,6 +429,8 @@ class SqlPipelineNodes:
             "- NULL: COALESCE() или IS NOT NULL\n"
             "- GROUP BY: все не-агрегированные колонки\n"
             "- DISTINCT на внешнем SELECT — ЗАПРЕЩЁН\n"
+            "- Составной JOIN: если join_keys содержит несколько пар для одной пары таблиц — "
+            "объединяй ВСЕ условия через AND в одном ON-клаузе\n"
             f"{join_subquery_warning}\n"
             f"{relevant_examples}\n\n"
             "Чеклист:\n"
@@ -372,7 +438,8 @@ class SqlPipelineNodes:
             "2. NULL обработан для колонок с высоким % NULL?\n"
             "3. JOIN НЕ множит данные (по стратегии из blueprint)?\n"
             "4. GROUP BY содержит все не-агрегированные колонки?\n"
-            "5. Алиасы на английском?\n\n"
+            "5. Алиасы на английском?\n"
+            "6. Если join_keys составной (несколько пар) — все условия объединены через AND?\n\n"
             "Верни ТОЛЬКО JSON:\n"
             '{"tool": "execute_query", "args": {"sql": "SELECT ..."}}'
         )

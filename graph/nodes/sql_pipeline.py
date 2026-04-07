@@ -198,12 +198,11 @@ class SqlPipelineNodes:
         if missing_from_columns:
             warn_tables = ", ".join(missing_from_columns)
             user_parts.append(
-                f"ВНИМАНИЕ: следующие таблицы присутствуют в JOIN-анализе, "
-                f"но отсутствуют в выбранных колонках: {warn_tables}. "
-                f"Колонки из этих таблиц (например, segment_name, segment) "
-                f"НЕ могут быть взяты из других таблиц — используй только реально "
-                f"доступные колонки из selected_columns. "
-                f"Если JOIN необходим, укажи это в notes для sql_writer."
+                f"ВНИМАНИЕ: таблицы {warn_tables} присутствуют в JOIN-анализе, "
+                f"но column_selector не включил их в selected_columns. "
+                f"Если запрос требует данных из этих таблиц (название, наименование, "
+                f"атрибут из справочника) — выбери стратегию fact_dim_join и укажи "
+                f"в notes что требуется JOIN с {warn_tables}."
             )
 
         user_prompt = "\n\n".join(user_parts)
@@ -233,8 +232,52 @@ class SqlPipelineNodes:
 
         logger.info("SqlPlanner: стратегия=%s", blueprint.get("strategy"))
 
+        # Если dim-таблица пропущена в selected_columns — формируем подсказку для
+        # повторного запуска column_selector, но только один раз (hint ещё не установлен).
+        new_hint = ""
+        if missing_from_columns and not state.get("column_selector_hint", ""):
+            miss_str = ", ".join(missing_from_columns)
+            # Собираем список name-колонок из пропущенных таблиц для подсказки
+            name_col_examples: list[str] = []
+            for tbl in missing_from_columns:
+                parts = tbl.split(".", 1)
+                if len(parts) == 2:
+                    try:
+                        cols_df = self.schema.get_table_columns(parts[0], parts[1])
+                        if not cols_df.empty and "column_name" in cols_df.columns:
+                            name_cols = [
+                                c for c in cols_df["column_name"].tolist()
+                                if any(c.endswith(sfx) for sfx in
+                                       ("_name", "_short_name", "_full_name"))
+                            ]
+                            if name_cols:
+                                name_col_examples.append(
+                                    f"{tbl}: {', '.join(name_cols[:3])}"
+                                )
+                    except Exception:
+                        pass
+
+            hint_lines = [
+                f"Таблица {miss_str} была выбрана планировщиком, но ты не включил "
+                f"её в selected_columns на предыдущем шаге.",
+                f"Пользователь запрашивает данные из этой таблицы — ОБЯЗАТЕЛЬНО "
+                f"включи {miss_str} в columns и заполни join_keys для связи с "
+                f"основной таблицей.",
+            ]
+            if name_col_examples:
+                hint_lines.append(
+                    f"Name-колонки доступные в пропущенных таблицах: "
+                    + "; ".join(name_col_examples)
+                )
+            new_hint = " ".join(hint_lines)
+            logger.warning(
+                "SqlPlanner: dim-таблица пропущена (%s) — отправляю обратно в column_selector",
+                miss_str,
+            )
+
         return {
             "sql_blueprint": blueprint,
+            "column_selector_hint": new_hint,
             "graph_iterations": iterations,
             "messages": state["messages"] + [
                 {"role": "assistant",

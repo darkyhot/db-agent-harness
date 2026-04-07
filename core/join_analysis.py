@@ -132,6 +132,10 @@ class JoinCandidate:
     col1_status: str = ""
     col2_status: str = ""
 
+    # Описания колонок — помогают LLM выбрать семантически верный ключ
+    col1_desc: str = ""
+    col2_desc: str = ""
+
 
 # Минимальный score для включения в вывод
 MIN_CANDIDATE_SCORE = 0.3
@@ -229,6 +233,7 @@ def _col_info(row: Any, pk_count: int) -> dict:
         "description": desc,
         "col_class": col_class,
         "status": status,
+        "desc_short": desc[:60].strip() if desc else "",
     }
 
 
@@ -283,6 +288,8 @@ def _make_candidate(
         risk_detail=risk_detail,
         col1_status=info1["status"],
         col2_status=info2["status"],
+        col1_desc=info1.get("desc_short", ""),
+        col2_desc=info2.get("desc_short", ""),
     )
 
 
@@ -582,9 +589,11 @@ def format_join_analysis(
     has_unsafe = False
     for c in shown:
         safety = "безопасен" if c.safe else f"ОПАСНО: {c.risk_detail}"
+        desc1_part = f" '{c.col1_desc}'" if c.col1_desc else ""
+        desc2_part = f" '{c.col2_desc}'" if c.col2_desc else ""
         lines.append(
-            f"  [{c.score:.2f}] {c.col1} ({c.col1_status}) ↔ "
-            f"{c.col2} ({c.col2_status}) — {c.reason} → {safety}"
+            f"  [{c.score:.2f}] {c.col1}{desc1_part} ({c.col1_status}) ↔ "
+            f"{c.col2}{desc2_part} ({c.col2_status}) — {c.reason} → {safety}"
         )
         # Для ОПАСНО — конкретный безопасный SQL-паттерн по типам таблиц
         if not c.safe:

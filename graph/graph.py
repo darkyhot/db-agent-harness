@@ -136,6 +136,22 @@ def _route_after_validator(state: AgentState) -> str:
     return "column_selector"
 
 
+def _route_after_sql_planner(state: AgentState) -> str:
+    """Маршрутизация после sql_planner.
+
+    Если column_selector пропустил dim-таблицу, возвращаемся в column_selector
+    с корректирующей подсказкой. Иначе — стандартный путь к sql_writer.
+    """
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("column_selector_hint", ""):
+        return "column_selector"
+
+    return "sql_writer"
+
+
 def _route_after_error_diagnoser(state: AgentState) -> str:
     """Маршрутизация после error_diagnoser."""
     limit = _check_limits(state)
@@ -243,11 +259,18 @@ def build_graph(
         "summarizer": "summarizer",
     })
 
-    # table_resolver → table_explorer → column_selector → sql_planner → sql_writer
+    # table_resolver → table_explorer → column_selector → sql_planner
     graph.add_edge("table_resolver", "table_explorer")
     graph.add_edge("table_explorer", "column_selector")
     graph.add_edge("column_selector", "sql_planner")
-    graph.add_edge("sql_planner", "sql_writer")
+
+    # sql_planner → conditional routing:
+    # если dim-таблица пропущена → column_selector (повтор с hint), иначе → sql_writer
+    graph.add_conditional_edges("sql_planner", _route_after_sql_planner, {
+        "column_selector": "column_selector",
+        "sql_writer": "sql_writer",
+        "summarizer": "summarizer",
+    })
 
     # sql_writer → conditional routing
     graph.add_conditional_edges("sql_writer", _route_after_sql_writer, {
@@ -327,4 +350,5 @@ def create_initial_state(user_input: str) -> AgentState:
         sql_blueprint={},
         error_diagnosis={},
         pending_sql_tool_call=None,
+        column_selector_hint="",
     )

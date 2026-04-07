@@ -342,6 +342,12 @@ class ExplorerNodes:
             "- Предупреждай о колонках с возможными NULL через null_warnings\n"
             "- join_keys заполняй только если таблиц больше одной\n"
             "- safe=true если JOIN по первичному/уникальному ключу без риска дубликатов\n"
+            "- КРИТИЧНО: если пользователь просит 'название', 'наименование' или 'имя' "
+            "какой-либо сущности — ОБЯЗАТЕЛЬНО включи колонку с суффиксом "
+            "_name/_short_name/_full_name из справочной (dim) таблицы в selected_columns. "
+            "Числовой идентификатор (_id) из фактовой таблицы НЕ является названием.\n"
+            "- КРИТИЧНО: если доступны таблицы нескольких типов (факт + справочник) — "
+            "включи ОБЕ таблицы в columns и заполни join_keys между ними.\n"
         )
 
         # --- Пользовательский промпт ---
@@ -384,6 +390,12 @@ class ExplorerNodes:
             f"=== Образцы данных (первые строки) ==={samples_block}"
             f"{join_block}"
         )
+
+        # Если sql_planner обнаружил пропущенную таблицу — добавляем корректирующую подсказку
+        hint = state.get("column_selector_hint", "")
+        if hint:
+            user_prompt += f"\n\n=== КОРРЕКТИРУЮЩАЯ ИНСТРУКЦИЯ ===\n{hint}"
+            logger.info("ColumnSelector: применяю корректирующую подсказку от sql_planner")
 
         system_prompt, user_prompt = self._trim_to_budget(system_prompt, user_prompt)
 
@@ -487,6 +499,8 @@ class ExplorerNodes:
         return {
             "selected_columns": selected_columns,
             "join_spec": join_spec,
+            # Сбрасываем hint после использования, чтобы не зациклиться
+            "column_selector_hint": "",
             "messages": state["messages"] + [
                 {
                     "role": "assistant",

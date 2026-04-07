@@ -78,3 +78,8 @@ class AgentState(TypedDict):
 
     # sql_validator → pending tool call info
     pending_sql_tool_call: dict[str, Any] | None
+
+    # sql_planner → корректирующая подсказка для повторного запуска column_selector
+    # Устанавливается когда dim-таблица пропущена в selected_columns.
+    # Сбрасывается в "" после того как column_selector её использует.
+    column_selector_hint: str

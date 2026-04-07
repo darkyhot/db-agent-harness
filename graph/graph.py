@@ -1,4 +1,11 @@
-"""Сборка графа LangGraph с логикой переходов."""
+"""Сборка графа LangGraph с логикой переходов.
+
+Новая архитектура: 11 узлов вместо 6.
+intent_classifier → table_resolver → table_explorer → column_selector
+  → sql_planner → sql_writer → sql_validator
+      → [ошибка] → error_diagnoser → sql_fixer → sql_validator
+      → [успех] → summarizer → END
+"""
 
 import logging
 import time
@@ -32,106 +39,154 @@ def _is_timed_out(state: AgentState) -> bool:
     return False
 
 
-def _route_after_executor(state: AgentState) -> str:
-    """Маршрутизация после узла executor.
-
-    Returns:
-        Имя следующего узла.
-    """
-    # Лимит итераций графа — защита от бесконечных циклов
+def _check_limits(state: AgentState) -> str | None:
+    """Общая проверка лимитов. Возвращает 'summarizer' если лимит достигнут."""
     if state.get("graph_iterations", 0) >= MAX_GRAPH_ITERATIONS:
         logger.warning("Достигнут лимит итераций графа (%d)", MAX_GRAPH_ITERATIONS)
         return "summarizer"
-
     if _is_timed_out(state):
         return "summarizer"
+    return None
 
-    # Нужна disambiguation — выходим для уточнения у пользователя
+
+# ======================================================================
+# Функции маршрутизации для новых узлов
+# ======================================================================
+
+def _route_after_intent_classifier(state: AgentState) -> str:
+    """Маршрутизация после intent_classifier."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    intent = state.get("intent", {})
+
+    # Вопрос по схеме — сразу к summarizer (ответ из каталога)
+    if intent.get("intent") == "schema_question":
+        return "summarizer"
+
+    # Нужен поиск таблиц — к tool_dispatcher
+    if intent.get("needs_search"):
+        return "tool_dispatcher"
+
+    # Обычный путь — к table_resolver
+    return "table_resolver"
+
+
+def _route_after_tool_dispatcher(state: AgentState) -> str:
+    """Маршрутизация после tool_dispatcher."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    # Если dispatcher обработал search запрос — возврат к intent_classifier
+    intent = state.get("intent", {})
+    if intent.get("search_results"):
+        return "table_resolver"
+
+    # Если dispatcher загрузил sample — возврат к error_diagnoser
+    diagnosis = state.get("error_diagnosis", {})
+    if diagnosis.get("sample_data"):
+        return "error_diagnoser"
+
+    # Fallback
+    return "table_resolver"
+
+
+def _route_after_sql_writer(state: AgentState) -> str:
+    """Маршрутизация после sql_writer."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
     if state.get("needs_disambiguation"):
         return END
 
-    # Есть SQL для валидации
     if state.get("sql_to_validate"):
         return "sql_validator"
 
-    # Есть ошибка — идём в корректор
     if state.get("last_error"):
-        return "corrector"
+        return "error_diagnoser"
 
-    # Есть финальный ответ (установлен ранее)
     if state.get("final_answer"):
         return "summarizer"
 
-    # Все шаги выполнены
     if state["current_step"] >= len(state["plan"]):
         return "summarizer"
 
-    # Ещё есть шаги — продолжаем выполнение
-    return "executor"
+    # Ещё есть шаги — возврат к column_selector для следующего шага
+    return "column_selector"
 
 
 def _route_after_validator(state: AgentState) -> str:
-    """Маршрутизация после узла sql_validator.
-
-    Returns:
-        Имя следующего узла.
-    """
-    # Нужно подтверждение пользователя — выходим
+    """Маршрутизация после sql_validator."""
     if state.get("needs_confirmation"):
         return END
 
     if _is_timed_out(state):
         return "summarizer"
 
-    # Есть ошибка — идём в корректор
     if state.get("last_error"):
-        return "corrector"
+        return "error_diagnoser"
 
-    # Все шаги выполнены
     if state["current_step"] >= len(state["plan"]):
         return "summarizer"
 
-    # Продолжаем выполнение
-    return "executor"
+    # Ещё есть шаги — к column_selector
+    return "column_selector"
 
 
-def _route_after_corrector(state: AgentState) -> str:
-    """Маршрутизация после узла corrector.
+def _route_after_error_diagnoser(state: AgentState) -> str:
+    """Маршрутизация после error_diagnoser."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
 
-    Returns:
-        Имя следующего узла.
-    """
-    # Лимит итераций графа — защита от бесконечных циклов
-    if state.get("graph_iterations", 0) >= MAX_GRAPH_ITERATIONS:
-        logger.warning("Достигнут лимит итераций графа (%d)", MAX_GRAPH_ITERATIONS)
-        return "summarizer"
-
-    if _is_timed_out(state):
-        return "summarizer"
-
-    # Нужен replanning — возвращаемся к planner
+    # Нужен replanning — к table_resolver с контекстом ошибки
     if state.get("needs_replan"):
-        return "planner"
+        return "table_resolver"
 
-    # Есть SQL для валидации после коррекции
+    # Тривиальный фикс кодом — SQL уже исправлен, к валидатору
     if state.get("sql_to_validate"):
         return "sql_validator"
 
-    # Есть финальный ответ (исчерпаны попытки)
+    # Нужен sample — к tool_dispatcher
+    diagnosis = state.get("error_diagnosis", {})
+    if diagnosis.get("needs_sample"):
+        return "tool_dispatcher"
+
+    # Исчерпаны попытки — финальный ответ
     if state.get("final_answer"):
         return "summarizer"
 
-    # Всё ещё ошибка — повторяем коррекцию
-    if state.get("last_error"):
-        return "corrector"
+    # Обычный путь — к sql_fixer для переписывания SQL
+    return "sql_fixer"
 
-    # Все шаги выполнены
+
+def _route_after_sql_fixer(state: AgentState) -> str:
+    """Маршрутизация после sql_fixer."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("sql_to_validate"):
+        return "sql_validator"
+
+    if state.get("final_answer"):
+        return "summarizer"
+
+    if state.get("last_error"):
+        return "error_diagnoser"
+
     if state["current_step"] >= len(state["plan"]):
         return "summarizer"
 
-    # Продолжаем выполнение
-    return "executor"
+    return "column_selector"
 
+
+# ======================================================================
+# Сборка графа
+# ======================================================================
 
 def build_graph(
     llm: RateLimitedLLM,
@@ -144,75 +199,100 @@ def build_graph(
 ) -> StateGraph:
     """Собрать граф агента.
 
-    Args:
-        llm: LLM клиент.
-        db_manager: Менеджер БД.
-        schema_loader: Загрузчик схемы.
-        memory: Менеджер памяти.
-        sql_validator: Валидатор SQL.
-        tools: Список LangChain tools.
-        debug_prompt: Если True, выводить полный промпт в консоль.
-
-    Returns:
-        Скомпилированный граф LangGraph.
+    Новая архитектура с 11 узлами:
+    intent_classifier → table_resolver → table_explorer → column_selector
+      → sql_planner → sql_writer → sql_validator
+          → [ошибка] → error_diagnoser → sql_fixer → sql_validator
+          → [успех] → summarizer → END
     """
-    nodes = GraphNodes(llm, db_manager, schema_loader, memory, sql_validator, tools, debug_prompt=debug_prompt)
+    nodes = GraphNodes(
+        llm, db_manager, schema_loader, memory, sql_validator, tools,
+        debug_prompt=debug_prompt,
+    )
 
     graph = StateGraph(AgentState)
 
-    # Добавляем узлы
-    graph.add_node("planner", nodes.planner)
+    # Добавляем все 11 узлов
+    graph.add_node("intent_classifier", nodes.intent_classifier)
+    graph.add_node("table_resolver", nodes.table_resolver)
     graph.add_node("table_explorer", nodes.table_explorer)
-    graph.add_node("executor", nodes.executor)
+    graph.add_node("column_selector", nodes.column_selector)
+    graph.add_node("sql_planner", nodes.sql_planner)
+    graph.add_node("sql_writer", nodes.sql_writer)
     graph.add_node("sql_validator", nodes.sql_validator_node)
-    graph.add_node("corrector", nodes.corrector)
+    graph.add_node("error_diagnoser", nodes.error_diagnoser)
+    graph.add_node("sql_fixer", nodes.sql_fixer)
     graph.add_node("summarizer", nodes.summarizer)
+    graph.add_node("tool_dispatcher", nodes.tool_dispatcher)
 
     # Точка входа
-    graph.set_entry_point("planner")
+    graph.set_entry_point("intent_classifier")
 
-    # Переходы: planner → table_explorer → executor
-    graph.add_edge("planner", "table_explorer")
-    graph.add_edge("table_explorer", "executor")
-
-    graph.add_conditional_edges("executor", _route_after_executor, {
-        END: END,
-        "sql_validator": "sql_validator",
-        "corrector": "corrector",
+    # === Линейная цепочка: intent → tables → explore → columns → plan → write ===
+    # intent_classifier → conditional routing
+    graph.add_conditional_edges("intent_classifier", _route_after_intent_classifier, {
         "summarizer": "summarizer",
-        "executor": "executor",
+        "tool_dispatcher": "tool_dispatcher",
+        "table_resolver": "table_resolver",
     })
 
+    # tool_dispatcher → conditional routing (back to resolver or diagnoser)
+    graph.add_conditional_edges("tool_dispatcher", _route_after_tool_dispatcher, {
+        "table_resolver": "table_resolver",
+        "error_diagnoser": "error_diagnoser",
+        "summarizer": "summarizer",
+    })
+
+    # table_resolver → table_explorer → column_selector → sql_planner → sql_writer
+    graph.add_edge("table_resolver", "table_explorer")
+    graph.add_edge("table_explorer", "column_selector")
+    graph.add_edge("column_selector", "sql_planner")
+    graph.add_edge("sql_planner", "sql_writer")
+
+    # sql_writer → conditional routing
+    graph.add_conditional_edges("sql_writer", _route_after_sql_writer, {
+        END: END,
+        "sql_validator": "sql_validator",
+        "error_diagnoser": "error_diagnoser",
+        "summarizer": "summarizer",
+        "column_selector": "column_selector",
+    })
+
+    # sql_validator → conditional routing
     graph.add_conditional_edges("sql_validator", _route_after_validator, {
         END: END,
-        "corrector": "corrector",
+        "error_diagnoser": "error_diagnoser",
         "summarizer": "summarizer",
-        "executor": "executor",
+        "column_selector": "column_selector",
     })
 
-    graph.add_conditional_edges("corrector", _route_after_corrector, {
-        "planner": "planner",
+    # === Цикл коррекции ===
+    # error_diagnoser → conditional routing
+    graph.add_conditional_edges("error_diagnoser", _route_after_error_diagnoser, {
+        "table_resolver": "table_resolver",
         "sql_validator": "sql_validator",
-        "corrector": "corrector",
+        "tool_dispatcher": "tool_dispatcher",
+        "sql_fixer": "sql_fixer",
         "summarizer": "summarizer",
-        "executor": "executor",
     })
 
+    # sql_fixer → conditional routing
+    graph.add_conditional_edges("sql_fixer", _route_after_sql_fixer, {
+        "sql_validator": "sql_validator",
+        "error_diagnoser": "error_diagnoser",
+        "summarizer": "summarizer",
+        "column_selector": "column_selector",
+    })
+
+    # summarizer → END
     graph.add_edge("summarizer", END)
 
-    logger.info("Граф агента собран")
+    logger.info("Граф агента собран (11 узлов)")
     return graph.compile()
 
 
 def create_initial_state(user_input: str) -> AgentState:
-    """Создать начальное состояние для запуска графа.
-
-    Args:
-        user_input: Запрос пользователя.
-
-    Returns:
-        Начальное состояние AgentState.
-    """
+    """Создать начальное состояние для запуска графа."""
     return AgentState(
         messages=[],
         plan=[],
@@ -235,4 +315,16 @@ def create_initial_state(user_input: str) -> AgentState:
         replan_count=0,
         needs_replan=False,
         replan_context="",
+        # Новые структурированные поля
+        intent={},
+        selected_tables=[],
+        table_structures={},
+        table_samples={},
+        table_types={},
+        join_analysis_data={},
+        selected_columns={},
+        join_spec=[],
+        sql_blueprint={},
+        error_diagnosis={},
+        pending_sql_tool_call=None,
     )

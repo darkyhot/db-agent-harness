@@ -30,12 +30,22 @@ LOG_FILE = WORKSPACE_DIR / "agent.log"
 
 # Маппинг узлов графа на пользовательские статусы
 _NODE_STATUS = {
-    "planner": "Анализирую запрос и составляю план...",
+    # Новая архитектура (11 узлов)
+    "intent_classifier": "Анализирую запрос...",
+    "table_resolver": "Определяю нужные таблицы...",
     "table_explorer": "Подгружаю структуру и образцы данных таблиц...",
-    "executor": "Выполняю шаг плана...",
-    "sql_validator": "Проверяю SQL-запрос...",
-    "corrector": "Исправляю ошибку...",
+    "column_selector": "Выбираю колонки для запроса...",
+    "sql_planner": "Планирую стратегию SQL...",
+    "sql_writer": "Пишу SQL-запрос...",
+    "sql_validator": "Проверяю и выполняю SQL...",
+    "error_diagnoser": "Анализирую ошибку...",
+    "sql_fixer": "Исправляю SQL...",
+    "tool_dispatcher": "Выполняю поиск...",
     "summarizer": "Формирую ответ...",
+    # Обратная совместимость (старые узлы)
+    "planner": "Анализирую запрос и составляю план...",
+    "executor": "Выполняю шаг плана...",
+    "corrector": "Исправляю ошибку...",
 }
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -404,8 +414,8 @@ class CLIInterface:
                 elapsed = time.time() - start_time
                 status_text = _NODE_STATUS.get(node_name, node_name)
 
-                # Дополняем статус executor номером шага
-                if node_name == "executor":
+                # Дополняем статус sql_writer номером шага
+                if node_name in ("sql_writer", "executor"):
                     step = result.get("current_step", 0)
                     total = len(result.get("plan", []))
                     if total:

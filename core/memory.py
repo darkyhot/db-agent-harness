@@ -1,6 +1,9 @@
 """Персистентная память агента на SQLite."""
 
+import atexit
+import json
 import logging
+import signal
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -27,6 +30,7 @@ class MemoryManager:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._session_id: str | None = None
         self._init_db()
+        self._register_cleanup()
 
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
@@ -36,6 +40,7 @@ class MemoryManager:
             timeout=30,
             check_same_thread=False,
         )
+        conn.execute("PRAGMA busy_timeout=30000")
         try:
             yield conn
             conn.commit()
@@ -48,11 +53,123 @@ class MemoryManager:
     def close(self) -> None:
         """Совместимость с прежним API (соединения теперь закрываются автоматически)."""
 
+    def _register_cleanup(self) -> None:
+        """Зарегистрировать cleanup при нормальном завершении (atexit + SIGTERM).
+
+        При выходе делаем WAL checkpoint → чистим -wal/-shm файлы.
+        Для SIGKILL (kill -9) это не сработает — на этот случай есть _break_stale_lock().
+        """
+        db_path = str(self._db_path)
+
+        def _do_cleanup() -> None:
+            try:
+                conn = sqlite3.connect(db_path, timeout=2)
+                conn.execute("PRAGMA busy_timeout=2000")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.close()
+            except Exception:
+                pass  # Best effort, не бросаем при shutdown
+
+        atexit.register(_do_cleanup)
+
+        # SIGTERM — Jupyter посылает перед SIGKILL, успеваем почистить
+        original_handler = signal.getsignal(signal.SIGTERM)
+
+        def _sigterm_handler(signum: int, frame: Any) -> None:
+            _do_cleanup()
+            if callable(original_handler) and original_handler not in (
+                signal.SIG_DFL, signal.SIG_IGN,
+            ):
+                original_handler(signum, frame)
+            else:
+                raise SystemExit(128 + signum)
+
+        try:
+            signal.signal(signal.SIGTERM, _sigterm_handler)
+        except (OSError, ValueError):
+            pass  # signal.signal работает только из main thread
+
+    def _break_stale_lock(self) -> None:
+        """Сбросить зависшие блокировки SQLite от мёртвых процессов (Jupyter kernel).
+
+        В WAL mode чтения никогда не блокируются — только записи. Поэтому
+        проверяем именно write lock через BEGIN IMMEDIATE. Если мёртвый процесс
+        держит блокировку через .db-shm — удаляем файл и восстанавливаем.
+        """
+        shm_path = Path(str(self._db_path) + "-shm")
+        wal_path = Path(str(self._db_path) + "-wal")
+
+        # Проверяем WRITE lock (не read!). BEGIN IMMEDIATE запрашивает RESERVED lock.
+        test_conn = None
+        try:
+            test_conn = sqlite3.connect(str(self._db_path), timeout=2)
+            test_conn.execute("PRAGMA busy_timeout=2000")
+            test_conn.execute("BEGIN IMMEDIATE")
+            test_conn.execute("ROLLBACK")
+            test_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            test_conn.close()
+            return  # Write lock свободен, всё ок
+        except sqlite3.OperationalError as e:
+            logger.warning("SQLite write-locked: %s — сбрасываем stale lock", e)
+            if test_conn:
+                try:
+                    test_conn.close()
+                except Exception:
+                    pass
+
+        # Удаляем -shm (shared memory lock). WAL-файл сохраняем — в нём данные.
+        if shm_path.exists():
+            try:
+                shm_path.unlink()
+                logger.info("Удалён stale lock-файл: %s", shm_path)
+            except OSError as e:
+                logger.warning("Не удалось удалить %s: %s", shm_path, e)
+
+        # Переоткрываем и делаем checkpoint для восстановления WAL
+        try:
+            recover_conn = sqlite3.connect(str(self._db_path), timeout=5)
+            recover_conn.execute("PRAGMA busy_timeout=5000")
+            if wal_path.exists():
+                recover_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                logger.info("WAL checkpoint выполнен после сброса lock")
+            recover_conn.close()
+        except Exception as e:
+            logger.warning("Восстановление после сброса lock: %s", e)
+
+        # Верификация: write lock должен быть свободен после recovery
+        verify_conn = None
+        try:
+            verify_conn = sqlite3.connect(str(self._db_path), timeout=3)
+            verify_conn.execute("PRAGMA busy_timeout=3000")
+            verify_conn.execute("BEGIN IMMEDIATE")
+            verify_conn.execute("ROLLBACK")
+            verify_conn.close()
+            logger.info("Write lock подтверждён после stale lock recovery")
+        except sqlite3.OperationalError:
+            if verify_conn:
+                try:
+                    verify_conn.close()
+                except Exception:
+                    pass
+            logger.error(
+                "БД всё ещё заблокирована после recovery. "
+                "Возможно, другой живой процесс держит блокировку."
+            )
+            raise
+
     def _init_db(self) -> None:
         """Создать таблицы если не существуют."""
+        # Сбросить stale locks от мёртвых Jupyter kernels
+        if self._db_path.exists():
+            self._break_stale_lock()
+
         with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=30000")
+            # WAL mode персистентен — ставим один раз, проверяем при каждом init
+            mode = conn.execute("PRAGMA journal_mode").fetchone()
+            if mode and mode[0].lower() != "wal":
+                conn.execute("PRAGMA journal_mode=WAL")
+                logger.info("SQLite journal_mode переключён на WAL")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
@@ -77,6 +194,47 @@ class MemoryManager:
                     updated_at TEXT
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sql_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    timestamp TEXT,
+                    user_input TEXT,
+                    sql TEXT,
+                    row_count INTEGER,
+                    status TEXT,
+                    duration_ms INTEGER,
+                    retry_count INTEGER DEFAULT 0,
+                    error_type TEXT DEFAULT ''
+                )
+            """)
+            # Миграция: добавить новые колонки для существующих БД
+            try:
+                conn.execute("ALTER TABLE sql_audit ADD COLUMN retry_count INTEGER DEFAULT 0")
+            except Exception:
+                pass  # колонка уже существует
+            try:
+                conn.execute("ALTER TABLE sql_audit ADD COLUMN error_type TEXT DEFAULT ''")
+            except Exception:
+                pass  # колонка уже существует
+
+            # Индексы для ускорения частых запросов
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                "ON messages(session_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sql_audit_session "
+                "ON sql_audit(session_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sql_audit_timestamp "
+                "ON sql_audit(timestamp)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_timestamp "
+                "ON sessions(timestamp)"
+            )
         logger.info("SQLite память инициализирована: %s", self._db_path)
 
     def start_session(self, user_id: str = "") -> str:
@@ -204,6 +362,62 @@ class MemoryManager:
             for r in rows
         ]
 
+    def get_unsummarized_sessions(self) -> list[str]:
+        """Получить ID сессий, у которых есть сообщения, но нет резюме.
+
+        Используется для восстановления памяти после аварийного завершения.
+
+        Returns:
+            Список ID незавершённых сессий (исключая текущую).
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT s.id FROM sessions s "
+                "WHERE (s.summary IS NULL OR s.summary = '') "
+                "AND s.id != ? "
+                "AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id) "
+                "ORDER BY s.timestamp DESC LIMIT 5",
+                (self._session_id or "",),
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    # --- SQL audit ---
+
+    def log_sql_execution(
+        self,
+        user_input: str,
+        sql: str,
+        row_count: int,
+        status: str,
+        duration_ms: int,
+        retry_count: int = 0,
+        error_type: str = "",
+    ) -> None:
+        """Записать выполненный SQL в аудит-лог.
+
+        Args:
+            user_input: Исходный запрос пользователя.
+            sql: Выполненный SQL-запрос.
+            row_count: Количество строк в результате.
+            status: Статус выполнения ('success', 'empty', 'error', 'row_explosion').
+            duration_ms: Время выполнения в миллисекундах.
+            retry_count: Количество попыток коррекции до успешного выполнения.
+            error_type: Тип ошибки (например, 'syntax', 'join_explosion', 'missing_column').
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO sql_audit "
+                    "(session_id, timestamp, user_input, sql, row_count, status, "
+                    "duration_ms, retry_count, error_type) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (self._session_id or "", now, user_input, sql, row_count, status,
+                     duration_ms, retry_count, error_type),
+                )
+        except Exception as e:
+            logger.warning("Ошибка записи SQL-аудита: %s", e)
+
     # --- Long-term memory ---
 
     def set_memory(self, key: str, value: str) -> None:
@@ -250,6 +464,24 @@ class MemoryManager:
             rows = cursor.fetchall()
         return {r[0]: r[1] for r in rows}
 
+    def get_memory_list(self, key: str) -> list[str]:
+        """Получить значение из долгосрочной памяти как JSON-список.
+
+        Args:
+            key: Ключ.
+
+        Returns:
+            Список строк или пустой список если не найдено / ошибка парсинга.
+        """
+        raw = self.get_memory(key)
+        if not raw:
+            return []
+        try:
+            val = json.loads(raw)
+            return val if isinstance(val, list) else []
+        except (json.JSONDecodeError, ValueError):
+            return []
+
     def delete_memory(self, key: str) -> None:
         """Удалить запись из долгосрочной памяти.
 
@@ -259,6 +491,121 @@ class MemoryManager:
         with self._connect() as conn:
             conn.execute("DELETE FROM long_term_memory WHERE key = ?", (key,))
         logger.info("Долгосрочная память удалена: key=%s", key)
+
+    def cleanup_old_sessions(self, keep_days: int = 90) -> int:
+        """Удалить сессии и их сообщения старше keep_days дней.
+
+        Args:
+            keep_days: Сколько дней хранить (по умолчанию 90).
+
+        Returns:
+            Количество удалённых сессий.
+        """
+        cutoff = datetime.now(timezone.utc).isoformat()
+        # Вычисляем дату отсечения (ISO формат сортируется лексикографически)
+        from datetime import timedelta
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=keep_days)
+        cutoff = cutoff_dt.isoformat()
+
+        with self._connect() as conn:
+            # Сначала считаем сколько удалим
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE timestamp < ?", (cutoff,)
+            )
+            count = cursor.fetchone()[0]
+
+            if count > 0:
+                # Удаляем сообщения старых сессий
+                conn.execute(
+                    "DELETE FROM messages WHERE session_id IN "
+                    "(SELECT id FROM sessions WHERE timestamp < ?)",
+                    (cutoff,),
+                )
+                # Удаляем записи аудита старых сессий
+                conn.execute(
+                    "DELETE FROM sql_audit WHERE session_id IN "
+                    "(SELECT id FROM sessions WHERE timestamp < ?)",
+                    (cutoff,),
+                )
+                # Удаляем сессии
+                conn.execute("DELETE FROM sessions WHERE timestamp < ?", (cutoff,))
+                logger.info("Очищено %d старых сессий (старше %d дней)", count, keep_days)
+
+        return count
+
+    def get_sql_quality_metrics(self, days: int = 30) -> dict[str, Any]:
+        """Получить метрики качества генерации SQL за указанный период.
+
+        Args:
+            days: Период в днях для анализа.
+
+        Returns:
+            Словарь с метриками качества.
+        """
+        from datetime import timedelta
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff = cutoff_dt.isoformat()
+
+        with self._connect() as conn:
+            # Общее количество SQL-запросов
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM sql_audit WHERE timestamp >= ?", (cutoff,)
+            )
+            total = cursor.fetchone()[0]
+
+            if total == 0:
+                return {"total_queries": 0, "period_days": days}
+
+            # Распределение по статусам
+            cursor = conn.execute(
+                "SELECT status, COUNT(*) FROM sql_audit WHERE timestamp >= ? GROUP BY status",
+                (cutoff,),
+            )
+            status_dist = dict(cursor.fetchall())
+
+            # Успешность с первой попытки (retry_count = 0 и status = 'success')
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM sql_audit "
+                "WHERE timestamp >= ? AND status = 'success' AND retry_count = 0",
+                (cutoff,),
+            )
+            first_try_success = cursor.fetchone()[0]
+
+            # Среднее количество retry
+            cursor = conn.execute(
+                "SELECT AVG(retry_count), MAX(retry_count) FROM sql_audit WHERE timestamp >= ?",
+                (cutoff,),
+            )
+            avg_retry, max_retry = cursor.fetchone()
+
+            # Среднее время выполнения
+            cursor = conn.execute(
+                "SELECT AVG(duration_ms), MAX(duration_ms) FROM sql_audit WHERE timestamp >= ?",
+                (cutoff,),
+            )
+            avg_duration, max_duration = cursor.fetchone()
+
+            # Распределение типов ошибок
+            cursor = conn.execute(
+                "SELECT error_type, COUNT(*) FROM sql_audit "
+                "WHERE timestamp >= ? AND error_type != '' GROUP BY error_type",
+                (cutoff,),
+            )
+            error_dist = dict(cursor.fetchall())
+
+            success_count = status_dist.get("success", 0)
+            return {
+                "total_queries": total,
+                "period_days": days,
+                "success_rate": round(success_count / total * 100, 1) if total > 0 else 0,
+                "first_try_success_rate": round(first_try_success / total * 100, 1) if total > 0 else 0,
+                "status_distribution": status_dist,
+                "avg_retries": round(float(avg_retry or 0), 2),
+                "max_retries": int(max_retry or 0),
+                "avg_duration_ms": round(float(avg_duration or 0), 0),
+                "max_duration_ms": int(max_duration or 0),
+                "error_distribution": error_dist,
+            }
 
     @property
     def session_count(self) -> int:

@@ -2,5 +2,6 @@
     "user_id": "",
     "host": "",
     "port": 5432,
-    "database": "prom"
+    "database": "prom",
+    "debug_prompt": false
 }

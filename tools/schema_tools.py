@@ -26,14 +26,28 @@ def create_schema_tools(schema_loader: SchemaLoader) -> list:
     def search_tables(query: str) -> str:
         """Поиск таблиц по имени, схеме или описанию.
 
+        Если запрос — вопрос-перечисление ('все', 'какие', 'список'),
+        возвращает полный каталог таблиц.
+
         Args:
             query: Строка поиска (например: 'зарплата', 'employee', 'hr').
 
         Returns:
             Список найденных таблиц с описаниями.
         """
+        import re
+
         try:
-            df = schema_loader.search_tables(query)
+            # Вопросы-перечисления: вернуть все таблицы
+            listing_pattern = re.compile(
+                r'(какие|покажи\s+все|список|перечисли|все\s+(витрины|таблицы))',
+                re.IGNORECASE,
+            )
+            if listing_pattern.search(query):
+                df = schema_loader.tables_df
+            else:
+                df = schema_loader.search_tables(query)
+
             if df.empty:
                 return f"Таблицы по запросу '{query}' не найдены."
             lines = [f"Найдено таблиц: {len(df)}", ""]

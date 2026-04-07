@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from core.synonym_map import expand_with_synonyms
+
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data_for_agent"
@@ -82,23 +84,35 @@ class SchemaLoader:
         return len(self.attrs_df)
 
     def search_tables(self, query: str) -> pd.DataFrame:
-        """Поиск таблиц по имени или описанию (case-insensitive).
+        """Поиск таблиц по имени или описанию (case-insensitive) с учётом синонимов.
 
         Args:
-            query: Строка поиска.
+            query: Строка поиска (русский или английский).
 
         Returns:
             DataFrame с найденными таблицами.
         """
         df = self.tables_df
         q = query.lower()
+
+        # Прямой поиск по оригинальному запросу
         mask = (
             df["table_name"].str.lower().str.contains(q, na=False)
             | df["schema_name"].str.lower().str.contains(q, na=False)
             | df["description"].str.lower().str.contains(q, na=False)
         )
+
+        # Расширенный поиск по синонимам
+        synonyms = expand_with_synonyms(query)
+        for syn in synonyms:
+            mask = mask | (
+                df["table_name"].str.lower().str.contains(syn, na=False)
+                | df["schema_name"].str.lower().str.contains(syn, na=False)
+                | df["description"].str.lower().str.contains(syn, na=False)
+            )
+
         result = df[mask].copy()
-        logger.info("search_tables('%s'): найдено %d", query, len(result))
+        logger.info("search_tables('%s'): найдено %d (синонимов: %d)", query, len(result), len(synonyms))
         return result
 
     def get_table_columns(self, schema: str, table: str) -> pd.DataFrame:
@@ -151,19 +165,22 @@ class SchemaLoader:
         return keys
 
     def search_by_description(self, text: str) -> pd.DataFrame:
-        """Поиск таблиц и колонок по текстовому описанию.
+        """Поиск таблиц и колонок по текстовому описанию с учётом синонимов.
 
         Args:
-            text: Текст для поиска в описаниях.
+            text: Текст для поиска в описаниях (русский или английский).
 
         Returns:
             DataFrame с результатами (schema, table, column, description).
         """
         q = text.lower()
+        synonyms = expand_with_synonyms(text)
 
         # Поиск в описаниях таблиц
         tdf = self.tables_df
         t_mask = tdf["description"].str.lower().str.contains(q, na=False)
+        for syn in synonyms:
+            t_mask = t_mask | tdf["description"].str.lower().str.contains(syn, na=False)
         tables_found = tdf[t_mask][["schema_name", "table_name", "description"]].copy()
         tables_found["column_name"] = ""
         tables_found["source"] = "table"
@@ -171,13 +188,15 @@ class SchemaLoader:
         # Поиск в описаниях атрибутов
         adf = self.attrs_df
         a_mask = adf["description"].str.lower().str.contains(q, na=False)
+        for syn in synonyms:
+            a_mask = a_mask | adf["description"].str.lower().str.contains(syn, na=False)
         attrs_found = adf[a_mask][
             ["schema_name", "table_name", "column_name", "description"]
         ].copy()
         attrs_found["source"] = "column"
 
         result = pd.concat([tables_found, attrs_found], ignore_index=True)
-        logger.info("search_by_description('%s'): найдено %d", text, len(result))
+        logger.info("search_by_description('%s'): найдено %d (синонимов: %d)", text, len(result), len(synonyms))
         return result
 
     def check_key_uniqueness(
@@ -233,8 +252,35 @@ class SchemaLoader:
                 any_fully_unique = True
             min_unique_perc = min(min_unique_perc, u_perc)
 
-        is_unique = all_pk or any_fully_unique
+        # Количество PK-колонок в таблице — для определения составного PK
+        pk_count = (
+            int(cols_df["is_primary_key"].astype(bool).sum())
+            if "is_primary_key" in cols_df.columns
+            else 0
+        )
+
+        # Для single column: одна полностью уникальная колонка достаточна.
+        # НО: если колонка — часть составного PK (pk_count > 1) и имеет
+        # низкий unique_perc, она НЕ уникальна сама по себе.
+        # Для composite key: any_fully_unique недостаточно — другая колонка
+        # может создавать дубли внутри уникальных значений первой.
+        if len(columns) == 1:
+            col_detail = list(details.values())[0]
+            is_composite_pk_member = (
+                col_detail.get("found")
+                and col_detail.get("is_primary_key")
+                and pk_count > 1
+            )
+            if is_composite_pk_member:
+                # Член составного PK НИКОГДА не уникален сам по себе.
+                # Безопасен только если unique_perc == 100%.
+                is_unique = any_fully_unique
+            else:
+                is_unique = all_pk or any_fully_unique
+        else:
+            is_unique = all_pk or min_unique_perc >= 95.0
         duplicate_pct = round(100.0 - min_unique_perc, 2)
+        status = "safe" if is_unique else "risky"
 
         return {
             "is_unique": is_unique,
@@ -242,6 +288,7 @@ class SchemaLoader:
             "min_unique_perc": min_unique_perc,
             "duplicate_pct": duplicate_pct,
             "columns": details,
+            "status": status,
         }
 
     def generate_ddl(self, schema: str, table: str) -> str:

@@ -448,9 +448,10 @@ class ExplorerNodes:
                         if col_str.lower() not in real_col_names:
                             logger.warning(
                                 "ColumnSelector: колонка %s.%s не существует "
-                                "в каталоге — оставляем для error_diagnoser",
+                                "в каталоге — пропускаем",
                                 table_key, col_str,
                             )
+                            continue
                     validated.append(col_str)
                 if validated:
                     validated_roles[role] = validated

@@ -54,6 +54,11 @@ _STRATEGY_EXAMPLES: dict[str, str] = {
         ") agg ON agg.client_id = c.client_id;"
     ),
     "fact_fact_join": (
+        "Стратегия ФАКТ + ФАКТ — ОБЯЗАТЕЛЬНЫЕ правила:\n"
+        "1. КАЖДАЯ таблица должна быть в ОТДЕЛЬНОМ CTE с агрегацией или DISTINCT ON по join-ключу\n"
+        "2. ПРЯМОЙ JOIN без CTE — ЗАПРЕЩЁН (риск размножения строк)\n"
+        "3. Колонки берутся ТОЛЬКО из той таблицы, в которой они реально существуют\n"
+        "4. SELECT * в финальном запросе — ЗАПРЕЩЁН\n\n"
         "Пример — ФАКТ + ФАКТ (обе стороны агрегированы в CTE):\n"
         "WITH sales_agg AS (\n"
         "    SELECT client_id, SUM(amount) AS total_sales\n"
@@ -63,7 +68,18 @@ _STRATEGY_EXAMPLES: dict[str, str] = {
         "    FROM dm.payments GROUP BY client_id\n"
         ")\n"
         "SELECT s.client_id, s.total_sales, p.total_paid\n"
-        "FROM sales_agg s JOIN payments_agg p ON p.client_id = s.client_id;"
+        "FROM sales_agg s JOIN payments_agg p ON p.client_id = s.client_id;\n\n"
+        "Пример — ФАКТ + таблица с атрибутом (DISTINCT ON по ключу):\n"
+        "WITH epk_seg AS (\n"
+        "    SELECT DISTINCT ON (inn) inn, segment_name\n"
+        "    FROM schema.epk_consolidation ORDER BY inn\n"
+        "), outflow_agg AS (\n"
+        "    SELECT report_dt, inn, SUM(outflow_qty) AS total_outflow\n"
+        "    FROM schema.fact_outflow GROUP BY report_dt, inn\n"
+        ")\n"
+        "SELECT o.report_dt, e.segment_name, SUM(o.total_outflow) AS total_outflow\n"
+        "FROM outflow_agg o JOIN epk_seg e ON e.inn = o.inn\n"
+        "GROUP BY o.report_dt, e.segment_name;"
     ),
     "dim_dim_join": (
         "Пример — СПРАВОЧНИК + СПРАВОЧНИК (уникальные выборки из обеих сторон):\n"
@@ -104,6 +120,25 @@ class SqlPipelineNodes:
         join_analysis_data = state.get("join_analysis_data", {})
 
         logger.info("SqlPlanner: строю blueprint для запроса")
+
+        # --- Проверка согласованности: join_analysis_data vs selected_columns ---
+        # Если join_analysis_data содержит таблицы, которых нет в selected_columns,
+        # значит column_selector пропустил одну из таблиц — предупреждаем планировщик.
+        missing_from_columns: list[str] = []
+        if join_analysis_data and selected_columns:
+            for pair_key, data in join_analysis_data.items():
+                for tbl_field in ("table1", "table2"):
+                    tbl = data.get(tbl_field, "") if isinstance(data, dict) else ""
+                    if tbl and tbl not in selected_columns:
+                        missing_from_columns.append(tbl)
+        missing_from_columns = list(dict.fromkeys(missing_from_columns))  # deduplicate
+
+        if missing_from_columns:
+            logger.warning(
+                "SqlPlanner: таблицы из join_analysis_data отсутствуют в selected_columns: %s. "
+                "Возможно, column_selector пропустил их — укажем в notes для sql_writer.",
+                missing_from_columns,
+            )
 
         # --- System prompt (~2K) ---
         system_prompt = (
@@ -159,6 +194,18 @@ class SqlPipelineNodes:
             ja_str = json.dumps(join_analysis_data, ensure_ascii=False, indent=2)
             user_parts.append(f"JOIN-анализ:\n{ja_str}")
 
+        # Предупреждение о несогласованности: таблицы из join_analysis без колонок
+        if missing_from_columns:
+            warn_tables = ", ".join(missing_from_columns)
+            user_parts.append(
+                f"ВНИМАНИЕ: следующие таблицы присутствуют в JOIN-анализе, "
+                f"но отсутствуют в выбранных колонках: {warn_tables}. "
+                f"Колонки из этих таблиц (например, segment_name, segment) "
+                f"НЕ могут быть взяты из других таблиц — используй только реально "
+                f"доступные колонки из selected_columns. "
+                f"Если JOIN необходим, укажи это в notes для sql_writer."
+            )
+
         user_prompt = "\n\n".join(user_parts)
 
         if self.debug_prompt:
@@ -208,9 +255,30 @@ class SqlPipelineNodes:
         iterations = state.get("graph_iterations", 0) + 1
         blueprint = state.get("sql_blueprint", {})
         selected_columns = state.get("selected_columns", {})
+        join_spec_check = state.get("join_spec", [])
         strategy = blueprint.get("strategy", "simple_select")
 
         logger.info("SqlWriter: пишу SQL, стратегия=%s", strategy)
+
+        # --- Guard: JOIN-стратегия без join_spec и без второй таблицы ---
+        _join_strategies = {"fact_fact_join", "fact_dim_join", "dim_fact_join", "dim_dim_join"}
+        if strategy in _join_strategies and not join_spec_check and len(selected_columns) < 2:
+            err = (
+                f"SqlWriter: стратегия '{strategy}' требует JOIN, "
+                f"но join_spec пуст и selected_columns содержит только одну таблицу "
+                f"({list(selected_columns.keys())}). "
+                f"Невозможно построить корректный JOIN — возврат на column_selector."
+            )
+            logger.error(err)
+            return {
+                "last_error": err,
+                "sql_to_validate": None,
+                "pending_sql_tool_call": None,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": f"Ошибка: {err}"}
+                ],
+            }
 
         # --- System prompt (~3K) ---
         # Выбираем 1-2 релевантных примера по стратегии

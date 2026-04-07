@@ -57,6 +57,13 @@ class IntentNodes:
             '  "needs_search": <true|false>,\n'
             '  "complexity": "<single_table|multi_table|join|subquery>"\n'
             "}\n\n"
+            "ПРАВИЛО complexity:\n"
+            "- single_table: данные нужны только из одной таблицы\n"
+            "- join: нужно объединить данные из двух+ таблиц "
+            "(сигналы: 'возьми из', 'дотяни из', 'подтяни из', 'по ключу из', 'из таблицы X', "
+            "'join', 'связать', упомянуты две разные таблицы)\n"
+            "- multi_table: несколько независимых запросов к разным таблицам\n"
+            "- subquery: нужен вложенный подзапрос\n\n"
             "=== ПРИМЕРЫ ===\n\n"
             'Запрос: "Сколько клиентов в регионе Москва?"\n'
             '{"intent": "analytics", "entities": ["клиенты", "регион", "Москва"], '
@@ -69,7 +76,19 @@ class IntentNodes:
             'Запрос: "Есть ли данные по оттоку клиентов?"\n'
             '{"intent": "table_search", "entities": ["отток", "клиенты"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": null, '
-            '"needs_search": true, "complexity": "single_table"}\n'
+            '"needs_search": true, "complexity": "single_table"}\n\n'
+            'Запрос: "Посчитай сумму оттока. Сегмент возьми по inn из uzp_data_epk_consolidation"\n'
+            '{"intent": "analytics", "entities": ["отток", "сегмент", "inn", "uzp_data_epk_consolidation"], '
+            '"date_filters": {"from": null, "to": null}, "aggregation_hint": "sum", '
+            '"needs_search": false, "complexity": "join"}\n\n'
+            'Запрос: "Покажи сумму продаж по менеджерам, сегмент дотяни по inn из справочника клиентов"\n'
+            '{"intent": "analytics", "entities": ["продажи", "менеджеры", "сегмент", "inn", "справочник клиентов"], '
+            '"date_filters": {"from": null, "to": null}, "aggregation_hint": "sum", '
+            '"needs_search": false, "complexity": "join"}\n\n'
+            'Запрос: "Сколько договоров по каждому сегменту, подтяни сегмент из таблицы clients"\n'
+            '{"intent": "analytics", "entities": ["договоры", "сегмент", "clients"], '
+            '"date_filters": {"from": null, "to": null}, "aggregation_hint": "count", '
+            '"needs_search": false, "complexity": "join"}\n'
         )
 
         # --- Пользовательский промпт ---

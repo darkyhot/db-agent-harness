@@ -31,6 +31,21 @@ _BUSINESS_KEY_NAMES = {
     "saphr_id", "tab_num",
 }
 
+# Префиксы для нормализации имён PK-колонок при поиске FK-пар в фактовых таблицах.
+# Позволяет находить соответствия вида old_gosb_id ↔ gosb_id, new_client_id ↔ client_id.
+_PK_NAME_PREFIXES = re.compile(r"^(old|new|prev|cur|current|actual|base|src|tgt)_", re.I)
+
+
+def _normalize_key_name(name: str) -> str:
+    """Нормализовать имя ключевой колонки для сравнения с FK-колонками.
+
+    Удаляет временные/версионные префиксы: old_, new_, prev_, cur_ и т.д.
+    Примеры: old_gosb_id → gosb_id, new_client_id → client_id.
+    Колонки без таких префиксов возвращаются без изменений.
+    """
+    return _PK_NAME_PREFIXES.sub("", name.lower())
+
+
 # Типы данных, характерные для атрибутов
 _ATTRIBUTE_DTYPES = re.compile(
     r"^(text|boolean|timestamp|json|jsonb|xml|bytea)", re.I,
@@ -163,7 +178,7 @@ def _compute_score(
     # Match type bonus
     if match_type == "exact_name":
         base = 0.5
-    elif match_type == "fk_pattern":
+    elif match_type in ("fk_pattern", "normalized_pk"):
         base = 0.55
     elif match_type == "suffix":
         base = 0.35
@@ -194,20 +209,36 @@ def _compute_score(
     if col1_class == "attribute" or col2_class == "attribute":
         score *= 0.4
 
-    # Штраф за non-PK в стороне справочника (raw_pk=False при наличии PK в таблице)
-    # И при этом колонка не полностью уникальна (u < 100).
-    # Полностью уникальная колонка (u=100) равнозначна PK для JOIN — штраф не нужен.
-    # Снижаем приоритет не-ключевых дублирующих колонок — но не обнуляем, т.к. пользователь
-    # может явно указать соединение по такому полю.
-    if not raw_pk2 and pk_count2 > 0 and u2 < 100:
+    # Штраф за non-PK колонку при наличии составного PK в таблице.
+    # Если dim имеет составной PK, а join идёт по не-PK колонке — это семантически
+    # неверный ключ (например, new_gosb_id вместо tb_id+old_gosb_id).
+    if not raw_pk2 and pk_count2 > 1:
+        score *= 0.2  # жёсткий штраф: составной PK не покрыт
+    elif not raw_pk1 and pk_count1 > 1:
+        score *= 0.2
+    elif not raw_pk2 and pk_count2 > 0 and u2 < 100:
+        # Обычный штраф за non-PK при одиночном PK
         score *= 0.6
-    elif not raw_pk1 and pk_count1 > 0 and u1 < 100:
+    elif not raw_pk1 and not raw_pk2 and pk_count1 > 0 and u1 < 100:
+        # Штраф за non-PK только когда обе стороны не являются PK.
+        # Если raw_pk2=True — сторона 1 является легитимным FK и штраф не нужен.
         score *= 0.6
 
-    # Штраф за неуникальность: чем ниже unique_perc, тем ниже score
-    min_u = min(u1, u2)
-    if min_u < 100:
-        score *= max(min_u / 100.0, 0.1)  # floor 0.1 чтобы не обнулять
+    # Штраф за неуникальность.
+    # Ключевые соображения:
+    # 1. Для члена составного PK: individual unique_perc занижен по природе составного
+    #    ключа — используем floor 50% чтобы не обнулять хорошие кандидаты.
+    # 2. Для FK-стороны (fact): low unique_perc нормален и ожидаем — в факт-таблице
+    #    много строк на один ключ. Релевантна только unique_perc PK-стороны (dim).
+    if raw_pk2:
+        u_for_penalty = max(u2, 50.0) if pk_count2 > 1 else u2
+    elif raw_pk1:
+        u_for_penalty = max(u1, 50.0) if pk_count1 > 1 else u1
+    else:
+        u_for_penalty = min(u1, u2)
+
+    if u_for_penalty < 100:
+        score *= max(u_for_penalty / 100.0, 0.1)  # floor 0.1 чтобы не обнулять
 
     return round(score, 2)
 
@@ -289,6 +320,7 @@ def _make_candidate(
         "exact_name": "одинаковое имя",
         "fk_pattern": "FK-паттерн",
         "suffix": "suffix-паттерн",
+        "normalized_pk": "нормализованное PK-имя (old_/new_-префикс)",
     }
     reason = reason_parts.get(match_type, match_type)
 
@@ -389,8 +421,34 @@ def rank_join_candidates(
                     else:
                         _add(fk_actual, pk_col, "fk_pattern")
 
-    # --- 3. Suffix matching (_id колонки) ---
-    # Только если хотя бы одна сторона — key/business_key (не оба attribute)
+    # --- 3. Нормализованный матчинг PK-колонок (old_X_id ↔ X_id) ---
+    # Выполняется ДО суффиксного матчинга, чтобы иметь приоритет.
+    # Для составных PK, где колонки имеют временные/версионные префиксы.
+    # Например: old_gosb_id (PK в dim) ↔ gosb_id (FK в fact).
+    for (pk_s, pk_t, pk_map, fk_s, fk_t, fk_map) in [
+        (s1, t1, info1_map, s2, t2, info2_map),
+        (s2, t2, info2_map, s1, t1, info1_map),
+    ]:
+        pk_cols = [n for n, info in pk_map.items() if info["raw_pk"]]
+        # Строим индекс: нормализованное_имя → реальное имя колонки в FK-таблице
+        fk_normalized: dict[str, str] = {_normalize_key_name(n): n for n in fk_map}
+
+        for pk_col in pk_cols:
+            norm_pk = _normalize_key_name(pk_col)
+            if norm_pk == pk_col.lower():
+                continue  # Нет префикса — уже обработано в шагах 1–2
+            if norm_pk in fk_normalized:
+                fk_actual = fk_normalized[norm_pk]
+                # Сравниваем по (schema, table), а не только по schema —
+                # во избежание ложных совпадений при одинаковых схемах.
+                if (pk_s, pk_t) == (s1, t1):
+                    _add(pk_col, fk_actual, "normalized_pk")
+                else:
+                    _add(fk_actual, pk_col, "normalized_pk")
+
+    # --- 4. Suffix matching (_id колонки) ---
+    # Только если хотя бы одна сторона — key/business_key (не оба attribute).
+    # Запускается после normalized_pk — пары уже добавленные туда пропускаются через seen.
     id_cols1 = [n for n in info1_map if n.endswith("_id")]
     id_cols2 = [n for n in info2_map if n.endswith("_id")]
     for c1 in id_cols1:
@@ -610,13 +668,39 @@ def suggest_composite_joins(
         pair_map_2to1[c.col2] = c.col1
         pair_map_1to2[c.col1] = c.col2
 
+    def _find_normalized_in_df(pk_col: str, df: pd.DataFrame) -> str | None:
+        """Найти пару для PK-колонки через нормализацию имени.
+
+        Fallback для случаев, когда пара не попала в candidates из-за штрафов.
+        Пример: old_gosb_id → gosb_id → найдено в другой таблице.
+        """
+        if df.empty or "column_name" not in df.columns:
+            return None
+        norm = _normalize_key_name(pk_col)
+        for col in df["column_name"].tolist():
+            if _normalize_key_name(col) == norm:
+                return col
+        return None
+
     def _build_composite(pk_side: list[str], pair_map: dict[str, str],
                          alias_pk: str, alias_other: str,
-                         pk_tbl: str, other_tbl: str) -> list[str]:
-        """Строим ON-условие: все PK-колонки pk_side нашли пару в pair_map."""
+                         pk_tbl: str, other_tbl: str,
+                         other_df: pd.DataFrame | None = None) -> list[str]:
+        """Строим ON-условие: все PK-колонки pk_side нашли пару в pair_map.
+
+        Если колонка не найдена в pair_map — пробуем нормализованный поиск по other_df
+        (fallback для old_/new_-префиксов, не попавших в candidates из-за штрафов).
+        """
         if len(pk_side) < 2:
             return []
-        matched = [(pk_col, pair_map[pk_col]) for pk_col in pk_side if pk_col in pair_map]
+        matched = []
+        for pk_col in pk_side:
+            if pk_col in pair_map:
+                matched.append((pk_col, pair_map[pk_col]))
+            elif other_df is not None:
+                found = _find_normalized_in_df(pk_col, other_df)
+                if found:
+                    matched.append((pk_col, found))
         if len(matched) < len(pk_side):
             return []  # Не все PK-колонки нашли пару — не предлагаем
 
@@ -631,7 +715,8 @@ def suggest_composite_joins(
         return result
 
     # Проверяем pk2 (правая таблица — чаще справочник)
-    composite2 = _build_composite(pk2, pair_map_2to1, "g", "f", tbl2, tbl1)
+    composite2 = _build_composite(pk2, pair_map_2to1, "g", "f", tbl2, tbl1,
+                                   other_df=cols1_df)
     if composite2:
         lines.append("")
         lines.append("РЕКОМЕНДУЕМЫЙ СОСТАВНОЙ JOIN (покрывает полный PK справочника):")
@@ -643,7 +728,8 @@ def suggest_composite_joins(
 
     # Проверяем pk1 (если pk2 не дал результата)
     if not composite2:
-        composite1 = _build_composite(pk1, pair_map_1to2, "f", "g", tbl1, tbl2)
+        composite1 = _build_composite(pk1, pair_map_1to2, "f", "g", tbl1, tbl2,
+                                       other_df=cols2_df)
         if composite1:
             lines.append("")
             lines.append("РЕКОМЕНДУЕМЫЙ СОСТАВНОЙ JOIN (покрывает полный PK):")

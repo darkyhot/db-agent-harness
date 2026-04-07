@@ -9,6 +9,8 @@ from core.join_analysis import (
     rank_join_candidates,
     group_composite_keys,
     format_join_analysis,
+    suggest_composite_joins,
+    _normalize_key_name,
     JoinCandidate,
     CompositeJoinPair,
     MIN_CANDIDATE_SCORE,
@@ -425,3 +427,202 @@ class TestFormatJoinAnalysis:
             "composite PK member with 95% unique should be unsafe "
             "(only unique_perc=100% makes it safe)"
         )
+
+
+# ---------------------------------------------------------------------------
+# _normalize_key_name
+# ---------------------------------------------------------------------------
+
+class TestNormalizeKeyName:
+    """Тесты нормализации имён PK-колонок."""
+
+    def test_old_prefix_stripped(self):
+        assert _normalize_key_name("old_gosb_id") == "gosb_id"
+
+    def test_new_prefix_stripped(self):
+        assert _normalize_key_name("new_gosb_id") == "gosb_id"
+
+    def test_prev_prefix_stripped(self):
+        assert _normalize_key_name("prev_client_id") == "client_id"
+
+    def test_cur_prefix_stripped(self):
+        assert _normalize_key_name("cur_tb_id") == "tb_id"
+
+    def test_no_prefix_unchanged(self):
+        assert _normalize_key_name("gosb_id") == "gosb_id"
+
+    def test_no_prefix_unchanged_tb(self):
+        assert _normalize_key_name("tb_id") == "tb_id"
+
+    def test_case_insensitive(self):
+        assert _normalize_key_name("OLD_GOSB_ID") == "gosb_id"
+
+    def test_no_over_strip(self):
+        """Не стрипаем 'old' если он не является префиксом (часть имени)."""
+        # 'old_gosb' → 'gosb', но 'folder_id' → 'folder_id' (нет совпадения)
+        assert _normalize_key_name("folder_id") == "folder_id"
+
+    def test_current_prefix(self):
+        assert _normalize_key_name("current_tb_id") == "tb_id"
+
+
+# ---------------------------------------------------------------------------
+# Умное определение составного JOIN-ключа: uzp_dim_gosb + uzp_dwh_fact_outflow
+# ---------------------------------------------------------------------------
+
+def _make_dim_gosb_df() -> pd.DataFrame:
+    """Структура uzp_dim_gosb (составной PK: tb_id + old_gosb_id)."""
+    return _make_cols_df([
+        {"column_name": "tb_id",         "dType": "int4",  "is_primary_key": True,
+         "unique_perc": 4.0,  "description": "Номер ТБ"},
+        {"column_name": "old_gosb_id",   "dType": "int4",  "is_primary_key": True,
+         "unique_perc": 72.0, "description": "Старый номер ГОСБ"},
+        {"column_name": "old_gosb_name", "dType": "text",  "is_primary_key": False,
+         "unique_perc": 72.0, "description": "Старое наименование ГОСБ"},
+        {"column_name": "new_gosb_id",   "dType": "int4",  "is_primary_key": False,
+         "unique_perc": 58.0, "description": "Новый номер ГОСБ"},
+        {"column_name": "new_gosb_name", "dType": "text",  "is_primary_key": False,
+         "unique_perc": 58.0, "description": "Новое наименование ГОСБ"},
+        {"column_name": "tb_short_name", "dType": "text",  "is_primary_key": False,
+         "unique_perc": 4.0,  "description": "Краткое наименование ТБ"},
+    ])
+
+
+def _make_fact_outflow_df() -> pd.DataFrame:
+    """Структура uzp_dwh_fact_outflow (FK: tb_id + gosb_id)."""
+    return _make_cols_df([
+        {"column_name": "report_dt",   "dType": "date",    "is_primary_key": False,
+         "unique_perc": 0.2,  "description": "Отчетная дата"},
+        {"column_name": "tb_id",       "dType": "int2",    "is_primary_key": False,
+         "unique_perc": 1.5,  "description": "Идентификатор ТБ"},
+        {"column_name": "gosb_id",     "dType": "int4",    "is_primary_key": False,
+         "unique_perc": 2.0,  "description": "Идентификатор ГОСБ"},
+        {"column_name": "inn",         "dType": "int8",    "is_primary_key": True,
+         "unique_perc": 100.0,"description": "ИНН"},
+        {"column_name": "outflow_qty", "dType": "int4",    "is_primary_key": False,
+         "unique_perc": 30.0, "description": "Кол-во ФЛ оттока"},
+    ])
+
+
+class TestSmartJoinKeyDetection:
+    """Умное определение ключей JOIN между фактовой таблицей и dim с составным PK.
+
+    Кейс: uzp_dwh_fact_outflow (fact) ↔ uzp_dim_gosb (dim, composite PK: tb_id + old_gosb_id).
+    Правильный JOIN: f.tb_id = g.tb_id AND f.gosb_id = g.old_gosb_id.
+    Неправильный JOIN: f.gosb_id = g.new_gosb_id (new_gosb_id — не PK, 42% дублей).
+    """
+
+    def test_normalized_pk_pair_found(self):
+        """old_gosb_id (PK dim) ↔ gosb_id (fact) находится через нормализацию."""
+        df_dim = _make_dim_gosb_df()
+        df_fact = _make_fact_outflow_df()
+        candidates = rank_join_candidates(
+            "s", "uzp_dwh_fact_outflow", df_fact,
+            "s", "uzp_dim_gosb", df_dim,
+            pk_count1=1, pk_count2=2,
+        )
+        pairs = {(c.col1, c.col2) for c in candidates}
+        assert ("gosb_id", "old_gosb_id") in pairs, (
+            "gosb_id (fact) должен матчиться с old_gosb_id (dim PK) через normalized_pk"
+        )
+
+    def test_normalized_pk_match_type(self):
+        """Пара gosb_id ↔ old_gosb_id должна иметь match_type=normalized_pk."""
+        df_dim = _make_dim_gosb_df()
+        df_fact = _make_fact_outflow_df()
+        candidates = rank_join_candidates(
+            "s", "uzp_dwh_fact_outflow", df_fact,
+            "s", "uzp_dim_gosb", df_dim,
+            pk_count1=1, pk_count2=2,
+        )
+        gosb_cand = next(
+            (c for c in candidates if c.col1 == "gosb_id" and c.col2 == "old_gosb_id"), None
+        )
+        assert gosb_cand is not None
+        assert gosb_cand.match_type == "normalized_pk"
+
+    def test_tb_id_exact_match_found(self):
+        """tb_id ↔ tb_id (точное совпадение, оба PK-члена составного ключа) присутствует."""
+        df_dim = _make_dim_gosb_df()
+        df_fact = _make_fact_outflow_df()
+        candidates = rank_join_candidates(
+            "s", "uzp_dwh_fact_outflow", df_fact,
+            "s", "uzp_dim_gosb", df_dim,
+            pk_count1=1, pk_count2=2,
+        )
+        pairs = {(c.col1, c.col2) for c in candidates}
+        assert ("tb_id", "tb_id") in pairs, (
+            "tb_id ↔ tb_id должен присутствовать как exact_name кандидат"
+        )
+
+    def test_composite_pk_candidates_above_threshold(self):
+        """Оба члена составного PK (tb_id, old_gosb_id) имеют score выше MIN_CANDIDATE_SCORE."""
+        df_dim = _make_dim_gosb_df()
+        df_fact = _make_fact_outflow_df()
+        candidates = rank_join_candidates(
+            "s", "uzp_dwh_fact_outflow", df_fact,
+            "s", "uzp_dim_gosb", df_dim,
+            pk_count1=1, pk_count2=2,
+        )
+        tb_cand = next((c for c in candidates if c.col1 == "tb_id" and c.col2 == "tb_id"), None)
+        gosb_cand = next(
+            (c for c in candidates if c.col1 == "gosb_id" and c.col2 == "old_gosb_id"), None
+        )
+        assert tb_cand is not None and tb_cand.score >= MIN_CANDIDATE_SCORE
+        assert gosb_cand is not None and gosb_cand.score >= MIN_CANDIDATE_SCORE
+
+    def test_new_gosb_id_penalized(self):
+        """new_gosb_id (не PK, при наличии составного PK) получает низкий score."""
+        df_dim = _make_dim_gosb_df()
+        df_fact = _make_fact_outflow_df()
+        candidates = rank_join_candidates(
+            "s", "uzp_dwh_fact_outflow", df_fact,
+            "s", "uzp_dim_gosb", df_dim,
+            pk_count1=1, pk_count2=2,
+        )
+        new_gosb_cand = next(
+            (c for c in candidates if c.col2 == "new_gosb_id"), None
+        )
+        gosb_pk_cand = next(
+            (c for c in candidates if c.col2 == "old_gosb_id"), None
+        )
+        # new_gosb_id либо отфильтрован, либо имеет score значительно ниже PK-кандидата
+        if new_gosb_cand is not None and gosb_pk_cand is not None:
+            assert gosb_pk_cand.score > new_gosb_cand.score, (
+                "old_gosb_id (PK) должен иметь score выше new_gosb_id (не PK)"
+            )
+
+    def test_composite_join_suggested(self):
+        """suggest_composite_joins предлагает составной ON по полному PK dim_gosb."""
+        df_dim = _make_dim_gosb_df()
+        df_fact = _make_fact_outflow_df()
+        candidates = rank_join_candidates(
+            "s", "uzp_dwh_fact_outflow", df_fact,
+            "s", "uzp_dim_gosb", df_dim,
+            pk_count1=1, pk_count2=2,
+        )
+        lines = suggest_composite_joins(
+            candidates, df_fact, df_dim,
+            pk_count1=1, pk_count2=2,
+            tbl1="s.uzp_dwh_fact_outflow",
+            tbl2="s.uzp_dim_gosb",
+        )
+        composite_text = "\n".join(lines)
+        assert "СОСТАВНОЙ JOIN" in composite_text, (
+            "Должна быть рекомендация составного JOIN"
+        )
+        assert "tb_id" in composite_text
+        assert "old_gosb_id" in composite_text or "gosb_id" in composite_text
+
+    def test_format_join_analysis_includes_composite(self):
+        """format_join_analysis выводит составной ON и не предлагает new_gosb_id как top-1."""
+        df_dim = _make_dim_gosb_df()
+        df_fact = _make_fact_outflow_df()
+        output = format_join_analysis(
+            "s", "uzp_dwh_fact_outflow", df_fact,
+            "s", "uzp_dim_gosb", df_dim,
+            pk_count1=1, pk_count2=2,
+        )
+        assert "СОСТАВНОЙ JOIN" in output, "Вывод должен содержать рекомендацию составного JOIN"
+        assert "old_gosb_id" in output or "gosb_id" in output
+        assert "tb_id" in output

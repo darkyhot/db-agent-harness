@@ -139,6 +139,46 @@ def _check_select_star(sql: str, result: StaticCheckResult) -> None:
         )
 
 
+def _build_alias_to_table_map(sql: str, real_tables: dict[tuple[str, str], set[str]]) -> dict[str, tuple[str, str]]:
+    """Построить маппинг алиас/имя_таблицы → (schema, table).
+
+    Парсит FROM и JOIN клаузы для извлечения явных алиасов.
+    Также регистрирует короткое имя таблицы как алиас (без schema-префикса).
+
+    Returns:
+        {"s": ("dm", "sales"), "sales": ("dm", "sales"), ...}
+    """
+    alias_map: dict[str, tuple[str, str]] = {}
+
+    # Регистрируем table_name (без schema) как implicit alias
+    for (schema, table) in real_tables:
+        alias_map[table.lower()] = (schema, table)
+
+    # Ищем паттерны: schema.table [AS] alias или просто schema.table alias
+    # Поддерживаем: JOIN dm.sales s, FROM dm.sales AS s, FROM dm.sales s
+    from_join_pat = re.compile(
+        r'(?:FROM|JOIN)\s+'
+        r'([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)'
+        r'(?:\s+AS\s+|\s+)([a-zA-Z_][a-zA-Z0-9_]*)',
+        re.IGNORECASE,
+    )
+    for m in from_join_pat.finditer(sql):
+        schema_part = m.group(1).lower()
+        table_part = m.group(2).lower()
+        alias_part = m.group(3).lower()
+        # Проверяем что это реальная таблица из каталога
+        if (schema_part, table_part) in real_tables:
+            # Пропускаем если alias — ключевое слово SQL
+            if alias_part.upper() not in {
+                'WHERE', 'ON', 'SET', 'JOIN', 'LEFT', 'RIGHT',
+                'INNER', 'OUTER', 'CROSS', 'FULL', 'GROUP', 'ORDER',
+                'HAVING', 'LIMIT', 'UNION', 'EXCEPT', 'INTERSECT',
+            }:
+                alias_map[alias_part] = (schema_part, table_part)
+
+    return alias_map
+
+
 def _check_columns_against_catalog(
     sql: str,
     schema_loader,
@@ -148,9 +188,9 @@ def _check_columns_against_catalog(
 
     Логика:
     1. Извлечь все schema.table из SQL
-    2. Для каждой таблицы получить реальные колонки из schema_loader
-    3. Найти упоминания alias.column или schema.table.column
-    4. Проверить что колонки существуют
+    2. Построить маппинг alias → (schema, table) с учётом явных алиасов
+    3. Для каждой ссылки alias.column найти реальную таблицу по алиасу
+    4. Проверить column против колонок КОНКРЕТНОЙ таблицы (не всех сразу)
     """
     if schema_loader is None:
         return
@@ -170,50 +210,55 @@ def _check_columns_against_catalog(
     if not real_tables:
         return  # Каталог пуст или таблицы не найдены — не блокируем
 
-    # Паттерн alias.column или table.column
-    col_ref_pattern = re.compile(
-        r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b'
-    )
+    # Строим alias → (schema, table) маппинг с учётом явных алиасов из SQL
+    alias_to_table = _build_alias_to_table_map(sql, real_tables)
 
-    # Строим обратный маппинг: alias/table_name → real (schema, table)
-    # Упрощение: используем table_name как ключ
-    table_to_cols: dict[str, set[str]] = {}
-    for (schema, table), cols in real_tables.items():
-        table_to_cols[table] = cols
-        # Также регистрируем по алиасам из SQL (a, s, c и т.д.)
-        # Для этого ищем паттерн "schema.table alias" или "table alias"
-
-    # Более простой подход: ищем паттерны вида alias.column
-    # и проверяем column против объединённого списка колонок всех таблиц
+    # Объединённый список всех реальных колонок (для fallback)
     all_real_columns: set[str] = set()
     for cols in real_tables.values():
         all_real_columns.update(cols)
 
-    # Найти все alias.column ссылки, исключая schema.table паттерны
-    # (где правая часть — это имя таблицы, а не колонки)
-    all_table_names = {t for _, t in real_tables}
     all_schema_names = {s for s, _ in real_tables}
+    all_table_names = {t for _, t in real_tables}
+
+    # SQL-ключевые слова, которые могут выглядеть как колонки
+    _SQL_KEYWORDS = {
+        "NULL", "TRUE", "FALSE", "CURRENT_DATE", "CURRENT_TIMESTAMP",
+        "NOW", "DISTINCT", "ALL", "ASC", "DESC", "OVER", "PARTITION",
+        "ROWS", "RANGE", "PRECEDING", "FOLLOWING", "UNBOUNDED", "CURRENT",
+    }
+
+    col_ref_pattern = re.compile(
+        r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b'
+    )
 
     suspicious_cols: list[str] = []
     for m in col_ref_pattern.finditer(sql):
         left, right = m.group(1).lower(), m.group(2).lower()
+
         # Пропускаем schema.table паттерны
         if left in all_schema_names and right in all_table_names:
             continue
-        # Пропускаем если правая часть — имя таблицы (FROM alias JOIN ...)
+        # Пропускаем если правая часть — имя таблицы
         if right in all_table_names:
             continue
-        # right — вероятно колонка
-        if right not in all_real_columns:
-            # Дополнительная фильтрация: пропускаем ключевые слова SQL
-            if right.upper() not in {
-                "NULL", "TRUE", "FALSE", "CURRENT_DATE", "NOW",
-                "DISTINCT", "ALL", "ASC", "DESC",
-            }:
+        # Пропускаем SQL-ключевые слова
+        if right.upper() in _SQL_KEYWORDS:
+            continue
+
+        # Пытаемся найти таблицу по алиасу (точная проверка)
+        tbl_key = alias_to_table.get(left)
+        if tbl_key is not None:
+            # Проверяем против колонок конкретной таблицы
+            table_cols = real_tables.get(tbl_key, set())
+            if right not in table_cols:
+                suspicious_cols.append(f"{left}.{right}")
+        else:
+            # Алиас не распознан → fallback: проверяем против всех колонок
+            if right not in all_real_columns:
                 suspicious_cols.append(f"{left}.{right}")
 
     if suspicious_cols:
-        # Дедупликация
         unique_suspicious = list(dict.fromkeys(suspicious_cols))
         result.add_error(
             f"Возможные галлюцинированные колонки (не найдены в каталоге): "
@@ -332,11 +377,28 @@ def _strip_ctes(sql: str) -> str:
     return stripped
 
 
+def _has_aggregation(sql: str) -> bool:
+    """Проверить что SQL содержит агрегатные функции (кроме COUNT(*))."""
+    # Убираем COUNT(*) чтобы не путать его с «настоящей» агрегацией
+    sql_no_count_star = re.sub(r'COUNT\s*\(\s*\*\s*\)', 'COUNT_STAR', sql, flags=re.I)
+    agg_pat = re.compile(
+        r'\b(COUNT|SUM|AVG|MIN|MAX|STDDEV|VARIANCE|STRING_AGG|ARRAY_AGG'
+        r'|PERCENTILE_CONT|PERCENTILE_DISC|BOOL_AND|BOOL_OR)\s*\(',
+        re.I,
+    )
+    return bool(agg_pat.search(sql_no_count_star))
+
+
 def _check_group_by_completeness(sql: str, result: StaticCheckResult) -> None:
     """Проверить что все не-агрегированные SELECT-колонки присутствуют в GROUP BY.
 
     Это самая частая ошибка LLM: добавить колонку в SELECT, но забыть в GROUP BY.
     Работает только когда в SQL есть GROUP BY на уровне финального SELECT.
+
+    Severity:
+    - ERROR если запрос содержит агрегатные функции (SUM, AVG, MIN, MAX, ...)
+      — пропущенный GROUP BY гарантированно сломает запрос в PostgreSQL/Greenplum
+    - WARNING если агрегации нет (например, только GROUP BY без агрегата)
     """
     # Работаем только с финальным SELECT (без CTE)
     outer_sql = _strip_ctes(sql)
@@ -357,10 +419,15 @@ def _check_group_by_completeness(sql: str, result: StaticCheckResult) -> None:
     missing -= _KNOWN_CONSTANTS
 
     if missing:
-        result.add_warning(
+        msg = (
             f"GROUP BY completeness: колонки {sorted(missing)} присутствуют в SELECT, "
-            "но отсутствуют в GROUP BY. Возможна ошибка агрегации."
+            "но отсутствуют в GROUP BY."
         )
+        if _has_aggregation(outer_sql):
+            # Агрегация есть → пропущенные колонки в GROUP BY = жёсткая ошибка SQL
+            result.add_error(msg + " При наличии агрегатов это вызовет ошибку БД.")
+        else:
+            result.add_warning(msg + " Возможна ошибка агрегации.")
 
 
 def check_sql(

@@ -12,7 +12,12 @@ import time
 from typing import Any
 
 from core.join_analysis import detect_table_type, format_join_analysis
+from core.column_selector_deterministic import select_columns as _det_select_columns
 from graph.state import AgentState
+
+# Минимальная confidence для использования детерминированного результата без LLM.
+# При confidence >= порога LLM column_selector не вызывается.
+_DET_CONFIDENCE_THRESHOLD = 0.70
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +311,58 @@ class ExplorerNodes:
                 "messages": state["messages"],
                 "graph_iterations": state.get("graph_iterations", 0) + 1,
             }
+
+        # --- Детерминированная попытка (без LLM) ---
+        # Запускаем перед LLM. Если confidence >= порога — возвращаем сразу.
+        # Это экономит один LLM-вызов (5с задержки) для стандартных запросов.
+        _det_result = _det_select_columns(
+            intent=intent,
+            table_structures=table_structures,
+            table_types=state.get("table_types", {}),
+            join_analysis_data=join_analysis_data,
+            schema_loader=self.schema,
+        )
+        _det_conf = _det_result.get("confidence", 0.0)
+        logger.info(
+            "ColumnSelector: детерминированный результат confidence=%.2f (%s)",
+            _det_conf,
+            _det_result.get("reason", ""),
+        )
+
+        if _det_conf >= _DET_CONFIDENCE_THRESHOLD and not state.get("column_selector_hint", ""):
+            # Достаточная уверенность — пропускаем LLM
+            logger.info(
+                "ColumnSelector: confidence=%.2f >= %.2f → используем детерминированный результат",
+                _det_conf,
+                _DET_CONFIDENCE_THRESHOLD,
+            )
+            self.memory.add_message(
+                "assistant",
+                f"[column_selector/det] confidence={_det_conf:.2f}; "
+                f"таблиц: {len(_det_result['selected_columns'])}, "
+                f"join-ключей: {len(_det_result['join_spec'])}",
+            )
+            return {
+                "selected_columns": _det_result["selected_columns"],
+                "join_spec": _det_result["join_spec"],
+                "column_selector_hint": "",
+                "messages": state["messages"] + [
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"[det] Колонки выбраны детерминированно (conf={_det_conf:.2f}): "
+                            f"{', '.join(_det_result['selected_columns'].keys())}"
+                        ),
+                    }
+                ],
+                "graph_iterations": state.get("graph_iterations", 0) + 1,
+            }
+
+        logger.info(
+            "ColumnSelector: confidence=%.2f < %.2f → запускаем LLM",
+            _det_conf,
+            _DET_CONFIDENCE_THRESHOLD,
+        )
 
         # --- Системный промпт ---
         system_prompt = (

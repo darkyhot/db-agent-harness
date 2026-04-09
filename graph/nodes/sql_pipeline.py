@@ -16,6 +16,7 @@ from typing import Any
 from core.sql_static_checker import check_sql
 from core.sql_planner_deterministic import build_blueprint as _deterministic_blueprint
 from core.sql_builder import SqlBuilder as _SqlBuilder
+from core.sql_formatter import format_sql_safe as _format_sql
 from graph.nodes.common import (
     BaseNodeMixin,
     ToolResult,
@@ -334,6 +335,7 @@ class SqlPipelineNodes:
             table_types=table_types,
         )
         if template_sql:
+            template_sql = _format_sql(template_sql)
             # Проверяем статическим чекером до принятия
             check_result = check_sql(template_sql, schema_loader=self.schema)
             if check_result.is_valid:
@@ -447,6 +449,10 @@ class SqlPipelineNodes:
         tool_call = self._parse_tool_call(response)
 
         sql = tool_call.get("args", {}).get("sql")
+        if sql:
+            sql = _format_sql(sql)
+            if isinstance(tool_call.get("args"), dict):
+                tool_call["args"]["sql"] = sql
         tool_name = tool_call.get("tool", "execute_query")
 
         if sql and tool_name in self.SQL_TOOL_NAMES:

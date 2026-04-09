@@ -43,6 +43,8 @@ class IntentNodes:
             "Твоя задача — определить тип запроса пользователя и извлечь ключевые сущности.\n\n"
             "Типы интентов:\n"
             "- analytics: требуется SQL-запрос (агрегация, выборка, подсчёт)\n"
+            "- followup: продолжение/уточнение предыдущего запроса "
+            "(сигналы: 'это', 'ещё раз', 'теперь', 'добавь', 'измени', 'сгруппируй', 'а если', 'а теперь')\n"
             "- schema_question: ответ можно дать из каталога таблиц (что есть в базе, описание таблиц)\n"
             "- table_search: нужен поиск таблиц (пользователь не знает какая таблица нужна)\n"
             "- export: выгрузка данных в CSV/файл\n"
@@ -110,6 +112,16 @@ class IntentNodes:
             user_prompt += f"История сессии:\n{compact_history}\n\n"
         if lt_ctx:
             user_prompt += f"Инструкции пользователя из долгосрочной памяти:\n{lt_ctx}\n\n"
+        # Multi-turn: предыдущий успешный запрос (для followup-детекции)
+        prev_sql = state.get("prev_sql", "")
+        prev_summary = state.get("prev_result_summary", "")
+        if prev_sql:
+            user_prompt += (
+                f"Предыдущий успешный SQL-запрос:\n{prev_sql[:300]}\n"
+            )
+            if prev_summary:
+                user_prompt += f"Результат: {prev_summary[:200]}\n"
+            user_prompt += "\n"
         user_prompt += f"Запрос пользователя: {user_input}\n"
 
         # Контекст replanning если есть
@@ -260,6 +272,16 @@ class IntentNodes:
         raw_tables = parsed.get("tables", [])
         df = self.schema.tables_df
         validated_tables: list[tuple[str, str]] = []
+        table_confidences: dict[str, int] = {}  # "schema.table" -> 0..100
+
+        # Предвычисляем: явные упоминания schema.table в user_input
+        _explicit_pattern = re.compile(
+            r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b'
+        )
+        _explicit_mentions = {
+            f"{m.group(1).lower()}.{m.group(2).lower()}"
+            for m in _explicit_pattern.finditer(user_input)
+        }
 
         for entry in raw_tables:
             schema_name = str(entry.get("schema", "")).strip().lower()
@@ -276,6 +298,21 @@ class IntentNodes:
                 if not df[mask].empty:
                     row = df[mask].iloc[0]
                     validated_tables.append((row["schema_name"], row["table_name"]))
+
+                    # Вычисляем confidence
+                    full_key = f"{schema_name}.{table_name}"
+                    if full_key in _explicit_mentions:
+                        confidence = 100  # явное упоминание schema.table
+                    elif table_name in user_input.lower() or schema_name in user_input.lower():
+                        confidence = 85  # прямое упоминание имени
+                    else:
+                        # Проверяем через entities
+                        entities_lower = [str(e).lower() for e in intent.get("entities", [])]
+                        if any(table_name in e or e in table_name for e in entities_lower):
+                            confidence = 70  # совпадение через entities
+                        else:
+                            confidence = 45  # найдено через TF-IDF/синонимы
+                    table_confidences[full_key] = confidence
                 else:
                     logger.warning(
                         "TableResolver: таблица %s.%s не найдена в каталоге — пропускаем",
@@ -287,11 +324,27 @@ class IntentNodes:
         if not plan_steps:
             plan_steps = self._parse_plan(response)
 
+        # Предупреждение при низкой уверенности
+        low_confidence_warning = ""
+        if table_confidences:
+            min_conf = min(table_confidences.values())
+            if min_conf < 50 and len(validated_tables) == 1:
+                low_table = next(iter(table_confidences))
+                low_confidence_warning = (
+                    f"\n⚠ Таблица '{low_table}' выбрана с низкой уверенностью ({min_conf}%). "
+                    "Если результат неверный — уточните запрос или используйте команду поиска таблиц."
+                )
+                logger.warning(
+                    "TableResolver: низкая уверенность в выборе таблицы %s (%d%%)",
+                    low_table, min_conf,
+                )
+
         logger.info(
-            "TableResolver: выбрано %d таблиц: %s, план из %d шагов",
+            "TableResolver: выбрано %d таблиц: %s, план из %d шагов, confidence=%s",
             len(validated_tables),
             ", ".join(f"{s}.{t}" for s, t in validated_tables),
             len(plan_steps),
+            table_confidences,
         )
 
         self.memory.add_message(
@@ -312,7 +365,8 @@ class IntentNodes:
             "messages": state["messages"] + [
                 {"role": "assistant", "content": (
                     f"Таблицы: {', '.join(f'{s}.{t}' for s, t in validated_tables)}\n"
-                    f"План:\n" + "\n".join(plan_steps)
+                    f"Уверенность: {table_confidences}\n"
+                    f"План:\n" + "\n".join(plan_steps) + low_confidence_warning
                 )},
             ],
         }

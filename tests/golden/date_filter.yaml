@@ -1,0 +1,9 @@
+# Запрос с фильтром по дате
+query: "Продажи за январь 2024"
+intent_must_be: "analytics"
+sql_must_contain:
+  - "WHERE"
+  - "2024"
+sql_must_not_contain:
+  - "AS \"" # кириллица в алиасах
+max_retries: 1

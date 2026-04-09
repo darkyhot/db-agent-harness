@@ -464,6 +464,13 @@ class SqlPipelineNodes:
             js_str = json.dumps(join_spec, ensure_ascii=False, indent=2)
             user_parts.append(f"JOIN ключи:\n{js_str}")
 
+        # Multi-turn: добавить предыдущий SQL как базу для модификации (followup)
+        prev_sql = state.get("prev_sql", "")
+        if prev_sql and state.get("intent", {}).get("intent") == "followup":
+            user_parts.append(
+                f"ПРЕДЫДУЩИЙ SQL (измени его под новый запрос, не переписывай с нуля):\n{prev_sql}"
+            )
+
         # Few-shot примеры из audit log (похожие успешные запросы)
         try:
             few_shot_examples = self.few_shot.get_similar(

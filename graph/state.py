@@ -83,3 +83,8 @@ class AgentState(TypedDict):
     # Устанавливается когда dim-таблица пропущена в selected_columns.
     # Сбрасывается в "" после того как column_selector её использует.
     column_selector_hint: str
+
+    # Multi-turn context: предыдущий успешный SQL и краткое резюме результата
+    # Передаётся из CLIInterface при follow-up запросах ("а теперь по регионам")
+    prev_sql: str
+    prev_result_summary: str

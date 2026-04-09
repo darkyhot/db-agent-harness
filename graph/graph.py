@@ -340,7 +340,11 @@ def build_graph(
     return graph.compile()
 
 
-def create_initial_state(user_input: str) -> AgentState:
+def create_initial_state(
+    user_input: str,
+    prev_sql: str = "",
+    prev_result_summary: str = "",
+) -> AgentState:
     """Создать начальное состояние для запуска графа."""
     return AgentState(
         messages=[],
@@ -377,4 +381,7 @@ def create_initial_state(user_input: str) -> AgentState:
         error_diagnosis={},
         pending_sql_tool_call=None,
         column_selector_hint="",
+        # Multi-turn context
+        prev_sql=prev_sql,
+        prev_result_summary=prev_result_summary,
     )

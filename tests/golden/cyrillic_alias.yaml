@@ -1,0 +1,8 @@
+# SQL не должен содержать кириллицу в алиасах
+query: "Покажи количество заказов по менеджерам"
+intent_must_be: "analytics"
+sql_must_contain:
+  - "COUNT"
+  - "GROUP BY"
+sql_alias_no_cyrillic: true
+max_retries: 0

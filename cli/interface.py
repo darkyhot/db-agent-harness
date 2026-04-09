@@ -117,6 +117,9 @@ class CLIInterface:
 
         # Кэш повторных запросов
         self.query_cache = QueryCache(self.memory)
+        # Multi-turn контекст: последний успешный SQL и краткое резюме
+        self._prev_sql: str = ""
+        self._prev_result_summary: str = ""
 
         # Флаг отладки промптов из конфига
         self.debug_prompt = self.db.runtime_config.get("debug_prompt", False)
@@ -462,7 +465,11 @@ class CLIInterface:
                 print(cached["final_answer"])
                 return
 
-        state = create_initial_state(user_input)
+        state = create_initial_state(
+            user_input,
+            prev_sql=self._prev_sql,
+            prev_result_summary=self._prev_result_summary,
+        )
         result = {}
         spinner_idx = 0
         start_time = time.time()
@@ -554,7 +561,7 @@ class CLIInterface:
             answer = result.get("final_answer", "Нет ответа.")
             print(f"\n{answer}")
 
-            # Сохраняем успешные read-запросы в кэш
+            # Сохраняем успешные read-запросы в кэш + multi-turn контекст
             if not _is_write and answer and answer != "Нет ответа.":
                 executed_sql = None
                 for tc in reversed(result.get("tool_calls", [])):
@@ -562,6 +569,12 @@ class CLIInterface:
                         executed_sql = tc.get("args", {}).get("sql")
                         break
                 self.query_cache.put(user_input, answer, sql=executed_sql)
+                # Обновляем multi-turn контекст для следующего запроса
+                if executed_sql:
+                    self._prev_sql = executed_sql
+                    # Краткое резюме: первые 200 символов ответа без markdown
+                    summary = re.sub(r'```[^`]*```', '', answer, flags=re.DOTALL).strip()
+                    self._prev_result_summary = summary[:200]
 
         except Exception as e:
             _status_print("")

@@ -8,6 +8,7 @@
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from graph.nodes.common import BaseNodeMixin, ToolResult, SQL_RULES, GIGACHAT_COMMON_ERRORS
@@ -109,8 +110,20 @@ class CorrectionNodes:
         # --- Проверка лимита попыток ---
         if retry_count >= self.MAX_RETRIES:
             replan_count = state.get("replan_count", 0)
-            # Попробовать replanning один раз перед сдачей
-            if replan_count < 1:
+            # Budget-aware: если осталось < 60 секунд до wall-clock timeout — пропускаем replanning
+            _budget_ok = True
+            start_t = state.get("start_time", 0)
+            if start_t:
+                from graph.graph import MAX_WALL_CLOCK_SECONDS
+                elapsed = time.monotonic() - start_t
+                if elapsed > MAX_WALL_CLOCK_SECONDS - 60:
+                    _budget_ok = False
+                    logger.warning(
+                        "ErrorDiagnoser: осталось менее 60с до таймаута (elapsed=%.0fs) — пропускаем replanning",
+                        elapsed,
+                    )
+            # Попробовать replanning один раз перед сдачей (если есть бюджет)
+            if replan_count < 1 and _budget_ok:
                 logger.info("ErrorDiagnoser: попытки исчерпаны, запрашиваю replanning")
                 return {
                     "last_error": None,
@@ -198,6 +211,27 @@ class CorrectionNodes:
             "Если ошибка неисправима — установи needs_replan: true."
         )
 
+        # --- Авто-сэмпл для empty_result: показываем реальные значения из таблиц ---
+        auto_sample_text = ""
+        if "0 строк" in error or "empty_result" in error.lower():
+            sample_parts = []
+            for s, t in list(found_tables)[:2]:  # максимум 2 таблицы чтобы не раздувать промпт
+                try:
+                    sample_df = self.db.get_sample(s, t, n=5)
+                    if not sample_df.empty:
+                        sample_md = sample_df.to_markdown(index=False)
+                        sample_parts.append(
+                            f"Образец {s}.{t} (5 строк — проверь форматы значений для фильтров):\n"
+                            f"{sample_md[:600]}"
+                        )
+                except Exception as e:
+                    logger.debug("auto_sample %s.%s: %s", s, t, e)
+            if sample_parts:
+                auto_sample_text = "\n\n".join(sample_parts)
+                logger.info(
+                    "ErrorDiagnoser: авто-сэмпл для empty_result: %d таблиц", len(sample_parts)
+                )
+
         # --- Пользовательский промпт ---
         user_parts = []
         if last_sql:
@@ -205,6 +239,8 @@ class CorrectionNodes:
         user_parts.append(f"[СООБЩЕНИЕ ОБ ОШИБКЕ]\n{error}")
         if column_metadata:
             user_parts.append(f"[МЕТАДАННЫЕ КОЛОНОК]\n{column_metadata}")
+        if auto_sample_text:
+            user_parts.append(f"[ОБРАЗЦЫ ДАННЫХ — для диагностики пустого результата]\n{auto_sample_text}")
         user_parts.append(f"[ПОПЫТКА {retry_count + 1} из {self.MAX_RETRIES}]")
         if prev_attempts:
             user_parts.append(f"[ПРЕДЫДУЩИЕ ПОПЫТКИ ИСПРАВЛЕНИЯ]\n{prev_attempts}")

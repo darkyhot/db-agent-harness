@@ -1,0 +1,6 @@
+# Вопрос по схеме — не должен генерировать SQL
+query: "Какие таблицы есть в схеме dm?"
+intent_must_be: "schema_question"
+should_reach_node: "summarizer"
+should_not_reach_node: "sql_writer"
+max_retries: 0

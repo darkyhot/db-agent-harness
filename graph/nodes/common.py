@@ -181,13 +181,28 @@ class BaseNodeMixin:
     управление контекстом и бюджетом промптов.
     """
 
-    MAX_RETRIES = 3
+    MAX_RETRIES = 4
     SQL_TOOL_NAMES = {"execute_query", "execute_write", "execute_ddl", "export_query"}
     MAX_PROMPT_CHARS = 100_000
     SAMPLE_CACHE_TTL = 600
     # Лимиты на размер списков в state — предотвращают раздувание промпта summarizer'а
     MAX_MESSAGES = 30
     MAX_TOOL_CALLS = 15
+
+    # Бюджет символов для каждой ноды (переопределяет MAX_PROMPT_CHARS если указан)
+    # Маленький бюджет для простых нод, большой — для тех, где нужен полный контекст таблиц
+    NODE_BUDGET: dict[str, int] = {
+        "intent_classifier": 20_000,
+        "table_resolver": 40_000,
+        "table_explorer": 60_000,
+        "column_selector": 80_000,   # нужен полный контекст всех таблиц
+        "sql_planner": 40_000,
+        "sql_writer": 60_000,
+        "sql_static_checker": 20_000,
+        "error_diagnoser": 30_000,
+        "sql_fixer": 50_000,
+        "summarizer": 60_000,
+    }
 
     # Стоп-слова для предфильтрации каталога
     _STOP_WORDS = frozenset({
@@ -202,7 +217,7 @@ class BaseNodeMixin:
         "show", "get", "find", "give", "tell", "make", "how", "many",
     })
 
-    _MAX_TABLES_FOR_FULL_CATALOG = 50
+    _MAX_TABLES_FOR_FULL_CATALOG = 100
 
     def __init__(
         self,
@@ -417,39 +432,15 @@ class BaseNodeMixin:
                 lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
             return "\n".join(lines)
 
-        words = re.findall(r'[a-zA-Zа-яА-ЯёЁ]{3,}', user_input.lower())
-        keywords = [w for w in words if w not in self._STOP_WORDS]
+        # Используем TF-IDF поиск из SchemaLoader (включает synonym expansion + keyword match)
+        filtered = self.schema.search_tables(user_input, top_n=30)
 
-        if expand_with_synonyms is not None and keywords:
-            expanded = expand_with_synonyms(" ".join(keywords))
-            extra_words = re.findall(r'[a-zA-ZА-Яа-яёЁ]{3,}', expanded.lower())
-            for ew in extra_words:
-                if ew not in keywords and ew not in self._STOP_WORDS:
-                    keywords.append(ew)
-
-        if not keywords:
-            lines = ["Доступные таблицы (schema.table — описание):"]
-            for _, row in df.iterrows():
-                desc = row.get("description", "")
-                lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
-            return "\n".join(lines)
-
-        found_indices: set[int] = set()
-        for kw in keywords:
-            mask = (
-                df["table_name"].str.lower().str.contains(kw, na=False)
-                | df["schema_name"].str.lower().str.contains(kw, na=False)
-                | df["description"].str.lower().str.contains(kw, na=False)
-            )
-            found_indices.update(df[mask].index.tolist())
-
-        if not found_indices:
+        if filtered.empty:
             return (
                 f"В каталоге {len(df)} таблиц, но по запросу не найдено прямых совпадений.\n"
                 "Используй search_tables или search_by_description для поиска нужных таблиц."
             )
 
-        filtered = df.loc[sorted(found_indices)]
         lines = [
             f"Релевантные таблицы (найдено {len(filtered)} из {len(df)} по запросу):"
         ]
@@ -566,6 +557,26 @@ class BaseNodeMixin:
                     return parsed
             except (json.JSONDecodeError, ValueError, Exception):
                 pass
+
+        # Эвристика: попробовать извлечь SQL из свободного текста перед LLM retry
+        # Экономит 5с задержки и один LLM-вызов когда GigaChat объясняет SQL вместо JSON
+        sql_in_text = re.search(
+            r'(?:^|\n)\s*(SELECT\s.{10,})',
+            response,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if sql_in_text:
+            extracted = sql_in_text.group(1).strip().rstrip(';')
+            # Обрезаем на первом явном закрытии запроса (пустая строка после SQL)
+            first_break = re.search(r'\n\s*\n', extracted)
+            if first_break:
+                extracted = extracted[:first_break.start()].strip()
+            if len(extracted) > 20:
+                logger.info(
+                    "_parse_tool_call: SQL извлечён через regex (без LLM retry), len=%d",
+                    len(extracted),
+                )
+                return {"tool": "execute_query", "args": {"sql": extracted}}
 
         if retry_on_fail:
             logger.warning("JSON не найден в ответе LLM, retry с уточнением формата")

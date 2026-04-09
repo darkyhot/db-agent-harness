@@ -1,0 +1,9 @@
+# Базовый подсчёт строк
+query: "Сколько клиентов в базе?"
+intent_must_be: "analytics"
+complexity_must_be: "single_table"
+sql_must_contain:
+  - "COUNT"
+sql_must_not_contain:
+  - "JOIN"
+max_retries: 0

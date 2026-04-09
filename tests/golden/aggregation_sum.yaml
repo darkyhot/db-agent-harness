@@ -1,0 +1,9 @@
+# Агрегация с SUM
+query: "Покажи сумму продаж по регионам за последний месяц"
+intent_must_be: "analytics"
+sql_must_contain:
+  - "SUM"
+  - "GROUP BY"
+sql_must_not_contain:
+  - "AS \"" # кириллица в алиасах
+max_retries: 0

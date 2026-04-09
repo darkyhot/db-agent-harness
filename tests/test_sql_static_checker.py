@@ -118,3 +118,57 @@ class TestStaticCheckResult:
         result = check_sql("SELECT a AS б FROM t", check_columns=False)
         assert isinstance(result.errors, list)
         assert isinstance(result.warnings, list)
+
+
+# ---------------------------------------------------------------------------
+# GROUP BY completeness
+# ---------------------------------------------------------------------------
+
+class TestGroupByCompleteness:
+    def test_correct_group_by_no_warning(self):
+        sql = "SELECT region, COUNT(*) AS cnt FROM dm.sales GROUP BY region"
+        result = check_sql(sql, check_columns=False)
+        gb_warnings = [w for w in result.warnings if "GROUP BY" in w]
+        assert not gb_warnings
+
+    def test_missing_col_in_group_by_warns(self):
+        sql = "SELECT region, segment, COUNT(*) AS cnt FROM dm.sales GROUP BY region"
+        result = check_sql(sql, check_columns=False)
+        gb_warnings = [w for w in result.warnings if "GROUP BY" in w]
+        assert gb_warnings
+        assert "segment" in gb_warnings[0]
+
+    def test_no_group_by_no_check(self):
+        sql = "SELECT region, amount FROM dm.sales LIMIT 10"
+        result = check_sql(sql, check_columns=False)
+        gb_warnings = [w for w in result.warnings if "GROUP BY" in w]
+        assert not gb_warnings
+
+    def test_aggregate_col_excluded_from_check(self):
+        sql = "SELECT region, SUM(amount) AS total FROM dm.sales GROUP BY region"
+        result = check_sql(sql, check_columns=False)
+        gb_warnings = [w for w in result.warnings if "GROUP BY" in w]
+        assert not gb_warnings
+
+    def test_qualified_col_in_group_by_ok(self):
+        sql = "SELECT t.region, COUNT(*) AS cnt FROM dm.sales t GROUP BY t.region"
+        result = check_sql(sql, check_columns=False)
+        gb_warnings = [w for w in result.warnings if "GROUP BY" in w]
+        assert not gb_warnings
+
+    def test_multiple_missing_cols(self):
+        sql = "SELECT region, segment, manager, COUNT(*) AS cnt FROM dm.sales GROUP BY region"
+        result = check_sql(sql, check_columns=False)
+        gb_warnings = [w for w in result.warnings if "GROUP BY" in w]
+        assert gb_warnings
+        assert "segment" in gb_warnings[0] or "manager" in gb_warnings[0]
+
+    def test_cte_does_not_confuse_parser(self):
+        sql = (
+            "WITH agg AS (SELECT client_id, SUM(amount) AS total FROM dm.sales GROUP BY client_id)\n"
+            "SELECT c.name, agg.total FROM dm.clients c JOIN agg ON agg.client_id = c.id"
+        )
+        result = check_sql(sql, check_columns=False)
+        # Внешний SELECT без GROUP BY — проверка GROUP BY completeness не применяется
+        gb_warnings = [w for w in result.warnings if "GROUP BY completeness" in w]
+        assert not gb_warnings

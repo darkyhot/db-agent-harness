@@ -5,7 +5,6 @@
 - sql_writer: написание SQL по blueprint
 - sql_static_checker: детерминированная проверка SQL до БД (без LLM)
 - sql_validator_node: валидация, выполнение, проверка результата
-- _semantic_sql_check: лёгкая LLM-проверка семантики
 """
 
 import json
@@ -15,6 +14,8 @@ import time
 from typing import Any
 
 from core.sql_static_checker import check_sql
+from core.sql_planner_deterministic import build_blueprint as _deterministic_blueprint
+from core.sql_builder import SqlBuilder as _SqlBuilder
 from graph.nodes.common import (
     BaseNodeMixin,
     ToolResult,
@@ -191,138 +192,52 @@ class SqlPipelineNodes:
     def sql_planner(self, state: AgentState) -> dict[str, Any]:
         """Определение стратегии SQL-запроса: тип JOIN, агрегация, CTE, фильтры.
 
-        Получает extracted-данные из column_selector и решает КАК писать SQL.
+        Полностью детерминированный — LLM не вызывается.
+        Использует core.sql_planner_deterministic.build_blueprint.
 
         Returns:
             Обновления состояния с sql_blueprint.
         """
         iterations = state.get("graph_iterations", 0) + 1
-        user_input = state["user_input"]
         intent = state.get("intent", {})
         selected_columns = state.get("selected_columns", {})
         join_spec = state.get("join_spec", [])
         table_types = state.get("table_types", {})
         join_analysis_data = state.get("join_analysis_data", {})
 
-        logger.info("SqlPlanner: строю blueprint для запроса")
+        logger.info("SqlPlanner (deterministic): строю blueprint")
 
         # --- Проверка согласованности: join_analysis_data vs selected_columns ---
-        # Если join_analysis_data содержит таблицы, которых нет в selected_columns,
-        # значит column_selector пропустил одну из таблиц — предупреждаем планировщик.
         missing_from_columns: list[str] = []
         if join_analysis_data and selected_columns:
-            for pair_key, data in join_analysis_data.items():
+            for _pair_key, data in join_analysis_data.items():
                 for tbl_field in ("table1", "table2"):
                     tbl = data.get(tbl_field, "") if isinstance(data, dict) else ""
                     if tbl and tbl not in selected_columns:
                         missing_from_columns.append(tbl)
-        missing_from_columns = list(dict.fromkeys(missing_from_columns))  # deduplicate
+        missing_from_columns = list(dict.fromkeys(missing_from_columns))
 
         if missing_from_columns:
             logger.warning(
-                "SqlPlanner: таблицы из join_analysis_data отсутствуют в selected_columns: %s. "
-                "Возможно, column_selector пропустил их — укажем в notes для sql_writer.",
+                "SqlPlanner: таблицы из join_analysis_data отсутствуют в selected_columns: %s",
                 missing_from_columns,
             )
 
-        # --- System prompt (~2K) ---
-        system_prompt = (
-            "Ты — планировщик SQL-стратегии для Greenplum (PostgreSQL-совместимая).\n"
-            "Определи КАК написать SQL: тип JOIN, нужны ли CTE/подзапросы, агрегация.\n\n"
-            "Стратегии безопасного JOIN по типам таблиц:\n"
-            "1. ФАКТ + ФАКТ → CTE с агрегацией ОБЕИХ сторон по ключу\n"
-            "2. ФАКТ + СПРАВОЧНИК → подзапрос с DISTINCT ON из справочника\n"
-            "3. СПРАВОЧНИК + ФАКТ → подзапрос с агрегацией фактов\n"
-            "4. СПРАВОЧНИК + СПРАВОЧНИК → DISTINCT ON из обеих сторон в CTE\n"
-            "5. Прямой JOIN допустим ТОЛЬКО если ключ помечен как безопасный\n\n"
-            "Верни ТОЛЬКО JSON:\n"
-            "{\n"
-            '  "strategy": "<simple_select|fact_dim_join|dim_fact_join|fact_fact_join|dim_dim_join|subquery>",\n'
-            '  "main_table": "<schema.table>",\n'
-            '  "cte_needed": <true|false>,\n'
-            '  "subquery_for": ["<schema.table>"],\n'
-            '  "where_conditions": ["<condition1>", ...],\n'
-            '  "aggregation": {"function": "<SUM|COUNT|AVG|...>", "column": "<col>", "alias": "<alias>"} | null,\n'
-            '  "group_by": ["<col1>", ...],\n'
-            '  "order_by": "<expression>" | null,\n'
-            '  "limit": <number> | null,\n'
-            '  "notes": "<дополнительные указания для sql_writer>"\n'
-            "}"
+        # --- Детерминированное построение blueprint (без LLM) ---
+        blueprint = _deterministic_blueprint(
+            intent=intent,
+            selected_columns=selected_columns,
+            join_spec=join_spec,
+            table_types=table_types,
+            join_analysis_data=join_analysis_data,
         )
 
-        # --- User prompt (~5-10K) ---
-        user_parts = []
-        user_parts.append(f"Запрос пользователя: {user_input}")
+        logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
 
-        # Intent
-        if intent:
-            intent_str = json.dumps(intent, ensure_ascii=False, indent=None)
-            user_parts.append(f"Интент: {intent_str}")
-
-        # Selected columns
-        if selected_columns:
-            cols_str = json.dumps(selected_columns, ensure_ascii=False, indent=2)
-            user_parts.append(f"Выбранные колонки:\n{cols_str}")
-
-        # Join spec
-        if join_spec:
-            join_str = json.dumps(join_spec, ensure_ascii=False, indent=2)
-            user_parts.append(f"JOIN-спецификация:\n{join_str}")
-
-        # Table types
-        if table_types:
-            types_str = ", ".join(f"{k}: {v}" for k, v in table_types.items())
-            user_parts.append(f"Типы таблиц: {types_str}")
-
-        # JOIN analysis (only relevant pairs)
-        if join_analysis_data:
-            ja_str = json.dumps(join_analysis_data, ensure_ascii=False, indent=2)
-            user_parts.append(f"JOIN-анализ:\n{ja_str}")
-
-        # Предупреждение о несогласованности: таблицы из join_analysis без колонок
-        if missing_from_columns:
-            warn_tables = ", ".join(missing_from_columns)
-            user_parts.append(
-                f"ВНИМАНИЕ: таблицы {warn_tables} присутствуют в JOIN-анализе, "
-                f"но column_selector не включил их в selected_columns. "
-                f"Если запрос требует данных из этих таблиц (название, наименование, "
-                f"атрибут из справочника) — выбери стратегию fact_dim_join и укажи "
-                f"в notes что требуется JOIN с {warn_tables}."
-            )
-
-        user_prompt = "\n\n".join(user_parts)
-
-        if self.debug_prompt:
-            print(f"\n{'='*80}\n[DEBUG PROMPT — sql_planner]\n{'='*80}\n"
-                  f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
-
-        response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.2)
-
-        # --- Парсинг blueprint ---
-        blueprint = self._parse_json_response(response)
-        if not blueprint or "strategy" not in blueprint:
-            logger.warning("SqlPlanner: не удалось распарсить blueprint, fallback")
-            blueprint = {
-                "strategy": "simple_select",
-                "main_table": list(selected_columns.keys())[0] if selected_columns else "",
-                "cte_needed": False,
-                "subquery_for": [],
-                "where_conditions": [],
-                "aggregation": None,
-                "group_by": [],
-                "order_by": None,
-                "limit": 100,
-                "notes": response[:500],
-            }
-
-        logger.info("SqlPlanner: стратегия=%s", blueprint.get("strategy"))
-
-        # Если dim-таблица пропущена в selected_columns — формируем подсказку для
-        # повторного запуска column_selector, но только один раз (hint ещё не установлен).
+        # Если dim-таблица пропущена — формируем подсказку для повторного column_selector
         new_hint = ""
         if missing_from_columns and not state.get("column_selector_hint", ""):
             miss_str = ", ".join(missing_from_columns)
-            # Собираем список name-колонок из пропущенных таблиц для подсказки
             name_col_examples: list[str] = []
             for tbl in missing_from_columns:
                 parts = tbl.split(".", 1)
@@ -351,7 +266,7 @@ class SqlPipelineNodes:
             ]
             if name_col_examples:
                 hint_lines.append(
-                    f"Name-колонки доступные в пропущенных таблицах: "
+                    "Name-колонки доступные в пропущенных таблицах: "
                     + "; ".join(name_col_examples)
                 )
             new_hint = " ".join(hint_lines)
@@ -366,7 +281,7 @@ class SqlPipelineNodes:
             "graph_iterations": iterations,
             "messages": state["messages"] + [
                 {"role": "assistant",
-                 "content": f"SQL стратегия: {blueprint.get('strategy', 'unknown')}"}
+                 "content": f"SQL стратегия: {blueprint.get('strategy', 'unknown')} [детерминировано]"}
             ],
         }
 
@@ -407,6 +322,44 @@ class SqlPipelineNodes:
                     {"role": "assistant", "content": f"Ошибка: {err}"}
                 ],
             }
+
+        # --- Попытка детерминированной генерации SQL через SqlBuilder ---
+        table_types = state.get("table_types", {})
+        _builder = _SqlBuilder()
+        template_sql = _builder.build(
+            strategy=strategy,
+            selected_columns=selected_columns,
+            join_spec=join_spec_check,
+            blueprint=blueprint,
+            table_types=table_types,
+        )
+        if template_sql:
+            # Проверяем статическим чекером до принятия
+            check_result = check_sql(template_sql, schema_loader=self.schema)
+            if check_result.is_valid:
+                logger.info("SqlWriter: SQL сгенерирован детерминированно, минуем LLM")
+                step_idx = state["current_step"]
+                return {
+                    "sql_to_validate": template_sql,
+                    "pending_sql_tool_call": {
+                        "tool": "execute_query",
+                        "args": {"sql": template_sql},
+                        "step_idx": step_idx,
+                    },
+                    "graph_iterations": iterations,
+                    "tool_calls": state.get("tool_calls", []) + [
+                        {"tool": "execute_query", "args": {"sql": template_sql},
+                         "result": "awaiting_validation"}
+                    ],
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": "SQL сгенерирован детерминированно"}
+                    ],
+                }
+            else:
+                logger.info(
+                    "SqlWriter: шаблонный SQL не прошёл статический чекер (%s) — передаём LLM",
+                    check_result.summary()[:200],
+                )
 
         # --- System prompt (~3K) ---
         # Выбираем 1-2 релевантных примера по стратегии
@@ -732,15 +685,6 @@ class SqlPipelineNodes:
                 "слишком строгие или данные отсутствуют."
             )
 
-        # Семантическая проверка (лёгкий LLM-вызов — только SQL + запрос + blueprint)
-        semantic_warnings = self._semantic_sql_check(
-            state["user_input"], sql, state.get("sql_blueprint", {}),
-        )
-        if semantic_warnings:
-            warnings_text += "\n" + "\n".join(
-                f"⚠ Семантика: {w}" for w in semantic_warnings
-            )
-
         # Подсчёт строк
         if structured_payload is not None:
             row_count = max(0, int(structured_payload.get("total_rows", 0)))
@@ -838,46 +782,6 @@ class SqlPipelineNodes:
                  "content": f"SQL выполнен.{warnings_text}\n{rendered_result[:1000]}"}
             ],
         }
-
-    # --------------------------------------------------------------------------
-    # _semantic_sql_check (лёгкий LLM-вызов)
-    # --------------------------------------------------------------------------
-
-    def _semantic_sql_check(
-        self, user_input: str, sql: str, blueprint: dict | None = None,
-    ) -> list[str]:
-        """Лёгкая LLM-проверка семантического соответствия SQL запросу.
-
-        Получает только SQL + запрос + blueprint (~5K), не full table context.
-        """
-        system = (
-            "Ты — валидатор SQL-запросов. Проверь соответствие SQL запросу.\n"
-            "Проверяй ТОЛЬКО:\n"
-            "1. Фильтры дат: есть ли ОБЕ границы (>= и <)?\n"
-            "2. Агрегация: COUNT(DISTINCT) при 'сколько уникальных'?\n"
-            "3. GROUP BY: все не-агрегированные колонки?\n\n"
-            "Верни JSON-массив: [] если всё ок, [\"предупреждение\"] если нет.\n"
-            "Верни ТОЛЬКО JSON-массив."
-        )
-
-        user_parts = [f"Запрос: {user_input}", f"SQL:\n{sql}"]
-        if blueprint:
-            bp_str = json.dumps(blueprint, ensure_ascii=False, indent=None)
-            user_parts.append(f"Blueprint: {bp_str[:1000]}")
-        user = "\n\n".join(user_parts)
-
-        try:
-            response = self.llm.invoke_with_system(system, user, temperature=0.0)
-            cleaned = self._clean_llm_json(response)
-            match = re.search(r'\[.*\]', cleaned, re.DOTALL)
-            if match:
-                warnings = json.loads(match.group())
-                if isinstance(warnings, list):
-                    return [str(w) for w in warnings if w]
-        except Exception as e:
-            logger.warning("Semantic SQL check failed: %s", e)
-
-        return []
 
     # --------------------------------------------------------------------------
     # _parse_json_response — общий парсер JSON из ответа LLM

@@ -57,8 +57,18 @@ class IntentNodes:
             '  "date_filters": {"from": "<дата или null>", "to": "<дата или null>"},\n'
             '  "aggregation_hint": "<count|sum|avg|min|max|list|null>",\n'
             '  "needs_search": <true|false>,\n'
-            '  "complexity": "<single_table|multi_table|join|subquery>"\n'
+            '  "complexity": "<single_table|multi_table|join|subquery>",\n'
+            '  "filter_conditions": [\n'
+            '    {"column_hint": "<ключевое слово для поиска колонки>", '
+            '"operator": "<= | >= | = | != | LIKE | IN>", "value": "<литеральное значение>"}\n'
+            "  ]\n"
             "}\n\n"
+            "ПРАВИЛО filter_conditions:\n"
+            "- Заполняй ТОЛЬКО если в запросе есть явные фильтры по значениям "
+            "(например: 'по региону Москва', 'сегмент = Малый бизнес', 'сумма > 1000')\n"
+            "- column_hint — ключевое слово из запроса (регион, сегмент, сумма и т.д.)\n"
+            "- value — точное значение из запроса ('Москва', 'Малый бизнес', '1000')\n"
+            "- Если явных фильтров нет — оставь пустым списком []\n\n"
             "ПРАВИЛО complexity:\n"
             "- single_table: данные нужны только из одной таблицы\n"
             "- join: нужно объединить данные из двух+ таблиц "

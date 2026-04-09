@@ -222,6 +222,147 @@ def _check_columns_against_catalog(
         )
 
 
+def _extract_select_columns(sql: str) -> list[str]:
+    """Извлечь колонки из SELECT-клаузы (без агрегатных функций).
+
+    Возвращает список имён колонок, которые НЕ обёрнуты в агрегатную функцию.
+    Только верхний уровень SELECT (не CTEs, не подзапросы).
+    Упрощённый парсер через regex — работает для стандартных случаев.
+    """
+    # Убираем CTE-часть (WITH ... AS (...))
+    sql_no_cte = re.sub(r"(?i)\bWITH\b.+?\)\s*(?=SELECT)", "", sql, flags=re.DOTALL)
+    # Берём первый верхний SELECT
+    select_match = re.search(r"(?i)\bSELECT\b(.+?)\bFROM\b", sql_no_cte, re.DOTALL)
+    if not select_match:
+        return []
+
+    select_body = select_match.group(1)
+
+    # Убираем вложенные скобки (подзапросы, агрегаты)
+    depth = 0
+    tokens: list[str] = []
+    current = ""
+    for ch in select_body:
+        if ch == "(":
+            depth += 1
+            current += ch
+        elif ch == ")":
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            tokens.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        tokens.append(current.strip())
+
+    non_agg_cols: list[str] = []
+    _agg_pattern = re.compile(
+        r"(?i)^(COUNT|SUM|AVG|MIN|MAX|STDDEV|VARIANCE|STRING_AGG|ARRAY_AGG"
+        r"|PERCENTILE_CONT|PERCENTILE_DISC|BOOL_AND|BOOL_OR)\s*\(",
+    )
+
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        # Пропускаем агрегаты
+        if _agg_pattern.match(token):
+            continue
+        # Убираем алиас: col AS alias → col
+        alias_match = re.match(r"(?i)^(.+?)\s+AS\s+\S+$", token)
+        if alias_match:
+            token = alias_match.group(1).strip()
+        # Убираем квалификаторы таблиц: t.col → col
+        if "." in token:
+            token = token.rsplit(".", 1)[-1]
+        # Только простые идентификаторы
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", token):
+            non_agg_cols.append(token.lower())
+
+    return non_agg_cols
+
+
+def _extract_group_by_columns(sql: str) -> list[str]:
+    """Извлечь колонки из GROUP BY клаузы."""
+    gb_match = re.search(r"(?i)\bGROUP\s+BY\b(.+?)(?:\bHAVING\b|\bORDER\b|\bLIMIT\b|$)", sql, re.DOTALL)
+    if not gb_match:
+        return []
+
+    gb_body = gb_match.group(1).strip()
+    cols: list[str] = []
+    for col in gb_body.split(","):
+        col = col.strip()
+        # Убираем квалификатор таблицы
+        if "." in col:
+            col = col.rsplit(".", 1)[-1]
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", col):
+            cols.append(col.lower())
+    return cols
+
+
+def _strip_ctes(sql: str) -> str:
+    """Убрать CTE-блок (WITH ... AS (...)) и вернуть финальный SELECT.
+
+    Упрощённый подход: убираем всё до последнего верхнего SELECT,
+    который следует после закрытия всех CTE-скобок.
+    """
+    stripped = sql.strip()
+    if not re.match(r"(?i)^\s*WITH\b", stripped):
+        return stripped
+
+    # Сканируем до нулевой глубины скобок, потом ищем SELECT
+    depth = 0
+    i = 0
+    in_cte_body = False
+    while i < len(stripped):
+        ch = stripped[i]
+        if ch == "(":
+            depth += 1
+            in_cte_body = True
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and in_cte_body:
+                # После закрытия CTE идёт запятая или финальный SELECT
+                rest = stripped[i + 1:].lstrip()
+                if rest.upper().startswith("SELECT"):
+                    return rest
+        i += 1
+    return stripped
+
+
+def _check_group_by_completeness(sql: str, result: StaticCheckResult) -> None:
+    """Проверить что все не-агрегированные SELECT-колонки присутствуют в GROUP BY.
+
+    Это самая частая ошибка LLM: добавить колонку в SELECT, но забыть в GROUP BY.
+    Работает только когда в SQL есть GROUP BY на уровне финального SELECT.
+    """
+    # Работаем только с финальным SELECT (без CTE)
+    outer_sql = _strip_ctes(sql)
+
+    # Проверяем только если в финальном SELECT есть GROUP BY
+    if not re.search(r"(?i)\bGROUP\s+BY\b", outer_sql):
+        return
+
+    select_cols = set(_extract_select_columns(outer_sql))
+    group_by_cols = set(_extract_group_by_columns(outer_sql))
+
+    if not select_cols:
+        return  # Не смогли распарсить — не блокируем
+
+    missing = select_cols - group_by_cols
+    # Исключаем известные константы и псевдоколонки
+    _KNOWN_CONSTANTS = {"true", "false", "null", "current_date", "current_timestamp"}
+    missing -= _KNOWN_CONSTANTS
+
+    if missing:
+        result.add_warning(
+            f"GROUP BY completeness: колонки {sorted(missing)} присутствуют в SELECT, "
+            "но отсутствуют в GROUP BY. Возможна ошибка агрегации."
+        )
+
+
 def check_sql(
     sql: str,
     schema_loader=None,
@@ -256,5 +397,11 @@ def check_sql(
         except Exception as e:
             logger.warning("StaticChecker: ошибка проверки колонок: %s", e)
             # Не блокируем — каталог мог быть недоступен
+
+    # 4. GROUP BY completeness — предупреждение
+    try:
+        _check_group_by_completeness(sql, result)
+    except Exception as e:
+        logger.warning("StaticChecker: ошибка проверки GROUP BY: %s", e)
 
     return result

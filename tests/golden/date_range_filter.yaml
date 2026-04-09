@@ -1,0 +1,12 @@
+query: "Сумма продаж за январь 2024 года по регионам"
+intent_must_be: analytics
+complexity_must_be: single_table
+sql_must_contain:
+  - SUM
+  - GROUP BY
+  - "2024"
+sql_must_not_contain:
+  - "SELECT *"
+sql_alias_no_cyrillic: true
+should_reach_node: sql_writer
+max_retries: 0

@@ -1,6 +1,6 @@
 """Кэш для идентичных/похожих запросов пользователя.
 
-Хранит результат (sql + final_answer) с TTL 1 час в SQLite.
+Хранит результат (sql + final_answer) с TTL 1 час в JSON-файле.
 Ключ — SHA-256 от нормализованного user_input.
 Интегрируется в CLIInterface до запуска графа.
 """
@@ -8,7 +8,6 @@
 import hashlib
 import logging
 import re
-import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,20 +15,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from core.memory import MemoryManager
 
+from core.memory import _load_json, _write_json_atomic
+
 logger = logging.getLogger(__name__)
 
 # TTL кэша — 1 час
 _CACHE_TTL_SECONDS = 3600
-
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS query_cache (
-    key TEXT PRIMARY KEY,
-    user_input TEXT NOT NULL,
-    sql TEXT,
-    final_answer TEXT NOT NULL,
-    created_at TEXT NOT NULL
-)
-"""
 
 
 def _normalize(user_input: str) -> str:
@@ -47,20 +38,16 @@ def _cache_key(user_input: str) -> str:
 
 
 class QueryCache:
-    """SQLite-backed кэш с TTL для повторных запросов."""
+    """JSON-backed кэш с TTL для повторных запросов."""
 
     def __init__(self, memory: "MemoryManager") -> None:
-        self._memory = memory
-        self._ensure_table()
+        self._cache_path: Path = memory._memory_dir / "query_cache.json"
 
-    def _ensure_table(self) -> None:
-        """Создать таблицу кэша если не существует."""
-        try:
-            with self._memory._connect() as conn:
-                conn.execute(_CREATE_TABLE_SQL)
-                conn.commit()
-        except Exception as e:
-            logger.warning("QueryCache: ошибка создания таблицы: %s", e)
+    def _load(self) -> dict:
+        return _load_json(self._cache_path, {})
+
+    def _save(self, data: dict) -> None:
+        _write_json_atomic(self._cache_path, data)
 
     def get(self, user_input: str) -> dict | None:
         """Найти кэшированный результат.
@@ -70,19 +57,20 @@ class QueryCache:
             или None если кэш промах / устарел.
         """
         key = _cache_key(user_input)
-        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_CACHE_TTL_SECONDS)).isoformat()
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=_CACHE_TTL_SECONDS)
+        ).isoformat()
 
         try:
-            with self._memory._connect() as conn:
-                row = conn.execute(
-                    "SELECT sql, final_answer, created_at FROM query_cache "
-                    "WHERE key = ? AND created_at >= ?",
-                    (key, cutoff),
-                ).fetchone()
-
-            if row:
+            cache = self._load()
+            entry = cache.get(key)
+            if entry and entry.get("created_at", "") >= cutoff:
                 logger.info("QueryCache: попадание в кэш (key=%s)", key[:12])
-                return {"sql": row[0], "final_answer": row[1], "created_at": row[2]}
+                return {
+                    "sql": entry.get("sql", ""),
+                    "final_answer": entry["final_answer"],
+                    "created_at": entry["created_at"],
+                }
         except Exception as e:
             logger.warning("QueryCache: ошибка чтения: %s", e)
 
@@ -100,13 +88,14 @@ class QueryCache:
         created_at = datetime.now(timezone.utc).isoformat()
 
         try:
-            with self._memory._connect() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO query_cache (key, user_input, sql, final_answer, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (key, user_input, sql or "", final_answer, created_at),
-                )
-                conn.commit()
+            cache = self._load()
+            cache[key] = {
+                "user_input": user_input,
+                "sql": sql or "",
+                "final_answer": final_answer,
+                "created_at": created_at,
+            }
+            self._save(cache)
             logger.info("QueryCache: сохранён результат (key=%s)", key[:12])
         except Exception as e:
             logger.warning("QueryCache: ошибка записи: %s", e)
@@ -115,22 +104,26 @@ class QueryCache:
         """Удалить конкретный запрос из кэша."""
         key = _cache_key(user_input)
         try:
-            with self._memory._connect() as conn:
-                conn.execute("DELETE FROM query_cache WHERE key = ?", (key,))
-                conn.commit()
+            cache = self._load()
+            if key in cache:
+                del cache[key]
+                self._save(cache)
         except Exception as e:
             logger.warning("QueryCache: ошибка удаления: %s", e)
 
     def clear_expired(self) -> int:
         """Очистить устаревшие записи. Возвращает количество удалённых."""
-        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_CACHE_TTL_SECONDS)).isoformat()
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=_CACHE_TTL_SECONDS)
+        ).isoformat()
         try:
-            with self._memory._connect() as conn:
-                cur = conn.execute(
-                    "DELETE FROM query_cache WHERE created_at < ?", (cutoff,)
-                )
-                conn.commit()
-                return cur.rowcount
+            cache = self._load()
+            expired = [k for k, v in cache.items() if v.get("created_at", "") < cutoff]
+            for k in expired:
+                del cache[k]
+            if expired:
+                self._save(cache)
+            return len(expired)
         except Exception as e:
             logger.warning("QueryCache: ошибка очистки: %s", e)
             return 0
@@ -138,9 +131,7 @@ class QueryCache:
     def clear_all(self) -> None:
         """Полностью очистить кэш."""
         try:
-            with self._memory._connect() as conn:
-                conn.execute("DELETE FROM query_cache")
-                conn.commit()
+            self._save({})
             logger.info("QueryCache: кэш очищен")
         except Exception as e:
             logger.warning("QueryCache: ошибка очистки: %s", e)

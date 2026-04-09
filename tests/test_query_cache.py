@@ -1,10 +1,8 @@
 """Тесты для core/query_cache.py."""
 
-import time
-from unittest.mock import MagicMock, patch
-import sqlite3
 import pytest
 
+from core.memory import MemoryManager
 from core.query_cache import QueryCache, _normalize, _cache_key
 
 
@@ -47,101 +45,90 @@ class TestCacheKey:
 
 
 # ---------------------------------------------------------------------------
-# QueryCache через in-memory SQLite
+# QueryCache через реальные JSON-файлы во временной директории
 # ---------------------------------------------------------------------------
 
-def _make_cache():
-    """Создать QueryCache с in-memory SQLite."""
-    conn = sqlite3.connect(":memory:")
-
-    memory_mock = MagicMock()
-    memory_mock._connect.return_value.__enter__ = lambda s: conn
-    memory_mock._connect.return_value.__exit__ = MagicMock(return_value=False)
-
-    cache = QueryCache(memory_mock)
-    return cache, conn
+@pytest.fixture
+def cache(tmp_path):
+    """Создать QueryCache с временной директорией."""
+    memory = MemoryManager(memory_dir=tmp_path)
+    return QueryCache(memory)
 
 
 class TestQueryCachePutGet:
-    def setup_method(self):
-        self.cache, self.conn = _make_cache()
-
-    def test_put_and_get(self):
-        self.cache.put("покажи клиентов", "Клиентов: 100", sql="SELECT COUNT(*) FROM dm.clients")
-        result = self.cache.get("покажи клиентов")
+    def test_put_and_get(self, cache):
+        cache.put("покажи клиентов", "Клиентов: 100", sql="SELECT COUNT(*) FROM dm.clients")
+        result = cache.get("покажи клиентов")
         assert result is not None
         assert result["final_answer"] == "Клиентов: 100"
         assert result["sql"] == "SELECT COUNT(*) FROM dm.clients"
 
-    def test_get_miss_returns_none(self):
-        result = self.cache.get("несуществующий запрос xyz123")
+    def test_get_miss_returns_none(self, cache):
+        result = cache.get("несуществующий запрос xyz123")
         assert result is None
 
-    def test_normalized_key_hit(self):
-        self.cache.put("покажи клиентов", "answer")
+    def test_normalized_key_hit(self, cache):
+        cache.put("покажи клиентов", "answer")
         # Тот же запрос с иным регистром/пробелами
-        result = self.cache.get("  ПОКАЖИ  КЛИЕНТОВ  ")
+        result = cache.get("  ПОКАЖИ  КЛИЕНТОВ  ")
         assert result is not None
 
-    def test_put_overwrites(self):
-        self.cache.put("запрос", "первый ответ")
-        self.cache.put("запрос", "второй ответ")
-        result = self.cache.get("запрос")
+    def test_put_overwrites(self, cache):
+        cache.put("запрос", "первый ответ")
+        cache.put("запрос", "второй ответ")
+        result = cache.get("запрос")
         assert result["final_answer"] == "второй ответ"
 
-    def test_put_without_sql(self):
-        self.cache.put("запрос без sql", "answer")
-        result = self.cache.get("запрос без sql")
+    def test_put_without_sql(self, cache):
+        cache.put("запрос без sql", "answer")
+        result = cache.get("запрос без sql")
         assert result is not None
         assert result["sql"] == ""
 
 
 class TestQueryCacheInvalidate:
-    def setup_method(self):
-        self.cache, self.conn = _make_cache()
+    def test_invalidate_removes_entry(self, cache):
+        cache.put("запрос", "answer")
+        cache.invalidate("запрос")
+        assert cache.get("запрос") is None
 
-    def test_invalidate_removes_entry(self):
-        self.cache.put("запрос", "answer")
-        self.cache.invalidate("запрос")
-        assert self.cache.get("запрос") is None
-
-    def test_invalidate_nonexistent_no_error(self):
-        self.cache.invalidate("несуществующий запрос")  # не должно бросать исключение
+    def test_invalidate_nonexistent_no_error(self, cache):
+        cache.invalidate("несуществующий запрос")  # не должно бросать исключение
 
 
 class TestQueryCacheClear:
-    def setup_method(self):
-        self.cache, self.conn = _make_cache()
-
-    def test_clear_all(self):
-        self.cache.put("запрос 1", "answer 1")
-        self.cache.put("запрос 2", "answer 2")
-        self.cache.clear_all()
-        assert self.cache.get("запрос 1") is None
-        assert self.cache.get("запрос 2") is None
+    def test_clear_all(self, cache):
+        cache.put("запрос 1", "answer 1")
+        cache.put("запрос 2", "answer 2")
+        cache.clear_all()
+        assert cache.get("запрос 1") is None
+        assert cache.get("запрос 2") is None
 
 
 class TestQueryCacheTTL:
-    def setup_method(self):
-        self.cache, self.conn = _make_cache()
-
-    def test_expired_entry_not_returned(self):
+    def test_expired_entry_not_returned(self, cache):
         """Запись с истёкшим TTL не должна возвращаться."""
+        import json
+        from core.memory import _write_json_atomic, _load_json
+
         # Вставляем запись вручную с очень старым timestamp
         old_ts = "2020-01-01T00:00:00+00:00"
         key = _cache_key("старый запрос")
-        self.conn.execute(
-            "INSERT OR REPLACE INTO query_cache (key, user_input, sql, final_answer, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (key, "старый запрос", "", "old answer", old_ts),
-        )
-        self.conn.commit()
-        result = self.cache.get("старый запрос")
+        data = _load_json(cache._cache_path, {})
+        data[key] = {
+            "user_input": "старый запрос",
+            "sql": "",
+            "final_answer": "old answer",
+            "created_at": old_ts,
+        }
+        _write_json_atomic(cache._cache_path, data)
+
+        result = cache.get("старый запрос")
         assert result is None
 
-    def test_fresh_entry_returned(self):
+    def test_fresh_entry_returned(self, cache):
         """Свежая запись возвращается."""
-        self.cache.put("свежий запрос", "fresh answer")
-        result = self.cache.get("свежий запрос")
+        cache.put("свежий запрос", "fresh answer")
+        result = cache.get("свежий запрос")
         assert result is not None
         assert result["final_answer"] == "fresh answer"

@@ -3,6 +3,7 @@
 Содержит SqlPipelineNodes — миксин для GraphNodes с методами:
 - sql_planner: определение стратегии SQL-запроса
 - sql_writer: написание SQL по blueprint
+- sql_static_checker: детерминированная проверка SQL до БД (без LLM)
 - sql_validator_node: валидация, выполнение, проверка результата
 - _semantic_sql_check: лёгкая LLM-проверка семантики
 """
@@ -13,6 +14,7 @@ import re
 import time
 from typing import Any
 
+from core.sql_static_checker import check_sql
 from graph.nodes.common import (
     BaseNodeMixin,
     ToolResult,
@@ -462,6 +464,17 @@ class SqlPipelineNodes:
             js_str = json.dumps(join_spec, ensure_ascii=False, indent=2)
             user_parts.append(f"JOIN ключи:\n{js_str}")
 
+        # Few-shot примеры из audit log (похожие успешные запросы)
+        try:
+            few_shot_examples = self.few_shot.get_similar(
+                state["user_input"], strategy=strategy, n=2
+            )
+            if few_shot_examples:
+                user_parts.append(self.few_shot.format_for_prompt(few_shot_examples))
+                logger.debug("SqlWriter: добавлено %d few-shot примеров", len(few_shot_examples))
+        except Exception:
+            pass  # few-shot не критичен — продолжаем без него
+
         user_prompt = "\n\n".join(user_parts)
 
         if self.debug_prompt:
@@ -544,6 +557,56 @@ class SqlPipelineNodes:
                 {"role": "assistant", "content": f"Результат: {result_str[:1000]}"}
             ],
         }
+
+    # --------------------------------------------------------------------------
+    # sql_static_checker
+    # --------------------------------------------------------------------------
+
+    def sql_static_checker(self, state: AgentState) -> dict[str, Any]:
+        """Детерминированная проверка SQL до отправки в БД (без LLM).
+
+        Проверяет:
+        - кириллические алиасы
+        - SELECT *
+        - галлюцинированные колонки (не существуют в каталоге)
+
+        При ошибке → error_diagnoser. При успехе → sql_validator.
+        """
+        sql = state.get("sql_to_validate")
+        pending_call = state.get("pending_sql_tool_call")
+        if not sql and pending_call:
+            sql = pending_call.get("args", {}).get("sql")
+        if not sql:
+            return {}
+
+        iterations = state.get("graph_iterations", 0) + 1
+        logger.info("StaticChecker: проверка SQL (%d символов)", len(sql))
+
+        check_result = check_sql(sql, schema_loader=self.schema)
+
+        if not check_result.is_valid:
+            error_msg = (
+                f"[sql_static_checker] {check_result.summary()}\n"
+                "Исправь SQL перед отправкой в БД."
+            )
+            logger.warning("StaticChecker: найдены ошибки: %s", error_msg[:300])
+            return {
+                "last_error": error_msg,
+                "sql_to_validate": None,
+                "pending_sql_tool_call": None,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": error_msg}
+                ],
+            }
+
+        if check_result.warnings:
+            logger.info(
+                "StaticChecker: предупреждения: %s",
+                "; ".join(check_result.warnings),
+            )
+
+        return {"graph_iterations": iterations}
 
     # --------------------------------------------------------------------------
     # sql_validator_node
@@ -729,6 +792,9 @@ class SqlPipelineNodes:
             retry_count=state.get("retry_count", 0),
         )
         self.memory.add_message("tool", f"[{tool_name}] {rendered_result[:500]}")
+        # Сбрасываем few-shot кэш: новый успешный запрос попадёт в следующую сессию
+        if audit_status == "success":
+            self.few_shot.invalidate_cache()
 
         # Пустой результат → коррекция
         if empty_result:

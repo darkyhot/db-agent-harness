@@ -11,6 +11,16 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data_for_agent"
 
+# TF-IDF опционально (scikit-learn может быть не установлен)
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    import numpy as np
+    _TFIDF_AVAILABLE = True
+except ImportError:
+    _TFIDF_AVAILABLE = False
+    logger.info("scikit-learn не установлен — TF-IDF поиск недоступен, используется keyword поиск")
+
 
 class SchemaLoader:
     """Загрузка tables_list.csv и attr_list.csv с кешированием в памяти."""
@@ -24,6 +34,10 @@ class SchemaLoader:
         self._data_dir = data_dir or DATA_DIR
         self._tables_df: pd.DataFrame | None = None
         self._attrs_df: pd.DataFrame | None = None
+        # TF-IDF индекс (строится лениво при первом поиске)
+        self._tfidf_vectorizer: "TfidfVectorizer | None" = None
+        self._tfidf_matrix = None
+        self._tfidf_index: list[tuple[str, str]] = []  # [(schema, table), ...]
 
     def _load_tables(self) -> pd.DataFrame:
         """Загрузить и закешировать tables_list.csv."""
@@ -83,37 +97,147 @@ class SchemaLoader:
         """Количество загруженных атрибутов."""
         return len(self.attrs_df)
 
-    def search_tables(self, query: str) -> pd.DataFrame:
-        """Поиск таблиц по имени или описанию (case-insensitive) с учётом синонимов.
+    def _build_tfidf_index(self) -> None:
+        """Построить TF-IDF индекс по таблицам (вызывается лениво)."""
+        if not _TFIDF_AVAILABLE:
+            return
+        df = self.tables_df
+        if df.empty:
+            return
+
+        # Объединяем schema, table_name и description в один текст для индексации
+        docs = []
+        index = []
+        for _, row in df.iterrows():
+            schema = str(row.get("schema_name", ""))
+            table = str(row.get("table_name", ""))
+            desc = str(row.get("description", ""))
+            # Разбиваем snake_case на слова для лучшего матчинга
+            table_words = table.replace("_", " ")
+            schema_words = schema.replace("_", " ")
+            text = f"{schema_words} {table_words} {table_words} {desc}"
+            docs.append(text.lower())
+            index.append((schema, table))
+
+        if not docs:
+            return
+
+        try:
+            vectorizer = TfidfVectorizer(
+                analyzer="word",
+                token_pattern=r"[a-zA-Zа-яА-ЯёЁ][a-zA-Zа-яА-ЯёЁ0-9]*",
+                ngram_range=(1, 2),
+                min_df=1,
+                sublinear_tf=True,
+            )
+            matrix = vectorizer.fit_transform(docs)
+            self._tfidf_vectorizer = vectorizer
+            self._tfidf_matrix = matrix
+            self._tfidf_index = index
+            logger.info("TF-IDF индекс построен: %d таблиц", len(index))
+        except Exception as e:
+            logger.warning("Ошибка построения TF-IDF индекса: %s", e)
+
+    def _tfidf_search(self, query: str, top_n: int = 20) -> list[tuple[str, str, float]]:
+        """Поиск по TF-IDF индексу.
+
+        Returns:
+            Список (schema, table, score) отсортированный по убыванию score.
+        """
+        if not _TFIDF_AVAILABLE:
+            return []
+
+        # Ленивое построение индекса
+        if self._tfidf_vectorizer is None:
+            self._build_tfidf_index()
+
+        if self._tfidf_vectorizer is None or self._tfidf_matrix is None:
+            return []
+
+        # Расширяем запрос синонимами для лучшего покрытия
+        synonyms = expand_with_synonyms(query)
+        expanded = f"{query} {' '.join(synonyms)}".lower()
+        # Разбиваем snake_case
+        expanded = expanded.replace("_", " ")
+
+        try:
+            query_vec = self._tfidf_vectorizer.transform([expanded])
+            scores = cosine_similarity(query_vec, self._tfidf_matrix).flatten()
+            top_indices = np.argsort(scores)[::-1][:top_n]
+            results = []
+            for idx in top_indices:
+                score = float(scores[idx])
+                if score > 0.01:  # Отсекаем нерелевантные
+                    schema, table = self._tfidf_index[idx]
+                    results.append((schema, table, score))
+            return results
+        except Exception as e:
+            logger.warning("Ошибка TF-IDF поиска: %s", e)
+            return []
+
+    def search_tables(self, query: str, top_n: int = 30) -> pd.DataFrame:
+        """Поиск таблиц по имени или описанию с TF-IDF + keyword fallback.
 
         Args:
             query: Строка поиска (русский или английский).
+            top_n: Максимальное количество результатов.
 
         Returns:
-            DataFrame с найденными таблицами.
+            DataFrame с найденными таблицами, отсортированный по релевантности.
         """
         df = self.tables_df
-        q = query.lower()
+        if df.empty:
+            return df
 
-        # Прямой поиск по оригинальному запросу
+        q = query.lower()
+        synonyms = expand_with_synonyms(query)
+
+        # 1. Keyword поиск
         mask = (
             df["table_name"].str.lower().str.contains(q, na=False)
             | df["schema_name"].str.lower().str.contains(q, na=False)
             | df["description"].str.lower().str.contains(q, na=False)
         )
-
-        # Расширенный поиск по синонимам
-        synonyms = expand_with_synonyms(query)
         for syn in synonyms:
             mask = mask | (
                 df["table_name"].str.lower().str.contains(syn, na=False)
                 | df["schema_name"].str.lower().str.contains(syn, na=False)
                 | df["description"].str.lower().str.contains(syn, na=False)
             )
+        keyword_result = df[mask].copy()
+        keyword_result["_score"] = 2.0  # Keyword match — высокий приоритет
 
-        result = df[mask].copy()
-        logger.info("search_tables('%s'): найдено %d (синонимов: %d)", query, len(result), len(synonyms))
-        return result
+        # 2. TF-IDF поиск
+        tfidf_hits = self._tfidf_search(query, top_n=top_n)
+        if tfidf_hits:
+            tfidf_rows = []
+            for schema, table, score in tfidf_hits:
+                row_mask = (
+                    (df["schema_name"] == schema) & (df["table_name"] == table)
+                )
+                match = df[row_mask]
+                if not match.empty:
+                    r = match.iloc[0].to_dict()
+                    r["_score"] = score
+                    tfidf_rows.append(r)
+            tfidf_df = pd.DataFrame(tfidf_rows) if tfidf_rows else pd.DataFrame()
+        else:
+            tfidf_df = pd.DataFrame()
+
+        # 3. Объединяем, дедуплицируем, сортируем по score
+        if not tfidf_df.empty and "_score" in tfidf_df.columns:
+            combined = pd.concat([keyword_result, tfidf_df], ignore_index=True)
+            combined = combined.drop_duplicates(subset=["schema_name", "table_name"], keep="first")
+            combined = combined.sort_values("_score", ascending=False).head(top_n)
+            result = combined.drop(columns=["_score"], errors="ignore")
+        else:
+            result = keyword_result.head(top_n)
+
+        logger.info(
+            "search_tables('%s'): найдено %d (keyword: %d, tfidf: %d)",
+            query, len(result), len(keyword_result), len(tfidf_hits),
+        )
+        return result.reset_index(drop=True)
 
     def get_table_columns(self, schema: str, table: str) -> pd.DataFrame:
         """Получить атрибуты конкретной таблицы.

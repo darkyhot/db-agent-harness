@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from core.few_shot_retriever import FewShotRetriever
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.schema_loader import SchemaLoader
@@ -184,6 +185,9 @@ class BaseNodeMixin:
     SQL_TOOL_NAMES = {"execute_query", "execute_write", "execute_ddl", "export_query"}
     MAX_PROMPT_CHARS = 100_000
     SAMPLE_CACHE_TTL = 600
+    # Лимиты на размер списков в state — предотвращают раздувание промпта summarizer'а
+    MAX_MESSAGES = 30
+    MAX_TOOL_CALLS = 15
 
     # Стоп-слова для предфильтрации каталога
     _STOP_WORDS = frozenset({
@@ -218,6 +222,7 @@ class BaseNodeMixin:
         self.tools = tools
         self.debug_prompt = debug_prompt
         self.tool_map: dict[str, Any] = {t.name: t for t in tools}
+        self.few_shot = FewShotRetriever(memory)
         self._sample_cache: dict[tuple[str, str], tuple[float, str]] = {}
         self.tools_description = "\n".join(
             f"- {t.name}: {t.description}" for t in tools
@@ -228,6 +233,29 @@ class BaseNodeMixin:
             first_sentence = t.description.split("\n")[0].split(". ")[0]
             compact_lines.append(f"- {t.name}: {first_sentence}")
         self.tools_compact = "\n".join(compact_lines)
+
+    # ------------------------------------------------------------------
+    # Ограничение роста state-списков
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cap_messages(messages: list, max_size: int | None = None) -> list:
+        """Обрезать список сообщений до последних max_size элементов.
+
+        Предотвращает раздувание промпта summarizer'а при длинных сессиях с retry.
+        """
+        limit = max_size or BaseNodeMixin.MAX_MESSAGES
+        if len(messages) > limit:
+            return messages[-limit:]
+        return messages
+
+    @staticmethod
+    def _cap_tool_calls(tool_calls: list, max_size: int | None = None) -> list:
+        """Обрезать список tool_calls до последних max_size элементов."""
+        limit = max_size or BaseNodeMixin.MAX_TOOL_CALLS
+        if len(tool_calls) > limit:
+            return tool_calls[-limit:]
+        return tool_calls
 
     # ------------------------------------------------------------------
     # Бюджет промптов

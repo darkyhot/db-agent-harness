@@ -20,8 +20,10 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 # Regex для валидации идентификаторов (схема, таблица, колонка)
 _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
-# Таймаут на SQL-запросы (мс)
-STATEMENT_TIMEOUT_MS = 300_000  # 5 минут
+# Таймаут на SQL-запросы (мс).
+# Намеренно меньше wall-clock таймаута графа (300s), чтобы при тяжёлом запросе
+# оставалось время на диагностику и retry через error_diagnoser.
+STATEMENT_TIMEOUT_MS = 90_000  # 90 секунд
 
 
 def _has_top_level_limit(sql: str) -> bool:

@@ -44,8 +44,10 @@ class SummarizerNodes:
             self.memory.add_message("assistant", state["final_answer"])
             return {}
 
+        # Используем только последние N tool_calls — предотвращаем раздувание промпта
+        capped_tool_calls = self._cap_tool_calls(state.get("tool_calls", []))
         tool_results_parts = []
-        for tc in state.get("tool_calls", []):
+        for tc in capped_tool_calls:
             sql = tc.get("args", {}).get("sql", "")
             sql_line = f"\n  SQL: {sql}" if sql else ""
             tool_results_parts.append(

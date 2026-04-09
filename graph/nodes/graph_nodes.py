@@ -23,7 +23,7 @@ class GraphNodes(
     Каждый mixin содержит 1-3 узла графа:
     - IntentNodes: intent_classifier, table_resolver
     - ExplorerNodes: table_explorer, column_selector
-    - SqlPipelineNodes: sql_planner, sql_writer, sql_validator_node
+    - SqlPipelineNodes: sql_planner, sql_writer, sql_static_checker, sql_validator_node
     - CorrectionNodes: error_diagnoser, sql_fixer
     - SummarizerNodes: summarizer
     - DispatcherNodes: tool_dispatcher

@@ -1,9 +1,9 @@
 """Сборка графа LangGraph с логикой переходов.
 
-Новая архитектура: 11 узлов вместо 6.
+Новая архитектура: 12 узлов.
 intent_classifier → table_resolver → table_explorer → column_selector
-  → sql_planner → sql_writer → sql_validator
-      → [ошибка] → error_diagnoser → sql_fixer → sql_validator
+  → sql_planner → sql_writer → sql_static_checker → sql_validator
+      → [ошибка] → error_diagnoser → sql_fixer → sql_static_checker → sql_validator
       → [успех] → summarizer → END
 """
 
@@ -103,7 +103,7 @@ def _route_after_sql_writer(state: AgentState) -> str:
         return END
 
     if state.get("sql_to_validate"):
-        return "sql_validator"
+        return "sql_static_checker"
 
     if state.get("last_error"):
         return "error_diagnoser"
@@ -115,6 +115,24 @@ def _route_after_sql_writer(state: AgentState) -> str:
         return "summarizer"
 
     # Ещё есть шаги — возврат к column_selector для следующего шага
+    return "column_selector"
+
+
+def _route_after_static_checker(state: AgentState) -> str:
+    """Маршрутизация после sql_static_checker."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("last_error"):
+        return "error_diagnoser"
+
+    if state.get("sql_to_validate"):
+        return "sql_validator"
+
+    if state["current_step"] >= len(state["plan"]):
+        return "summarizer"
+
     return "column_selector"
 
 
@@ -228,13 +246,14 @@ def build_graph(
 
     graph = StateGraph(AgentState)
 
-    # Добавляем все 11 узлов
+    # Добавляем все 12 узлов
     graph.add_node("intent_classifier", nodes.intent_classifier)
     graph.add_node("table_resolver", nodes.table_resolver)
     graph.add_node("table_explorer", nodes.table_explorer)
     graph.add_node("column_selector", nodes.column_selector)
     graph.add_node("sql_planner", nodes.sql_planner)
     graph.add_node("sql_writer", nodes.sql_writer)
+    graph.add_node("sql_static_checker", nodes.sql_static_checker)
     graph.add_node("sql_validator", nodes.sql_validator_node)
     graph.add_node("error_diagnoser", nodes.error_diagnoser)
     graph.add_node("sql_fixer", nodes.sql_fixer)
@@ -272,9 +291,16 @@ def build_graph(
         "summarizer": "summarizer",
     })
 
-    # sql_writer → conditional routing
+    # sql_writer → sql_static_checker → sql_validator (или error_diagnoser)
     graph.add_conditional_edges("sql_writer", _route_after_sql_writer, {
         END: END,
+        "sql_static_checker": "sql_static_checker",
+        "error_diagnoser": "error_diagnoser",
+        "summarizer": "summarizer",
+        "column_selector": "column_selector",
+    })
+
+    graph.add_conditional_edges("sql_static_checker", _route_after_static_checker, {
         "sql_validator": "sql_validator",
         "error_diagnoser": "error_diagnoser",
         "summarizer": "summarizer",
@@ -299,9 +325,9 @@ def build_graph(
         "summarizer": "summarizer",
     })
 
-    # sql_fixer → conditional routing
+    # sql_fixer → sql_static_checker → sql_validator (через тот же static check)
     graph.add_conditional_edges("sql_fixer", _route_after_sql_fixer, {
-        "sql_validator": "sql_validator",
+        "sql_validator": "sql_static_checker",
         "error_diagnoser": "error_diagnoser",
         "summarizer": "summarizer",
         "column_selector": "column_selector",
@@ -310,7 +336,7 @@ def build_graph(
     # summarizer → END
     graph.add_edge("summarizer", END)
 
-    logger.info("Граф агента собран (11 узлов)")
+    logger.info("Граф агента собран (12 узлов)")
     return graph.compile()
 
 

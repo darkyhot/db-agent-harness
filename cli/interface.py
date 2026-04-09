@@ -12,6 +12,7 @@ from IPython.display import clear_output, display, Markdown
 from core.database import DatabaseManager
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
+from core.query_cache import QueryCache
 from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
 from graph.graph import build_graph, create_initial_state
@@ -84,12 +85,13 @@ def setup_logging() -> None:
 
 HELP_TEXT = """
 Доступные команды:
-  help   — показать этот список
-  config — настроить подключение к БД (user, host, port)
-  memory — просмотр и управление долгосрочной памятью
-  reset  — сбросить контекст текущей сессии
-  clear  — очистить вывод ячейки
-  exit   — завершить работу (сохранить резюме сессии)
+  help    — показать этот список
+  config  — настроить подключение к БД (user, host, port)
+  memory  — просмотр и управление долгосрочной памятью
+  metrics — метрики качества генерации SQL (последние 30 дней)
+  reset   — сбросить контекст текущей сессии
+  clear   — очистить вывод ячейки
+  exit    — завершить работу (сохранить резюме сессии)
 
 Любой другой ввод обрабатывается как запрос к агенту.
 """.strip()
@@ -112,6 +114,9 @@ class CLIInterface:
         db_tools = create_db_tools(self.db, self.validator, self.schema)
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
+
+        # Кэш повторных запросов
+        self.query_cache = QueryCache(self.memory)
 
         # Флаг отладки промптов из конфига
         self.debug_prompt = self.db.runtime_config.get("debug_prompt", False)
@@ -350,6 +355,45 @@ class CLIInterface:
             else:
                 print(f"✗ Ключ '{key_to_delete}' не найден.")
 
+    def _handle_metrics(self) -> None:
+        """Показать метрики качества генерации SQL."""
+        metrics = self.memory.get_sql_quality_metrics(days=30)
+        total = metrics.get("total_queries", 0)
+
+        if total == 0:
+            print("\nНет данных за последние 30 дней.\nВыполните несколько запросов для накопления статистики.")
+            return
+
+        success_rate = metrics.get("success_rate", 0)
+        first_try = metrics.get("first_try_success_rate", 0)
+        avg_retry = metrics.get("avg_retries", 0)
+        max_retry = metrics.get("max_retries", 0)
+        avg_ms = metrics.get("avg_duration_ms", 0)
+        errors = metrics.get("error_distribution", {})
+        statuses = metrics.get("status_distribution", {})
+
+        print(f"""
+╔══════════════════════════════════════════╗
+║       Метрики качества SQL (30 дней)     ║
+╚══════════════════════════════════════════╝
+
+  Всего запросов:       {total}
+  Успешность:           {success_rate:.1f}%
+  С первой попытки:     {first_try:.1f}%
+  Среднее retry:        {avg_retry:.2f}  (макс: {max_retry})
+  Среднее время:        {avg_ms:.0f} мс
+
+  Распределение статусов:""")
+        for status, cnt in sorted(statuses.items(), key=lambda x: -x[1]):
+            bar = "█" * min(int(cnt / max(statuses.values()) * 20), 20)
+            print(f"    {status:<15} {cnt:>4}  {bar}")
+
+        if errors:
+            print("\n  Топ ошибок:")
+            for err_type, cnt in sorted(errors.items(), key=lambda x: -x[1])[:5]:
+                print(f"    {err_type:<25} {cnt}")
+        print()
+
     def _handle_exit(self) -> None:
         """Завершение работы с сохранением резюме."""
         _status_print("Сохранение резюме сессии...")
@@ -401,6 +445,23 @@ class CLIInterface:
         Args:
             user_input: Запрос пользователя.
         """
+        # --- Проверка кэша (только для read-запросов без явных write-ключевых слов) ---
+        _write_keywords = ("insert", "update", "delete", "drop", "create", "truncate", "alter")
+        _is_write = any(kw in user_input.lower() for kw in _write_keywords)
+        if not _is_write:
+            cached = self.query_cache.get(user_input)
+            if cached:
+                from datetime import datetime, timezone
+                try:
+                    ts = datetime.fromisoformat(cached["created_at"])
+                    age_min = int((datetime.now(timezone.utc) - ts).total_seconds() / 60)
+                    age_str = f"{age_min} мин. назад" if age_min < 60 else f"{age_min // 60} ч. назад"
+                except Exception:
+                    age_str = "ранее"
+                print(f"\n💾 Найден кэшированный ответ ({age_str}). Используется без запроса к БД.\n")
+                print(cached["final_answer"])
+                return
+
         state = create_initial_state(user_input)
         result = {}
         spinner_idx = 0
@@ -493,6 +554,15 @@ class CLIInterface:
             answer = result.get("final_answer", "Нет ответа.")
             print(f"\n{answer}")
 
+            # Сохраняем успешные read-запросы в кэш
+            if not _is_write and answer and answer != "Нет ответа.":
+                executed_sql = None
+                for tc in reversed(result.get("tool_calls", [])):
+                    if tc.get("tool") == "execute_query":
+                        executed_sql = tc.get("args", {}).get("sql")
+                        break
+                self.query_cache.put(user_input, answer, sql=executed_sql)
+
         except Exception as e:
             _status_print("")
             logger.error("Ошибка обработки запроса: %s", e, exc_info=True)
@@ -523,6 +593,8 @@ class CLIInterface:
                 self._handle_config()
             elif command == "memory":
                 self._handle_memory()
+            elif command == "metrics":
+                self._handle_metrics()
             elif command == "reset":
                 self._handle_reset()
             elif command == "clear":

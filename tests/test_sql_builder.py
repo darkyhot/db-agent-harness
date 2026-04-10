@@ -2,7 +2,7 @@
 
 import re
 import pytest
-from core.sql_builder import SqlBuilder, _short_alias, _resolve_join_key
+from core.sql_builder import SqlBuilder, _short_alias, _resolve_join_key, _resolve_join_keys_composite
 
 
 # ---------------------------------------------------------------------------
@@ -453,31 +453,148 @@ class TestCountDistinct:
         assert "DISTINCT" not in sql.upper()
 
 
-class TestCompositeJoinFallsToLLM:
-    """SqlBuilder возвращает None для составного JOIN → передаём LLM sql_writer."""
+class TestCompositeJoin:
+    """SqlBuilder корректно обрабатывает составной PK в fact_dim_join."""
 
     def _composite_spec(self):
         return [
-            {"left": "dm.fact.tb_id",   "right": "dm.dim.tb_id",       "safe": False},
             {"left": "dm.fact.gosb_id", "right": "dm.dim.old_gosb_id", "safe": False},
+            {"left": "dm.fact.tb_id",   "right": "dm.dim.tb_id",       "safe": False},
         ]
 
-    def test_composite_join_returns_none(self):
-        cols = {
-            "dm.fact": {"select": ["tb_id", "gosb_id", "outflow_qty"], "aggregate": ["outflow_qty"], "group_by": []},
-            "dm.dim":  {"select": ["new_gosb_name"], "group_by": []},
+    def _cols(self):
+        return {
+            "dm.fact": {
+                "select": ["report_dt", "outflow_qty"],
+                "aggregate": ["outflow_qty"],
+                "group_by": ["report_dt"],
+            },
+            "dm.dim": {
+                "select": ["new_gosb_name"],
+                "group_by": [],
+            },
         }
-        bp = {
+
+    def _bp(self):
+        return {
             "strategy": "fact_dim_join",
             "main_table": "dm.fact",
             "aggregation": {"function": "SUM", "column": "outflow_qty", "alias": "sum_outflow"},
-            "group_by": ["new_gosb_name"],
+            "group_by": ["report_dt", "new_gosb_name"],
+            "where_conditions": [],
+            "order_by": "sum_outflow DESC",
+            "limit": None,
+        }
+
+    def test_composite_join_produces_sql(self):
+        """Составной join_spec теперь генерирует SQL (не None)."""
+        sql = builder.build(
+            "fact_dim_join", self._cols(), self._composite_spec(), self._bp(),
+            {"dm.fact": "fact", "dm.dim": "dim"},
+        )
+        assert sql is not None, "Составной JOIN должен генерировать SQL, а не None"
+
+    def test_composite_join_uses_distinct_on_both_keys(self):
+        """DISTINCT ON должен включать оба ключа составного PK."""
+        sql = builder.build(
+            "fact_dim_join", self._cols(), self._composite_spec(), self._bp(),
+            {"dm.fact": "fact", "dm.dim": "dim"},
+        )
+        assert sql is not None
+        n = norm(sql)
+        assert "DISTINCT ON" in n
+        # Оба dim-ключа должны быть в DISTINCT ON
+        assert "OLD_GOSB_ID" in n
+        assert "TB_ID" in n
+
+    def test_composite_join_on_condition_has_and(self):
+        """ON-условие содержит AND для обоих ключей."""
+        sql = builder.build(
+            "fact_dim_join", self._cols(), self._composite_spec(), self._bp(),
+            {"dm.fact": "fact", "dm.dim": "dim"},
+        )
+        assert sql is not None
+        n = norm(sql)
+        assert " AND " in n
+
+    def test_single_key_still_works(self):
+        """Одиночный ключ (не составной) по-прежнему работает."""
+        single_spec = [{"left": "dm.fact.gosb_id", "right": "dm.dim.old_gosb_id", "safe": False}]
+        sql = builder.build(
+            "fact_dim_join", self._cols(), single_spec, self._bp(),
+            {"dm.fact": "fact", "dm.dim": "dim"},
+        )
+        assert sql is not None
+        n = norm(sql)
+        assert "DISTINCT ON" in n
+        assert " AND " not in n.split("ON")[-1].split("ORDER")[0]  # нет AND в DISTINCT ON
+
+
+class TestResolveJoinKeysComposite:
+    """_resolve_join_keys_composite возвращает все пары для составного PK."""
+
+    def test_returns_single_pair(self):
+        spec = [{"left": "dm.fact.gosb_id", "right": "dm.dim.old_gosb_id", "safe": False}]
+        pairs = _resolve_join_keys_composite(spec, "dm.fact", "dm.dim")
+        assert pairs == [("gosb_id", "old_gosb_id")]
+
+    def test_returns_all_composite_pairs(self):
+        spec = [
+            {"left": "dm.fact.gosb_id", "right": "dm.dim.old_gosb_id", "safe": False},
+            {"left": "dm.fact.tb_id",   "right": "dm.dim.tb_id",       "safe": False},
+        ]
+        pairs = _resolve_join_keys_composite(spec, "dm.fact", "dm.dim")
+        assert len(pairs) == 2
+        assert ("gosb_id", "old_gosb_id") in pairs
+        assert ("tb_id", "tb_id") in pairs
+
+    def test_swapped_order(self):
+        spec = [{"left": "dm.dim.old_gosb_id", "right": "dm.fact.gosb_id", "safe": False}]
+        pairs = _resolve_join_keys_composite(spec, "dm.fact", "dm.dim")
+        assert pairs == [("gosb_id", "old_gosb_id")]
+
+    def test_empty_spec(self):
+        pairs = _resolve_join_keys_composite([], "dm.fact", "dm.dim")
+        assert pairs == []
+
+    def test_no_match(self):
+        spec = [{"left": "dm.other.col", "right": "dm.dim.col", "safe": False}]
+        pairs = _resolve_join_keys_composite(spec, "dm.fact", "dm.dim")
+        assert pairs == []
+
+
+class TestMultiPKCountDistinct:
+    """_build_select_items агрегирует все колонки из aggregate-роли, а не только agg_col."""
+
+    def test_second_pk_col_is_aggregated_not_bare(self):
+        """Второй PK в aggregate-роли должен стать COUNT(DISTINCT ...), а не bare-колонкой."""
+        cols = {
+            "dm.gosb": {
+                "select": ["tb_id", "old_gosb_id"],
+                "aggregate": ["tb_id", "old_gosb_id"],
+                "group_by": [],
+            }
+        }
+        bp = {
+            "strategy": "simple_select",
+            "main_table": "dm.gosb",
+            "aggregation": {
+                "function": "COUNT",
+                "column": "tb_id",
+                "alias": "count_tb_id",
+                "distinct": True,
+            },
+            "group_by": [],
             "where_conditions": [],
             "order_by": None,
             "limit": None,
         }
-        sql = builder.build(
-            "fact_dim_join", cols, self._composite_spec(), bp,
-            {"dm.fact": "fact", "dm.dim": "dim"},
-        )
-        assert sql is None, "Составной JOIN должен возвращать None → LLM sql_writer"
+        sql = builder.build("simple_select", cols, [], bp, {"dm.gosb": "dim"})
+        assert sql is not None, f"Ожидали SQL, получили None"
+        n = norm(sql)
+        # Обе колонки должны быть агрегированы
+        assert "COUNT(DISTINCT" in n, f"Ожидали COUNT(DISTINCT ...) в SQL: {sql}"
+        # Не должно быть GROUP BY (обе колонки агрегированы)
+        assert "GROUP BY" not in n, f"GROUP BY не должен появляться: {sql}"
+        # Вторая колонка также агрегирована (не bare)
+        assert "COUNT_OLD_GOSB_ID" in n or "COUNT(DISTINCT" in n

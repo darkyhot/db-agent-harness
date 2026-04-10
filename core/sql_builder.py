@@ -68,17 +68,23 @@ def _build_select_items(
 
     for table, roles in selected_columns.items():
         alias = table_alias_map.get(table, "t")
+        agg_set = set(roles.get("aggregate", []))
         for col in roles.get("select", []):
             if col in seen_cols:
                 continue
             seen_cols.add(col)
             if col == agg_col and agg_func:
-                # Агрегируем
+                # Основная агрегируемая колонка
                 if col == "*":
                     items.append(f"{agg_func}(*) AS {agg_alias}")
                 else:
                     d = "DISTINCT " if agg_distinct else ""
                     items.append(f"{agg_func}({d}{alias}.{col}) AS {agg_alias}")
+            elif col in agg_set and agg_func:
+                # Дополнительная агрегируемая колонка (напр. второй PK при COUNT DISTINCT).
+                # Агрегируем её вместо bare-select, чтобы не потребовался GROUP BY.
+                d = "DISTINCT " if agg_distinct else ""
+                items.append(f"{agg_func}({d}{alias}.{col}) AS {agg_func.lower()}_{col}")
             else:
                 items.append(f"{alias}.{col}")
 
@@ -178,28 +184,38 @@ def _build_simple_select(
 
 
 def _resolve_join_key(join_spec: list[dict], left_table: str, right_table: str) -> tuple[str, str]:
-    """Найти колонки для JOIN между двумя таблицами из join_spec.
+    """Найти первую пару колонок для JOIN между двумя таблицами из join_spec.
 
     Returns:
         (left_col, right_col) или ("", "") если не найдено.
     """
+    pairs = _resolve_join_keys_composite(join_spec, left_table, right_table)
+    return pairs[0] if pairs else ("", "")
+
+
+def _resolve_join_keys_composite(
+    join_spec: list[dict], left_table: str, right_table: str
+) -> list[tuple[str, str]]:
+    """Вернуть ВСЕ join-пары для данной пары таблиц (поддержка составного PK).
+
+    Returns:
+        Список (left_col, right_col). Пустой список если пар не найдено.
+    """
+    pairs: list[tuple[str, str]] = []
     for jk in join_spec:
         left_full = jk.get("left", "")
         right_full = jk.get("right", "")
-        # Разбиваем schema.table.column
-        left_parts = left_full.rsplit(".", 1)
-        right_parts = right_full.rsplit(".", 1)
         left_tbl = ".".join(left_full.split(".")[:2]) if left_full.count(".") >= 2 else ""
         right_tbl = ".".join(right_full.split(".")[:2]) if right_full.count(".") >= 2 else ""
-        left_col = left_parts[-1] if left_parts else ""
-        right_col = right_parts[-1] if right_parts else ""
+        left_col = left_full.rsplit(".", 1)[-1] if left_full else ""
+        right_col = right_full.rsplit(".", 1)[-1] if right_full else ""
 
         if left_tbl == left_table and right_tbl == right_table:
-            return left_col, right_col
-        if left_tbl == right_table and right_tbl == left_table:
-            return right_col, left_col  # swap
+            pairs.append((left_col, right_col))
+        elif left_tbl == right_table and right_tbl == left_table:
+            pairs.append((right_col, left_col))  # swap
 
-    return "", ""
+    return pairs
 
 
 def _get_select_cols(roles: dict, exclude_col: str = "") -> list[str]:
@@ -235,11 +251,13 @@ def _build_fact_dim_join(
         return None
     dim_table = dim_tables[0]
 
-    # JOIN-ключи
-    join_key_fact, join_key_dim = _resolve_join_key(join_spec, main_table, dim_table)
-    if not join_key_fact or not join_key_dim:
+    # JOIN-ключи (все пары для составного PK)
+    join_pairs = _resolve_join_keys_composite(join_spec, main_table, dim_table)
+    if not join_pairs:
         # Нет join_spec — не можем построить JOIN без LLM
         return None
+    # Первичная пара (для обратной совместимости)
+    join_key_fact, join_key_dim = join_pairs[0]
 
     # Безопасность: берём из join_spec
     is_safe = any(
@@ -253,8 +271,6 @@ def _build_fact_dim_join(
     d_alias = _short_alias(dim_table, used)
 
     aggregation = blueprint.get("aggregation")
-    alias_map_fact = {main_table: f_alias}
-    alias_map_dim = {dim_table: d_alias}
 
     # SELECT из факт-таблицы
     fact_roles = selected_columns.get(main_table, {})
@@ -268,13 +284,19 @@ def _build_fact_dim_join(
     agg_col = aggregation.get("column") if aggregation else None
     agg_func = aggregation.get("function") if aggregation else None
     agg_alias = aggregation.get("alias") if aggregation else None
+    agg_distinct = aggregation.get("distinct", False) if aggregation else False
+    fact_agg_set = set(fact_roles.get("aggregate", []))
 
     for col in (fact_roles.get("select", []) + fact_roles.get("group_by", [])):
         if col in seen:
             continue
         seen.add(col)
         if col == agg_col and agg_func:
-            select_items.append(f"{agg_func}({f_alias}.{col}) AS {agg_alias}")
+            d = "DISTINCT " if agg_distinct else ""
+            select_items.append(f"{agg_func}({d}{f_alias}.{col}) AS {agg_alias}")
+        elif col in fact_agg_set and agg_func:
+            d = "DISTINCT " if agg_distinct else ""
+            select_items.append(f"{agg_func}({d}{f_alias}.{col}) AS {agg_func.lower()}_{col}")
         else:
             select_items.append(f"{f_alias}.{col}")
 
@@ -283,11 +305,13 @@ def _build_fact_dim_join(
             continue
         seen.add(col)
         if agg_func:
-            select_items.append(f"{agg_func}({f_alias}.{col}) AS {agg_alias or f'{agg_func.lower()}_{col}'}")
+            d = "DISTINCT " if agg_distinct else ""
+            select_items.append(f"{agg_func}({d}{f_alias}.{col}) AS {agg_alias or f'{agg_func.lower()}_{col}'}")
 
-    # Колонки из справочника
+    # Колонки из справочника (исключаем все dim join-ключи)
+    dim_join_cols = {p[1] for p in join_pairs}
     for col in dim_roles.get("select", []):
-        if col == join_key_dim or col in seen:
+        if col in dim_join_cols or col in seen:
             continue
         seen.add(col)
         select_items.append(f"{d_alias}.{col}")
@@ -315,15 +339,33 @@ def _build_fact_dim_join(
     limit_clause = _build_limit(blueprint.get("limit"))
 
     # Формируем dim-подзапрос или прямой JOIN
-    dim_select_cols = [join_key_dim] + [c for c in dim_roles.get("select", []) if c != join_key_dim]
+    # dim_select_cols: все PK-ключи + остальные нужные колонки справочника
+    all_dim_join_cols = list(dict.fromkeys(p[1] for p in join_pairs))  # порядок сохранён
+    dim_extra_cols = [c for c in dim_roles.get("select", []) if c not in dim_join_cols]
+    dim_select_cols = all_dim_join_cols + dim_extra_cols
 
     if is_safe:
-        # Прямой JOIN
+        # Прямой JOIN — только первая пара (ключ должен быть уникален)
         join_sql = (
             f"JOIN {dim_table} {d_alias} ON {d_alias}.{join_key_dim} = {f_alias}.{join_key_fact}"
         )
+    elif len(join_pairs) > 1:
+        # Составной DISTINCT ON по всем ключам PK
+        distinct_on_str = ", ".join(p[1] for p in join_pairs)
+        order_by_str = ", ".join(p[1] for p in join_pairs)
+        dim_cols_str = ", ".join(dim_select_cols) if dim_select_cols else distinct_on_str
+        on_conditions = " AND ".join(
+            f"{d_alias}.{p[1]} = {f_alias}.{p[0]}" for p in join_pairs
+        )
+        join_sql = (
+            f"JOIN (\n"
+            f"    SELECT DISTINCT ON ({distinct_on_str}) {dim_cols_str}\n"
+            f"    FROM {dim_table}\n"
+            f"    ORDER BY {order_by_str}\n"
+            f") {d_alias} ON {on_conditions}"
+        )
     else:
-        # DISTINCT ON для безопасности
+        # Одиночный ключ — DISTINCT ON по нему
         dim_cols_str = ", ".join(dim_select_cols) if dim_select_cols else join_key_dim
         join_sql = (
             f"JOIN (\n"
@@ -367,9 +409,10 @@ def _build_dim_fact_join(
     dim_table = dim_tables[0]
     fact_table = fact_tables[0]
 
-    join_key_dim, join_key_fact = _resolve_join_key(join_spec, dim_table, fact_table)
-    if not join_key_dim or not join_key_fact:
+    join_pairs = _resolve_join_keys_composite(join_spec, dim_table, fact_table)
+    if not join_pairs:
         return None
+    join_key_dim, join_key_fact = join_pairs[0]
 
     used: set[str] = set()
     d_alias = _short_alias(dim_table, used)
@@ -382,18 +425,27 @@ def _build_dim_fact_join(
     fact_roles = selected_columns.get(fact_table, {})
     dim_roles = selected_columns.get(dim_table, {})
 
-    # Dim SELECT
-    dim_select_cols = [join_key_dim] + [
-        c for c in dim_roles.get("select", []) if c != join_key_dim
+    # Dim SELECT — исключаем все join-ключи справочника
+    dim_join_cols = {p[0] for p in join_pairs}
+    dim_select_cols = list(dict.fromkeys(p[0] for p in join_pairs)) + [
+        c for c in dim_roles.get("select", []) if c not in dim_join_cols
     ]
     dim_select_str = ", ".join(f"{d_alias}.{c}" for c in dim_select_cols)
 
-    # Fact aggregation subquery
+    # Fact aggregation subquery — GROUP BY по всем join-ключам факта (составной)
+    fact_join_cols = list(dict.fromkeys(p[1] for p in join_pairs))
+    fact_group_by_str = ", ".join(fact_join_cols)
+    fact_select_keys_str = ", ".join(fact_join_cols)
     fact_agg_col = "*" if agg_col == "*" else agg_col
     fact_subquery = (
-        f"SELECT {join_key_fact}, {agg_func}({fact_agg_col}) AS {agg_alias}\n"
+        f"SELECT {fact_select_keys_str}, {agg_func}({fact_agg_col}) AS {agg_alias}\n"
         f"    FROM {fact_table}\n"
-        f"    GROUP BY {join_key_fact}"
+        f"    GROUP BY {fact_group_by_str}"
+    )
+
+    # ON-условие: составной JOIN по всем парам
+    on_conditions = " AND ".join(
+        f"agg.{p[1]} = {d_alias}.{p[0]}" for p in join_pairs
     )
 
     where_clause = _build_where_clause(blueprint.get("where_conditions", []))
@@ -403,7 +455,7 @@ def _build_dim_fact_join(
     parts = [
         f"SELECT {dim_select_str}, agg.{agg_alias}",
         f"FROM {dim_table} {d_alias}",
-        f"JOIN (\n    {fact_subquery}\n) agg ON agg.{join_key_fact} = {d_alias}.{join_key_dim}",
+        f"JOIN (\n    {fact_subquery}\n) agg ON {on_conditions}",
     ]
     if where_clause:
         parts.append(where_clause)
@@ -575,18 +627,6 @@ class SqlBuilder:
             return None
 
         table_types = table_types or {}
-
-        # Составной JOIN (несколько пар для одной пары таблиц) → LLM sql_writer
-        if join_spec:
-            _pair_cnt: dict[frozenset, int] = {}
-            for _j in join_spec:
-                _lt = ".".join(_j.get("left", "").split(".")[:2])
-                _rt = ".".join(_j.get("right", "").split(".")[:2])
-                _k: frozenset = frozenset([_lt, _rt])
-                _pair_cnt[_k] = _pair_cnt.get(_k, 0) + 1
-            if any(v > 1 for v in _pair_cnt.values()):
-                logger.info("SqlBuilder: составной JOIN — передаём LLM sql_writer")
-                return None
 
         # Fallback-условия: когда шаблон не подходит
         # - Нетривиальные WHERE-литералы (фильтры по значениям, кроме дат)

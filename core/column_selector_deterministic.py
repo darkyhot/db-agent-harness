@@ -268,8 +268,8 @@ def select_columns(
             t_conf += 0.20
         elif agg_hint == 'count':
             t_conf += 0.15
-        elif wants_aggregation and not agg_cols:
-            t_conf -= 0.20   # хотим агрегацию, но не нашли числовых колонок
+        elif wants_aggregation and not agg_cols and t_type not in ('dim', 'ref'):
+            t_conf -= 0.20   # хотим агрегацию, но не нашли числовых колонок (не применяется к справочникам)
         if entities and not group_by_cols and agg_hint not in ('count', ''):
             t_conf -= 0.10   # есть entities, но GROUP BY пустой — подозрительно
 

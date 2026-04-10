@@ -12,7 +12,10 @@ import time
 from typing import Any
 
 from core.join_analysis import detect_table_type, format_join_analysis
-from core.column_selector_deterministic import select_columns as _det_select_columns
+from core.column_selector_deterministic import (
+    select_columns as _det_select_columns,
+    _complete_composite_join,
+)
 from graph.state import AgentState
 
 # Минимальная confidence для использования детерминированного результата без LLM.
@@ -606,6 +609,35 @@ class ExplorerNodes:
                         )
 
                 join_spec.append(entry)
+
+        # Hardening: дополнить LLM join_spec составными парами PK, которые LLM мог пропустить.
+        # Если dim-таблица имеет составной PK, но LLM вернул только одну пару — добавляем остальные.
+        _table_types_for_composite = state.get("table_types", {})
+        if join_spec and _table_types_for_composite:
+            _extra: list[dict[str, Any]] = []
+            for _entry in list(join_spec):
+                try:
+                    _extra_pairs = _complete_composite_join(
+                        _entry,
+                        ".".join(_entry["left"].split(".")[:2]),
+                        ".".join(_entry["right"].split(".")[:2]),
+                        _table_types_for_composite,
+                        self.schema,
+                    )
+                    for _ep in _extra_pairs:
+                        # Не добавляем дубли (проверяем по left+right)
+                        if not any(
+                            x["left"] == _ep["left"] and x["right"] == _ep["right"]
+                            for x in join_spec + _extra
+                        ):
+                            _extra.append(_ep)
+                except Exception as _ce:
+                    logger.debug("ColumnSelector composite hardening: %s", _ce)
+            if _extra:
+                join_spec.extend(_extra)
+                logger.info(
+                    "ColumnSelector: дополнено %d составных join-пар после LLM", len(_extra)
+                )
 
         logger.info(
             "ColumnSelector: выбрано колонок для %d таблиц, %d join-ключей",

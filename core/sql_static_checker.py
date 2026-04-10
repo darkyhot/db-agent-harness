@@ -134,8 +134,8 @@ def _check_select_star(sql: str, result: StaticCheckResult) -> None:
     count_star = re.compile(r'COUNT\s*\(\s*\*\s*\)', re.IGNORECASE)
     sql_without_count = count_star.sub('COUNT(__STAR__)', sql)
     if star_pattern.search(sql_without_count):
-        result.add_warning(
-            "Используется SELECT * — рекомендуется явно перечислить нужные колонки."
+        result.add_error(
+            "SELECT * запрещён. Явно перечисли нужные колонки в SELECT."
         )
 
 
@@ -430,6 +430,49 @@ def _check_group_by_completeness(sql: str, result: StaticCheckResult) -> None:
             result.add_warning(msg + " Возможна ошибка агрегации.")
 
 
+def _extract_select_aliases(sql: str) -> set[str]:
+    """Извлечь алиасы, объявленные через AS в SELECT (например SUM(x) AS cnt → cnt)."""
+    aliases: set[str] = set()
+    for m in re.finditer(r'\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', sql, re.IGNORECASE):
+        aliases.add(m.group(1).lower())
+    return aliases
+
+
+def _check_order_by_aliases(sql: str, result: StaticCheckResult) -> None:
+    """Проверить что ORDER BY ссылается только на колонки/алиасы из SELECT.
+
+    Распространённая ошибка LLM: ORDER BY cnt, но cnt не объявлен в SELECT.
+    Работает только для финального SELECT (без CTE).
+    """
+    outer_sql = _strip_ctes(sql)
+
+    ob_match = re.search(
+        r"(?i)\bORDER\s+BY\b(.+?)(?:\bLIMIT\b|;|$)", outer_sql, re.DOTALL
+    )
+    if not ob_match:
+        return
+
+    ob_cols: list[str] = []
+    for part in ob_match.group(1).split(","):
+        col = re.sub(r"\s+(ASC|DESC)\b", "", part.strip(), flags=re.IGNORECASE).strip()
+        # Убираем квалификатор таблицы
+        if "." in col:
+            col = col.rsplit(".", 1)[-1]
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", col):
+            ob_cols.append(col.lower())
+
+    if not ob_cols:
+        return
+
+    defined = set(_extract_select_columns(outer_sql)) | _extract_select_aliases(outer_sql)
+    missing = [c for c in ob_cols if c not in defined]
+    if missing:
+        result.add_error(
+            f"ORDER BY ссылается на неопределённые имена: {missing}. "
+            "Алиас или колонка должны быть объявлены в SELECT."
+        )
+
+
 def check_sql(
     sql: str,
     schema_loader=None,
@@ -454,7 +497,7 @@ def check_sql(
     # 1. Кириллические алиасы — жёсткая ошибка
     _check_cyrillic_aliases(sql, result)
 
-    # 2. SELECT * — предупреждение
+    # 2. SELECT * — жёсткая ошибка (запрещено правилами агента)
     _check_select_star(sql, result)
 
     # 3. Колонки против каталога — ошибка если найдены галлюцинации
@@ -465,10 +508,16 @@ def check_sql(
             logger.warning("StaticChecker: ошибка проверки колонок: %s", e)
             # Не блокируем — каталог мог быть недоступен
 
-    # 4. GROUP BY completeness — предупреждение
+    # 4. GROUP BY completeness — предупреждение/ошибка
     try:
         _check_group_by_completeness(sql, result)
     except Exception as e:
         logger.warning("StaticChecker: ошибка проверки GROUP BY: %s", e)
+
+    # 5. ORDER BY алиасы — жёсткая ошибка
+    try:
+        _check_order_by_aliases(sql, result)
+    except Exception as e:
+        logger.warning("StaticChecker: ошибка проверки ORDER BY: %s", e)
 
     return result

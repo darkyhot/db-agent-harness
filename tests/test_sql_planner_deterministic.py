@@ -405,3 +405,57 @@ class TestBuildBlueprint:
         bp = build_blueprint(self._intent(agg=None), cols, [], types, {})
         assert bp["strategy"] == "dim_dim_join"
         assert bp["cte_needed"] is True
+
+    def test_filter_col_promoted_to_group_by_when_no_where(self):
+        """Лог 1: report_dt в filter без WHERE-условия → должен попасть в group_by.
+
+        Пользователь просит 'по дате и названию ГОСБ' — column_selector кладёт
+        report_dt в filter, но явных date_filters нет. Планировщик должен
+        автоматически перенести report_dt в group_by.
+        """
+        intent = {
+            "aggregation_hint": "sum",
+            "date_filters": {"from": None, "to": None},
+            "complexity": "join",
+        }
+        cols = {
+            "dm.fact_outflow": {
+                "select": ["outflow_qty"],
+                "filter": ["report_dt"],   # ← column_selector положил в filter
+                "aggregate": ["outflow_qty"],
+                "group_by": [],
+            },
+            "dm.dim_gosb": {
+                "select": ["new_gosb_name"],
+                "filter": [],
+                "aggregate": [],
+                "group_by": [],
+            },
+        }
+        bp = build_blueprint(
+            intent, cols, [],
+            {"dm.fact_outflow": "fact", "dm.dim_gosb": "dim"},
+            {},
+        )
+        assert "report_dt" in bp["group_by"], (
+            "report_dt в filter без WHERE-условия должен быть продвинут в group_by"
+        )
+
+    def test_filter_col_not_promoted_when_where_exists(self):
+        """Если для filter-колонки есть WHERE-условие, в group_by она НЕ добавляется."""
+        intent = {
+            "aggregation_hint": "sum",
+            "date_filters": {"from": "2024-01-01", "to": None},
+            "complexity": "single_table",
+        }
+        cols = {
+            "dm.sales": {
+                "select": ["region", "amount"],
+                "filter": ["sale_date"],
+                "aggregate": ["amount"],
+                "group_by": ["region"],
+            },
+        }
+        bp = build_blueprint(intent, cols, [], {"dm.sales": "fact"}, {})
+        # sale_date используется в WHERE (date_filters.from) → не должна быть в group_by
+        assert "sale_date" not in bp["group_by"]

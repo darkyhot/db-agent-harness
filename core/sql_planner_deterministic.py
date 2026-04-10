@@ -327,6 +327,18 @@ def build_blueprint(
     group_by    = _compute_group_by(selected_columns, aggregation)
     where_conditions = _compute_where_from_intent(intent, selected_columns)
 
+    # Если есть агрегация — filter-колонки без WHERE-условия нужны в GROUP BY.
+    # Типичный случай: column_selector кладёт report_dt в filter, но пользователь
+    # хочет группировку «по дате» — и явного фильтра по дате нет.
+    if aggregation:
+        where_str = " ".join(where_conditions).lower()
+        seen_gb: set[str] = set(group_by)
+        for _table, roles in selected_columns.items():
+            for col in roles.get("filter", []):
+                if col not in seen_gb and col.lower() not in where_str:
+                    group_by.append(col)
+                    seen_gb.add(col)
+
     # CTE нужен при: fact+fact, dim+dim, или при небезопасном JOIN
     cte_needed = (
         strategy in {"fact_fact_join", "dim_dim_join"}

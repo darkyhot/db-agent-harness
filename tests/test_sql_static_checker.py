@@ -44,24 +44,24 @@ class TestCyrillicAliases:
 # ---------------------------------------------------------------------------
 
 class TestSelectStar:
-    def test_select_star_warns(self):
+    def test_select_star_is_error(self):
         sql = "SELECT * FROM dm.clients LIMIT 10"
         result = check_sql(sql, check_columns=False)
-        # SELECT * — warning, не ошибка
-        assert result.is_valid
-        assert any("*" in w for w in result.warnings)
+        # SELECT * — жёсткая ошибка (запрещено правилами агента)
+        assert not result.is_valid
+        assert any("*" in e or "SELECT *" in e for e in result.errors)
 
-    def test_count_star_no_warning(self):
+    def test_count_star_no_error(self):
         sql = "SELECT COUNT(*) AS cnt FROM dm.sales"
         result = check_sql(sql, check_columns=False)
         assert result.is_valid
-        assert not result.warnings
+        assert not result.errors
 
-    def test_subquery_star_warns(self):
-        sql = "SELECT * FROM (SELECT * FROM dm.sales) sub LIMIT 5"
+    def test_subquery_star_is_error(self):
+        sql = "SELECT * FROM (SELECT col FROM dm.sales) sub LIMIT 5"
         result = check_sql(sql, check_columns=False)
-        assert result.is_valid
-        assert result.warnings
+        assert not result.is_valid
+        assert result.errors
 
 
 # ---------------------------------------------------------------------------
@@ -172,3 +172,47 @@ class TestGroupByCompleteness:
         # Внешний SELECT без GROUP BY — проверка GROUP BY completeness не применяется
         gb_warnings = [w for w in result.warnings if "GROUP BY completeness" in w]
         assert not gb_warnings
+
+
+# ---------------------------------------------------------------------------
+# ORDER BY алиасы
+# ---------------------------------------------------------------------------
+
+class TestOrderByAliases:
+    def test_order_by_defined_alias_ok(self):
+        sql = "SELECT region, SUM(amount) AS total_amt FROM dm.sales GROUP BY region ORDER BY total_amt DESC"
+        result = check_sql(sql, check_columns=False)
+        ob_errors = [e for e in result.errors if "ORDER BY" in e]
+        assert not ob_errors
+
+    def test_order_by_undefined_alias_error(self):
+        """ORDER BY cnt, но cnt не объявлен в SELECT — жёсткая ошибка."""
+        sql = (
+            "SELECT tb_short_name, tb_full_name, COUNT(*) AS total "
+            "FROM dm.gosb GROUP BY tb_short_name, tb_full_name ORDER BY cnt DESC"
+        )
+        result = check_sql(sql, check_columns=False)
+        ob_errors = [e for e in result.errors if "ORDER BY" in e]
+        assert ob_errors, "Должна быть ошибка: 'cnt' не определён в SELECT"
+        assert "cnt" in ob_errors[0]
+
+    def test_order_by_column_in_select_ok(self):
+        sql = "SELECT region, amount FROM dm.sales ORDER BY region"
+        result = check_sql(sql, check_columns=False)
+        ob_errors = [e for e in result.errors if "ORDER BY" in e]
+        assert not ob_errors
+
+    def test_order_by_qualified_column_ok(self):
+        sql = "SELECT t.region, t.amount FROM dm.sales t ORDER BY t.region DESC"
+        result = check_sql(sql, check_columns=False)
+        ob_errors = [e for e in result.errors if "ORDER BY" in e]
+        assert not ob_errors
+
+    def test_order_by_with_cte_alias_ok(self):
+        sql = (
+            "WITH agg AS (SELECT client_id, SUM(amount) AS total FROM dm.sales GROUP BY client_id) "
+            "SELECT client_id, total FROM agg ORDER BY total DESC"
+        )
+        result = check_sql(sql, check_columns=False)
+        ob_errors = [e for e in result.errors if "ORDER BY" in e]
+        assert not ob_errors

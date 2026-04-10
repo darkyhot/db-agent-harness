@@ -212,9 +212,11 @@ def _compute_score(
     # Штраф за non-PK колонку при наличии составного PK в таблице.
     # Если dim имеет составной PK, а join идёт по не-PK колонке — это семантически
     # неверный ключ (например, new_gosb_id вместо tb_id+old_gosb_id).
-    if not raw_pk2 and pk_count2 > 1:
-        score *= 0.2  # жёсткий штраф: составной PK не покрыт
-    elif not raw_pk1 and pk_count1 > 1:
+    # ВАЖНО: штраф НЕ применяется, если другая сторона является PK — это
+    # легитимная пара PK(dim)↔FK(fact), где FK не входит в PK fact-таблицы.
+    if not raw_pk2 and pk_count2 > 1 and not raw_pk1:
+        score *= 0.2  # жёсткий штраф: non-PK в composite-PK таблице (не FK к другому PK)
+    elif not raw_pk1 and pk_count1 > 1 and not raw_pk2:
         score *= 0.2
     elif not raw_pk2 and pk_count2 > 0 and u2 < 100:
         # Обычный штраф за non-PK при одиночном PK

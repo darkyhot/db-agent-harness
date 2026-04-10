@@ -61,19 +61,22 @@ def create_db_tools(
                 )
 
             total = len(df)
+            # Всегда сохраняем CSV — чтобы last_query_result.csv всегда содержал
+            # результат ПОСЛЕДНЕГО запроса, независимо от размера выборки.
+            auto_file = resolve_workspace_path(WORKSPACE_DIR, "last_query_result.csv")
+            df.to_csv(auto_file, index=False, encoding="utf-8")
+
             if total <= PREVIEW_ROWS:
                 return _build_sql_tool_payload(
                     message=f"Показаны все {total} строк.",
                     preview_markdown=df.to_markdown(index=False),
                     total_rows=total,
                     is_empty=False,
-                    saved_file=None,
+                    saved_file="last_query_result.csv",
                     mode="preview",
                 )
 
             preview = df.head(PREVIEW_ROWS).to_markdown(index=False)
-            auto_file = resolve_workspace_path(WORKSPACE_DIR, "last_query_result.csv")
-            df.to_csv(auto_file, index=False, encoding="utf-8")
             return _build_sql_tool_payload(
                 message=(
                     f"Показано {PREVIEW_ROWS} из {total} строк. "

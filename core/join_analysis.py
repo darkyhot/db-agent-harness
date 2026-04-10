@@ -696,9 +696,18 @@ def suggest_composite_joins(
         if len(pk_side) < 2:
             return []
         matched = []
+        other_col_set = (
+            set(other_df["column_name"].tolist()) if other_df is not None and not other_df.empty
+            else set()
+        )
         for pk_col in pk_side:
-            if pk_col in pair_map:
+            # 1) Exact same-name match — highest priority (e.g. dim.tb_id → fact.tb_id)
+            if pk_col in other_col_set:
+                matched.append((pk_col, pk_col))
+            # 2) pair_map from ranked candidates
+            elif pk_col in pair_map:
                 matched.append((pk_col, pair_map[pk_col]))
+            # 3) Normalized name fallback (old_gosb_id → gosb_id)
             elif other_df is not None:
                 found = _find_normalized_in_df(pk_col, other_df)
                 if found:

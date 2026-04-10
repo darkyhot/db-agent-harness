@@ -64,6 +64,8 @@ def _build_select_items(
     agg_func = aggregation.get("function") if aggregation else None
     agg_alias = aggregation.get("alias") if aggregation else None
 
+    agg_distinct = aggregation.get("distinct", False) if aggregation else False
+
     for table, roles in selected_columns.items():
         alias = table_alias_map.get(table, "t")
         for col in roles.get("select", []):
@@ -75,7 +77,8 @@ def _build_select_items(
                 if col == "*":
                     items.append(f"{agg_func}(*) AS {agg_alias}")
                 else:
-                    items.append(f"{agg_func}({alias}.{col}) AS {agg_alias}")
+                    d = "DISTINCT " if agg_distinct else ""
+                    items.append(f"{agg_func}({d}{alias}.{col}) AS {agg_alias}")
             else:
                 items.append(f"{alias}.{col}")
 
@@ -88,7 +91,11 @@ def _build_select_items(
                 if col == "*":
                     items.append(f"{agg_func}(*) AS {agg_alias or 'agg_val'}")
                 else:
-                    items.append(f"{agg_func}({alias}.{col}) AS {agg_alias or f'{agg_func.lower()}_{col}'}")
+                    d = "DISTINCT " if agg_distinct else ""
+                    items.append(
+                        f"{agg_func}({d}{alias}.{col}) AS "
+                        f"{agg_alias if col == agg_col else f'{agg_func.lower()}_{col}'}"
+                    )
 
     if not items:
         # Совсем пусто — возвращаем count(*)
@@ -568,6 +575,18 @@ class SqlBuilder:
             return None
 
         table_types = table_types or {}
+
+        # Составной JOIN (несколько пар для одной пары таблиц) → LLM sql_writer
+        if join_spec:
+            _pair_cnt: dict[frozenset, int] = {}
+            for _j in join_spec:
+                _lt = ".".join(_j.get("left", "").split(".")[:2])
+                _rt = ".".join(_j.get("right", "").split(".")[:2])
+                _k: frozenset = frozenset([_lt, _rt])
+                _pair_cnt[_k] = _pair_cnt.get(_k, 0) + 1
+            if any(v > 1 for v in _pair_cnt.values()):
+                logger.info("SqlBuilder: составной JOIN — передаём LLM sql_writer")
+                return None
 
         # Fallback-условия: когда шаблон не подходит
         # - Нетривиальные WHERE-литералы (фильтры по значениям, кроме дат)

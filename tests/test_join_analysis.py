@@ -626,3 +626,31 @@ class TestSmartJoinKeyDetection:
         assert "СОСТАВНОЙ JOIN" in output, "Вывод должен содержать рекомендацию составного JOIN"
         assert "old_gosb_id" in output or "gosb_id" in output
         assert "tb_id" in output
+
+    def test_composite_on_uses_same_name_priority(self):
+        """_build_composite должен использовать точное совпадение имён в приоритете.
+
+        Для dim.tb_id должна быть выбрана fact.tb_id (exact same name),
+        а не fact.gosb_id (который был ошибочно выбран до исправления).
+        Ожидаемый ON: g.tb_id = f.tb_id AND g.old_gosb_id = f.gosb_id
+        """
+        df_dim = _make_dim_gosb_df()
+        df_fact = _make_fact_outflow_df()
+        candidates = rank_join_candidates(
+            "s", "uzp_dwh_fact_outflow", df_fact,
+            "s", "uzp_dim_gosb", df_dim,
+            pk_count1=1, pk_count2=2,
+        )
+        lines = suggest_composite_joins(
+            candidates, df_fact, df_dim,
+            pk_count1=1, pk_count2=2,
+            tbl1="s.uzp_dwh_fact_outflow",
+            tbl2="s.uzp_dim_gosb",
+        )
+        on_text = "\n".join(lines)
+        # tb_id должен сопоставляться с tb_id (не с gosb_id)
+        assert "tb_id = f.tb_id" in on_text or "tb_id = g.tb_id" in on_text, (
+            f"tb_id должен маппироваться на tb_id (same name), а не на gosb_id. ON: {on_text}"
+        )
+        # gosb_id должен сопоставляться с old_gosb_id
+        assert "gosb_id" in on_text

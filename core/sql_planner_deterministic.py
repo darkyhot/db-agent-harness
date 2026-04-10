@@ -146,7 +146,15 @@ def _compute_aggregation(
         if agg_cols:
             col = agg_cols[0]
             alias = f"{func.lower()}_{col}"
-            return {"function": func, "column": col, "alias": alias}
+            # COUNT DISTINCT: если агрегируемая колонка явно помечена (_count_distinct)
+            # или если hint=count и колонка выглядит как PK (имя оканчивается на _id/_num)
+            distinct = False
+            if hint == "count" and col != "*":
+                distinct = True
+            result: dict = {"function": func, "column": col, "alias": alias}
+            if distinct:
+                result["distinct"] = True
+            return result
 
     # Нет явной aggregate-роли — COUNT(*) как fallback для count
     if hint == "count":
@@ -359,8 +367,8 @@ def build_blueprint(
     if aggregation and aggregation.get("alias"):
         order_by = f"{aggregation['alias']} DESC"
 
-    # LIMIT: для analytics-запросов ставим 100 по умолчанию
-    limit: int | None = intent.get("limit") or 100
+    # LIMIT: только если явно задан в intent; без умолчания
+    limit: int | None = intent.get("limit") or None
 
     blueprint = {
         "strategy": strategy,

@@ -387,9 +387,10 @@ class TestBuildBlueprint:
         assert bp["aggregation"] is None
         assert bp["order_by"] is None
 
-    def test_limit_default_100(self):
+    def test_no_default_limit(self):
+        """Без явного intent.limit не должен ставиться дефолтный LIMIT."""
         bp = build_blueprint(self._intent(), self._cols(), [], {"dm.sales": "fact"}, {})
-        assert bp["limit"] == 100
+        assert bp["limit"] is None
 
     def test_notes_contain_strategy(self):
         bp = build_blueprint(self._intent(), self._cols(), [], {"dm.sales": "fact"}, {})
@@ -459,3 +460,52 @@ class TestBuildBlueprint:
         bp = build_blueprint(intent, cols, [], {"dm.sales": "fact"}, {})
         # sale_date используется в WHERE (date_filters.from) → не должна быть в group_by
         assert "sale_date" not in bp["group_by"]
+
+
+# ---------------------------------------------------------------------------
+# Проверки: нет дефолтного LIMIT и поддержка COUNT DISTINCT
+# ---------------------------------------------------------------------------
+
+class TestNoDefaultLimit:
+    """LIMIT не должен добавляться если пользователь его не запрашивал."""
+
+    def test_no_limit_by_default(self):
+        intent = {
+            "aggregation_hint": "sum",
+            "date_filters": {"from": None, "to": None},
+            "complexity": "single_table",
+        }
+        cols = {"dm.sales": {"select": ["region", "amount"], "aggregate": ["amount"], "group_by": ["region"]}}
+        bp = build_blueprint(intent, cols, [], {"dm.sales": "fact"}, {})
+        assert bp.get("limit") is None, f"Ожидали limit=None, получили {bp.get('limit')}"
+
+    def test_explicit_limit_from_intent(self):
+        intent = {
+            "aggregation_hint": "sum",
+            "limit": 50,
+            "date_filters": {"from": None, "to": None},
+            "complexity": "single_table",
+        }
+        cols = {"dm.sales": {"select": ["amount"], "aggregate": ["amount"], "group_by": []}}
+        bp = build_blueprint(intent, cols, [], {"dm.sales": "fact"}, {})
+        assert bp.get("limit") == 50
+
+
+class TestCountDistinctAggregation:
+    """_compute_aggregation должен выставлять distinct=True для COUNT по pk-колонке."""
+
+    def test_count_with_pk_col_gets_distinct(self):
+        intent = {"aggregation_hint": "count"}
+        cols = {"dm.gosb": {"select": ["gosb_id"], "aggregate": ["gosb_id"], "group_by": []}}
+        agg = _compute_aggregation(intent, cols)
+        assert agg is not None
+        assert agg["function"] == "COUNT"
+        assert agg.get("distinct") is True, "Ожидали distinct=True для COUNT по pk-колонке"
+
+    def test_count_star_fallback_no_distinct(self):
+        intent = {"aggregation_hint": "count"}
+        cols = {"dm.gosb": {"select": ["gosb_name"], "group_by": ["gosb_name"]}}
+        agg = _compute_aggregation(intent, cols)
+        assert agg is not None
+        assert agg["column"] == "*"
+        assert not agg.get("distinct"), "COUNT(*) не должен иметь distinct"

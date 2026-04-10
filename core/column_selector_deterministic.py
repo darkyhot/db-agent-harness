@@ -32,6 +32,9 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Префиксы PK-нормализации: old_gosb_id → gosb_id
+_PK_NORM_RE = re.compile(r"^(old|new|prev|cur|current|actual|base|src|tgt)_", re.I)
+
 
 # ---------------------------------------------------------------------------
 # Паттерны типов колонок
@@ -224,6 +227,17 @@ def select_columns(
             agg_sorted = sorted(agg_candidates, key=lambda x: x[1], reverse=True)
             agg_cols = [c for c, s in agg_sorted if s > 0.45][:1]
 
+        # COUNT на dim/ref-таблице: используем PK для COUNT(DISTINCT pk_col)
+        # Это отвечает на «сколько всего X?» вместо генерации GROUP BY + COUNT(*).
+        # Признак: agg_hint=count, таблица-справочник, нет явных числовых агрегатов.
+        _use_count_distinct = False
+        if agg_hint == 'count' and t_type in ('dim', 'ref') and not agg_cols:
+            pk_mask = cols_df.get('is_primary_key', pd.Series(dtype=bool)).astype(bool)
+            pk_for_count = cols_df.loc[pk_mask, 'column_name'].tolist()
+            if pk_for_count:
+                agg_cols = pk_for_count[:2]  # максимум 2 PK для COUNT DISTINCT
+                _use_count_distinct = True
+
         # filter: все с score > 0.5, max 4
         flt_sorted = sorted(filter_candidates, key=lambda x: x[1], reverse=True)
         filter_cols = [c for c, s in flt_sorted if s > 0.50][:4]
@@ -232,6 +246,10 @@ def select_columns(
         agg_set = set(agg_cols)
         gb_sorted = sorted(gb_candidates, key=lambda x: x[1], reverse=True)
         group_by_cols = [c for c, s in gb_sorted if s > 0.30 and c not in agg_set][:3]
+
+        # COUNT DISTINCT на dim-таблице: group_by не нужен (считаем сами PK-сущности)
+        if _use_count_distinct:
+            group_by_cols = []
 
         # select = group_by ∪ aggregate (без дублей, порядок: group_by первым)
         seen: dict[str, None] = {}
@@ -311,6 +329,111 @@ def select_columns(
 # JOIN-спецификация
 # ---------------------------------------------------------------------------
 
+def _norm_col_name(name: str) -> str:
+    """Нормализовать имя ключевой колонки: убрать old_/new_/prev_ префиксы."""
+    return _PK_NORM_RE.sub("", name.lower())
+
+
+def _complete_composite_join(
+    initial_entry: dict[str, Any],
+    t1: str,
+    t2: str,
+    table_types: dict[str, str],
+    schema_loader: Any,
+) -> list[dict[str, Any]]:
+    """Найти дополнительные join-пары для составного PK dim-таблицы.
+
+    Если dim-таблица имеет составной PK, но initial_entry покрывает лишь одну его
+    колонку — ищем пары для оставшихся PK-колонок в fact-таблице.
+    Пример: dim PK = (tb_id, old_gosb_id), initial = fact.gosb_id↔dim.old_gosb_id →
+    добавляем fact.tb_id↔dim.tb_id (exact same-name match).
+    """
+    _DIM = {'dim', 'ref'}
+    t1_type = table_types.get(t1, 'unknown')
+    t2_type = table_types.get(t2, 'unknown')
+
+    if t2_type in _DIM:
+        dim_table, fact_table = t2, t1
+    elif t1_type in _DIM:
+        dim_table, fact_table = t1, t2
+    else:
+        return []
+
+    # PK-колонки dim-таблицы
+    dim_parts = dim_table.split('.', 1)
+    if len(dim_parts) != 2:
+        return []
+    try:
+        dim_cols_df = schema_loader.get_table_columns(dim_parts[0], dim_parts[1])
+        if dim_cols_df.empty or 'column_name' not in dim_cols_df.columns:
+            return []
+        pk_mask = dim_cols_df.get('is_primary_key', pd.Series(dtype=bool)).astype(bool)
+        pk_cols: list[str] = dim_cols_df.loc[pk_mask, 'column_name'].tolist()
+    except Exception:
+        return []
+
+    if len(pk_cols) < 2:
+        return []  # Не составной PK
+
+    # Уже покрытая dim-колонка из initial_entry
+    initial_left_tbl = '.'.join(initial_entry['left'].split('.')[:2])
+    if initial_left_tbl == dim_table:
+        covered_dim_col = initial_entry['left'].rsplit('.', 1)[-1]
+        fact_is_left = False
+    else:
+        covered_dim_col = initial_entry['right'].rsplit('.', 1)[-1]
+        fact_is_left = True
+
+    # Колонки fact-таблицы
+    fact_parts = fact_table.split('.', 1)
+    try:
+        fact_cols_df = schema_loader.get_table_columns(fact_parts[0], fact_parts[1])
+        fact_col_names: list[str] = (
+            fact_cols_df['column_name'].tolist() if not fact_cols_df.empty else []
+        )
+    except Exception:
+        fact_col_names = []
+
+    additional: list[dict[str, Any]] = []
+    for pk_col in pk_cols:
+        if pk_col == covered_dim_col:
+            continue  # уже покрыто initial_entry
+
+        # Ищем пару в fact-таблице: exact same name first, затем normalized
+        fact_col: str | None = None
+        if pk_col in fact_col_names:
+            fact_col = pk_col
+        else:
+            norm_pk = _norm_col_name(pk_col)
+            for fc in fact_col_names:
+                if _norm_col_name(fc) == norm_pk:
+                    fact_col = fc
+                    break
+
+        if not fact_col:
+            continue
+
+        if fact_is_left:
+            entry: dict[str, Any] = {
+                'left': f'{fact_table}.{fact_col}',
+                'right': f'{dim_table}.{pk_col}',
+                'safe': False,
+                'strategy': initial_entry.get('strategy', 'fact_dim_join'),
+                'risk': f'{fact_col} — composite PK pair, не уникален в {fact_table}',
+            }
+        else:
+            entry = {
+                'left': f'{dim_table}.{pk_col}',
+                'right': f'{fact_table}.{fact_col}',
+                'safe': False,
+                'strategy': initial_entry.get('strategy', 'dim_fact_join'),
+                'risk': f'{fact_col} — composite PK pair, не уникален в {fact_table}',
+            }
+        additional.append(entry)
+
+    return additional
+
+
 def _build_join_spec(
     join_analysis_data: dict[str, Any],
     selected_columns: dict[str, dict],
@@ -363,6 +486,10 @@ def _build_join_spec(
             entry['risk'] = f'{col2} не уникален в {t2}'
 
         join_spec.append(entry)
+
+        # Если dim-таблица имеет составной PK — добавляем пары для недостающих колонок
+        extra = _complete_composite_join(entry, t1, t2, table_types, schema_loader)
+        join_spec.extend(extra)
 
     return join_spec
 

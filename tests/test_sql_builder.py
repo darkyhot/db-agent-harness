@@ -397,3 +397,87 @@ class TestFallbackConditions:
               "aggregation": None, "group_by": [], "where_conditions": [], "order_by": None, "limit": 100}
         sql = builder.build("fact_dim_join", cols, [], bp, {"dm.sales": "fact", "dm.clients": "dim"})
         assert sql is None
+
+
+# ---------------------------------------------------------------------------
+# COUNT DISTINCT и составной JOIN
+# ---------------------------------------------------------------------------
+
+class TestCountDistinct:
+    """SELECT COUNT(DISTINCT col) генерируется при distinct=True в aggregation."""
+
+    def test_count_distinct_in_simple_select(self):
+        cols = {
+            "dm.gosb": {
+                "select": ["gosb_id"],
+                "filter": [],
+                "aggregate": ["gosb_id"],
+                "group_by": [],
+            }
+        }
+        bp = {
+            "strategy": "simple_select",
+            "main_table": "dm.gosb",
+            "aggregation": {"function": "COUNT", "column": "gosb_id", "alias": "cnt_gosb", "distinct": True},
+            "group_by": [],
+            "where_conditions": [],
+            "order_by": None,
+            "limit": None,
+        }
+        sql = builder.build("simple_select", cols, [], bp, {"dm.gosb": "dim"})
+        assert sql is not None
+        assert "COUNT(DISTINCT" in sql.upper(), f"Ожидали COUNT(DISTINCT ...), получили: {sql}"
+        assert "LIMIT" not in sql.upper(), "LIMIT не должен появляться при limit=None"
+
+    def test_count_without_distinct_flag_has_no_distinct_keyword(self):
+        """Когда distinct не задан — в SQL нет слова DISTINCT."""
+        cols = {
+            "dm.gosb": {
+                "select": ["gosb_id"],
+                "filter": [],
+                "aggregate": ["gosb_id"],
+                "group_by": [],
+            }
+        }
+        bp = {
+            "strategy": "simple_select",
+            "main_table": "dm.gosb",
+            "aggregation": {"function": "COUNT", "column": "gosb_id", "alias": "cnt_gosb"},
+            "group_by": [],
+            "where_conditions": [],
+            "order_by": None,
+            "limit": None,
+        }
+        sql = builder.build("simple_select", cols, [], bp, {"dm.gosb": "dim"})
+        assert sql is not None
+        assert "DISTINCT" not in sql.upper()
+
+
+class TestCompositeJoinFallsToLLM:
+    """SqlBuilder возвращает None для составного JOIN → передаём LLM sql_writer."""
+
+    def _composite_spec(self):
+        return [
+            {"left": "dm.fact.tb_id",   "right": "dm.dim.tb_id",       "safe": False},
+            {"left": "dm.fact.gosb_id", "right": "dm.dim.old_gosb_id", "safe": False},
+        ]
+
+    def test_composite_join_returns_none(self):
+        cols = {
+            "dm.fact": {"select": ["tb_id", "gosb_id", "outflow_qty"], "aggregate": ["outflow_qty"], "group_by": []},
+            "dm.dim":  {"select": ["new_gosb_name"], "group_by": []},
+        }
+        bp = {
+            "strategy": "fact_dim_join",
+            "main_table": "dm.fact",
+            "aggregation": {"function": "SUM", "column": "outflow_qty", "alias": "sum_outflow"},
+            "group_by": ["new_gosb_name"],
+            "where_conditions": [],
+            "order_by": None,
+            "limit": None,
+        }
+        sql = builder.build(
+            "fact_dim_join", cols, self._composite_spec(), bp,
+            {"dm.fact": "fact", "dm.dim": "dim"},
+        )
+        assert sql is None, "Составной JOIN должен возвращать None → LLM sql_writer"

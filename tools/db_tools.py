@@ -19,8 +19,10 @@ def _build_sql_tool_payload(
     *,
     message: str,
     preview_markdown: str = "",
-    total_rows: int = 0,
+    rows_returned: int = 0,
+    rows_saved: int = 0,
     is_empty: bool = False,
+    is_truncated: bool = False,
     saved_file: str | None = None,
     mode: str = "preview",
 ) -> str:
@@ -28,8 +30,10 @@ def _build_sql_tool_payload(
     payload = {
         "message": message,
         "preview_markdown": preview_markdown,
-        "total_rows": int(total_rows),
+        "rows_returned": int(rows_returned),
+        "rows_saved": int(rows_saved),
         "is_empty": bool(is_empty),
+        "is_truncated": bool(is_truncated),
         "saved_file": saved_file,
         "mode": mode,
     }
@@ -47,31 +51,35 @@ def create_db_tools(
 
     @tool
     def execute_query(sql: str, limit: int = 1000) -> str:
-        """Run SELECT query and return a structured preview/full-result metadata payload."""
+        """Run SELECT query in preview mode and return a structured payload."""
         try:
             df = db_manager.preview_query(sql, limit=limit)
             if df.empty:
                 return _build_sql_tool_payload(
                     message="Запрос выполнен. Результат пуст.",
                     preview_markdown="",
-                    total_rows=0,
+                    rows_returned=0,
+                    rows_saved=0,
                     is_empty=True,
+                    is_truncated=False,
                     saved_file=None,
                     mode="preview",
                 )
 
-            total = len(df)
-            # Всегда сохраняем CSV — чтобы last_query_result.csv всегда содержал
-            # результат ПОСЛЕДНЕГО запроса, независимо от размера выборки.
+            returned = len(df)
+            # Сохраняем именно preview-результат, чтобы диск и сообщение отражали правду.
             auto_file = resolve_workspace_path(WORKSPACE_DIR, "last_query_result.csv")
             df.to_csv(auto_file, index=False, encoding="utf-8")
+            is_truncated = returned >= limit
 
-            if total <= PREVIEW_ROWS:
+            if returned <= PREVIEW_ROWS:
                 return _build_sql_tool_payload(
-                    message=f"Показаны все {total} строк.",
+                    message=f"Preview выполнен. Показаны все {returned} строк из полученного preview.",
                     preview_markdown=df.to_markdown(index=False),
-                    total_rows=total,
+                    rows_returned=returned,
+                    rows_saved=returned,
                     is_empty=False,
+                    is_truncated=is_truncated,
                     saved_file="last_query_result.csv",
                     mode="preview",
                 )
@@ -79,12 +87,15 @@ def create_db_tools(
             preview = df.head(PREVIEW_ROWS).to_markdown(index=False)
             return _build_sql_tool_payload(
                 message=(
-                    f"Показано {PREVIEW_ROWS} из {total} строк. "
-                    "Полный результат сохранен в last_query_result.csv"
+                    f"Preview выполнен. Показано {PREVIEW_ROWS} из {returned} строк preview-результата. "
+                    "В файл last_query_result.csv сохранён только preview-результат. "
+                    "Для полной выгрузки используй export_query."
                 ),
                 preview_markdown=preview,
-                total_rows=total,
+                rows_returned=returned,
+                rows_saved=returned,
                 is_empty=False,
+                is_truncated=True,
                 saved_file="last_query_result.csv",
                 mode="preview",
             )
@@ -223,8 +234,10 @@ def create_db_tools(
             return _build_sql_tool_payload(
                 message=f"Запрос выполнен. Затронуто строк: {affected}",
                 preview_markdown="",
-                total_rows=affected,
+                rows_returned=affected,
+                rows_saved=0,
                 is_empty=affected == 0,
+                is_truncated=False,
                 saved_file=None,
                 mode="write",
             )
@@ -257,8 +270,10 @@ def create_db_tools(
             return _build_sql_tool_payload(
                 message=ddl_message,
                 preview_markdown="",
-                total_rows=0,
+                rows_returned=0,
+                rows_saved=0,
                 is_empty=True,
+                is_truncated=False,
                 saved_file=None,
                 mode="ddl",
             )
@@ -281,8 +296,10 @@ def create_db_tools(
             return _build_sql_tool_payload(
                 message=f"Сохранено в {rel_path} ({row_count} строк)",
                 preview_markdown="",
-                total_rows=row_count,
+                rows_returned=row_count,
+                rows_saved=row_count,
                 is_empty=row_count == 0,
+                is_truncated=False,
                 saved_file=rel_path,
                 mode="export",
             )

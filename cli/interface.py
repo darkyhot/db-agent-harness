@@ -497,6 +497,22 @@ class CLIInterface:
             _status_print("")
 
             # Проверяем нужна ли disambiguation (несколько таблиц)
+            if result.get("needs_clarification"):
+                msg = result.get(
+                    "clarification_message",
+                    "Не хватает деталей для выполнения запроса.",
+                )
+                print(f"\n{msg}")
+                clarification = input("\nУточнение: ").strip()
+                if clarification:
+                    self.memory.add_message("user", f"Уточнение пользователя: {clarification}")
+                    augmented_input = f"{user_input}\nУточнение пользователя: {clarification}"
+                    self._process_query(augmented_input)
+                else:
+                    print("Уточнение не получено. Операция отменена.")
+                return
+
+            # Проверяем нужна ли disambiguation (несколько таблиц)
             if result.get("needs_disambiguation"):
                 msg = result.get("confirmation_message", "Найдено несколько таблиц.")
                 print(f"\n{msg}")

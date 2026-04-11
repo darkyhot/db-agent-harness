@@ -12,6 +12,22 @@ import re
 
 logger = logging.getLogger(__name__)
 
+_RU_MONTHS: dict[str, int] = {
+    'январ': 1,
+    'феврал': 2,
+    'март': 3,
+    'апрел': 4,
+    'май': 5,
+    'мая': 5,
+    'июн': 6,
+    'июл': 7,
+    'август': 8,
+    'сентябр': 9,
+    'октябр': 10,
+    'ноябр': 11,
+    'декабр': 12,
+}
+
 # Сопоставление aggregation_hint → SQL-функция
 _HINT_TO_FUNC: dict[str, str] = {
     "sum": "SUM",
@@ -204,6 +220,7 @@ def _quote_value(value: str, operator: str) -> str:
 def _compute_where_from_intent(
     intent: dict,
     selected_columns: dict[str, dict],
+    user_input: str = "",
 ) -> list[str]:
     """Сформировать WHERE-условия из структурированных данных в intent.
 
@@ -215,7 +232,9 @@ def _compute_where_from_intent(
     conditions: list[str] = []
 
     # 1. Дата-диапазон
-    date_filters = intent.get("date_filters") or {}
+    date_filters = dict(intent.get("date_filters") or {})
+    if not date_filters.get("from") and not date_filters.get("to"):
+        date_filters.update(_derive_date_filters_from_text(user_input))
     date_from = date_filters.get("from")
     date_to   = date_filters.get("to")
 
@@ -284,6 +303,30 @@ def _compute_where_from_intent(
     return conditions
 
 
+def _derive_date_filters_from_text(user_input: str) -> dict[str, str | None]:
+    """Вытащить простой месячный диапазон из текста пользователя."""
+    q = (user_input or "").lower()
+    year_match = re.search(r"\b(20\d{2})\b", q)
+    if not year_match:
+        return {"from": None, "to": None}
+
+    year = int(year_match.group(1))
+    month = None
+    for stem, num in _RU_MONTHS.items():
+        if stem in q:
+            month = num
+            break
+    if month is None:
+        return {"from": None, "to": None}
+
+    next_year = year + 1 if month == 12 else year
+    next_month = 1 if month == 12 else month + 1
+    return {
+        "from": f"{year:04d}-{month:02d}-01",
+        "to": f"{next_year:04d}-{next_month:02d}-01",
+    }
+
+
 def _find_date_column(selected_columns: dict[str, dict]) -> str | None:
     """Найти первую колонку с date/timestamp-семантикой в filter-ролях."""
     _date_suffixes = ("_dt", "_date", "_dttm", "_timestamp", "_ts", "date", "dttm")
@@ -316,6 +359,7 @@ def build_blueprint(
     join_spec: list[dict],
     table_types: dict[str, str],
     join_analysis_data: dict,
+    user_input: str = "",
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -329,11 +373,25 @@ def build_blueprint(
     Returns:
         dict совместимый с форматом sql_blueprint из AgentState.
     """
+    aggregation = _compute_aggregation(intent, selected_columns)
     strategy, main_table = _determine_strategy(table_types, join_spec)
 
-    aggregation = _compute_aggregation(intent, selected_columns)
+    # Если одна таблица даёт метрику, а вторая только атрибуты для группировки/селекта,
+    # рассматриваем вторую как dimension-like источник атрибута, даже если её тип unknown/fact.
+    if len(selected_columns) == 2:
+        aggregate_tables = [t for t, roles in selected_columns.items() if roles.get("aggregate")]
+        attribute_tables = [
+            t for t, roles in selected_columns.items()
+            if roles.get("group_by") or [c for c in roles.get("select", []) if c not in roles.get("aggregate", [])]
+        ]
+        if len(aggregate_tables) == 1 and strategy in {"fact_fact_join", "fact_dim_join"}:
+            main_table = aggregate_tables[0]
+            other_tables = [t for t in selected_columns if t != main_table]
+            if other_tables and other_tables[0] in attribute_tables:
+                strategy = "fact_dim_join"
+
     group_by    = _compute_group_by(selected_columns, aggregation)
-    where_conditions = _compute_where_from_intent(intent, selected_columns)
+    where_conditions = _compute_where_from_intent(intent, selected_columns, user_input=user_input)
 
     # Если есть агрегация — filter-колонки без WHERE-условия нужны в GROUP BY.
     # Типичный случай: column_selector кладёт report_dt в filter, но пользователь

@@ -1,8 +1,10 @@
-query: "Сравни продажи и платежи по клиентам — сумму по каждой таблице"
+query: "Покажи количество строк uzp_data_payroll_m по segment_name, подтяни segment_name из uzp_data_epk_consolidation по inn"
 intent_must_be: analytics
 complexity_must_be: join
 sql_must_contain:
   - JOIN
+  - "UZP_DATA_PAYROLL_M"
+  - "UZP_DATA_EPK_CONSOLIDATION"
 sql_must_not_contain:
   - "SELECT *"
 sql_alias_no_cyrillic: true

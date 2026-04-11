@@ -11,6 +11,14 @@ import logging
 import re
 from typing import Any
 
+from core.column_selector_deterministic import (
+    _derive_requested_slots,
+    _is_label_slot,
+    _is_metric_slot,
+    _normalize_query_text,
+    _semantic_match_score,
+)
+from core.join_analysis import detect_table_type
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -58,16 +66,24 @@ class IntentNodes:
             '  "aggregation_hint": "<count|sum|avg|min|max|list|null>",\n'
             '  "needs_search": <true|false>,\n'
             '  "complexity": "<single_table|multi_table|join|subquery>",\n'
+            '  "clarification_question": "<короткий вопрос пользователю или пустая строка>",\n'
             '  "filter_conditions": [\n'
             '    {"column_hint": "<ключевое слово для поиска колонки>", '
             '"operator": "<= | >= | = | != | LIKE | IN>", "value": "<литеральное значение>"}\n'
             "  ]\n"
             "}\n\n"
+            "ПРАВИЛО clarification:\n"
+            "- Выбирай intent=clarification ТОЛЬКО если без ответа пользователя высок риск построить неверный SQL\n"
+            "- Сначала пытайся опереться на историю, предыдущий SQL, память и каталог; не спрашивай то, что можно разумно вывести\n"
+            "- НЕ используй clarification для косметических деталей, формата вывода, очевидных допущений или случаев, где можно безопасно продолжить\n"
+            "- Хорошие поводы для clarification: неоднозначная метрика, неизвестный период, конфликтующие сущности, несколько равноправных трактовок бизнес-термина\n"
+            "- Если intent != clarification, верни clarification_question пустой строкой\n"
+            "- Если intent = clarification, задай ОДИН короткий конкретный вопрос, который разблокирует следующий шаг\n\n"
             "ПРАВИЛО filter_conditions:\n"
             "- Заполняй ТОЛЬКО если в запросе есть явные фильтры по значениям "
-            "(например: 'по региону Москва', 'сегмент = Малый бизнес', 'сумма > 1000')\n"
+            "(например: 'по региону North', 'product_category = Electronics', 'сумма > 1000')\n"
             "- column_hint — ключевое слово из запроса (регион, сегмент, сумма и т.д.)\n"
-            "- value — точное значение из запроса ('Москва', 'Малый бизнес', '1000')\n"
+            "- value — точное значение из запроса ('North', 'Electronics', '1000')\n"
             "- Если явных фильтров нет — оставь пустым списком []\n\n"
             "ПРАВИЛО complexity:\n"
             "- single_table: данные нужны только из одной таблицы\n"
@@ -77,30 +93,35 @@ class IntentNodes:
             "- multi_table: несколько независимых запросов к разным таблицам\n"
             "- subquery: нужен вложенный подзапрос\n\n"
             "=== ПРИМЕРЫ ===\n\n"
-            'Запрос: "Сколько клиентов в регионе Москва?"\n'
-            '{"intent": "analytics", "entities": ["клиенты", "регион", "Москва"], '
+            'Запрос: "Сколько клиентов в регионе North?"\n'
+            '{"intent": "analytics", "entities": ["клиенты", "регион", "North"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": "count", '
-            '"needs_search": false, "complexity": "single_table"}\n\n'
-            'Запрос: "Какие таблицы есть по продажам?"\n'
-            '{"intent": "schema_question", "entities": ["продажи"], '
+            '"needs_search": false, "complexity": "single_table", "clarification_question": ""}\n\n'
+            'Запрос: "Какие таблицы есть по заказам?"\n'
+            '{"intent": "schema_question", "entities": ["заказы"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": null, '
-            '"needs_search": false, "complexity": "single_table"}\n\n'
-            'Запрос: "Есть ли данные по оттоку клиентов?"\n'
-            '{"intent": "table_search", "entities": ["отток", "клиенты"], '
+            '"needs_search": false, "complexity": "single_table", "clarification_question": ""}\n\n'
+            'Запрос: "Есть ли данные по обращениям пользователей?"\n'
+            '{"intent": "table_search", "entities": ["обращения", "пользователи"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": null, '
-            '"needs_search": true, "complexity": "single_table"}\n\n'
-            'Запрос: "Посчитай сумму оттока. Сегмент возьми по inn из uzp_data_epk_consolidation"\n'
-            '{"intent": "analytics", "entities": ["отток", "сегмент", "inn", "uzp_data_epk_consolidation"], '
+            '"needs_search": true, "complexity": "single_table", "clarification_question": ""}\n\n'
+            'Запрос: "Посчитай сумму платежей. Категорию клиента возьми по customer_id из справочника клиентов"\n'
+            '{"intent": "analytics", "entities": ["платежи", "категория клиента", "customer_id", "справочник клиентов"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": "sum", '
-            '"needs_search": false, "complexity": "join"}\n\n'
-            'Запрос: "Покажи сумму продаж по менеджерам, сегмент дотяни по inn из справочника клиентов"\n'
-            '{"intent": "analytics", "entities": ["продажи", "менеджеры", "сегмент", "inn", "справочник клиентов"], '
+            '"needs_search": false, "complexity": "join", "clarification_question": ""}\n\n'
+            'Запрос: "Покажи сумму заказов по менеджерам, категорию дотяни по customer_id из справочника клиентов"\n'
+            '{"intent": "analytics", "entities": ["заказы", "менеджеры", "категория", "customer_id", "справочник клиентов"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": "sum", '
-            '"needs_search": false, "complexity": "join"}\n\n'
-            'Запрос: "Сколько договоров по каждому сегменту, подтяни сегмент из таблицы clients"\n'
-            '{"intent": "analytics", "entities": ["договоры", "сегмент", "clients"], '
+            '"needs_search": false, "complexity": "join", "clarification_question": ""}\n\n'
+            'Запрос: "Сколько полисов по каждому типу, подтяни тип из таблицы policies"\n'
+            '{"intent": "analytics", "entities": ["полисы", "тип", "policies"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": "count", '
-            '"needs_search": false, "complexity": "join"}\n'
+            '"needs_search": false, "complexity": "join", "clarification_question": ""}\n\n'
+            'Запрос: "Покажи заказы"\n'
+            '{"intent": "clarification", "entities": ["заказы"], '
+            '"date_filters": {"from": null, "to": null}, "aggregation_hint": null, '
+            '"needs_search": false, "complexity": "single_table", '
+            '"clarification_question": "Что именно показать по заказам: сумму, количество или список записей?"}\n'
         )
 
         # --- Пользовательский промпт ---
@@ -178,6 +199,13 @@ class IntentNodes:
         logger.info("IntentClassifier: intent=%s, entities=%s",
                      intent.get("intent"), intent.get("entities"))
 
+        needs_clarification = intent.get("intent") == "clarification"
+        clarification_message = str(intent.get("clarification_question") or "").strip()
+        if needs_clarification and not clarification_message:
+            clarification_message = (
+                "Не хватает деталей, чтобы корректно продолжить. Уточните, пожалуйста, запрос."
+            )
+
         self.memory.add_message(
             "assistant",
             f"[intent_classifier] Интент: {intent.get('intent')}, "
@@ -190,6 +218,8 @@ class IntentNodes:
                 {"role": "user", "content": user_input},
                 {"role": "assistant", "content": f"Интент: {json.dumps(intent, ensure_ascii=False)}"},
             ],
+            "needs_clarification": needs_clarification,
+            "clarification_message": clarification_message,
             "graph_iterations": state.get("graph_iterations", 0) + 1,
         }
 
@@ -348,6 +378,153 @@ class IntentNodes:
                     "TableResolver: низкая уверенность в выборе таблицы %s (%d%%)",
                     low_table, min_conf,
                 )
+
+        # --- Детерминированная коррекция по семантике запроса и каталогу ---
+        query_norm = _normalize_query_text(user_input)
+        requested = _derive_requested_slots(user_input, intent)
+        tables_df = self.schema.tables_df
+
+        def _norm_key(name: str) -> str:
+            return re.sub(r"^(old|new|prev|cur|current|actual|base|src|tgt)_", "", name.lower())
+
+        def _table_type(schema_name: str, table_name: str) -> str:
+            cols = self.schema.get_table_columns(schema_name, table_name)
+            return detect_table_type(table_name, cols)
+
+        def _score_table_for_slot(schema_name: str, table_name: str, slot: str) -> float:
+            cols = self.schema.get_table_columns(schema_name, table_name)
+            if cols.empty:
+                return -1.0
+            t_type = _table_type(schema_name, table_name)
+            best = -1.0
+            for _, row in cols.iterrows():
+                col_name = str(row.get("column_name", "") or "")
+                desc = str(row.get("description", "") or "")
+                semantic = _semantic_match_score(col_name, desc, slot)
+                if semantic <= 0:
+                    continue
+                not_null = float(row.get("not_null_perc", 0) or 0)
+                unique = float(row.get("unique_perc", 0) or 0)
+                score = semantic * 1000 + not_null * 1.5 + min(unique, 100.0) * 0.1
+                if _is_label_slot(slot):
+                    if t_type in ("dim", "ref", "unknown"):
+                        score += 35
+                    if t_type == "fact":
+                        score -= 25
+                elif _is_metric_slot(slot):
+                    if t_type == "fact":
+                        score += 35
+                    else:
+                        score -= 20
+                best = max(best, score)
+            return best
+
+        def _joinability_score(base: tuple[str, str] | None, candidate: tuple[str, str]) -> float:
+            if base is None or base == candidate:
+                return 0.0
+            bs, bt = base
+            cs, ct = candidate
+            left = self.schema.get_table_columns(bs, bt)
+            right = self.schema.get_table_columns(cs, ct)
+            if left.empty or right.empty:
+                return 0.0
+
+            left_cols = set(left["column_name"].astype(str))
+            right_cols = set(right["column_name"].astype(str))
+            exact_common = left_cols & right_cols
+            norm_left = {_norm_key(c): c for c in left_cols}
+            norm_right = {_norm_key(c): c for c in right_cols}
+            normalized_common = set(norm_left) & set(norm_right)
+
+            if "is_primary_key" in right.columns:
+                right_pks = set(
+                    right[right["is_primary_key"].astype(bool)]["column_name"].astype(str).tolist()
+                )
+            else:
+                right_pks = set()
+            matched_pk = sum(1 for pk in right_pks if _norm_key(pk) in norm_left)
+            return matched_pk * 80 + len(exact_common) * 20 + len(normalized_common) * 12
+
+        explicit_tables: list[tuple[str, str]] = []
+        for _, row in tables_df.iterrows():
+            schema_name = str(row.get("schema_name", "") or "")
+            table_name = str(row.get("table_name", "") or "")
+            full = f"{schema_name}.{table_name}".lower()
+            if table_name.lower() in query_norm or full in query_norm:
+                explicit_tables.append((schema_name, table_name))
+
+        metric_slot = requested.get("metric")
+        dimension_slots = list(requested.get("dimensions", []))
+        join_requested = (
+            str(intent.get("complexity", "")).lower() in {"join", "subquery", "multi_table"}
+            or any(phrase in query_norm for phrase in ("подтяни", "дотяни", "возьми из", "join", "по ключу"))
+        )
+        candidate_tables = explicit_tables if len(explicit_tables) >= 2 else [
+            (str(row["schema_name"]), str(row["table_name"])) for _, row in tables_df.iterrows()
+        ]
+
+        main_table: tuple[str, str] | None = explicit_tables[0] if explicit_tables else None
+        if metric_slot and not explicit_tables:
+            metric_candidates: list[tuple[float, tuple[str, str]]] = []
+            for st in candidate_tables:
+                score = _score_table_for_slot(st[0], st[1], metric_slot)
+                if score > 0:
+                    if st in explicit_tables:
+                        score += 120
+                    metric_candidates.append((score, st))
+            if metric_candidates:
+                metric_candidates.sort(reverse=True)
+                main_table = metric_candidates[0][1]
+
+        deterministic_tables: list[tuple[str, str]] = list(dict.fromkeys(explicit_tables))
+        if main_table and main_table not in deterministic_tables:
+            deterministic_tables.insert(0, main_table)
+
+        preserve_single_explicit = (
+            len(explicit_tables) == 1
+            and not join_requested
+            and str(intent.get("complexity", "")).lower() == "single_table"
+        )
+
+        for slot in dimension_slots:
+            if preserve_single_explicit:
+                continue
+            if slot == "date" and main_table:
+                if _score_table_for_slot(main_table[0], main_table[1], slot) > 0:
+                    if main_table not in deterministic_tables:
+                        deterministic_tables.append(main_table)
+                    continue
+            dim_candidates: list[tuple[float, tuple[str, str]]] = []
+            for st in candidate_tables:
+                score = _score_table_for_slot(st[0], st[1], slot)
+                if score <= 0:
+                    continue
+                score += _joinability_score(main_table, st)
+                if st in explicit_tables:
+                    score += 90
+                dim_candidates.append((score, st))
+            if dim_candidates:
+                dim_candidates.sort(reverse=True)
+                best_table = dim_candidates[0][1]
+                if best_table not in deterministic_tables:
+                    deterministic_tables.append(best_table)
+
+        if not deterministic_tables:
+            deterministic_tables = validated_tables
+
+        if deterministic_tables:
+            deterministic_tables = list(dict.fromkeys(deterministic_tables))
+            if deterministic_tables != validated_tables:
+                logger.info(
+                    "TableResolver: семантически корректирую выбор таблиц: %s -> %s",
+                    validated_tables,
+                    deterministic_tables,
+                )
+                validated_tables = deterministic_tables
+                table_confidences = {
+                    f"{s}.{t}": 100 if (s, t) in explicit_tables else 85
+                    for s, t in deterministic_tables
+                }
 
         logger.info(
             "TableResolver: выбрано %d таблиц: %s, план из %d шагов, confidence=%s",

@@ -23,6 +23,11 @@ _AGG_FUNCS = frozenset({"SUM", "COUNT", "AVG", "MIN", "MAX", "STDDEV"})
 
 # Шаблон для генерации короткого алиаса таблицы из schema.table
 _ALIAS_RE = re.compile(r"(?:.*\.)?([a-zA-Z][a-zA-Z0-9_]*)")
+_GENERIC_TABLE_TOKENS = {
+    "schema", "data", "dwh", "fact", "dim", "ref", "table", "tbl", "mart", "dm", "uzp"
+}
+_GENERIC_COL_TOKENS = {"id", "name", "dt", "date", "dttm", "amt", "qty", "num", "code"}
+_TOKEN_ABBREVIATIONS = {"segment": "seg", "region": "reg"}
 
 
 def _short_alias(full_name: str, used: set[str]) -> str:
@@ -46,6 +51,44 @@ def _short_alias(full_name: str, used: set[str]) -> str:
             return c2
     used.add(candidate + "_x")
     return candidate + "_x"
+
+
+def _significant_tokens(name: str, stopwords: set[str]) -> list[str]:
+    parts = [p.lower() for p in re.split(r"[_\W]+", name) if p]
+    return [p for p in parts if p not in stopwords]
+
+
+def _semantic_alias(
+    full_name: str,
+    roles: dict[str, list[str]],
+    aggregation: dict | None,
+    used: set[str],
+) -> str:
+    tokens: list[str] = []
+    agg_col = aggregation.get("column") if aggregation else None
+    if agg_col and agg_col != "*":
+        tokens.extend(_significant_tokens(agg_col, _GENERIC_COL_TOKENS))
+    for col in roles.get("select", []) + roles.get("group_by", []):
+        tokens.extend(_significant_tokens(col, _GENERIC_COL_TOKENS))
+    tokens.extend(_significant_tokens(full_name.split(".")[-1], _GENERIC_TABLE_TOKENS))
+
+    for token in tokens:
+        candidate = token[0]
+        if candidate.isalpha() and candidate not in used:
+            used.add(candidate)
+            return candidate
+    return _short_alias(full_name, used)
+
+
+def _derive_cte_alias(table_full: str, roles: dict[str, list[str]]) -> str:
+    table_tokens = _significant_tokens(table_full.split(".")[-1], _GENERIC_TABLE_TOKENS)
+    attr_tokens: list[str] = []
+    for col in roles.get("select", []):
+        attr_tokens.extend(_significant_tokens(col, _GENERIC_COL_TOKENS))
+    left = table_tokens[0] if table_tokens else "src"
+    right = attr_tokens[0] if attr_tokens else "attr"
+    right = _TOKEN_ABBREVIATIONS.get(right, right)
+    return f"{left}_{right}"
 
 
 def _build_select_items(
@@ -265,16 +308,18 @@ def _build_fact_dim_join(
         for j in join_spec
         if main_table in j.get("left", "") or main_table in j.get("right", "")
     )
-
-    used: set[str] = set()
-    f_alias = _short_alias(main_table, used)
-    d_alias = _short_alias(dim_table, used)
+    use_full_refs = is_safe
 
     aggregation = blueprint.get("aggregation")
 
     # SELECT из факт-таблицы
     fact_roles = selected_columns.get(main_table, {})
     dim_roles = selected_columns.get(dim_table, {})
+
+    used: set[str] = set()
+    f_alias = _semantic_alias(main_table, fact_roles, aggregation, used)
+    d_alias = _semantic_alias(dim_table, dim_roles, None, used)
+    initial_d_alias = d_alias
 
     # Строим SELECT-items
     select_items: list[str] = []
@@ -293,12 +338,14 @@ def _build_fact_dim_join(
         seen.add(col)
         if col == agg_col and agg_func:
             d = "DISTINCT " if agg_distinct else ""
-            select_items.append(f"{agg_func}({d}{f_alias}.{col}) AS {agg_alias}")
+            source = col if use_full_refs else f"{f_alias}.{col}"
+            select_items.append(f"{agg_func}({d}{source}) AS {agg_alias}")
         elif col in fact_agg_set and agg_func:
             d = "DISTINCT " if agg_distinct else ""
-            select_items.append(f"{agg_func}({d}{f_alias}.{col}) AS {agg_func.lower()}_{col}")
+            source = col if use_full_refs else f"{f_alias}.{col}"
+            select_items.append(f"{agg_func}({d}{source}) AS {agg_func.lower()}_{col}")
         else:
-            select_items.append(f"{f_alias}.{col}")
+            select_items.append(col if use_full_refs else f"{f_alias}.{col}")
 
     for col in fact_roles.get("aggregate", []):
         if col in seen:
@@ -306,7 +353,8 @@ def _build_fact_dim_join(
         seen.add(col)
         if agg_func:
             d = "DISTINCT " if agg_distinct else ""
-            select_items.append(f"{agg_func}({d}{f_alias}.{col}) AS {agg_alias or f'{agg_func.lower()}_{col}'}")
+            source = col if use_full_refs else f"{f_alias}.{col}"
+            select_items.append(f"{agg_func}({d}{source}) AS {agg_alias or f'{agg_func.lower()}_{col}'}")
 
     # Колонки из справочника (исключаем все dim join-ключи)
     dim_join_cols = {p[1] for p in join_pairs}
@@ -314,7 +362,7 @@ def _build_fact_dim_join(
         if col in dim_join_cols or col in seen:
             continue
         seen.add(col)
-        select_items.append(f"{d_alias}.{col}")
+        select_items.append(col if use_full_refs else f"{d_alias}.{col}")
 
     if not select_items:
         select_items = [f"COUNT(*) AS cnt"]
@@ -322,19 +370,7 @@ def _build_fact_dim_join(
     # WHERE
     where_clause = _build_where_clause(blueprint.get("where_conditions", []))
 
-    # GROUP BY
     group_by_cols = blueprint.get("group_by", [])
-    gb_items: list[str] = []
-    for col in group_by_cols:
-        # Определяем принадлежность колонки
-        if col in (fact_roles.get("select", []) + fact_roles.get("group_by", [])):
-            gb_items.append(f"{f_alias}.{col}")
-        elif col in dim_roles.get("select", []):
-            gb_items.append(f"{d_alias}.{col}")
-        else:
-            gb_items.append(col)
-
-    group_by_clause = ("GROUP BY " + ", ".join(gb_items)) if gb_items else ""
     order_by_clause = _build_order_by(blueprint.get("order_by"))
     limit_clause = _build_limit(blueprint.get("limit"))
 
@@ -344,11 +380,37 @@ def _build_fact_dim_join(
     dim_extra_cols = [c for c in dim_roles.get("select", []) if c not in dim_join_cols]
     dim_select_cols = all_dim_join_cols + dim_extra_cols
 
+    cte_sql = ""
+    from_sql = f"FROM {main_table}" if use_full_refs else f"FROM {main_table} {f_alias}"
+
     if is_safe:
-        # Прямой JOIN — только первая пара (ключ должен быть уникален)
-        join_sql = (
-            f"JOIN {dim_table} {d_alias} ON {d_alias}.{join_key_dim} = {f_alias}.{join_key_fact}"
+        main_ref = main_table.split(".")[-1]
+        dim_ref = dim_table.split(".")[-1]
+        if len(join_pairs) > 1:
+            on_conditions = " AND ".join(
+                f"{dim_ref}.{p[1]} = {main_ref}.{p[0]}" for p in join_pairs
+            )
+        else:
+            on_conditions = f"{dim_ref}.{join_key_dim} = {main_ref}.{join_key_fact}"
+        join_sql = f"JOIN {dim_table} ON {on_conditions}"
+    elif len(join_pairs) == 1 and dim_extra_cols:
+        cte_alias = _derive_cte_alias(dim_table, dim_roles)
+        cte_alias_short = cte_alias[0].lower()
+        if cte_alias_short in used:
+            d_alias = _short_alias(cte_alias, used)
+        else:
+            used.add(cte_alias_short)
+            d_alias = cte_alias_short
+        cte_sql = (
+            f"WITH {cte_alias} AS (\n"
+            f"    SELECT DISTINCT ON ({join_key_dim}) {', '.join(dim_select_cols)}\n"
+            f"    FROM {dim_table}\n"
+            f"    ORDER BY {join_key_dim}\n"
+            f")\n"
         )
+        join_sql = f"JOIN {cte_alias} {d_alias} ON {d_alias}.{join_key_dim} = {f_alias}.{join_key_fact}"
+        if d_alias != initial_d_alias:
+            select_items = [item.replace(f"{initial_d_alias}.", f"{d_alias}.") for item in select_items]
     elif len(join_pairs) > 1:
         # Составной DISTINCT ON по всем ключам PK
         distinct_on_str = ", ".join(p[1] for p in join_pairs)
@@ -375,11 +437,27 @@ def _build_fact_dim_join(
             f") {d_alias} ON {d_alias}.{join_key_dim} = {f_alias}.{join_key_fact}"
         )
 
+    gb_items: list[str] = []
+    fact_gb_items: list[str] = []
+    dim_gb_items: list[str] = []
+    other_gb_items: list[str] = []
+    for col in group_by_cols:
+        if col in (fact_roles.get("select", []) + fact_roles.get("group_by", [])):
+            fact_gb_items.append(col if use_full_refs else f"{f_alias}.{col}")
+        elif col in dim_roles.get("select", []):
+            dim_gb_items.append(col if use_full_refs else f"{d_alias}.{col}")
+        else:
+            other_gb_items.append(col)
+    gb_items = fact_gb_items + dim_gb_items + other_gb_items
+    group_by_clause = ("GROUP BY " + ", ".join(gb_items)) if gb_items else ""
+
     parts = [
+        cte_sql.rstrip() if cte_sql else "",
         f"SELECT {', '.join(select_items)}",
-        f"FROM {main_table} {f_alias}",
+        from_sql,
         join_sql,
     ]
+    parts = [p for p in parts if p]
     if where_clause:
         parts.append(where_clause)
     if group_by_clause:

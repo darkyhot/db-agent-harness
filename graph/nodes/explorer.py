@@ -324,6 +324,7 @@ class ExplorerNodes:
             table_types=state.get("table_types", {}),
             join_analysis_data=join_analysis_data,
             schema_loader=self.schema,
+            user_input=user_input,
         )
         _det_conf = _det_result.get("confidence", 0.0)
         logger.info(
@@ -415,8 +416,8 @@ class ExplorerNodes:
             "- КРИТИЧНО: если пользователь спрашивает «сколько всего есть X» или «количество X» "
             "БЕЗ явной группировки («по Y», «в разбивке по Y») — это COUNT DISTINCT, не GROUP BY. "
             "Помести PK-колонку(и) в 'aggregate' и оставь 'group_by' пустым. "
-            "Пример: «Сколько ГОСБ?» → aggregate: [gosb_id], group_by: [] "
-            "→ SELECT COUNT(DISTINCT gosb_id) AS gosb_count FROM ...\n"
+            "Пример: «Сколько клиентов?» → aggregate: [customer_id], group_by: [] "
+            "→ SELECT COUNT(DISTINCT customer_id) AS customer_count FROM ...\n"
         )
 
         # --- Пользовательский промпт ---

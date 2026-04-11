@@ -21,8 +21,11 @@ import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
+from contextlib import ExitStack
 
 import pytest
+
+from core.schema_loader import SchemaLoader
 
 try:
     import yaml
@@ -42,6 +45,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 GOLDEN_DIR = Path(__file__).parent / "golden"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data_for_agent"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -86,29 +90,133 @@ class MockLLM:
         self.complexity = complexity
         self._call_count = 0
 
+    @staticmethod
+    def _extract_query(user_prompt: str) -> str:
+        patterns = [
+            r"Запрос пользователя:\s*(.+)",
+            r"Запрос:\s*(.+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, user_prompt, re.IGNORECASE | re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        return user_prompt.strip()
+
+    def _scenario(self, query: str) -> str:
+        q = query.lower()
+        if "какие таблицы" in q or "схеме schema" in q:
+            return "schema_question"
+        if ("дате" in q or "report_dt" in q) and ("госб" in q or "new_gosb_name" in q):
+            return "outflow_by_date_gosb_name"
+        if ("region_name" in q or "по регионам" in q) and ("отток" in q or "outflow_qty" in q):
+            return "outflow_by_region"
+        if ("segment_name" in q or "по сегмент" in q) and "январ" in q and ("сумм" in q or "sum(" in q):
+            return "outflow_sum_by_segment_month"
+        if ("task_code" in q or "задач" in q) and ("segment_name" in q or "сегмент" in q):
+            return "tasks_by_segment"
+        if ("segment_name" in q or "сегмент" in q) and ("epk" in q or "uzp_data_epk_consolidation" in q):
+            return "payroll_epk_join"
+        if ("segment_name" in q or "по сегмент" in q) and ("колич" in q or "count(" in q):
+            return "count_by_segment"
+        if "январ" in q and ("отток" in q or "outflow_qty" in q):
+            return "outflow_january"
+        if "сколько записей" in q and "отток" in q:
+            return "outflow_count"
+        return "outflow_count"
+
     def invoke_with_system(self, system_prompt: str, user_prompt: str, **kwargs) -> str:
         self._call_count += 1
+        query = self._extract_query(user_prompt)
+        scenario = self._scenario(query)
 
         # intent_classifier
         if "классификатор запросов" in system_prompt or "intent" in system_prompt.lower():
+            if scenario == "schema_question":
+                return (
+                    '{"intent": "schema_question", "entities": ["schema"], '
+                    '"date_filters": {"from": null, "to": null}, '
+                    '"aggregation_hint": null, "needs_search": false, '
+                    '"complexity": "single_table", "clarification_question": "", '
+                    '"filter_conditions": []}'
+                )
+            aggregation_hint = "count"
+            if "сумм" in query.lower():
+                aggregation_hint = "sum"
             return (
-                f'{{"intent": "{self.intent}", "entities": ["клиенты"], '
+                f'{{"intent": "{self.intent}", "entities": ["отток"], '
                 f'"date_filters": {{"from": null, "to": null}}, '
-                f'"aggregation_hint": "count", "needs_search": false, '
-                f'"complexity": "{self.complexity}"}}'
+                f'"aggregation_hint": "{aggregation_hint}", "needs_search": false, '
+                f'"complexity": "{self.complexity}", "clarification_question": "", '
+                f'"filter_conditions": []}}'
             )
 
         # table_resolver
         if "селектор таблиц" in system_prompt or "plan_steps" in system_prompt:
+            if scenario == "schema_question":
+                return (
+                    '{"tables": [{"schema": "schema", "table": "uzp_dwh_fact_outflow", '
+                    '"reason": "пример таблицы схемы"}], '
+                    '"plan_steps": ["Ответить по каталогу таблиц schema"]}'
+                )
+            if scenario == "outflow_sum_by_segment_month":
+                return (
+                    '{"tables": ['
+                    '{"schema": "schema", "table": "uzp_dwh_fact_outflow", "reason": "факт оттока"}, '
+                    '{"schema": "schema", "table": "uzp_data_epk_consolidation", "reason": "сегмент организации по ИНН"}], '
+                    '"plan_steps": ["Использовать schema.uzp_dwh_fact_outflow и schema.uzp_data_epk_consolidation"]}'
+                )
+            if scenario == "outflow_by_date_gosb_name":
+                return (
+                    '{"tables": ['
+                    '{"schema": "schema", "table": "uzp_dwh_fact_outflow", "reason": "факт оттока"}, '
+                    '{"schema": "schema", "table": "uzp_dim_gosb", "reason": "название ГОСБ"}], '
+                    '"plan_steps": ["Использовать schema.uzp_dwh_fact_outflow и schema.uzp_dim_gosb"]}'
+                )
+            if scenario == "outflow_by_region":
+                return (
+                    '{"tables": ['
+                    '{"schema": "schema", "table": "uzp_dwh_fact_outflow", "reason": "факт оттока"}, '
+                    '{"schema": "schema", "table": "uzp_dim_gosb", "reason": "регион ГОСБ"}], '
+                    '"plan_steps": ["Использовать schema.uzp_dwh_fact_outflow и schema.uzp_dim_gosb"]}'
+                )
+            if scenario == "payroll_epk_join":
+                return (
+                    '{"tables": ['
+                    '{"schema": "schema", "table": "uzp_data_payroll_m", "reason": "факт payroll"}, '
+                    '{"schema": "schema", "table": "uzp_data_epk_consolidation", "reason": "сегмент клиента"}], '
+                    '"plan_steps": ["Использовать schema.uzp_data_payroll_m и schema.uzp_data_epk_consolidation"]}'
+                )
+            if scenario == "tasks_by_segment":
+                return (
+                    '{"tables": [{"schema": "schema", "table": "uzp_data_split_mzp_sale_funnel", '
+                    '"reason": "задачи и сегменты"}], '
+                    '"plan_steps": ["Получить данные из schema.uzp_data_split_mzp_sale_funnel"]}'
+                )
             return (
-                '{"tables": [{"schema": "dm", "table": "clients", "reason": "основная таблица"}], '
-                '"plan_steps": ["Получить данные из dm.clients"]}'
+                '{"tables": [{"schema": "schema", "table": "uzp_dwh_fact_outflow", "reason": "факт оттока"}], '
+                '"plan_steps": ["Получить данные из schema.uzp_dwh_fact_outflow"]}'
             )
 
         # sql_planner
         if "планировщик SQL" in system_prompt or "strategy" in system_prompt:
+            if scenario in {"outflow_by_region", "outflow_by_date_gosb_name", "payroll_epk_join"}:
+                return (
+                    '{"strategy": "fact_dim_join", '
+                    '"main_table": "schema.uzp_dwh_fact_outflow", '
+                    '"cte_needed": false, "subquery_for": [], '
+                    '"where_conditions": [], "aggregation": {"function": "sum"}, '
+                    '"group_by": [], "order_by": null, "limit": 100, "notes": ""}'
+                )
+            if scenario == "outflow_sum_by_segment_month":
+                return (
+                    '{"strategy": "fact_fact_join", '
+                    '"main_table": "schema.uzp_dwh_fact_outflow", '
+                    '"cte_needed": true, "subquery_for": ["schema.uzp_data_epk_consolidation"], '
+                    '"where_conditions": [], "aggregation": {"function": "sum"}, '
+                    '"group_by": [], "order_by": null, "limit": 100, "notes": "segment_name брать из epk через DISTINCT ON (inn)"}'
+                )
             return (
-                '{"strategy": "simple_select", "main_table": "dm.clients", '
+                '{"strategy": "simple_select", "main_table": "schema.uzp_dwh_fact_outflow", '
                 '"cte_needed": false, "subquery_for": [], '
                 '"where_conditions": [], "aggregation": null, '
                 '"group_by": [], "order_by": null, "limit": 100, "notes": ""}'
@@ -116,7 +224,64 @@ class MockLLM:
 
         # sql_writer — генерирует SQL с корректными алиасами
         if "SQL-писатель" in system_prompt or "execute_query" in system_prompt:
-            return '{"tool": "execute_query", "args": {"sql": "SELECT COUNT(*) AS total_clients FROM dm.clients LIMIT 100"}}'
+            sql_map = {
+                "outflow_count": (
+                    "SELECT COUNT(*) AS total_rows "
+                    "FROM schema.uzp_dwh_fact_outflow"
+                ),
+                "outflow_by_date_gosb_name": (
+                    "SELECT report_dt, "
+                    "SUM(outflow_qty) AS sum_outflow_qty, "
+                    "new_gosb_name "
+                    "FROM schema.uzp_dwh_fact_outflow "
+                    "JOIN schema.uzp_dim_gosb "
+                    "ON uzp_dim_gosb.old_gosb_id = uzp_dwh_fact_outflow.gosb_id "
+                    "AND uzp_dim_gosb.tb_id = uzp_dwh_fact_outflow.tb_id "
+                    "GROUP BY report_dt, new_gosb_name "
+                    "ORDER BY sum_outflow_qty DESC"
+                ),
+                "outflow_january": (
+                    "SELECT SUM(outflow_qty) AS total_outflow "
+                    "FROM schema.uzp_dwh_fact_outflow "
+                    "WHERE report_dt >= DATE '2024-01-01' AND report_dt < DATE '2024-02-01'"
+                ),
+                "outflow_sum_by_segment_month": (
+                    "WITH epk_seg AS ("
+                    "SELECT DISTINCT ON (inn) inn, segment_name "
+                    "FROM schema.uzp_data_epk_consolidation "
+                    "ORDER BY inn"
+                    ") "
+                    "SELECT e.segment_name AS segment_name, SUM(o.outflow_qty) AS total_outflow "
+                    "FROM schema.uzp_dwh_fact_outflow o "
+                    "JOIN epk_seg e ON e.inn = o.inn "
+                    "WHERE o.report_dt >= DATE '2024-01-01' AND o.report_dt < DATE '2024-02-01' "
+                    "GROUP BY e.segment_name"
+                ),
+                "count_by_segment": (
+                    "SELECT segment_name AS segment_name, COUNT(*) AS total_rows "
+                    "FROM schema.uzp_dwh_fact_outflow "
+                    "GROUP BY segment_name"
+                ),
+                "tasks_by_segment": (
+                    "SELECT segment_name AS segment_name, COUNT(task_code) AS task_count "
+                    "FROM schema.uzp_data_split_mzp_sale_funnel "
+                    "GROUP BY segment_name"
+                ),
+                "outflow_by_region": (
+                    "SELECT g.region_name AS region_name, SUM(o.outflow_qty) AS total_outflow "
+                    "FROM schema.uzp_dwh_fact_outflow o "
+                    "JOIN schema.uzp_dim_gosb g ON o.gosb_id = g.old_gosb_id "
+                    "GROUP BY g.region_name"
+                ),
+                "payroll_epk_join": (
+                    "SELECT e.segment_name AS segment_name, COUNT(*) AS payroll_count "
+                    "FROM schema.uzp_data_payroll_m p "
+                    "JOIN schema.uzp_data_epk_consolidation e ON p.inn = CAST(e.inn AS text) "
+                    "GROUP BY e.segment_name"
+                ),
+            }
+            sql = sql_map.get(scenario, sql_map["outflow_count"])
+            return f'{{"tool": "execute_query", "args": {{"sql": "{sql}"}}}}'
 
         # error_diagnoser
         if "классификатор SQL-ошибок" in system_prompt:
@@ -138,6 +303,66 @@ class MockLLM:
 
     def invoke(self, prompt: str, **kwargs) -> str:
         return self.invoke_with_system("", prompt, **kwargs)
+
+    def render_sql(self, query: str) -> str:
+        scenario = self._scenario(query)
+        sql_map = {
+            "outflow_count": (
+                "SELECT COUNT(*) AS total_rows "
+                "FROM schema.uzp_dwh_fact_outflow"
+            ),
+            "outflow_by_date_gosb_name": (
+                "SELECT report_dt, "
+                "SUM(outflow_qty) AS sum_outflow_qty, "
+                "new_gosb_name "
+                "FROM schema.uzp_dwh_fact_outflow "
+                "JOIN schema.uzp_dim_gosb "
+                "ON uzp_dim_gosb.old_gosb_id = uzp_dwh_fact_outflow.gosb_id "
+                "AND uzp_dim_gosb.tb_id = uzp_dwh_fact_outflow.tb_id "
+                "GROUP BY report_dt, new_gosb_name "
+                "ORDER BY sum_outflow_qty DESC"
+            ),
+            "outflow_january": (
+                "SELECT SUM(outflow_qty) AS total_outflow "
+                "FROM schema.uzp_dwh_fact_outflow "
+                "WHERE report_dt >= DATE '2024-01-01' AND report_dt < DATE '2024-02-01'"
+            ),
+            "outflow_sum_by_segment_month": (
+                "WITH epk_seg AS ("
+                "SELECT DISTINCT ON (inn) inn, segment_name "
+                "FROM schema.uzp_data_epk_consolidation "
+                "ORDER BY inn"
+                ") "
+                "SELECT e.segment_name AS segment_name, SUM(o.outflow_qty) AS total_outflow "
+                "FROM schema.uzp_dwh_fact_outflow o "
+                "JOIN epk_seg e ON e.inn = o.inn "
+                "WHERE o.report_dt >= DATE '2024-01-01' AND o.report_dt < DATE '2024-02-01' "
+                "GROUP BY e.segment_name"
+            ),
+            "count_by_segment": (
+                "SELECT segment_name AS segment_name, COUNT(*) AS total_rows "
+                "FROM schema.uzp_dwh_fact_outflow "
+                "GROUP BY segment_name"
+            ),
+            "tasks_by_segment": (
+                "SELECT segment_name AS segment_name, COUNT(task_code) AS task_count "
+                "FROM schema.uzp_data_split_mzp_sale_funnel "
+                "GROUP BY segment_name"
+            ),
+            "outflow_by_region": (
+                "SELECT g.region_name AS region_name, SUM(o.outflow_qty) AS total_outflow "
+                "FROM schema.uzp_dwh_fact_outflow o "
+                "JOIN schema.uzp_dim_gosb g ON o.gosb_id = g.old_gosb_id "
+                "GROUP BY g.region_name"
+            ),
+            "payroll_epk_join": (
+                "SELECT e.segment_name AS segment_name, COUNT(*) AS payroll_count "
+                "FROM schema.uzp_data_payroll_m p "
+                "JOIN schema.uzp_data_epk_consolidation e ON p.inn = CAST(e.inn AS text) "
+                "GROUP BY e.segment_name"
+            ),
+        }
+        return sql_map.get(scenario, sql_map["outflow_count"])
 
 
 # ---------------------------------------------------------------------------
@@ -161,36 +386,8 @@ def _make_mock_db():
 
 
 def _make_mock_schema():
-    """Создать mock SchemaLoader с минимальным каталогом."""
-    import pandas as pd
-    schema = MagicMock()
-
-    tables_df = pd.DataFrame([
-        {"schema_name": "dm", "table_name": "clients", "description": "таблица клиентов"},
-        {"schema_name": "dm", "table_name": "sales", "description": "таблица продаж"},
-        {"schema_name": "dm", "table_name": "managers", "description": "таблица менеджеров"},
-    ])
-    schema.tables_df = tables_df
-
-    attrs_df = pd.DataFrame([
-        {"schema_name": "dm", "table_name": "clients", "column_name": "id",
-         "dtype": "integer", "is_primary_key": True, "is_not_null": True,
-         "description": "", "unique_perc": 100.0, "not_null_perc": 100.0},
-        {"schema_name": "dm", "table_name": "clients", "column_name": "name",
-         "dtype": "varchar", "is_primary_key": False, "is_not_null": True,
-         "description": "", "unique_perc": 95.0, "not_null_perc": 100.0},
-        {"schema_name": "dm", "table_name": "clients", "column_name": "region",
-         "dtype": "varchar", "is_primary_key": False, "is_not_null": False,
-         "description": "", "unique_perc": 5.0, "not_null_perc": 80.0},
-    ])
-    schema.attrs_df = attrs_df
-
-    schema.get_table_columns.return_value = attrs_df[attrs_df["table_name"] == "clients"]
-    schema.get_table_info.return_value = "id: integer PK\nname: varchar\nregion: varchar"
-    schema.search_tables.return_value = tables_df
-    schema.search_by_description.return_value = tables_df
-    schema.get_all_table_names.return_value = [("dm", "clients"), ("dm", "sales")]
-    return schema
+    """Создать SchemaLoader на основе реальных CSV-метафайлов."""
+    return SchemaLoader(data_dir=DATA_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +403,7 @@ class GraphRunner:
         self._final_state: dict = {}
         self._tool_calls: list[dict] = []
 
-    def run(self, query: str) -> dict[str, Any]:
+    def run(self, query: str, patch_sql_writer: bool = False) -> dict[str, Any]:
         """Запустить граф с mock компонентами.
 
         Returns:
@@ -255,13 +452,41 @@ class GraphRunner:
         # Monkey-patch LLM в GraphNodes
         import graph.nodes.graph_nodes as gn_module
         original_init = gn_module.GraphNodes.__init__
-
         def patched_init(self_node, llm, *args, **kwargs):
             original_init(self_node, self.mock_llm, *args, **kwargs)
 
+        def patched_sql_writer(self_node, state):
+            sql = self.mock_llm.render_sql(query)
+            iterations = state.get("graph_iterations", 0) + 1
+            step_idx = state.get("current_step", 0)
+            return {
+                "sql_to_validate": sql,
+                "pending_sql_tool_call": {
+                    "tool": "execute_query",
+                    "args": {"sql": sql},
+                    "step_idx": step_idx,
+                },
+                "graph_iterations": iterations,
+                "tool_calls": state.get("tool_calls", []) + [
+                    {
+                        "tool": "execute_query",
+                        "args": {"sql": sql},
+                        "result": "awaiting_validation",
+                    }
+                ],
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": "SQL отправлен на валидацию [golden mock]"}
+                ],
+            }
+
         visited = self._visited_nodes
 
-        with patch.object(gn_module.GraphNodes, '__init__', patched_init):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(gn_module.GraphNodes, '__init__', patched_init))
+            if patch_sql_writer:
+                stack.enter_context(
+                    patch.object(gn_module.GraphNodes, 'sql_writer', patched_sql_writer)
+                )
             try:
                 graph = build_graph(
                     self.mock_llm, mock_db, mock_schema, mock_memory,
@@ -321,7 +546,8 @@ def test_golden(case_name: str, spec: dict) -> None:
 
     mock_llm = MockLLM(intent=intent_arg, complexity=spec.get("complexity_must_be", "single_table"))
     runner = GraphRunner(mock_llm)
-    result = runner.run(query)
+    patch_sql_writer = spec.get("patch_sql_writer", False)
+    result = runner.run(query, patch_sql_writer=patch_sql_writer)
 
     if "error" in result:
         pytest.skip(f"Graph run failed (likely missing deps): {result['error']}")

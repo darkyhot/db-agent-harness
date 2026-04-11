@@ -110,6 +110,7 @@ def format_sql(sql: str) -> str:
 
     # Шаг 3: нормализация переносов
     formatted = re.sub(r'\n{3,}', '\n\n', formatted)
+    formatted = re.sub(r'GROUP BY\s+([a-z0-9_\.]+),\s*\n\s*([a-z0-9_\.]+)', r'GROUP BY \1, \2', formatted, flags=re.I)
 
     # Шаг 4: trailing whitespace
     lines = [line.rstrip() for line in formatted.split('\n')]

@@ -1,9 +1,10 @@
 # Запрос с фильтром по дате
-query: "Продажи за январь 2024"
+query: "Покажи сумму outflow_qty из uzp_dwh_fact_outflow за январь 2024 по report_dt"
 intent_must_be: "analytics"
 sql_must_contain:
   - "WHERE"
   - "2024"
+  - "REPORT_DT"
 sql_must_not_contain:
   - "AS \"" # кириллица в алиасах
 max_retries: 1

@@ -1,7 +1,4 @@
-"""Тесты SchemaLoader: проверка composite key логики."""
-
-import tempfile
-from pathlib import Path
+"""Тесты SchemaLoader: проверка composite key логики и literal search."""
 
 import pandas as pd
 import pytest
@@ -16,7 +13,7 @@ def loader_with_data(tmp_path):
     tables_df = pd.DataFrame({
         "schema_name": ["hr", "hr", "hr"],
         "table_name": ["emp", "dept", "emp_dept"],
-        "table_description": ["Employees", "Departments", "Employee-Department link"],
+        "description": ["Employees", "Departments", "Employee-Department link"],
     })
     tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
 
@@ -25,10 +22,10 @@ def loader_with_data(tmp_path):
         "schema_name": ["hr", "hr", "hr", "hr", "hr", "hr", "hr"],
         "table_name": ["emp", "emp", "dept", "dept", "emp_dept", "emp_dept", "emp_dept"],
         "column_name": ["id", "dept_id", "id", "name", "emp_id", "dept_id", "role"],
-        "data_type": ["int", "int", "int", "varchar", "int", "int", "varchar"],
+        "dType": ["int", "int", "int", "varchar", "int", "int", "varchar"],
+        "description": ["PK", "FK to dept", "PK", "Name", "FK", "FK", "Role"],
         "is_primary_key": [True, False, True, False, True, True, False],
         "unique_perc": [100.0, 20.0, 100.0, 95.0, 80.0, 60.0, 30.0],
-        "column_description": ["PK", "FK to dept", "PK", "Name", "FK", "FK", "Role"],
     })
     attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
 
@@ -110,3 +107,43 @@ class TestCheckKeyUniqueness:
         result = loader_with_data.check_key_uniqueness("hr", "nonexistent", ["id"])
         assert result["is_unique"] is None
         assert "error" in result
+
+
+class TestLiteralSearchRobustness:
+    def test_search_tables_treats_regex_like_input_as_literal(self, loader_with_data):
+        assert loader_with_data.search_tables("[").empty
+        assert loader_with_data.search_tables("foo(bar").empty
+        assert loader_with_data.search_tables("a+b").empty
+
+    def test_search_tables_matches_literal_identifier(self, loader_with_data):
+        result = loader_with_data.search_tables("emp")
+        assert not result.empty
+        assert "emp" in set(result["table_name"])
+
+    def test_find_tables_with_column_handles_regex_like_input(self, loader_with_data):
+        assert loader_with_data.find_tables_with_column("client_id").empty
+        assert loader_with_data.find_tables_with_column("a+b").empty
+
+    def test_search_by_description_handles_mixed_and_russian_input(self, tmp_path):
+        tables_df = pd.DataFrame({
+            "schema_name": ["dm", "support"],
+            "table_name": ["orders", "tickets"],
+            "description": ["Customer orders and invoices", "История обращений пользователей"],
+        })
+        tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+
+        attrs_df = pd.DataFrame({
+            "schema_name": ["dm", "support"],
+            "table_name": ["orders", "tickets"],
+            "column_name": ["client_id", "ticket_text"],
+            "dType": ["int", "text"],
+            "description": ["Client identifier", "Русское описание обращения"],
+            "is_primary_key": [False, False],
+            "unique_perc": [10.0, 0.0],
+        })
+        attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+        loader = SchemaLoader(data_dir=tmp_path)
+
+        assert not loader.search_by_description("обращения").empty
+        assert not loader.search_by_description("client_id").empty
+        assert loader.search_by_description("[orders]+").empty

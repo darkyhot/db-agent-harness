@@ -30,6 +30,8 @@ from typing import Any
 
 import pandas as pd
 
+from core.synonym_map import expand_with_synonyms
+
 logger = logging.getLogger(__name__)
 
 # Префиксы PK-нормализации: old_gosb_id → gosb_id
@@ -66,6 +68,17 @@ _METRIC_PARTS = frozenset({
 
 # Ключевые слова в именах статусных/типовых колонок (кандидаты для filter)
 _STATUS_PARTS = frozenset({'status', 'state', 'flag', 'type', 'code', 'category', 'kind'})
+_METRIC_SUFFIXES = ('_qty', '_amt', '_sum', '_cnt', '_perc', '_pct', '_amount', '_value')
+_LABEL_SUFFIXES = ('_name', '_label', '_title')
+_DATE_HINTS = frozenset({'date', 'dt', 'dttm', 'timestamp', 'data'})
+_COUNT_HINTS = frozenset({'count', 'kolichestvo', 'qty', 'cnt'})
+_TRANSLIT_TABLE = str.maketrans({
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+    'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
+    'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+})
 
 
 def _is_numeric(dtype: str) -> bool:
@@ -78,6 +91,274 @@ def _is_date(dtype: str) -> bool:
 
 def _is_categorical(dtype: str) -> bool:
     return bool(_CATEGORICAL_RE.match(dtype.strip()))
+
+
+def _normalize_query_text(text: str) -> str:
+    return re.sub(r'\s+', ' ', (text or '').lower()).strip()
+
+
+def _translit(text: str) -> str:
+    return text.lower().translate(_TRANSLIT_TABLE)
+
+
+def _tokenize(text: str) -> list[str]:
+    raw = re.findall(r'[a-zA-Zа-яА-ЯёЁ_]+', text or '')
+    tokens: list[str] = []
+    for chunk in raw:
+        chunk = chunk.strip('_')
+        if not chunk:
+            continue
+        parts = [p for p in chunk.split('_') if p]
+        for part in parts:
+            tokens.append(part.lower())
+            tokens.append(_translit(part))
+    return [t for t in tokens if t]
+
+
+def _normalize_concept(text: str) -> str:
+    tokens = _tokenize(text)
+    return "_".join(dict.fromkeys(tokens[:3]))
+
+
+def _normalize_metric_concept(terms: list[str]) -> str:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        for token in _tokenize(term):
+            if token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+            if len(tokens) >= 6:
+                return "_".join(tokens)
+    return "_".join(tokens)
+
+
+def _looks_like_explicit_column(token: str) -> bool:
+    lower = token.lower()
+    return "_" in lower or lower.endswith(_METRIC_SUFFIXES + _LABEL_SUFFIXES + ('_id', '_code'))
+
+
+def _is_label_slot(slot: str) -> bool:
+    return slot.endswith(_LABEL_SUFFIXES) or slot in {'name', 'label'}
+
+
+def _is_metric_slot(slot: str) -> bool:
+    return slot.endswith(_METRIC_SUFFIXES) or slot.endswith(('_code', '_score'))
+
+
+def _fuzzy_overlap_score(slot_tokens: set[str], source_tokens: set[str]) -> float:
+    matched = 0.0
+    for st in slot_tokens:
+        if len(st) < 3:
+            continue
+        if st in source_tokens:
+            matched += 1.0
+            continue
+        for src in source_tokens:
+            if len(src) < 3:
+                continue
+            if st.startswith(src[:4]) or src.startswith(st[:4]):
+                matched += 0.6
+                break
+    return matched
+
+
+def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str, Any]:
+    """Вытащить из user_input явные аналитические слоты без LLM."""
+    query = _normalize_query_text(user_input)
+    agg_hint = str(intent.get('aggregation_hint') or '').lower().strip()
+    query_tokens = _tokenize(query)
+    dimensions: list[str] = []
+
+    explicit_cols = [
+        t for t in re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', query)
+        if _looks_like_explicit_column(t)
+    ]
+    for col in explicit_cols:
+        lower = col.lower()
+        if lower.endswith(_LABEL_SUFFIXES) or any(tok in _DATE_HINTS for tok in lower.split('_')):
+            dimensions.append(lower)
+
+    for m in re.finditer(r'(?:по|в разбивке по)\s+([a-zA-Zа-яА-ЯёЁ_]+)', query):
+        concept = _normalize_concept(m.group(1))
+        if not concept:
+            continue
+        if any(tok in _DATE_HINTS for tok in concept.split('_')):
+            dimensions.append('date')
+        elif _looks_like_explicit_column(m.group(1)):
+            dimensions.append(m.group(1).lower())
+        else:
+            dimensions.append(f'{concept}_name')
+
+    for m in re.finditer(r'(?:названи[еяю]|наименовани[еяю])\s+([a-zA-Zа-яА-ЯёЁ_]+)', query):
+        concept = _normalize_concept(m.group(1))
+        if concept:
+            dimensions.append(f'{concept}_name')
+
+    metric: str | None = None
+    metric_requires_numeric = True
+    metric_cols = [c.lower() for c in explicit_cols if _is_metric_slot(c.lower())]
+    if metric_cols:
+        metric = metric_cols[0]
+        metric_requires_numeric = metric.endswith(_METRIC_SUFFIXES)
+    elif agg_hint in {'sum', 'avg', 'min', 'max', 'count'}:
+        for entity in intent.get('entities') or []:
+            seed = str(entity).strip()
+            synonym_terms = sorted({str(term).strip() for term in expand_with_synonyms(seed) if str(term).strip()})
+            expanded_terms = [seed] + [term for term in synonym_terms if term != seed]
+            concept = _normalize_metric_concept(expanded_terms)
+            if concept:
+                metric = concept
+                break
+
+    join_key_hints = [
+        token.lower() for token in explicit_cols
+        if token.lower().endswith(('_id', '_code', '_num', '_no'))
+    ]
+    for m in re.finditer(r'(?:по|через|join|using|ключ[ауеом]?)\s+([a-zA-Z_][a-zA-Z0-9_]*)', query):
+        token = m.group(1).lower()
+        if _looks_like_explicit_column(token) or re.fullmatch(r'[a-z]{3,10}', token):
+            join_key_hints.append(token)
+
+    return {
+        'dimensions': list(dict.fromkeys(dimensions)),
+        'metric': metric,
+        'metric_requires_numeric': metric_requires_numeric,
+        'join_key_hints': list(dict.fromkeys(join_key_hints)),
+        'has_date_filter': ('январ' in query or 'феврал' in query or 'март' in query or
+                            'апрел' in query or 'май' in query or
+                            'мая' in query or 'июн' in query or
+                            'июл' in query or 'август' in query or 'сентябр' in query or
+                            'октябр' in query or 'ноябр' in query or 'декабр' in query),
+        'explicit_count_metric': agg_hint == 'count' and bool(metric_cols),
+    }
+
+
+def _semantic_match_score(col_name: str, desc: str, slot: str) -> float:
+    col_tokens = set(_tokenize(col_name))
+    desc_tokens = set(_tokenize(desc))
+    slot_tokens = [t for t in slot.split('_') if t]
+    slot_set = set(slot_tokens)
+    if _is_label_slot(slot):
+        slot_set = {t for t in slot_set if t not in {'name', 'label', 'title'}}
+
+    score = 0.0
+    if not slot_set:
+        slot_set = set(slot_tokens)
+        if not slot_set:
+            return 0.0
+
+    name_overlap = _fuzzy_overlap_score(slot_set, col_tokens)
+    desc_overlap = _fuzzy_overlap_score(slot_set, desc_tokens)
+    if name_overlap:
+        score += min(0.8, 0.35 * name_overlap)
+    if desc_overlap:
+        score += min(0.6, 0.25 * desc_overlap)
+
+    semantic_hit = name_overlap > 0 or desc_overlap > 0
+
+    if _is_label_slot(slot) and semantic_hit:
+        if any(t in col_tokens for t in ('name', 'label', 'title')):
+            score += 0.25
+        if any(t in desc_tokens for t in ('naimenovanie', 'nazvanie', 'name')):
+            score += 0.2
+        lower = col_name.lower()
+        if lower.startswith(('new_', 'current_', 'actual_')):
+            score += 0.8
+        if lower.startswith(('old_', 'prev_')):
+            score -= 0.8
+
+    if slot == 'date':
+        if any(t in col_tokens for t in _DATE_HINTS):
+            score += 0.6
+        if any(t in desc_tokens for t in ('data', 'date', 'otchetnaya')):
+            score += 0.2
+        lower = col_name.lower()
+        if 'report' in lower or 'otchetn' in desc_tokens:
+            score += 0.2
+        if lower.startswith(('inserted_', 'modified_', 'created_', 'updated_')):
+            score -= 0.2
+
+    if semantic_hit and slot.endswith('_name') and col_name.lower() == slot:
+        score += 0.2
+    if semantic_hit and col_name.lower() == slot:
+        score += 0.3
+
+    return min(score, 1.0)
+
+
+def _choose_best_column(
+    table_structures: dict[str, str],
+    table_types: dict[str, str],
+    schema_loader: Any,
+    slot: str,
+    allowed_tables: set[str] | None = None,
+    require_numeric: bool = False,
+    agg_hint: str | None = None,
+) -> tuple[str, str] | None:
+    """Выбрать лучший источник атрибута/метрики по имени, описанию и метаданным."""
+    best: tuple[float, str, str] | None = None
+
+    for table_key in table_structures:
+        if allowed_tables and table_key not in allowed_tables:
+            continue
+        parts = table_key.split('.', 1)
+        if len(parts) != 2:
+            continue
+        cols_df = schema_loader.get_table_columns(parts[0], parts[1])
+        if cols_df.empty:
+            continue
+        t_type = table_types.get(table_key, 'unknown')
+
+        for _, row in cols_df.iterrows():
+            col_name = str(row.get('column_name', '')).strip()
+            if not col_name:
+                continue
+            dtype = str(row.get('dType', '') or '').lower().strip()
+            if require_numeric and not _is_numeric(dtype):
+                continue
+
+            desc = str(row.get('description', '') or '')
+            semantic = _semantic_match_score(col_name, desc, slot)
+            if semantic <= 0:
+                continue
+            col_tokens = set(_tokenize(col_name))
+            desc_tokens = set(_tokenize(desc))
+            if _is_label_slot(slot) and not (
+                {'name', 'label', 'title'} & col_tokens
+                or {'naimenovanie', 'nazvanie', 'name'} & desc_tokens
+            ):
+                continue
+
+            not_null = float(row.get('not_null_perc', 0) or 0)
+            unique = float(row.get('unique_perc', 0) or 0)
+            score = semantic * 1000 + not_null * 1.5 + min(unique, 100.0) * 0.1
+            lower_name = col_name.lower()
+            if lower_name.startswith(('calc_', 'plan_', 'prev_', 'next_')):
+                score -= 180
+            elif lower_name.startswith(('fact_', 'avg_')):
+                score -= 40
+
+            if _is_label_slot(slot):
+                if t_type in ('dim', 'ref', 'unknown'):
+                    score += 40
+                if t_type == 'fact':
+                    score -= 30
+            elif _is_metric_slot(slot) and t_type == 'fact':
+                score += 25
+            if (agg_hint or '').lower() == 'sum' and any(
+                marker in lower_name for marker in ('perc', 'pct', 'rate', 'avg')
+            ):
+                score -= 320
+
+            candidate = (score, table_key, col_name)
+            if best is None or candidate > best:
+                best = candidate
+
+    if best is None:
+        return None
+    return best[1], best[2]
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +410,7 @@ def select_columns(
     table_types: dict[str, str],
     join_analysis_data: dict[str, Any],
     schema_loader: Any,
+    user_input: str = "",
 ) -> dict[str, Any]:
     """Детерминированно выбрать колонки и JOIN-спецификацию.
 
@@ -146,12 +428,16 @@ def select_columns(
     agg_hint: str = str(intent.get('aggregation_hint') or '').lower().strip()
     date_filters: dict = intent.get('date_filters') or {}
     filter_conditions: list[dict] = intent.get('filter_conditions') or []
+    requested = _derive_requested_slots(user_input, intent)
 
-    has_date_filter = bool(date_filters.get('from') or date_filters.get('to'))
+    has_date_filter = bool(
+        date_filters.get('from') or date_filters.get('to') or requested['has_date_filter']
+    )
     wants_aggregation = agg_hint not in ('', 'null', 'list', 'None')
 
     selected_columns: dict[str, dict] = {}
     per_table_confidence: list[float] = []
+    chosen_metric_ref: tuple[str, str] | None = None
 
     for table_key in table_structures:
         parts = table_key.split('.', 1)
@@ -183,6 +469,8 @@ def select_columns(
             if wants_aggregation and t_type in ('fact', 'unknown') and not is_pk:
                 if _is_numeric(dtype):
                     s = 0.4 + _metric_score(col_name, entities) * 0.6
+                    if requested['metric']:
+                        s = max(s, _semantic_match_score(col_name, desc, requested['metric']))
                     agg_candidates.append((col_name, round(s, 3)))
 
             # ---- group_by score ----
@@ -190,17 +478,23 @@ def select_columns(
             gb_s = 0.0
             if not is_pk:
                 entity_hit = _entity_score(col_name, desc, entities)
+                slot_hit = max(
+                    [_semantic_match_score(col_name, desc, slot) for slot in requested['dimensions']],
+                    default=0.0,
+                )
                 if _is_categorical(dtype):
                     gb_s += 0.25
-                if unique_perc > 0 and unique_perc < 30:
+                if (entity_hit > 0 or slot_hit > 0) and unique_perc > 0 and unique_perc < 30:
                     gb_s += 0.20
-                gb_s += entity_hit * 0.55
+                gb_s += max(entity_hit, slot_hit) * 0.75
                 # Числовые — только если явно упомянуты в entities
-                if _is_numeric(dtype) and entity_hit < 0.3:
+                if _is_numeric(dtype) and max(entity_hit, slot_hit) < 0.3:
                     gb_s = 0.0
-                # Дата — слабый кандидат для group_by (обычно это фильтр)
                 if _is_date(dtype):
-                    gb_s = min(gb_s, 0.2)
+                    if slot_hit >= 0.8:
+                        gb_s = max(gb_s, 0.95)
+                    else:
+                        gb_s = min(gb_s, 0.2)
             if gb_s > 0:
                 gb_candidates.append((col_name, round(gb_s, 3)))
 
@@ -208,6 +502,8 @@ def select_columns(
             flt_s = 0.0
             if _is_date(dtype) and has_date_filter:
                 flt_s = 0.90
+                if _semantic_match_score(col_name, desc, 'date') >= 0.8:
+                    flt_s = 0.98
             for fc in filter_conditions:
                 hint = str(fc.get('column_hint', '') or '').lower()
                 col_lower = col_name.lower()
@@ -290,7 +586,157 @@ def select_columns(
             selected_columns[table_key] = roles
 
     # ---- JOIN-спецификация из join_analysis_data ----
-    join_spec = _build_join_spec(join_analysis_data, selected_columns, schema_loader, table_types)
+    if requested['dimensions']:
+        for slot in requested['dimensions']:
+            choice = _choose_best_column(
+                table_structures, table_types, schema_loader, slot
+            )
+            if not choice:
+                continue
+            table_key, col_name = choice
+            roles = selected_columns.setdefault(table_key, {})
+            roles.setdefault('select', [])
+            roles.setdefault('group_by', [])
+            if col_name not in roles['select']:
+                roles['select'].append(col_name)
+            if col_name not in roles['group_by']:
+                roles['group_by'].append(col_name)
+            if slot == 'date':
+                roles.setdefault('filter', [])
+                if col_name not in roles['filter'] and has_date_filter:
+                    roles['filter'].append(col_name)
+
+    if wants_aggregation and agg_hint != 'count' and requested['metric']:
+        metric_choice = _choose_best_column(
+            table_structures,
+            table_types,
+            schema_loader,
+            requested['metric'],
+            require_numeric=requested.get('metric_requires_numeric', True),
+            agg_hint=agg_hint,
+        )
+        if metric_choice:
+            chosen_metric_ref = metric_choice
+            table_key, col_name = metric_choice
+            roles = selected_columns.setdefault(table_key, {})
+            roles.setdefault('select', [])
+            roles.setdefault('aggregate', [])
+            if col_name not in roles['select']:
+                roles['select'].append(col_name)
+            if col_name not in roles['aggregate']:
+                roles['aggregate'].append(col_name)
+
+    if requested['explicit_count_metric']:
+        metric_choice = _choose_best_column(
+            table_structures,
+            table_types,
+            schema_loader,
+            requested['metric'] or '',
+            require_numeric=requested.get('metric_requires_numeric', False),
+            agg_hint=agg_hint,
+        )
+        if metric_choice:
+            chosen_metric_ref = metric_choice
+            table_key, col_name = metric_choice
+            roles = selected_columns.setdefault(table_key, {})
+            roles.setdefault('select', [])
+            roles.setdefault('aggregate', [])
+            if col_name not in roles['select']:
+                roles['select'].append(col_name)
+            if col_name not in roles['aggregate']:
+                roles['aggregate'].append(col_name)
+
+    if has_date_filter:
+        date_choice = _choose_best_column(
+            table_structures, table_types, schema_loader, 'date'
+        )
+        if date_choice:
+            table_key, col_name = date_choice
+            roles = selected_columns.setdefault(table_key, {})
+            roles.setdefault('filter', [])
+            if col_name not in roles['filter']:
+                roles['filter'].append(col_name)
+
+    if agg_hint == 'count' and not requested['explicit_count_metric']:
+        query_norm = _normalize_query_text(user_input)
+        explicit_positions: list[tuple[int, str]] = []
+        for t in table_structures:
+            table_name = t.split('.', 1)[-1].lower()
+            pos = query_norm.find(table_name)
+            if pos >= 0:
+                explicit_positions.append((pos, t))
+        explicit_positions.sort()
+        main_table = explicit_positions[0][1] if explicit_positions else None
+        if main_table is None:
+            main_table = next((t for t, tp in table_types.items() if tp == 'fact'), None)
+        if main_table is None:
+            main_table = next(iter(table_structures), None)
+        if main_table:
+            roles = selected_columns.setdefault(main_table, {})
+            roles.setdefault('aggregate', [])
+            if '*' not in roles['aggregate']:
+                roles['aggregate'].append('*')
+
+    if requested['dimensions']:
+        allowed_refs: set[tuple[str, str]] = set()
+        for slot in requested['dimensions']:
+            choice = _choose_best_column(
+                table_structures, table_types, schema_loader, slot
+            )
+            if choice:
+                allowed_refs.add(choice)
+        if has_date_filter:
+            choice = _choose_best_column(
+                table_structures, table_types, schema_loader, 'date'
+            )
+            if choice:
+                allowed_refs.add(choice)
+        if requested['metric']:
+            choice = _choose_best_column(
+                table_structures,
+                table_types,
+                schema_loader,
+                requested['metric'],
+                require_numeric=requested.get('metric_requires_numeric', True),
+                agg_hint=agg_hint,
+            )
+            if choice:
+                allowed_refs.add(choice)
+                chosen_metric_ref = choice
+
+        for table_key, roles in list(selected_columns.items()):
+            if chosen_metric_ref and roles.get('aggregate'):
+                keep_agg = [
+                    c for c in roles['aggregate']
+                    if (table_key, c) == chosen_metric_ref or c == '*'
+                ]
+                if keep_agg:
+                    roles['aggregate'] = keep_agg[:1]
+                else:
+                    roles.pop('aggregate', None)
+            for role in ('select', 'group_by', 'filter'):
+                cols = roles.get(role, [])
+                if not cols:
+                    continue
+                protected = set(roles.get('aggregate', [])) if role != 'filter' else set()
+                pruned = [
+                    c for c in cols
+                    if (table_key, c) in allowed_refs or c in protected
+                ]
+                if pruned:
+                    roles[role] = pruned
+                else:
+                    roles.pop(role, None)
+            if not roles:
+                selected_columns.pop(table_key, None)
+
+    join_spec = _build_join_spec(
+        join_analysis_data,
+        selected_columns,
+        schema_loader,
+        table_types,
+        user_input=user_input,
+    )
 
     # ---- Итоговая confidence ----
     if not selected_columns:
@@ -301,6 +747,12 @@ def select_columns(
         reason = 'Нет данных о колонках'
     else:
         overall = sum(per_table_confidence) / len(per_table_confidence)
+        if requested['dimensions']:
+            overall += 0.10
+        if requested['metric'] and any(
+            roles.get('aggregate') for roles in selected_columns.values()
+        ):
+            overall += 0.10
         # Штраф: мультитабличный запрос без JOIN-ключей
         if len(selected_columns) > 1 and not join_spec:
             overall *= 0.55
@@ -314,6 +766,7 @@ def select_columns(
                 f'join-ключей: {len(join_spec)}, '
                 f'avg col confidence: {overall:.2f}'
             )
+        overall = min(overall, 0.99)
 
     logger.info('ColumnSelectorDet: %s', reason)
 
@@ -439,6 +892,7 @@ def _build_join_spec(
     selected_columns: dict[str, dict],
     schema_loader: Any,
     table_types: dict[str, str],
+    user_input: str = "",
 ) -> list[dict[str, Any]]:
     """Построить join_spec из pre-computed join_analysis_data (детерминированно).
 
@@ -465,7 +919,7 @@ def _build_join_spec(
             continue
 
         text = data.get('text', '')
-        cand = _parse_top_candidate(text, t1, t2)
+        cand = _pick_join_candidate(text, t1, t2, schema_loader, user_input=user_input)
         if not cand:
             continue
 
@@ -485,13 +939,135 @@ def _build_join_spec(
         if not safe:
             entry['risk'] = f'{col2} не уникален в {t2}'
 
+        pair_entries = [entry]
         join_spec.append(entry)
 
         # Если dim-таблица имеет составной PK — добавляем пары для недостающих колонок
         extra = _complete_composite_join(entry, t1, t2, table_types, schema_loader)
         join_spec.extend(extra)
+        pair_entries.extend(extra)
+        _apply_composite_safety(pair_entries, schema_loader, table_types)
 
     return join_spec
+
+
+def _apply_composite_safety(
+    pair_entries: list[dict[str, Any]],
+    schema_loader: Any,
+    table_types: dict[str, str],
+) -> None:
+    """Если составной join покрывает уникальный ключ одной стороны, считаем его safe."""
+    if len(pair_entries) < 2:
+        return
+
+    left_table = ".".join(pair_entries[0]["left"].split(".")[:2])
+    right_table = ".".join(pair_entries[0]["right"].split(".")[:2])
+    left_cols = [e["left"].rsplit(".", 1)[-1] for e in pair_entries]
+    right_cols = [e["right"].rsplit(".", 1)[-1] for e in pair_entries]
+
+    candidate_sides = [
+        (left_table, left_cols, table_types.get(left_table, "unknown")),
+        (right_table, right_cols, table_types.get(right_table, "unknown")),
+    ]
+    candidate_sides.sort(key=lambda x: 0 if x[2] in {"dim", "ref"} else 1)
+
+    for table_full, cols, _ttype in candidate_sides:
+        parts = table_full.split(".", 1)
+        if len(parts) != 2:
+            continue
+        uniq = schema_loader.check_key_uniqueness(parts[0], parts[1], cols)
+        if uniq.get("is_unique") is True:
+            for entry in pair_entries:
+                entry["safe"] = True
+                entry.pop("risk", None)
+                lt = ".".join(entry["left"].split(".")[:2])
+                rt = ".".join(entry["right"].split(".")[:2])
+                entry["strategy"] = _infer_strategy(
+                    table_types.get(lt, "unknown"),
+                    table_types.get(rt, "unknown"),
+                    True,
+                )
+            return
+
+
+def _pick_join_candidate(
+    text: str,
+    t1: str,
+    t2: str,
+    schema_loader: Any,
+    user_input: str = "",
+) -> dict[str, str] | None:
+    """Выбрать join-кандидат с учётом явного ключа из запроса пользователя."""
+    query = _normalize_query_text(user_input)
+    t1_parts = t1.split('.', 1)
+    t2_parts = t2.split('.', 1)
+    if query and len(t1_parts) == 2 and len(t2_parts) == 2:
+        cols1 = schema_loader.get_table_columns(t1_parts[0], t1_parts[1])
+        cols2 = schema_loader.get_table_columns(t2_parts[0], t2_parts[1])
+        if cols1.empty or cols2.empty:
+            return _parse_top_candidate(text, t1, t2)
+        rows1 = {
+            str(row.get('column_name', '')).strip(): row
+            for _, row in cols1.iterrows()
+            if str(row.get('column_name', '')).strip()
+        }
+        rows2 = {
+            str(row.get('column_name', '')).strip(): row
+            for _, row in cols2.iterrows()
+            if str(row.get('column_name', '')).strip()
+        }
+        names1 = set(rows1)
+        names2 = set(rows2)
+
+        def _is_key_like(row: Any) -> bool:
+            name = str(row.get('column_name', '')).lower()
+            if bool(row.get('is_primary_key', False)):
+                return True
+            if name.endswith(('_id', '_code', '_num', '_no')):
+                return True
+            unique = float(row.get('unique_perc', 0) or 0)
+            not_null = float(row.get('not_null_perc', 0) or 0)
+            return unique >= 50 and not_null >= 50
+
+        query_identifiers = {
+            token.lower()
+            for token in re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', query)
+        }
+        common_exact = sorted(
+            names1 & names2,
+            key=lambda name: (
+                not name.lower().endswith(('_id', '_code')),
+                len(name),
+                name,
+            ),
+        )
+        for hint in common_exact:
+            if (
+                hint.lower() in query_identifiers
+                and (_is_key_like(rows1[hint]) or _is_key_like(rows2[hint]))
+            ):
+                return {'col1': hint, 'col2': hint}
+
+        norm_left = {_norm_col_name(name): name for name in names1}
+        norm_right = {_norm_col_name(name): name for name in names2}
+        common_normalized = sorted(
+            set(norm_left) & set(norm_right),
+            key=lambda name: (
+                not name.endswith(('_id', '_code')),
+                len(name),
+                name,
+            ),
+        )
+        for hint in common_normalized:
+            left_name = norm_left[hint]
+            right_name = norm_right[hint]
+            if (
+                hint in query_identifiers
+                and (_is_key_like(rows1[left_name]) or _is_key_like(rows2[right_name]))
+            ):
+                return {'col1': left_name, 'col2': right_name}
+
+    return _parse_top_candidate(text, t1, t2)
 
 
 def _parse_top_candidate(text: str, t1: str, t2: str) -> dict[str, str] | None:
@@ -504,6 +1080,14 @@ def _parse_top_candidate(text: str, t1: str, t2: str) -> dict[str, str] | None:
     """
     if not text:
         return None
+
+    line_match = re.search(
+        r'^\s*\[\d+(?:\.\d+)?\]\s+([a-zA-Z_][a-zA-Z0-9_]*)[^↔\n]*↔\s+([a-zA-Z_][a-zA-Z0-9_]*)',
+        text,
+        re.MULTILINE,
+    )
+    if line_match:
+        return {'col1': line_match.group(1), 'col2': line_match.group(2)}
 
     def _escape(s: str) -> str:
         return re.escape(s)

@@ -1,9 +1,11 @@
-# Агрегация с SUM
-query: "Покажи сумму продаж по регионам за последний месяц"
+# Агрегация с SUM по реальным метафайлам
+query: "Покажи сумму оттока по сегментам за январь 2024"
 intent_must_be: "analytics"
+complexity_must_be: "single_table"
 sql_must_contain:
   - "SUM"
   - "GROUP BY"
+  - "UZP_DWH_FACT_OUTFLOW"
 sql_must_not_contain:
   - "AS \"" # кириллица в алиасах
 max_retries: 0

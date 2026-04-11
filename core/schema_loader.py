@@ -1,6 +1,7 @@
 """Загрузка и индексирование CSV-файлов со схемой БД."""
 
 import logging
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -20,6 +21,26 @@ try:
 except ImportError:
     _TFIDF_AVAILABLE = False
     logger.info("scikit-learn не установлен — TF-IDF поиск недоступен, используется keyword поиск")
+
+
+def _literal_contains(series: pd.Series, needle: str) -> pd.Series:
+    """Literal substring search for user input without regex interpretation."""
+    return series.fillna("").astype(str).str.lower().str.contains(needle.lower(), regex=False)
+
+
+def _should_run_semantic_search(query: str) -> bool:
+    """Disable semantic fallback for regex-like or punctuation-heavy user input."""
+    if not query.strip():
+        return False
+    if re.search(r"[\[\]\(\)\{\}\+\*\?\|\^\$\\]", query):
+        return False
+    tokens = re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9_]+", query)
+    return any(len(token) >= 2 for token in tokens)
+
+
+def _should_expand_synonyms(query: str) -> bool:
+    """Synonym expansion is helpful for natural language, but harmful for literal fragments."""
+    return _should_run_semantic_search(query)
 
 
 class SchemaLoader:
@@ -155,7 +176,7 @@ class SchemaLoader:
             return []
 
         # Расширяем запрос синонимами для лучшего покрытия
-        synonyms = expand_with_synonyms(query)
+        synonyms = expand_with_synonyms(query) if _should_expand_synonyms(query) else []
         expanded = f"{query} {' '.join(synonyms)}".lower()
         # Разбиваем snake_case
         expanded = expanded.replace("_", " ")
@@ -190,25 +211,25 @@ class SchemaLoader:
             return df
 
         q = query.lower()
-        synonyms = expand_with_synonyms(query)
+        synonyms = expand_with_synonyms(query) if _should_expand_synonyms(query) else []
 
         # 1. Keyword поиск
         mask = (
-            df["table_name"].str.lower().str.contains(q, na=False)
-            | df["schema_name"].str.lower().str.contains(q, na=False)
-            | df["description"].str.lower().str.contains(q, na=False)
+            _literal_contains(df["table_name"], q)
+            | _literal_contains(df["schema_name"], q)
+            | _literal_contains(df["description"], q)
         )
         for syn in synonyms:
             mask = mask | (
-                df["table_name"].str.lower().str.contains(syn, na=False)
-                | df["schema_name"].str.lower().str.contains(syn, na=False)
-                | df["description"].str.lower().str.contains(syn, na=False)
+                _literal_contains(df["table_name"], syn)
+                | _literal_contains(df["schema_name"], syn)
+                | _literal_contains(df["description"], syn)
             )
         keyword_result = df[mask].copy()
         keyword_result["_score"] = 2.0  # Keyword match — высокий приоритет
 
         # 2. TF-IDF поиск
-        tfidf_hits = self._tfidf_search(query, top_n=top_n)
+        tfidf_hits = self._tfidf_search(query, top_n=top_n) if _should_run_semantic_search(query) else []
         if tfidf_hits:
             tfidf_rows = []
             for schema, table, score in tfidf_hits:
@@ -263,7 +284,7 @@ class SchemaLoader:
             DataFrame с уникальными schema_name, table_name.
         """
         df = self.attrs_df
-        mask = df["column_name"].str.lower().str.contains(column_name.lower(), na=False)
+        mask = _literal_contains(df["column_name"], column_name)
         result = df[mask][["schema_name", "table_name", "column_name"]].drop_duplicates()
         logger.info("find_tables_with_column('%s'): найдено %d", column_name, len(result))
         return result
@@ -298,22 +319,30 @@ class SchemaLoader:
             DataFrame с результатами (schema, table, column, description).
         """
         q = text.lower()
-        synonyms = expand_with_synonyms(text)
+        synonyms = expand_with_synonyms(text) if _should_expand_synonyms(text) else []
 
-        # Поиск в описаниях таблиц
+        # Поиск в описаниях и именах таблиц
         tdf = self.tables_df
-        t_mask = tdf["description"].str.lower().str.contains(q, na=False)
+        t_mask = _literal_contains(tdf["description"], q) | _literal_contains(tdf["table_name"], q)
         for syn in synonyms:
-            t_mask = t_mask | tdf["description"].str.lower().str.contains(syn, na=False)
+            t_mask = (
+                t_mask
+                | _literal_contains(tdf["description"], syn)
+                | _literal_contains(tdf["table_name"], syn)
+            )
         tables_found = tdf[t_mask][["schema_name", "table_name", "description"]].copy()
         tables_found["column_name"] = ""
         tables_found["source"] = "table"
 
-        # Поиск в описаниях атрибутов
+        # Поиск в описаниях и именах атрибутов
         adf = self.attrs_df
-        a_mask = adf["description"].str.lower().str.contains(q, na=False)
+        a_mask = _literal_contains(adf["description"], q) | _literal_contains(adf["column_name"], q)
         for syn in synonyms:
-            a_mask = a_mask | adf["description"].str.lower().str.contains(syn, na=False)
+            a_mask = (
+                a_mask
+                | _literal_contains(adf["description"], syn)
+                | _literal_contains(adf["column_name"], syn)
+            )
         attrs_found = adf[a_mask][
             ["schema_name", "table_name", "column_name", "description"]
         ].copy()

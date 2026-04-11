@@ -74,16 +74,16 @@ _STRATEGY_EXAMPLES: dict[str, str] = {
         "SELECT s.client_id, s.total_sales, p.total_paid\n"
         "FROM sales_agg s JOIN payments_agg p ON p.client_id = s.client_id;\n\n"
         "Пример — ФАКТ + таблица с атрибутом (DISTINCT ON по ключу):\n"
-        "WITH epk_seg AS (\n"
-        "    SELECT DISTINCT ON (inn) inn, segment_name\n"
-        "    FROM schema.epk_consolidation ORDER BY inn\n"
-        "), outflow_agg AS (\n"
-        "    SELECT report_dt, inn, SUM(outflow_qty) AS total_outflow\n"
-        "    FROM schema.fact_outflow GROUP BY report_dt, inn\n"
+        "WITH customer_seg AS (\n"
+        "    SELECT DISTINCT ON (customer_id) customer_id, customer_segment\n"
+        "    FROM schema.customer_segments ORDER BY customer_id, updated_at DESC\n"
+        "), order_agg AS (\n"
+        "    SELECT order_dt, customer_id, SUM(order_amount) AS total_amount\n"
+        "    FROM schema.fact_orders GROUP BY order_dt, customer_id\n"
         ")\n"
-        "SELECT o.report_dt, e.segment_name, SUM(o.total_outflow) AS total_outflow\n"
-        "FROM outflow_agg o JOIN epk_seg e ON e.inn = o.inn\n"
-        "GROUP BY o.report_dt, e.segment_name;"
+        "SELECT o.order_dt, s.customer_segment, SUM(o.total_amount) AS total_amount\n"
+        "FROM order_agg o JOIN customer_seg s ON s.customer_id = o.customer_id\n"
+        "GROUP BY o.order_dt, s.customer_segment;"
     ),
     "dim_dim_join": (
         "Пример — СПРАВОЧНИК + СПРАВОЧНИК (уникальные выборки из обеих сторон):\n"
@@ -231,6 +231,7 @@ class SqlPipelineNodes:
             join_spec=join_spec,
             table_types=table_types,
             join_analysis_data=join_analysis_data,
+            user_input=state.get("user_input", ""),
         )
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
@@ -693,7 +694,7 @@ class SqlPipelineNodes:
 
         # Подсчёт строк
         if structured_payload is not None:
-            row_count = max(0, int(structured_payload.get("total_rows", 0)))
+            row_count = max(0, int(structured_payload.get("rows_returned", 0)))
         else:
             data_lines = [
                 ln for ln in rendered_result.split("\n") if ln.strip().startswith("|")

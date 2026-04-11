@@ -37,59 +37,59 @@ logger = logging.getLogger(__name__)
 SQL_FEW_SHOT_EXAMPLES = (
     "=== ПРИМЕРЫ SQL (используй как образец стиля) ===\n\n"
     "1. Агрегация + фильтр по дате:\n"
-    "   SELECT region, COUNT(DISTINCT client_id) AS unique_clients\n"
-    "   FROM dm.sales\n"
-    "   WHERE sale_date >= '2024-01-01'::date AND sale_date < '2024-02-01'::date\n"
-    "   GROUP BY region\n"
-    "   ORDER BY unique_clients DESC;\n\n"
+    "   SELECT customer_segment, COUNT(DISTINCT customer_id) AS customer_cnt\n"
+    "   FROM dm.orders\n"
+    "   WHERE order_date >= '2024-01-01'::date AND order_date < '2024-02-01'::date\n"
+    "   GROUP BY customer_segment\n"
+    "   ORDER BY customer_cnt DESC;\n\n"
     "2. СПРАВОЧНИК + ФАКТ (агрегация фактов в подзапросе):\n"
-    "   SELECT c.client_id, c.name, agg.total_sales\n"
-    "   FROM dm.clients c\n"
+    "   SELECT c.customer_id, c.customer_name, agg.total_amount\n"
+    "   FROM dm.customers c\n"
     "   JOIN (\n"
-    "       SELECT client_id, SUM(amount) AS total_sales\n"
-    "       FROM dm.sales GROUP BY client_id\n"
-    "   ) agg ON agg.client_id = c.client_id;\n\n"
+    "       SELECT customer_id, SUM(order_amount) AS total_amount\n"
+    "       FROM dm.orders GROUP BY customer_id\n"
+    "   ) agg ON agg.customer_id = c.customer_id;\n\n"
     "3. ФАКТ + СПРАВОЧНИК (уникальная выборка из справочника):\n"
-    "   SELECT s.sale_id, s.amount, d.name\n"
-    "   FROM dm.sales s\n"
+    "   SELECT o.order_id, o.order_amount, p.product_name\n"
+    "   FROM dm.orders o\n"
     "   JOIN (\n"
-    "       SELECT DISTINCT ON (client_id) client_id, name\n"
-    "       FROM dm.clients ORDER BY client_id, updated_at DESC\n"
-    "   ) d ON d.client_id = s.client_id;\n\n"
+    "       SELECT DISTINCT ON (product_id) product_id, product_name\n"
+    "       FROM dm.products ORDER BY product_id, updated_at DESC\n"
+    "   ) p ON p.product_id = o.product_id;\n\n"
     "4. ФАКТ + ФАКТ (обе стороны агрегированы в CTE):\n"
-    "   WITH sales_agg AS (\n"
-    "       SELECT client_id, SUM(amount) AS total_sales\n"
-    "       FROM dm.sales GROUP BY client_id\n"
+    "   WITH orders_agg AS (\n"
+    "       SELECT customer_id, SUM(order_amount) AS total_orders\n"
+    "       FROM dm.orders GROUP BY customer_id\n"
     "   ), payments_agg AS (\n"
-    "       SELECT client_id, SUM(payment) AS total_paid\n"
-    "       FROM dm.payments GROUP BY client_id\n"
+    "       SELECT customer_id, SUM(payment_amount) AS total_paid\n"
+    "       FROM dm.payments GROUP BY customer_id\n"
     "   )\n"
-    "   SELECT s.client_id, s.total_sales, p.total_paid\n"
-    "   FROM sales_agg s\n"
-    "   JOIN payments_agg p ON p.client_id = s.client_id;\n\n"
+    "   SELECT o.customer_id, o.total_orders, p.total_paid\n"
+    "   FROM orders_agg o\n"
+    "   JOIN payments_agg p ON p.customer_id = o.customer_id;\n\n"
     "5. СПРАВОЧНИК + СПРАВОЧНИК (уникальные выборки из обеих сторон):\n"
     "   WITH d1 AS (\n"
-    "       SELECT DISTINCT ON (org_id) org_id, org_name\n"
-    "       FROM dm.organizations ORDER BY org_id, effective_date DESC\n"
+    "       SELECT DISTINCT ON (contract_id) contract_id, contract_type\n"
+    "       FROM dm.contracts ORDER BY contract_id, effective_date DESC\n"
     "   ), d2 AS (\n"
-    "       SELECT DISTINCT ON (org_id) org_id, region\n"
-    "       FROM dm.org_regions ORDER BY org_id, effective_date DESC\n"
+    "       SELECT DISTINCT ON (contract_id) contract_id, risk_level\n"
+    "       FROM dm.contract_risk ORDER BY contract_id, effective_date DESC\n"
     "   )\n"
-    "   SELECT d1.org_id, d1.org_name, d2.region\n"
-    "   FROM d1 JOIN d2 ON d2.org_id = d1.org_id;\n\n"
+    "   SELECT d1.contract_id, d1.contract_type, d2.risk_level\n"
+    "   FROM d1 JOIN d2 ON d2.contract_id = d1.contract_id;\n\n"
     "6. NULL-обработка и COALESCE:\n"
-    "   SELECT client_id, COALESCE(phone, email, 'нет контакта') AS contact\n"
-    "   FROM dm.clients\n"
-    "   WHERE status IS NOT NULL AND region = 'Москва';\n\n"
+    "   SELECT customer_id, COALESCE(phone, email, 'нет контакта') AS contact\n"
+    "   FROM dm.customers\n"
+    "   WHERE status IS NOT NULL AND region_name = 'North';\n\n"
     "7. Поиск через search_by_description (диагностика):\n"
-    '   {"tool": "search_by_description", "args": {"query": "отток клиентов"}}\n'
+    '   {"tool": "search_by_description", "args": {"query": "заказы клиентов"}}\n'
 )
 
 SQL_RULES = (
     "Правила SQL (Greenplum / PostgreSQL):\n"
     "- Имена таблиц ВСЕГДА в формате schema.table\n"
     "- Алиасы СТРОГО на английском: AS outflow, AS total_cnt\n"
-    '- ЗАПРЕЩЕНО: AS "отток", AS "выручка", кириллица в алиасах и именах колонок\n'
+    '- ЗАПРЕЩЕНО: AS "сумма", AS "выручка", кириллица в алиасах и именах колонок\n'
     "- Изучи РАЗВЕДКУ ТАБЛИЦ (если есть) перед написанием SQL\n"
     "- Пойми гранулярность (что = одна строка) перед COUNT/агрегатами\n"
     "- GROUP BY: перечисли ВСЕ не-агрегированные колонки из SELECT\n"
@@ -695,16 +695,23 @@ class BaseNodeMixin:
         if not isinstance(data, dict):
             return None
 
-        required = {"message", "preview_markdown", "total_rows", "is_empty", "saved_file", "mode"}
-        if not required.issubset(set(data.keys())):
+        required = {"message", "preview_markdown", "is_empty", "saved_file", "mode"}
+        has_new_shape = {"rows_returned", "rows_saved", "is_truncated"}.issubset(set(data.keys()))
+        has_legacy_shape = "total_rows" in data
+        if not required.issubset(set(data.keys())) or not (has_new_shape or has_legacy_shape):
             return None
 
         try:
+            rows_returned = int(data.get("rows_returned", data.get("total_rows", 0)))
+            rows_saved = int(data.get("rows_saved", data.get("total_rows", 0)))
+            is_truncated = bool(data.get("is_truncated", False))
             return {
                 "message": str(data.get("message", "")),
                 "preview_markdown": str(data.get("preview_markdown", "")),
-                "total_rows": int(data.get("total_rows", 0)),
+                "rows_returned": rows_returned,
+                "rows_saved": rows_saved,
                 "is_empty": bool(data.get("is_empty", False)),
+                "is_truncated": is_truncated,
                 "saved_file": data.get("saved_file"),
                 "mode": str(data.get("mode", "")),
             }
@@ -722,6 +729,8 @@ class BaseNodeMixin:
         preview = p.get("preview_markdown", "")
         if preview:
             parts.append(preview)
+        if p.get("mode") == "preview" and p.get("is_truncated"):
+            parts.append("Результат усечён до preview-режима.")
         saved_file = p.get("saved_file")
         if saved_file:
             parts.append(f"Файл: {saved_file}")

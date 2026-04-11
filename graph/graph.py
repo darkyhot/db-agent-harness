@@ -59,6 +59,9 @@ def _route_after_intent_classifier(state: AgentState) -> str:
     if limit:
         return limit
 
+    if state.get("needs_clarification"):
+        return END
+
     intent = state.get("intent", {})
 
     # Вопрос по схеме — сразу к summarizer (ответ из каталога)
@@ -266,6 +269,7 @@ def build_graph(
     # === Линейная цепочка: intent → tables → explore → columns → plan → write ===
     # intent_classifier → conditional routing
     graph.add_conditional_edges("intent_classifier", _route_after_intent_classifier, {
+        END: END,
         "summarizer": "summarizer",
         "tool_dispatcher": "tool_dispatcher",
         "table_resolver": "table_resolver",
@@ -358,6 +362,8 @@ def create_initial_state(
         user_input=user_input,
         needs_confirmation=False,
         confirmation_message="",
+        needs_clarification=False,
+        clarification_message="",
         needs_disambiguation=False,
         disambiguation_options=[],
         tables_context="",

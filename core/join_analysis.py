@@ -111,11 +111,18 @@ def detect_table_type(table_name: str, cols_df: pd.DataFrame) -> str:
         return "dim"
     if re.search(r"(^|_)(ref|dict|lookup|directory)($|_)", t):
         return "ref"
+    if t.endswith("_m") or t.endswith("_funnel"):
+        return "fact"
     # Эвристика по структуре колонок
     if not cols_df.empty and "is_primary_key" in cols_df.columns:
         pk_ratio = cols_df["is_primary_key"].astype(bool).mean()
         if pk_ratio > 0.3:
             return "dim"
+        col_names = {str(c).lower() for c in cols_df.get("column_name", [])}
+        if {"report_dt", "amt"} & col_names:
+            return "fact"
+        if any(c.endswith("_qty") or c.endswith("_amt") or c.endswith("_perc") for c in col_names):
+            return "fact"
     return "unknown"
 
 

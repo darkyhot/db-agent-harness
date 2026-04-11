@@ -50,6 +50,7 @@ class TestCreateInitialState:
             "messages", "plan", "current_step", "tool_calls",
             "last_error", "retry_count", "sql_to_validate",
             "final_answer", "user_input", "needs_confirmation",
+            "needs_clarification", "clarification_message",
             "tables_context", "graph_iterations",
         ]
         for field in required:

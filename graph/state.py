@@ -25,6 +25,8 @@ class AgentState(TypedDict):
     user_input: str
     needs_confirmation: bool
     confirmation_message: str
+    needs_clarification: bool
+    clarification_message: str
     needs_disambiguation: bool
     disambiguation_options: list
     graph_iterations: int
@@ -47,8 +49,10 @@ class AgentState(TypedDict):
     selected_tables: list[tuple[str, str]]
     # Пример: [("dm", "sales"), ("dm", "managers")]
 
-    # table_explorer → структурированные данные по таблицам (вместо монолитного tables_context)
-    tables_context: str  # DEPRECATED: сохраняется для обратной совместимости
+    # table_explorer → структурированные данные по таблицам (источник истины ниже).
+    # tables_context оставлен только как compatibility shim для summarizer/старых call sites
+    # и должен быть удалён после полного ухода от строкового контекста.
+    tables_context: str
     table_structures: dict[str, str]
     # {"dm.sales": "column_name | dtype | is_pk | ...", ...}
     table_samples: dict[str, str]

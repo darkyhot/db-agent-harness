@@ -1,9 +1,10 @@
-query: "Сколько клиентов в каждом регионе?"
+query: "Покажи количество строк по segment_name из uzp_dwh_fact_outflow"
 intent_must_be: analytics
 complexity_must_be: single_table
 sql_must_contain:
   - COUNT
   - GROUP BY
+  - "SEGMENT_NAME"
 sql_must_not_contain:
   - "SELECT *"
   - JOIN

@@ -1,9 +1,10 @@
-# Базовый подсчёт строк
-query: "Сколько клиентов в базе?"
+# Базовый подсчёт строк по витрине оттока
+query: "Сколько записей в витрине оттока?"
 intent_must_be: "analytics"
 complexity_must_be: "single_table"
 sql_must_contain:
   - "COUNT"
+  - "UZP_DWH_FACT_OUTFLOW"
 sql_must_not_contain:
   - "JOIN"
 max_retries: 0

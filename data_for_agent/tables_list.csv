@@ -1,0 +1,8 @@
+schema_name,table_name,description
+schema,uzp_dwh_fact_outflow,Информация по фактическим оттокам
+schema,uzp_dim_gosb,Справочник ТБ и ГОСБ
+schema,uzp_data_split_mzp_sale_funnel,Сплит МЗП Воронка продаж
+schema,uzp_data_payroll_m,ЗП ведомости (месяц)
+schema,uzp_data_emp_epk_assignment,Данные по закреплению сотрудников за организациями
+schema,uzp_data_epk_consolidation,Данные по атрибутам ЕПК организаций
+schema,uzp_dwh_sap_staff_emp,Данные штатной численности сотрудников

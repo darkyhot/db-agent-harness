@@ -1,0 +1,523 @@
+"""Детерминированная статическая проверка SQL до отправки в БД.
+
+Не использует LLM. Работает через sqlparse + regex + schema_loader.
+Запускается между sql_writer и sql_validator, ловит:
+- галлюцинированные колонки (не существуют в каталоге)
+- кириллические алиасы
+- SELECT * (запрещено правилами)
+- GROUP BY не покрывает все не-агрегированные SELECT-колонки
+"""
+
+import logging
+import re
+from dataclasses import dataclass, field
+
+import sqlparse
+from sqlparse.sql import Identifier, IdentifierList, Function, Where
+from sqlparse.tokens import Keyword, DML, Wildcard
+
+logger = logging.getLogger(__name__)
+
+# Регулярка для кириллицы
+_CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
+
+# Агрегатные функции SQL
+_AGGREGATE_FUNCS = frozenset({
+    "count", "sum", "avg", "min", "max",
+    "stddev", "variance", "percentile_cont", "percentile_disc",
+    "string_agg", "array_agg", "json_agg", "bool_and", "bool_or",
+})
+
+
+@dataclass
+class StaticCheckResult:
+    """Результат статической проверки SQL."""
+    is_valid: bool = True
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def add_error(self, msg: str) -> None:
+        self.errors.append(msg)
+        self.is_valid = False
+        logger.warning("StaticChecker error: %s", msg)
+
+    def add_warning(self, msg: str) -> None:
+        self.warnings.append(msg)
+        logger.info("StaticChecker warning: %s", msg)
+
+    def summary(self) -> str:
+        lines = []
+        if self.errors:
+            lines.append("Статические ошибки:")
+            lines.extend(f"  ✗ {e}" for e in self.errors)
+        if self.warnings:
+            lines.append("Предупреждения:")
+            lines.extend(f"  ⚠ {w}" for w in self.warnings)
+        return "\n".join(lines) if lines else "OK"
+
+
+def _extract_table_aliases(parsed) -> dict[str, str]:
+    """Извлечь маппинг алиас → schema.table из FROM/JOIN клауз.
+
+    Returns:
+        {"s": "dm.sales", "c": "dm.clients", ...}
+    """
+    aliases: dict[str, str] = {}
+
+    def _process_identifier(identifier: Identifier) -> None:
+        alias = identifier.get_alias()
+        real_name = identifier.get_real_name()
+        schema = identifier.get_parent_name()
+        if real_name:
+            full = f"{schema}.{real_name}" if schema else real_name
+            key = alias if alias else real_name
+            aliases[key.lower()] = full.lower()
+
+    for token in parsed.tokens:
+        # FROM clause
+        if token.ttype is Keyword and token.normalized in ("FROM", "JOIN",
+                                                            "LEFT JOIN", "RIGHT JOIN",
+                                                            "INNER JOIN", "FULL JOIN",
+                                                            "CROSS JOIN"):
+            continue
+        if hasattr(token, "tokens"):
+            for sub in token.tokens:
+                if isinstance(sub, Identifier):
+                    _process_identifier(sub)
+                elif isinstance(sub, IdentifierList):
+                    for item in sub.get_identifiers():
+                        if isinstance(item, Identifier):
+                            _process_identifier(item)
+
+    return aliases
+
+
+def _extract_tables_from_sql(sql: str) -> set[tuple[str, str]]:
+    """Извлечь все упоминания schema.table из SQL через regex.
+
+    Returns:
+        {("dm", "sales"), ("dm", "clients"), ...}
+    """
+    pattern = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b')
+    tables: set[tuple[str, str]] = set()
+    for m in pattern.finditer(sql):
+        schema, table = m.group(1).lower(), m.group(2).lower()
+        # Исключаем alias.column паттерны (alias обычно короткий, без _)
+        # Настоящие schema.table имеют schema из реального каталога — проверяется выше
+        tables.add((schema, table))
+    return tables
+
+
+def _check_cyrillic_aliases(sql: str, result: StaticCheckResult) -> None:
+    """Проверить наличие кириллицы в SQL-алиасах."""
+    # Ищем паттерн: AS <что-то с кириллицей>
+    alias_pattern = re.compile(
+        r'\bAS\s+(?:"([^"]+)"|\'([^\']+)\'|([^\s,\)]+))',
+        re.IGNORECASE,
+    )
+    for m in alias_pattern.finditer(sql):
+        alias = m.group(1) or m.group(2) or m.group(3) or ""
+        if _CYRILLIC_RE.search(alias):
+            result.add_error(
+                f"Кириллица в алиасе: AS {alias!r}. "
+                "Алиасы должны быть только на английском."
+            )
+
+
+def _check_select_star(sql: str, result: StaticCheckResult) -> None:
+    """Проверить наличие SELECT * в финальном SELECT."""
+    # SELECT * запрещён на уровне правил агента
+    # Ищем SELECT * не внутри подзапроса COUNT(*) etc.
+    # Упрощённая проверка: SELECT\s+\* не внутри агрегата
+    star_pattern = re.compile(r'SELECT\s+\*', re.IGNORECASE)
+    # Исключаем COUNT(*) — это допустимо
+    count_star = re.compile(r'COUNT\s*\(\s*\*\s*\)', re.IGNORECASE)
+    sql_without_count = count_star.sub('COUNT(__STAR__)', sql)
+    if star_pattern.search(sql_without_count):
+        result.add_error(
+            "SELECT * запрещён. Явно перечисли нужные колонки в SELECT."
+        )
+
+
+def _build_alias_to_table_map(sql: str, real_tables: dict[tuple[str, str], set[str]]) -> dict[str, tuple[str, str]]:
+    """Построить маппинг алиас/имя_таблицы → (schema, table).
+
+    Парсит FROM и JOIN клаузы для извлечения явных алиасов.
+    Также регистрирует короткое имя таблицы как алиас (без schema-префикса).
+
+    Returns:
+        {"s": ("dm", "sales"), "sales": ("dm", "sales"), ...}
+    """
+    alias_map: dict[str, tuple[str, str]] = {}
+
+    # Регистрируем table_name (без schema) как implicit alias
+    for (schema, table) in real_tables:
+        alias_map[table.lower()] = (schema, table)
+
+    # Ищем паттерны: schema.table [AS] alias или просто schema.table alias
+    # Поддерживаем: JOIN dm.sales s, FROM dm.sales AS s, FROM dm.sales s
+    from_join_pat = re.compile(
+        r'(?:FROM|JOIN)\s+'
+        r'([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)'
+        r'(?:\s+AS\s+|\s+)([a-zA-Z_][a-zA-Z0-9_]*)',
+        re.IGNORECASE,
+    )
+    for m in from_join_pat.finditer(sql):
+        schema_part = m.group(1).lower()
+        table_part = m.group(2).lower()
+        alias_part = m.group(3).lower()
+        # Проверяем что это реальная таблица из каталога
+        if (schema_part, table_part) in real_tables:
+            # Пропускаем если alias — ключевое слово SQL
+            if alias_part.upper() not in {
+                'WHERE', 'ON', 'SET', 'JOIN', 'LEFT', 'RIGHT',
+                'INNER', 'OUTER', 'CROSS', 'FULL', 'GROUP', 'ORDER',
+                'HAVING', 'LIMIT', 'UNION', 'EXCEPT', 'INTERSECT',
+            }:
+                alias_map[alias_part] = (schema_part, table_part)
+
+    return alias_map
+
+
+def _check_columns_against_catalog(
+    sql: str,
+    schema_loader,
+    result: StaticCheckResult,
+) -> None:
+    """Проверить что колонки из SQL существуют в каталоге.
+
+    Логика:
+    1. Извлечь все schema.table из SQL
+    2. Построить маппинг alias → (schema, table) с учётом явных алиасов
+    3. Для каждой ссылки alias.column найти реальную таблицу по алиасу
+    4. Проверить column против колонок КОНКРЕТНОЙ таблицы (не всех сразу)
+    """
+    if schema_loader is None:
+        return
+
+    # Извлечь таблицы из SQL
+    raw_tables = _extract_tables_from_sql(sql)
+
+    # Фильтруем: оставляем только те, что есть в каталоге
+    real_tables: dict[tuple[str, str], set[str]] = {}
+    for schema, table in raw_tables:
+        cols_df = schema_loader.get_table_columns(schema, table)
+        if not cols_df.empty and "column_name" in cols_df.columns:
+            real_tables[(schema, table)] = set(
+                cols_df["column_name"].str.lower().tolist()
+            )
+
+    if not real_tables:
+        return  # Каталог пуст или таблицы не найдены — не блокируем
+
+    # Строим alias → (schema, table) маппинг с учётом явных алиасов из SQL
+    alias_to_table = _build_alias_to_table_map(sql, real_tables)
+
+    # Объединённый список всех реальных колонок (для fallback)
+    all_real_columns: set[str] = set()
+    for cols in real_tables.values():
+        all_real_columns.update(cols)
+
+    all_schema_names = {s for s, _ in real_tables}
+    all_table_names = {t for _, t in real_tables}
+
+    # SQL-ключевые слова, которые могут выглядеть как колонки
+    _SQL_KEYWORDS = {
+        "NULL", "TRUE", "FALSE", "CURRENT_DATE", "CURRENT_TIMESTAMP",
+        "NOW", "DISTINCT", "ALL", "ASC", "DESC", "OVER", "PARTITION",
+        "ROWS", "RANGE", "PRECEDING", "FOLLOWING", "UNBOUNDED", "CURRENT",
+    }
+
+    col_ref_pattern = re.compile(
+        r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b'
+    )
+
+    suspicious_cols: list[str] = []
+    for m in col_ref_pattern.finditer(sql):
+        left, right = m.group(1).lower(), m.group(2).lower()
+
+        # Пропускаем schema.table паттерны
+        if left in all_schema_names and right in all_table_names:
+            continue
+        # Пропускаем если правая часть — имя таблицы
+        if right in all_table_names:
+            continue
+        # Пропускаем SQL-ключевые слова
+        if right.upper() in _SQL_KEYWORDS:
+            continue
+
+        # Пытаемся найти таблицу по алиасу (точная проверка)
+        tbl_key = alias_to_table.get(left)
+        if tbl_key is not None:
+            # Проверяем против колонок конкретной таблицы
+            table_cols = real_tables.get(tbl_key, set())
+            if right not in table_cols:
+                suspicious_cols.append(f"{left}.{right}")
+        else:
+            # Алиас не распознан → fallback: проверяем против всех колонок
+            if right not in all_real_columns:
+                suspicious_cols.append(f"{left}.{right}")
+
+    if suspicious_cols:
+        unique_suspicious = list(dict.fromkeys(suspicious_cols))
+        result.add_error(
+            f"Возможные галлюцинированные колонки (не найдены в каталоге): "
+            f"{', '.join(unique_suspicious[:5])}. "
+            "Проверь названия колонок через get_table_columns."
+        )
+
+
+def _extract_select_columns(sql: str) -> list[str]:
+    """Извлечь колонки из SELECT-клаузы (без агрегатных функций).
+
+    Возвращает список имён колонок, которые НЕ обёрнуты в агрегатную функцию.
+    Только верхний уровень SELECT (не CTEs, не подзапросы).
+    Упрощённый парсер через regex — работает для стандартных случаев.
+    """
+    # Убираем CTE-часть (WITH ... AS (...))
+    sql_no_cte = re.sub(r"(?i)\bWITH\b.+?\)\s*(?=SELECT)", "", sql, flags=re.DOTALL)
+    # Берём первый верхний SELECT
+    select_match = re.search(r"(?i)\bSELECT\b(.+?)\bFROM\b", sql_no_cte, re.DOTALL)
+    if not select_match:
+        return []
+
+    select_body = select_match.group(1)
+
+    # Убираем вложенные скобки (подзапросы, агрегаты)
+    depth = 0
+    tokens: list[str] = []
+    current = ""
+    for ch in select_body:
+        if ch == "(":
+            depth += 1
+            current += ch
+        elif ch == ")":
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            tokens.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        tokens.append(current.strip())
+
+    non_agg_cols: list[str] = []
+    _agg_pattern = re.compile(
+        r"(?i)^(COUNT|SUM|AVG|MIN|MAX|STDDEV|VARIANCE|STRING_AGG|ARRAY_AGG"
+        r"|PERCENTILE_CONT|PERCENTILE_DISC|BOOL_AND|BOOL_OR)\s*\(",
+    )
+
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        # Пропускаем агрегаты
+        if _agg_pattern.match(token):
+            continue
+        # Убираем алиас: col AS alias → col
+        alias_match = re.match(r"(?i)^(.+?)\s+AS\s+\S+$", token)
+        if alias_match:
+            token = alias_match.group(1).strip()
+        # Убираем квалификаторы таблиц: t.col → col
+        if "." in token:
+            token = token.rsplit(".", 1)[-1]
+        # Только простые идентификаторы
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", token):
+            non_agg_cols.append(token.lower())
+
+    return non_agg_cols
+
+
+def _extract_group_by_columns(sql: str) -> list[str]:
+    """Извлечь колонки из GROUP BY клаузы."""
+    gb_match = re.search(r"(?i)\bGROUP\s+BY\b(.+?)(?:\bHAVING\b|\bORDER\b|\bLIMIT\b|$)", sql, re.DOTALL)
+    if not gb_match:
+        return []
+
+    gb_body = gb_match.group(1).strip()
+    cols: list[str] = []
+    for col in gb_body.split(","):
+        col = col.strip()
+        # Убираем квалификатор таблицы
+        if "." in col:
+            col = col.rsplit(".", 1)[-1]
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", col):
+            cols.append(col.lower())
+    return cols
+
+
+def _strip_ctes(sql: str) -> str:
+    """Убрать CTE-блок (WITH ... AS (...)) и вернуть финальный SELECT.
+
+    Упрощённый подход: убираем всё до последнего верхнего SELECT,
+    который следует после закрытия всех CTE-скобок.
+    """
+    stripped = sql.strip()
+    if not re.match(r"(?i)^\s*WITH\b", stripped):
+        return stripped
+
+    # Сканируем до нулевой глубины скобок, потом ищем SELECT
+    depth = 0
+    i = 0
+    in_cte_body = False
+    while i < len(stripped):
+        ch = stripped[i]
+        if ch == "(":
+            depth += 1
+            in_cte_body = True
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and in_cte_body:
+                # После закрытия CTE идёт запятая или финальный SELECT
+                rest = stripped[i + 1:].lstrip()
+                if rest.upper().startswith("SELECT"):
+                    return rest
+        i += 1
+    return stripped
+
+
+def _has_aggregation(sql: str) -> bool:
+    """Проверить что SQL содержит агрегатные функции (кроме COUNT(*))."""
+    # Убираем COUNT(*) чтобы не путать его с «настоящей» агрегацией
+    sql_no_count_star = re.sub(r'COUNT\s*\(\s*\*\s*\)', 'COUNT_STAR', sql, flags=re.I)
+    agg_pat = re.compile(
+        r'\b(COUNT|SUM|AVG|MIN|MAX|STDDEV|VARIANCE|STRING_AGG|ARRAY_AGG'
+        r'|PERCENTILE_CONT|PERCENTILE_DISC|BOOL_AND|BOOL_OR)\s*\(',
+        re.I,
+    )
+    return bool(agg_pat.search(sql_no_count_star))
+
+
+def _check_group_by_completeness(sql: str, result: StaticCheckResult) -> None:
+    """Проверить что все не-агрегированные SELECT-колонки присутствуют в GROUP BY.
+
+    Это самая частая ошибка LLM: добавить колонку в SELECT, но забыть в GROUP BY.
+    Работает только когда в SQL есть GROUP BY на уровне финального SELECT.
+
+    Severity:
+    - ERROR если запрос содержит агрегатные функции (SUM, AVG, MIN, MAX, ...)
+      — пропущенный GROUP BY гарантированно сломает запрос в PostgreSQL/Greenplum
+    - WARNING если агрегации нет (например, только GROUP BY без агрегата)
+    """
+    # Работаем только с финальным SELECT (без CTE)
+    outer_sql = _strip_ctes(sql)
+
+    # Проверяем только если в финальном SELECT есть GROUP BY
+    if not re.search(r"(?i)\bGROUP\s+BY\b", outer_sql):
+        return
+
+    select_cols = set(_extract_select_columns(outer_sql))
+    group_by_cols = set(_extract_group_by_columns(outer_sql))
+
+    if not select_cols:
+        return  # Не смогли распарсить — не блокируем
+
+    missing = select_cols - group_by_cols
+    # Исключаем известные константы и псевдоколонки
+    _KNOWN_CONSTANTS = {"true", "false", "null", "current_date", "current_timestamp"}
+    missing -= _KNOWN_CONSTANTS
+
+    if missing:
+        msg = (
+            f"GROUP BY completeness: колонки {sorted(missing)} присутствуют в SELECT, "
+            "но отсутствуют в GROUP BY."
+        )
+        if _has_aggregation(outer_sql):
+            # Агрегация есть → пропущенные колонки в GROUP BY = жёсткая ошибка SQL
+            result.add_error(msg + " При наличии агрегатов это вызовет ошибку БД.")
+        else:
+            result.add_warning(msg + " Возможна ошибка агрегации.")
+
+
+def _extract_select_aliases(sql: str) -> set[str]:
+    """Извлечь алиасы, объявленные через AS в SELECT (например SUM(x) AS cnt → cnt)."""
+    aliases: set[str] = set()
+    for m in re.finditer(r'\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', sql, re.IGNORECASE):
+        aliases.add(m.group(1).lower())
+    return aliases
+
+
+def _check_order_by_aliases(sql: str, result: StaticCheckResult) -> None:
+    """Проверить что ORDER BY ссылается только на колонки/алиасы из SELECT.
+
+    Распространённая ошибка LLM: ORDER BY cnt, но cnt не объявлен в SELECT.
+    Работает только для финального SELECT (без CTE).
+    """
+    outer_sql = _strip_ctes(sql)
+
+    ob_match = re.search(
+        r"(?i)\bORDER\s+BY\b(.+?)(?:\bLIMIT\b|;|$)", outer_sql, re.DOTALL
+    )
+    if not ob_match:
+        return
+
+    ob_cols: list[str] = []
+    for part in ob_match.group(1).split(","):
+        col = re.sub(r"\s+(ASC|DESC)\b", "", part.strip(), flags=re.IGNORECASE).strip()
+        # Убираем квалификатор таблицы
+        if "." in col:
+            col = col.rsplit(".", 1)[-1]
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", col):
+            ob_cols.append(col.lower())
+
+    if not ob_cols:
+        return
+
+    defined = set(_extract_select_columns(outer_sql)) | _extract_select_aliases(outer_sql)
+    missing = [c for c in ob_cols if c not in defined]
+    if missing:
+        result.add_error(
+            f"ORDER BY ссылается на неопределённые имена: {missing}. "
+            "Алиас или колонка должны быть объявлены в SELECT."
+        )
+
+
+def check_sql(
+    sql: str,
+    schema_loader=None,
+    check_columns: bool = True,
+) -> StaticCheckResult:
+    """Выполнить полный набор статических проверок SQL.
+
+    Args:
+        sql: SQL-запрос для проверки.
+        schema_loader: SchemaLoader для валидации колонок. None → колонки не проверяются.
+        check_columns: Включить проверку колонок против каталога.
+
+    Returns:
+        StaticCheckResult с ошибками и предупреждениями.
+    """
+    result = StaticCheckResult()
+
+    if not sql or not sql.strip():
+        result.add_error("SQL пустой.")
+        return result
+
+    # 1. Кириллические алиасы — жёсткая ошибка
+    _check_cyrillic_aliases(sql, result)
+
+    # 2. SELECT * — жёсткая ошибка (запрещено правилами агента)
+    _check_select_star(sql, result)
+
+    # 3. Колонки против каталога — ошибка если найдены галлюцинации
+    if check_columns and schema_loader is not None:
+        try:
+            _check_columns_against_catalog(sql, schema_loader, result)
+        except Exception as e:
+            logger.warning("StaticChecker: ошибка проверки колонок: %s", e)
+            # Не блокируем — каталог мог быть недоступен
+
+    # 4. GROUP BY completeness — предупреждение/ошибка
+    try:
+        _check_group_by_completeness(sql, result)
+    except Exception as e:
+        logger.warning("StaticChecker: ошибка проверки GROUP BY: %s", e)
+
+    # 5. ORDER BY алиасы — жёсткая ошибка
+    try:
+        _check_order_by_aliases(sql, result)
+    except Exception as e:
+        logger.warning("StaticChecker: ошибка проверки ORDER BY: %s", e)
+
+    return result

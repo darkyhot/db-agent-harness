@@ -1,0 +1,12 @@
+query: "Покажи сумму outflow_qty по region_name, подтяни region_name из uzp_dim_gosb по gosb_id"
+intent_must_be: analytics
+complexity_must_be: join
+sql_must_contain:
+  - JOIN
+  - SUM
+  - "UZP_DIM_GOSB"
+sql_must_not_contain:
+  - "SELECT *"
+sql_alias_no_cyrillic: true
+should_reach_node: sql_writer
+max_retries: 1

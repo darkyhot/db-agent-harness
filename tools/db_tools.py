@@ -115,12 +115,42 @@ def create_db_tools(
 
     @tool
     def check_key_uniqueness(schema: str, table: str, columns: str) -> str:
-        """Check key uniqueness in CSV metadata (fallback to DB)."""
+        """Check key uniqueness in CSV metadata (mandatory DB-probe for composite non-PK keys)."""
         cols = [c.strip() for c in columns.split(",")]
         if schema_loader is not None:
             result = schema_loader.check_key_uniqueness(schema, table, cols)
             if result.get("error"):
                 raise ValueError(result["error"])
+
+            # Для составных ключей без PK-гарантии CSV-статистика ненадёжна:
+            # fanout/row explosion может возникнуть даже при high unique_perc.
+            # DB-верификация обязательна — она единственный авторитетный источник.
+            if result.get("needs_db_probe"):
+                try:
+                    db_result = db_manager.check_key_uniqueness(schema, table, cols)
+                    is_uniq = db_result["is_unique"]
+                    db_suffix = (
+                        f"\n  DB-верификация: "
+                        f"{db_result['unique_keys']:,}/{db_result['total_rows']:,} уник., "
+                        f"дублей {db_result['duplicate_pct']}%"
+                    )
+                    prefix = "уникален" if is_uniq else "НЕ уникален"
+                    col_lines = "\n".join(
+                        f"  {c}: unique_perc={d.get('unique_perc', '?')}%, "
+                        f"is_pk={d.get('is_primary_key', False)}"
+                        for c, d in result["columns"].items()
+                        if d.get("found")
+                    )
+                    return (
+                        f"Ключ ({columns}) в {schema}.{table} {prefix} "
+                        f"(подтверждено БД).{db_suffix}\n{col_lines}"
+                    )
+                except Exception as db_e:
+                    logger.warning(
+                        "check_key_uniqueness: DB-проверка не удалась (%s), "
+                        "используем CSV-оценку (ненадёжно для составного ключа)", db_e
+                    )
+
             if result["is_unique"]:
                 reason = (
                     "все колонки являются PK"

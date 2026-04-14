@@ -432,8 +432,17 @@ class SchemaLoader:
                 is_unique = all_pk or any_fully_unique
         else:
             is_unique = all_pk or min_unique_perc >= 95.0
+
         duplicate_pct = round(100.0 - min_unique_perc, 2)
         status = "safe" if is_unique else "risky"
+
+        # needs_db_probe: CSV-статистика не гарантирует отсутствие fanout.
+        # Обязательна DB-верификация для:
+        # - составных ключей без полной PK-гарантии (all_pk=False)
+        # - ключей с колонками, отсутствующими в справочнике
+        needs_db_probe = (
+            len(columns) > 1 and not all_pk
+        ) or any(not d.get("found") for d in details.values())
 
         return {
             "is_unique": is_unique,
@@ -442,6 +451,7 @@ class SchemaLoader:
             "duplicate_pct": duplicate_pct,
             "columns": details,
             "status": status,
+            "needs_db_probe": needs_db_probe,
         }
 
     def generate_ddl(self, schema: str, table: str) -> str:

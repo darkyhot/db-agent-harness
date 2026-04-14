@@ -384,15 +384,25 @@ class IntentNodes:
         requested = _derive_requested_slots(user_input, intent)
         tables_df = self.schema.tables_df
 
+        # Кэш get_table_columns в пределах вызова: каждая таблица загружается ровно один раз,
+        # даже если её запрашивают _table_type, _score_table_for_slot и _joinability_score.
+        _col_cache: dict[tuple[str, str], object] = {}
+
+        def _get_cols(schema_name: str, table_name: str):
+            key = (schema_name, table_name)
+            if key not in _col_cache:
+                _col_cache[key] = self.schema.get_table_columns(schema_name, table_name)
+            return _col_cache[key]
+
         def _norm_key(name: str) -> str:
             return re.sub(r"^(old|new|prev|cur|current|actual|base|src|tgt)_", "", name.lower())
 
         def _table_type(schema_name: str, table_name: str) -> str:
-            cols = self.schema.get_table_columns(schema_name, table_name)
+            cols = _get_cols(schema_name, table_name)
             return detect_table_type(table_name, cols)
 
         def _score_table_for_slot(schema_name: str, table_name: str, slot: str) -> float:
-            cols = self.schema.get_table_columns(schema_name, table_name)
+            cols = _get_cols(schema_name, table_name)
             if cols.empty:
                 return -1.0
             t_type = _table_type(schema_name, table_name)
@@ -424,8 +434,8 @@ class IntentNodes:
                 return 0.0
             bs, bt = base
             cs, ct = candidate
-            left = self.schema.get_table_columns(bs, bt)
-            right = self.schema.get_table_columns(cs, ct)
+            left = _get_cols(bs, bt)
+            right = _get_cols(cs, ct)
             if left.empty or right.empty:
                 return 0.0
 
@@ -459,9 +469,38 @@ class IntentNodes:
             str(intent.get("complexity", "")).lower() in {"join", "subquery", "multi_table"}
             or any(phrase in query_norm for phrase in ("подтяни", "дотяни", "возьми из", "join", "по ключу"))
         )
-        candidate_tables = explicit_tables if len(explicit_tables) >= 2 else [
-            (str(row["schema_name"]), str(row["table_name"])) for _, row in tables_df.iterrows()
-        ]
+
+        # Для больших каталогов (>100 таблиц) без явных упоминаний: предварительная фильтрация
+        # через TF-IDF/keyword поиск сокращает O(N*cols) scoring до O(top_k*cols).
+        _LARGE_CATALOG = 100
+        if len(explicit_tables) >= 2:
+            candidate_tables = explicit_tables
+        elif len(tables_df) > _LARGE_CATALOG and not explicit_tables:
+            search_parts = [user_input]
+            search_parts += list(intent.get("entities", []))
+            if metric_slot:
+                search_parts.append(metric_slot)
+            search_parts += dimension_slots
+            search_query = " ".join(str(p) for p in search_parts if p)
+            search_df = self.schema.search_tables(search_query, top_n=50)
+            candidate_tables = [
+                (str(r["schema_name"]), str(r["table_name"]))
+                for _, r in search_df.iterrows()
+            ]
+            if not candidate_tables:
+                candidate_tables = [
+                    (str(row["schema_name"]), str(row["table_name"]))
+                    for _, row in tables_df.iterrows()
+                ]
+            logger.info(
+                "TableResolver: большой каталог (%d таблиц), кандидаты сужены до %d через поиск",
+                len(tables_df), len(candidate_tables),
+            )
+        else:
+            candidate_tables = [
+                (str(row["schema_name"]), str(row["table_name"]))
+                for _, row in tables_df.iterrows()
+            ]
 
         main_table: tuple[str, str] | None = explicit_tables[0] if explicit_tables else None
         if metric_slot and not explicit_tables:

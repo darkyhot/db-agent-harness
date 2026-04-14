@@ -25,6 +25,104 @@ _DET_CONFIDENCE_THRESHOLD = 0.70
 logger = logging.getLogger(__name__)
 
 
+def _apply_explicit_join_override(
+    join_spec: list[dict[str, Any]],
+    selected_columns: dict[str, Any],
+    intent: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Применить explicit_join из интента как override join_spec.
+
+    Когда пользователь явно указал ключ JOIN ("по инн", "по дате") — он имеет
+    абсолютный приоритет. Ищем колонку по col_hint семантически в selected_columns,
+    подставляем в join_spec вместо auto-detected пары.
+
+    Returns:
+        Обновлённый join_spec (исходный если explicit_join пуст или не нашли совпадений).
+    """
+    explicit_joins = intent.get("explicit_join") or []
+    if not explicit_joins:
+        return join_spec
+
+    result_spec = list(join_spec)
+
+    for ej in explicit_joins:
+        if not isinstance(ej, dict):
+            continue
+        col_hint = str(ej.get("column_hint") or "").lower().strip()
+        tbl_hint = str(ej.get("table_hint") or "").lower().strip()
+        if not col_hint:
+            continue
+
+        # Ищем колонку по col_hint во всех таблицах selected_columns
+        _candidates: list[tuple[float, str, str]] = []  # (score, tbl, col)
+        for tbl, roles in selected_columns.items():
+            tbl_lower = tbl.lower()
+            all_cols = (
+                roles.get("select", [])
+                + roles.get("filter", [])
+                + roles.get("group_by", [])
+                + roles.get("aggregate", [])
+            )
+            for c in dict.fromkeys(all_cols):  # уникальные, порядок сохранён
+                c_lower = c.lower()
+                if col_hint in c_lower or c_lower in col_hint:
+                    score = len(col_hint) / max(len(c_lower), 1) * 100
+                    if tbl_hint and (tbl_hint in tbl_lower or tbl_lower.endswith(tbl_hint)):
+                        score += 50
+                    _candidates.append((score, tbl, c))
+
+        if len(_candidates) < 2:
+            if _candidates:
+                logger.warning(
+                    "_apply_explicit_join_override: col_hint=%r найден только в одной таблице — "
+                    "недостаточно для JOIN-пары",
+                    col_hint,
+                )
+            continue
+
+        _candidates.sort(reverse=True)
+        # Берём лучшего с tbl_hint (правая сторона JOIN) и лучшего без (левая)
+        right_tbl, right_col = _candidates[0][1], _candidates[0][2]
+        left_tbl, left_col = None, None
+        for _, tbl, col in _candidates[1:]:
+            if tbl != right_tbl:
+                left_tbl, left_col = tbl, col
+                break
+
+        if left_tbl is None:
+            logger.warning(
+                "_apply_explicit_join_override: col_hint=%r только в одной таблице %s — пропускаем",
+                col_hint, right_tbl,
+            )
+            continue
+
+        override = {
+            "left": f"{left_tbl}.{left_col}",
+            "right": f"{right_tbl}.{right_col}",
+            "safe": False,
+            "strategy": "explicit_user",
+            "risk": "user_specified_key",
+        }
+
+        # Удаляем авто-detected пары между теми же таблицами
+        _left_tbl_prefix = ".".join(left_tbl.split(".")[:2])
+        _right_tbl_prefix = ".".join(right_tbl.split(".")[:2])
+        result_spec = [
+            j for j in result_spec
+            if not (
+                ".".join(j.get("left", "").split(".")[:2]) == _left_tbl_prefix
+                and ".".join(j.get("right", "").split(".")[:2]) == _right_tbl_prefix
+            )
+        ]
+        result_spec.insert(0, override)
+        logger.info(
+            "_apply_explicit_join_override: override join %s.%s = %s.%s (col_hint=%r)",
+            left_tbl, left_col, right_tbl, right_col, col_hint,
+        )
+
+    return result_spec
+
+
 class ExplorerNodes:
     """Миксин с узлами table_explorer и column_selector для GraphNodes."""
 
@@ -340,15 +438,21 @@ class ExplorerNodes:
                 _det_conf,
                 _DET_CONFIDENCE_THRESHOLD,
             )
+            # Применяем explicit_join override (Блок B) к детерминированному результату
+            _det_join_spec = _apply_explicit_join_override(
+                _det_result["join_spec"],
+                _det_result["selected_columns"],
+                intent,
+            )
             self.memory.add_message(
                 "assistant",
                 f"[column_selector/det] confidence={_det_conf:.2f}; "
                 f"таблиц: {len(_det_result['selected_columns'])}, "
-                f"join-ключей: {len(_det_result['join_spec'])}",
+                f"join-ключей: {len(_det_join_spec)}",
             )
             return {
                 "selected_columns": _det_result["selected_columns"],
-                "join_spec": _det_result["join_spec"],
+                "join_spec": _det_join_spec,
                 "column_selector_hint": "",
                 "messages": state["messages"] + [
                     {
@@ -520,6 +624,20 @@ class ExplorerNodes:
         raw_columns = parsed.get("columns", {})
         selected_columns: dict[str, Any] = {}
 
+        # Белый список таблиц: фильтруем LLM-ответ, отбрасываем чужие таблицы.
+        allowed_tables_set: set[str] = set()
+        _allowed_raw = state.get("allowed_tables") or []
+        if _allowed_raw:
+            allowed_tables_set = {t.lower() for t in _allowed_raw}
+            _raw_keys = list(raw_columns.keys())
+            for _tk in _raw_keys:
+                if _tk.lower() not in allowed_tables_set:
+                    logger.warning(
+                        "ColumnSelector: таблица %r не в allowed_tables %s — отбрасываем",
+                        _tk, _allowed_raw,
+                    )
+                    raw_columns.pop(_tk, None)
+
         for table_key, roles in raw_columns.items():
             if not isinstance(roles, dict):
                 continue
@@ -610,6 +728,9 @@ class ExplorerNodes:
                         )
 
                 join_spec.append(entry)
+
+        # --- Блок B: explicit_join override (LLM путь) ---
+        join_spec = _apply_explicit_join_override(join_spec, selected_columns, intent)
 
         # Hardening: дополнить LLM join_spec составными парами PK, которые LLM мог пропустить.
         # Если dim-таблица имеет составной PK, но LLM вернул только одну пару — добавляем остальные.

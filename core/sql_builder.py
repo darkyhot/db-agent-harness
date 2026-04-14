@@ -550,15 +550,30 @@ def _build_fact_fact_join(
     join_spec: list[dict],
     blueprint: dict,
 ) -> str | None:
-    """fact_fact_join: два CTE с агрегацией + финальный JOIN."""
+    """fact_fact_join: два CTE с агрегацией + финальный JOIN.
+
+    Поддерживает два режима:
+    - join_by_axis=True: JOIN по временной оси (report_dt и т.д.) — дата не PK,
+      обе таблицы агрегируются независимо по axis_column, затем JOIN по нему.
+    - Обычный режим: JOIN по join_spec-ключу.
+    """
     tables = list(selected_columns.keys())
     if len(tables) < 2:
         return None
 
     t1, t2 = tables[0], tables[1]
-    join_key_1, join_key_2 = _resolve_join_key(join_spec, t1, t2)
-    if not join_key_1 or not join_key_2:
-        return None
+
+    join_by_axis: bool = bool(blueprint.get("join_by_axis"))
+    axis_column: str = str(blueprint.get("axis_column") or "")
+
+    if join_by_axis and axis_column:
+        # --- Axis-join режим: GROUP BY axis_column, JOIN по нему ---
+        join_key_1 = axis_column
+        join_key_2 = axis_column
+    else:
+        join_key_1, join_key_2 = _resolve_join_key(join_spec, t1, t2)
+        if not join_key_1 or not join_key_2:
+            return None
 
     used: set[str] = set()
     a1 = _short_alias(t1, used)
@@ -568,31 +583,76 @@ def _build_fact_fact_join(
 
     aggregation = blueprint.get("aggregation")
     agg_func = aggregation.get("function") if aggregation else "COUNT"
-    agg_col = aggregation.get("column") if aggregation else "*"
-    agg_alias_base = aggregation.get("alias") if aggregation else "agg_val"
 
     roles1 = selected_columns[t1]
     roles2 = selected_columns[t2]
 
-    # Агрегации для каждой таблицы
-    def _agg_for(roles, agg_suffix):
-        agg_cols = roles.get("aggregate", [])
+    # Агрегации для каждой таблицы: ищем aggregate-роль, fallback COUNT(*)
+    def _agg_for(roles: dict, suffix: str, key_col: str) -> str:
+        agg_cols = [c for c in roles.get("aggregate", []) if c != key_col]
         if agg_cols:
             col = agg_cols[0]
             return f"{agg_func}({col}) AS {agg_func.lower()}_{col}"
-        return f"COUNT(*) AS cnt_{agg_suffix}"
+        # Попробуем найти числовую метрику в select
+        for col in roles.get("select", []):
+            if col == key_col:
+                continue
+            return f"{agg_func}({col}) AS {agg_func.lower()}_{col}"
+        return f"COUNT(*) AS cnt_{suffix}"
 
-    agg1_expr = _agg_for(roles1, a1)
-    agg2_expr = _agg_for(roles2, a2)
+    agg1_expr = _agg_for(roles1, a1, join_key_1)
+    agg2_expr = _agg_for(roles2, a2, join_key_2)
 
-    cte1_sql = f"{cte1} AS (\n    SELECT {join_key_1}, {agg1_expr}\n    FROM {t1}\n    GROUP BY {join_key_1}\n)"
-    cte2_sql = f"{cte2} AS (\n    SELECT {join_key_2}, {agg2_expr}\n    FROM {t2}\n    GROUP BY {join_key_2}\n)"
+    # В axis-join режиме group_by включает axis_column + дополнительные измерения
+    group_extra_1: list[str] = []
+    group_extra_2: list[str] = []
+    if join_by_axis:
+        # Добавляем колонки group_by каждой таблицы (кроме axis и агрегируемых)
+        agg1_col_name = agg1_expr.split(" AS ")[0].replace(f"{agg_func}(", "").rstrip(")")
+        agg2_col_name = agg2_expr.split(" AS ")[0].replace(f"{agg_func}(", "").rstrip(")")
+        for col in roles1.get("group_by", []) + roles1.get("select", []):
+            if col not in (join_key_1, agg1_col_name) and col not in group_extra_1:
+                group_extra_1.append(col)
+        for col in roles2.get("group_by", []) + roles2.get("select", []):
+            if col not in (join_key_2, agg2_col_name) and col not in group_extra_2:
+                group_extra_2.append(col)
+
+    gb1_cols = [join_key_1] + group_extra_1
+    gb2_cols = [join_key_2] + group_extra_2
+    gb1_str = ", ".join(gb1_cols)
+    gb2_str = ", ".join(gb2_cols)
+
+    sel1_extra = "".join(f", {c}" for c in group_extra_1)
+    sel2_extra = "".join(f", {c}" for c in group_extra_2)
+
+    where_clause = _build_where_clause(blueprint.get("where_conditions", []))
+    cte1_where = f"\n    {where_clause}" if where_clause else ""
+    cte2_where = f"\n    {where_clause}" if where_clause else ""
+
+    cte1_sql = (
+        f"{cte1} AS (\n"
+        f"    SELECT {join_key_1}{sel1_extra}, {agg1_expr}\n"
+        f"    FROM {t1}"
+        f"{cte1_where}\n"
+        f"    GROUP BY {gb1_str}\n"
+        f")"
+    )
+    cte2_sql = (
+        f"{cte2} AS (\n"
+        f"    SELECT {join_key_2}{sel2_extra}, {agg2_expr}\n"
+        f"    FROM {t2}"
+        f"{cte2_where}\n"
+        f"    GROUP BY {gb2_str}\n"
+        f")"
+    )
 
     # Финальный SELECT
     agg1_col = agg1_expr.split(" AS ")[-1]
     agg2_col = agg2_expr.split(" AS ")[-1]
 
-    select_str = f"c1.{join_key_1}, c1.{agg1_col}, c2.{agg2_col}"
+    final_extra_1 = "".join(f", c1.{c}" for c in group_extra_1)
+    final_extra_2 = "".join(f", c2.{c}" for c in group_extra_2)
+    select_str = f"c1.{join_key_1}{final_extra_1}, c1.{agg1_col}{final_extra_2}, c2.{agg2_col}"
 
     limit_clause = _build_limit(blueprint.get("limit"))
     order_by_clause = _build_order_by(blueprint.get("order_by"))

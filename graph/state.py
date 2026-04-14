@@ -92,3 +92,10 @@ class AgentState(TypedDict):
     # Передаётся из CLIInterface при follow-up запросах ("а теперь по регионам")
     prev_sql: str
     prev_result_summary: str
+
+    # === Контракт таблиц (Блок A) ===
+    # Белый список таблиц в формате "schema.table", разрешённых в SQL.
+    # Заполняется в table_resolver и остаётся неизменным до конца пайплайна.
+    # При followup-запросах — мёрджится (не перезаписывается).
+    # sql_writer и sql_static_checker используют его для проверки.
+    allowed_tables: list[str]

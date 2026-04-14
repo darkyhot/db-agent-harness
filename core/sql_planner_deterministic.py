@@ -12,6 +12,10 @@ import re
 
 logger = logging.getLogger(__name__)
 
+# Суффиксы date-колонок для определения axis-join по дате
+_DATE_AXIS_SUFFIXES = ("_dt", "_date", "_dttm", "_timestamp", "_ts", "date", "dttm", "report_dt")
+
+
 _RU_MONTHS: dict[str, int] = {
     'январ': 1,
     'феврал': 2,
@@ -241,8 +245,12 @@ def _compute_where_from_intent(
     if date_from or date_to:
         date_col = _find_date_column(selected_columns)
         if date_col:
-            if date_from:
+            if date_from and date_from != "NEEDS_YEAR":
                 conditions.append(f"{date_col} >= '{date_from}'::date")
+            elif date_from == "NEEDS_YEAR":
+                # Маркер: год не указан — добавляем placeholder вместо реального условия.
+                # sql_planner перехватит этот маркер и прервёт pipeline с clarification.
+                conditions.append("NEEDS_YEAR")
             if date_to:
                 conditions.append(f"{date_col} < '{date_to}'::date")
 
@@ -304,21 +312,29 @@ def _compute_where_from_intent(
 
 
 def _derive_date_filters_from_text(user_input: str) -> dict[str, str | None]:
-    """Вытащить простой месячный диапазон из текста пользователя."""
+    """Вытащить простой месячный диапазон из текста пользователя.
+
+    Если найден месяц БЕЗ года — возвращает маркер NEEDS_YEAR, чтобы
+    sql_planner мог прервать pipeline и запросить уточнение у пользователя.
+    """
     q = (user_input or "").lower()
     year_match = re.search(r"\b(20\d{2})\b", q)
-    if not year_match:
-        return {"from": None, "to": None}
 
-    year = int(year_match.group(1))
+    # Проверяем наличие месяца
     month = None
     for stem, num in _RU_MONTHS.items():
         if stem in q:
             month = num
             break
+
     if month is None:
         return {"from": None, "to": None}
 
+    if not year_match:
+        # Месяц есть, года нет → маркер для запроса уточнения
+        return {"from": "NEEDS_YEAR", "to": None}
+
+    year = int(year_match.group(1))
     next_year = year + 1 if month == 12 else year
     next_month = 1 if month == 12 else month + 1
     return {
@@ -353,6 +369,35 @@ def _find_date_column(selected_columns: dict[str, dict]) -> str | None:
 # 5. Главная функция
 # ---------------------------------------------------------------------------
 
+def _is_date_axis_join(join_spec: list[dict]) -> tuple[bool, str]:
+    """Определить, является ли JOIN осевым по дате (а не по PK).
+
+    Returns:
+        (is_date_axis, axis_column_name)
+    """
+    for jk in join_spec:
+        strategy = str(jk.get("strategy", "")).lower()
+        left_col = jk.get("left", "").rsplit(".", 1)[-1].lower()
+        right_col = jk.get("right", "").rsplit(".", 1)[-1].lower()
+        # Явный указатель от пользователя с date-hint
+        if strategy == "explicit_user":
+            for col in (left_col, right_col):
+                if any(col == suf.lstrip("_") or col.endswith(suf) for suf in _DATE_AXIS_SUFFIXES):
+                    return True, col
+        # Авто-обнаружение: оба ключа — date-колонки
+        left_is_date = any(
+            left_col == suf.lstrip("_") or left_col.endswith(suf)
+            for suf in _DATE_AXIS_SUFFIXES
+        )
+        right_is_date = any(
+            right_col == suf.lstrip("_") or right_col.endswith(suf)
+            for suf in _DATE_AXIS_SUFFIXES
+        )
+        if left_is_date and right_is_date:
+            return True, left_col
+    return False, ""
+
+
 def build_blueprint(
     intent: dict,
     selected_columns: dict[str, dict],
@@ -376,9 +421,29 @@ def build_blueprint(
     aggregation = _compute_aggregation(intent, selected_columns)
     strategy, main_table = _determine_strategy(table_types, join_spec)
 
+    # --- Блок C: date-aligned JOIN (axis-join по дате) ---
+    # Если join_spec указывает на date-колонки — это "аналитический JOIN по оси времени":
+    # обе таблицы агрегируются независимо по дате, затем соединяются.
+    # Форсируем fact_fact_join и добавляем флаг join_by_axis.
+    _is_axis, _axis_col = _is_date_axis_join(join_spec)
+    join_by_axis = False
+    axis_column = ""
+    if _is_axis and len(selected_columns) >= 2:
+        strategy = "fact_fact_join"
+        join_by_axis = True
+        axis_column = _axis_col
+        # Убираем "main_table" в пользу первой таблицы со select-агрегацией
+        _agg_tables = [t for t, r in selected_columns.items() if r.get("aggregate")]
+        if _agg_tables:
+            main_table = _agg_tables[0]
+        logger.info(
+            "DeterministicPlanner: date-aligned JOIN по оси '%s' → fact_fact_join",
+            axis_column,
+        )
+
     # Если одна таблица даёт метрику, а вторая только атрибуты для группировки/селекта,
     # рассматриваем вторую как dimension-like источник атрибута, даже если её тип unknown/fact.
-    if len(selected_columns) == 2:
+    if not join_by_axis and len(selected_columns) == 2:
         aggregate_tables = [t for t, roles in selected_columns.items() if roles.get("aggregate")]
         attribute_tables = [
             t for t, roles in selected_columns.items()
@@ -392,6 +457,32 @@ def build_blueprint(
 
     group_by    = _compute_group_by(selected_columns, aggregation)
     where_conditions = _compute_where_from_intent(intent, selected_columns, user_input=user_input)
+
+    # --- Блок D: required_output enforcement ---
+    # Колонки из required_output (обязательные в SELECT) добавляем в group_by если их нет.
+    required_output: list[str] = list(intent.get("required_output") or [])
+    if required_output and aggregation:
+        _gb_lower = {c.lower() for c in group_by}
+        for _req in required_output:
+            _req_norm = _req.lower().strip()
+            # Ищем в selected_columns колонку, семантически совпадающую с required_output
+            for _tbl, _roles in selected_columns.items():
+                _all_cols = (
+                    _roles.get("select", [])
+                    + _roles.get("group_by", [])
+                    + _roles.get("filter", [])
+                )
+                for _col in _all_cols:
+                    _col_lower = _col.lower()
+                    if _req_norm in _col_lower or _col_lower in _req_norm:
+                        if _col_lower not in _gb_lower:
+                            group_by.append(_col)
+                            _gb_lower.add(_col_lower)
+                            logger.info(
+                                "DeterministicPlanner: required_output %r → добавляем %s в group_by",
+                                _req, _col,
+                            )
+                        break
 
     # Если есть агрегация — filter-колонки без WHERE-условия нужны в GROUP BY.
     # Типичный случай: column_selector кладёт report_dt в filter, но пользователь
@@ -438,6 +529,9 @@ def build_blueprint(
         "group_by": group_by,
         "order_by": order_by,
         "limit": limit,
+        "join_by_axis": join_by_axis,
+        "axis_column": axis_column,
+        "required_output": required_output,
         "notes": f"[deterministic] strategy={strategy}, tables={list(table_types.keys())}",
     }
 

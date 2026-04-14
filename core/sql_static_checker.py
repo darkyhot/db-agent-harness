@@ -473,10 +473,54 @@ def _check_order_by_aliases(sql: str, result: StaticCheckResult) -> None:
         )
 
 
+def _check_allowed_tables(
+    sql: str,
+    allowed_tables: list[str],
+    result: StaticCheckResult,
+) -> None:
+    """Проверить, что все таблицы в FROM/JOIN присутствуют в белом списке allowed_tables.
+
+    Галлюцинированная таблица — немедленная критическая ошибка.
+    Схема нормализуется в lowercase для сравнения.
+
+    Args:
+        sql: SQL-запрос.
+        allowed_tables: Список разрешённых "schema.table" (из table_resolver).
+        result: StaticCheckResult для записи ошибок.
+    """
+    if not allowed_tables:
+        return
+
+    allowed_lower = {t.lower() for t in allowed_tables}
+
+    # Regex: FROM/JOIN schema.table [alias]
+    from_join_pat = re.compile(
+        r'(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)',
+        re.IGNORECASE,
+    )
+    found_tables: list[str] = []
+    for m in from_join_pat.finditer(sql):
+        schema_part = m.group(1).lower()
+        table_part = m.group(2).lower()
+        full = f"{schema_part}.{table_part}"
+        if full not in allowed_lower:
+            found_tables.append(f"{m.group(1)}.{m.group(2)}")
+
+    if found_tables:
+        unique = list(dict.fromkeys(found_tables))
+        result.add_error(
+            f"SQL содержит таблицы, не входящие в разрешённый список: "
+            f"{', '.join(unique)}. "
+            f"Разрешены только: {', '.join(sorted(allowed_tables))}. "
+            "Исправь SQL — используй только указанные таблицы."
+        )
+
+
 def check_sql(
     sql: str,
     schema_loader=None,
     check_columns: bool = True,
+    allowed_tables: list[str] | None = None,
 ) -> StaticCheckResult:
     """Выполнить полный набор статических проверок SQL.
 
@@ -484,6 +528,7 @@ def check_sql(
         sql: SQL-запрос для проверки.
         schema_loader: SchemaLoader для валидации колонок. None → колонки не проверяются.
         check_columns: Включить проверку колонок против каталога.
+        allowed_tables: Белый список "schema.table". None → проверка таблиц пропускается.
 
     Returns:
         StaticCheckResult с ошибками и предупреждениями.
@@ -493,6 +538,13 @@ def check_sql(
     if not sql or not sql.strip():
         result.add_error("SQL пустой.")
         return result
+
+    # 0. Белый список таблиц — критическая проверка (до всего остального)
+    if allowed_tables:
+        try:
+            _check_allowed_tables(sql, allowed_tables, result)
+        except Exception as e:
+            logger.warning("StaticChecker: ошибка проверки allowed_tables: %s", e)
 
     # 1. Кириллические алиасы — жёсткая ошибка
     _check_cyrillic_aliases(sql, result)

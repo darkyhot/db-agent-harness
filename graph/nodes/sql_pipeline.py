@@ -236,6 +236,33 @@ class SqlPipelineNodes:
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
 
+        # --- Блок C: NEEDS_YEAR guard ---
+        # Если intent_classifier уже поставил month_without_year=True, pipeline должен
+        # был остановиться на clarification. Если дошли сюда — where_conditions может
+        # содержать маркер NEEDS_YEAR от _derive_date_filters_from_text. Прерываем.
+        if any("NEEDS_YEAR" in str(w) for w in blueprint.get("where_conditions", [])):
+            import re as _re
+            _q = (state.get("user_input") or "").lower()
+            _ru_stems = {
+                'январ': 'январь', 'феврал': 'февраль', 'март': 'март',
+                'апрел': 'апрель', 'май': 'май', 'мая': 'май',
+                'июн': 'июнь', 'июл': 'июль', 'август': 'август',
+                'сентябр': 'сентябрь', 'октябр': 'октябрь',
+                'ноябр': 'ноябрь', 'декабр': 'декабрь',
+            }
+            _month = next((v for k, v in _ru_stems.items() if k in _q), "указанный месяц")
+            _clarif = f"За какой год считать данные за {_month}?"
+            logger.warning("SqlPlanner: NEEDS_YEAR в where_conditions → clarification: %r", _clarif)
+            return {
+                "needs_clarification": True,
+                "clarification_message": _clarif,
+                "sql_blueprint": blueprint,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": _clarif}
+                ],
+            }
+
         # Если dim-таблица пропущена — формируем подсказку для повторного column_selector
         new_hint = ""
         if missing_from_columns and not state.get("column_selector_hint", ""):
@@ -327,6 +354,7 @@ class SqlPipelineNodes:
 
         # --- Попытка детерминированной генерации SQL через SqlBuilder ---
         table_types = state.get("table_types", {})
+        allowed_tables: list[str] = state.get("allowed_tables") or []
         _builder = _SqlBuilder()
         template_sql = _builder.build(
             strategy=strategy,
@@ -337,8 +365,12 @@ class SqlPipelineNodes:
         )
         if template_sql:
             template_sql = _format_sql(template_sql)
-            # Проверяем статическим чекером до принятия
-            check_result = check_sql(template_sql, schema_loader=self.schema)
+            # Проверяем статическим чекером до принятия (включая белый список таблиц)
+            check_result = check_sql(
+                template_sql,
+                schema_loader=self.schema,
+                allowed_tables=allowed_tables if allowed_tables else None,
+            )
             if check_result.is_valid:
                 logger.info("SqlWriter: SQL сгенерирован детерминированно, минуем LLM")
                 step_idx = state["current_step"]
@@ -376,6 +408,27 @@ class SqlPipelineNodes:
         # - Composite JOIN: несколько записей для одной пары таблиц → AND в ON
         join_subquery_warning = _build_join_rule(strategy, join_spec_check)
 
+        # Формируем секцию разрешённых таблиц для LLM
+        _allowed_section = ""
+        if allowed_tables:
+            _allowed_section = (
+                "\n\n⚠ КРИТИЧНО — РАЗРЕШЁННЫЕ ТАБЛИЦЫ (только они):\n"
+                + "\n".join(f"  - {t}" for t in allowed_tables)
+                + "\nЛЮБАЯ другая таблица в FROM/JOIN — ЗАПРЕЩЕНА. "
+                "Если нужной метрики нет в этих таблицах — используй COUNT(*) или SUM "
+                "из доступных колонок, но НЕ выдумывай другие таблицы.\n"
+            )
+
+        # Формируем секцию обязательных колонок в SELECT
+        _required_section = ""
+        _required_output = blueprint.get("required_output") or []
+        if _required_output:
+            _required_section = (
+                "\n\n⚠ ОБЯЗАТЕЛЬНО в SELECT (пользователь явно запросил):\n"
+                + "\n".join(f"  - {r}" for r in _required_output)
+                + "\nЭти измерения ДОЛЖНЫ присутствовать в SELECT и GROUP BY финального запроса.\n"
+            )
+
         system_prompt = (
             "Ты — SQL-писатель для Greenplum (PostgreSQL-совместимая).\n"
             "Пиши SQL СТРОГО по blueprint. Не меняй стратегию.\n\n"
@@ -389,15 +442,19 @@ class SqlPipelineNodes:
             "- DISTINCT на внешнем SELECT — ЗАПРЕЩЁН\n"
             "- Составной JOIN: если join_keys содержит несколько пар для одной пары таблиц — "
             "объединяй ВСЕ условия через AND в одном ON-клаузе\n"
+            f"{_allowed_section}"
+            f"{_required_section}"
             f"{join_subquery_warning}\n"
             f"{relevant_examples}\n\n"
             "Чеклист:\n"
-            "1. Формат дат соответствует данным?\n"
-            "2. NULL обработан для колонок с высоким % NULL?\n"
-            "3. JOIN НЕ множит данные (по стратегии из blueprint)?\n"
-            "4. GROUP BY содержит все не-агрегированные колонки?\n"
-            "5. Алиасы на английском?\n"
-            "6. Если join_keys составной (несколько пар) — все условия объединены через AND?\n\n"
+            "1. Использую ТОЛЬКО таблицы из разрешённого списка?\n"
+            "2. Все required_output-атрибуты есть в SELECT и GROUP BY?\n"
+            "3. Формат дат соответствует данным?\n"
+            "4. NULL обработан для колонок с высоким % NULL?\n"
+            "5. JOIN НЕ множит данные (по стратегии из blueprint)?\n"
+            "6. GROUP BY содержит все не-агрегированные колонки?\n"
+            "7. Алиасы на английском?\n"
+            "8. Если join_keys составной (несколько пар) — все условия объединены через AND?\n\n"
             "Верни ТОЛЬКО JSON:\n"
             '{"tool": "execute_query", "args": {"sql": "SELECT ..."}}'
         )
@@ -549,7 +606,8 @@ class SqlPipelineNodes:
         iterations = state.get("graph_iterations", 0) + 1
         logger.info("StaticChecker: проверка SQL (%d символов)", len(sql))
 
-        check_result = check_sql(sql, schema_loader=self.schema)
+        _allowed = state.get("allowed_tables") or None
+        check_result = check_sql(sql, schema_loader=self.schema, allowed_tables=_allowed)
 
         if not check_result.is_valid:
             error_msg = (

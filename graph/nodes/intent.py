@@ -62,7 +62,7 @@ class IntentNodes:
             "{\n"
             '  "intent": "<тип>",\n'
             '  "entities": ["<сущность1>", "<сущность2>"],\n'
-            '  "date_filters": {"from": "<дата или null>", "to": "<дата или null>"},\n'
+            '  "date_filters": {"from": "<дата YYYY-MM-DD или null>", "to": "<дата YYYY-MM-DD или null>"},\n'
             '  "aggregation_hint": "<count|sum|avg|min|max|list|null>",\n'
             '  "needs_search": <true|false>,\n'
             '  "complexity": "<single_table|multi_table|join|subquery>",\n'
@@ -70,15 +70,46 @@ class IntentNodes:
             '  "filter_conditions": [\n'
             '    {"column_hint": "<ключевое слово для поиска колонки>", '
             '"operator": "<= | >= | = | != | LIKE | IN>", "value": "<литеральное значение>"}\n'
-            "  ]\n"
+            "  ],\n"
+            '  "explicit_join": [\n'
+            '    {"table_hint": "<часть имени таблицы, где лежит ключ, или null>", '
+            '"column_hint": "<имя или смысловая часть ключа-колонки>"}\n'
+            "  ],\n"
+            '  "required_output": ["<обязательный атрибут в SELECT 1>", "<атрибут 2>"],\n'
+            '  "month_without_year": <true|false>\n'
             "}\n\n"
-            "ПРАВИЛО clarification:\n"
-            "- Выбирай intent=clarification ТОЛЬКО если без ответа пользователя высок риск построить неверный SQL\n"
-            "- Сначала пытайся опереться на историю, предыдущий SQL, память и каталог; не спрашивай то, что можно разумно вывести\n"
-            "- НЕ используй clarification для косметических деталей, формата вывода, очевидных допущений или случаев, где можно безопасно продолжить\n"
-            "- Хорошие поводы для clarification: неоднозначная метрика, неизвестный период, конфликтующие сущности, несколько равноправных трактовок бизнес-термина\n"
-            "- Если intent != clarification, верни clarification_question пустой строкой\n"
-            "- Если intent = clarification, задай ОДИН короткий конкретный вопрос, который разблокирует следующий шаг\n\n"
+            "=== ПРАВИЛО clarification — МАТРИЦА ===\n\n"
+            "УТОЧНЯЙ (intent=clarification) ТОЛЬКО если выполняется хотя бы одно условие:\n"
+            "  1. Метрика неоднозначна: несколько равноправных трактовок ("
+            "например 'покажи заказы' — сумму? количество? список?)\n"
+            "  2. Запрос звучит слишком широко и риск полного сканирования "
+            "большой таблицы высок ('выгрузи всё', 'покажи все данные')\n"
+            "  3. Конфликт: два разных смысла у ключевого термина в контексте базы\n\n"
+            "НЕ УТОЧНЯЙ — продолжай с аналитикой если:\n"
+            "  - Пользователь спрашивает о справочных сущностях типа 'сколько ТБ', "
+            "'количество ГОСБ', 'список регионов' → это COUNT из dim-таблицы, не clarification\n"
+            "  - Агрегация очевидна из глагола: 'посчитай' → count, 'суммируй' → sum, "
+            "'сколько' → count\n"
+            "  - Таблица явно указана в запросе\n"
+            "  - Группировка очевидна: 'по дате', 'по сегменту', 'по региону'\n"
+            "  - Формат вывода не задан → выводи таблицей по умолчанию\n"
+            "  - Период — 'последний месяц', 'прошлый квартал' → считай от текущей даты\n\n"
+            "ПРАВИЛО month_without_year:\n"
+            "- Ставь true ТОЛЬКО если в запросе указан месяц (февраль, январь и т.д.) БЕЗ года\n"
+            "- При month_without_year=true clarification_question = 'За какой год считать данные за [месяц]?'\n"
+            "- При month_without_year=true intent ДОЛЖЕН быть 'clarification'\n\n"
+            "ПРАВИЛО explicit_join:\n"
+            "- Заполняй ТОЛЬКО если пользователь ЯВНО указал ключ/поле для JOIN\n"
+            "- Сигналы: 'по инн', 'по customer_id', 'join по X', 'связать по Y', 'ключ — Z', "
+            "'возьми сегмент по инн'\n"
+            "- table_hint — часть имени таблицы-источника (может быть null)\n"
+            "- column_hint — ключевое слово для имени join-колонки ('инн', 'customer_id', 'дата')\n"
+            "- Если явного join-ключа нет — оставь пустым списком []\n\n"
+            "ПРАВИЛО required_output:\n"
+            "- Перечисли ВСЕ измерения/группировки, которые пользователь явно требует в результате\n"
+            "- Сигналы: 'по дате', 'по сегменту', 'по региону', 'с разбивкой по X'\n"
+            "- Если пользователь сказал 'по дате и сегменту' → required_output: ['дата', 'сегмент']\n"
+            "- Если нет явных требований к выводу — пустой список []\n\n"
             "ПРАВИЛО filter_conditions:\n"
             "- Заполняй ТОЛЬКО если в запросе есть явные фильтры по значениям "
             "(например: 'по региону North', 'product_category = Electronics', 'сумма > 1000')\n"
@@ -90,38 +121,54 @@ class IntentNodes:
             "- join: нужно объединить данные из двух+ таблиц "
             "(сигналы: 'возьми из', 'дотяни из', 'подтяни из', 'по ключу из', 'из таблицы X', "
             "'join', 'связать', упомянуты две разные таблицы)\n"
-            "- multi_table: несколько независимых запросов к разным таблицам\n"
+            "- multi_table: посчитать несколько метрик из разных таблиц и показать вместе\n"
             "- subquery: нужен вложенный подзапрос\n\n"
             "=== ПРИМЕРЫ ===\n\n"
+            'Запрос: "Сколько ТБ и ГОСБ есть в базе?"\n'
+            '{"intent": "analytics", "entities": ["ТБ", "ГОСБ"], '
+            '"date_filters": {"from": null, "to": null}, "aggregation_hint": "count", '
+            '"needs_search": false, "complexity": "single_table", "clarification_question": "", '
+            '"explicit_join": [], "required_output": ["ТБ", "ГОСБ"], "month_without_year": false, '
+            '"filter_conditions": []}\n\n'
+            'Запрос: "Посчитай сумму оттока по дате и сегменту (сегмент возьми в epk_consolidation по инн)"\n'
+            '{"intent": "analytics", "entities": ["отток", "дата", "сегмент", "epk_consolidation", "инн"], '
+            '"date_filters": {"from": null, "to": null}, "aggregation_hint": "sum", '
+            '"needs_search": false, "complexity": "join", "clarification_question": "", '
+            '"explicit_join": [{"table_hint": "epk_consolidation", "column_hint": "inn"}], '
+            '"required_output": ["дата", "сегмент"], "month_without_year": false, '
+            '"filter_conditions": []}\n\n'
+            'Запрос: "Посчитай количество задач и количество оттока за февраль по дате"\n'
+            '{"intent": "clarification", "entities": ["задачи", "отток", "февраль", "дата"], '
+            '"date_filters": {"from": null, "to": null}, "aggregation_hint": "count", '
+            '"needs_search": false, "complexity": "multi_table", '
+            '"clarification_question": "За какой год считать данные за февраль?", '
+            '"explicit_join": [{"table_hint": null, "column_hint": "дата"}], '
+            '"required_output": ["дата"], "month_without_year": true, "filter_conditions": []}\n\n'
+            'Запрос: "Посчитай количество задач и оттока за февраль 2026 по дате"\n'
+            '{"intent": "analytics", "entities": ["задачи", "отток", "дата"], '
+            '"date_filters": {"from": "2026-02-01", "to": "2026-03-01"}, "aggregation_hint": "count", '
+            '"needs_search": false, "complexity": "multi_table", "clarification_question": "", '
+            '"explicit_join": [{"table_hint": null, "column_hint": "дата"}], '
+            '"required_output": ["дата"], "month_without_year": false, "filter_conditions": []}\n\n'
             'Запрос: "Сколько клиентов в регионе North?"\n'
             '{"intent": "analytics", "entities": ["клиенты", "регион", "North"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": "count", '
-            '"needs_search": false, "complexity": "single_table", "clarification_question": ""}\n\n'
-            'Запрос: "Какие таблицы есть по заказам?"\n'
-            '{"intent": "schema_question", "entities": ["заказы"], '
-            '"date_filters": {"from": null, "to": null}, "aggregation_hint": null, '
-            '"needs_search": false, "complexity": "single_table", "clarification_question": ""}\n\n'
-            'Запрос: "Есть ли данные по обращениям пользователей?"\n'
-            '{"intent": "table_search", "entities": ["обращения", "пользователи"], '
-            '"date_filters": {"from": null, "to": null}, "aggregation_hint": null, '
-            '"needs_search": true, "complexity": "single_table", "clarification_question": ""}\n\n'
-            'Запрос: "Посчитай сумму платежей. Категорию клиента возьми по customer_id из справочника клиентов"\n'
-            '{"intent": "analytics", "entities": ["платежи", "категория клиента", "customer_id", "справочник клиентов"], '
+            '"needs_search": false, "complexity": "single_table", "clarification_question": "", '
+            '"explicit_join": [], "required_output": [], "month_without_year": false, '
+            '"filter_conditions": [{"column_hint": "регион", "operator": "=", "value": "North"}]}\n\n'
+            'Запрос: "Покажи сумму заказов по менеджерам, категорию дотяни по customer_id из справочника"\n'
+            '{"intent": "analytics", "entities": ["заказы", "менеджеры", "категория", "customer_id", "справочник"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": "sum", '
-            '"needs_search": false, "complexity": "join", "clarification_question": ""}\n\n'
-            'Запрос: "Покажи сумму заказов по менеджерам, категорию дотяни по customer_id из справочника клиентов"\n'
-            '{"intent": "analytics", "entities": ["заказы", "менеджеры", "категория", "customer_id", "справочник клиентов"], '
-            '"date_filters": {"from": null, "to": null}, "aggregation_hint": "sum", '
-            '"needs_search": false, "complexity": "join", "clarification_question": ""}\n\n'
-            'Запрос: "Сколько полисов по каждому типу, подтяни тип из таблицы policies"\n'
-            '{"intent": "analytics", "entities": ["полисы", "тип", "policies"], '
-            '"date_filters": {"from": null, "to": null}, "aggregation_hint": "count", '
-            '"needs_search": false, "complexity": "join", "clarification_question": ""}\n\n'
+            '"needs_search": false, "complexity": "join", "clarification_question": "", '
+            '"explicit_join": [{"table_hint": "справочник", "column_hint": "customer_id"}], '
+            '"required_output": ["менеджер"], "month_without_year": false, "filter_conditions": []}\n\n'
             'Запрос: "Покажи заказы"\n'
             '{"intent": "clarification", "entities": ["заказы"], '
             '"date_filters": {"from": null, "to": null}, "aggregation_hint": null, '
             '"needs_search": false, "complexity": "single_table", '
-            '"clarification_question": "Что именно показать по заказам: сумму, количество или список записей?"}\n'
+            '"clarification_question": "Что именно показать по заказам: сумму, количество или список записей?", '
+            '"explicit_join": [], "required_output": [], "month_without_year": false, '
+            '"filter_conditions": []}\n'
         )
 
         # --- Пользовательский промпт ---
@@ -201,6 +248,38 @@ class IntentNodes:
 
         needs_clarification = intent.get("intent") == "clarification"
         clarification_message = str(intent.get("clarification_question") or "").strip()
+
+        # Если LLM не поставил clarification, но сам поставил month_without_year=True —
+        # принудительно переключаем на clarification (защита от несогласованности).
+        if intent.get("month_without_year") and not needs_clarification:
+            needs_clarification = True
+            intent["intent"] = "clarification"
+            if not clarification_message:
+                # Извлекаем название месяца для подстановки в вопрос
+                _month_names = {
+                    1: "январь", 2: "февраль", 3: "март", 4: "апрель",
+                    5: "май", 6: "июнь", 7: "июль", 8: "август",
+                    9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь",
+                }
+                import re as _re
+                _q = (state.get("user_input") or "").lower()
+                _ru_months_stems = {
+                    'январ': 1, 'феврал': 2, 'март': 3, 'апрел': 4,
+                    'май': 5, 'мая': 5, 'июн': 6, 'июл': 7, 'август': 8,
+                    'сентябр': 9, 'октябр': 10, 'ноябр': 11, 'декабр': 12,
+                }
+                _detected_month = None
+                for stem, num in _ru_months_stems.items():
+                    if stem in _q:
+                        _detected_month = _month_names[num]
+                        break
+                month_label = _detected_month or "указанный месяц"
+                clarification_message = f"За какой год считать данные за {month_label}?"
+            logger.info(
+                "IntentClassifier: month_without_year=True → принудительно clarification: %r",
+                clarification_message,
+            )
+
         if needs_clarification and not clarification_message:
             clarification_message = (
                 "Не хватает деталей, чтобы корректно продолжить. Уточните, пожалуйста, запрос."
@@ -580,8 +659,18 @@ class IntentNodes:
             f"план: {len(plan_steps)} шагов"
         )
 
+        # Формируем белый список таблиц — сквозной контракт для sql_writer и sql_static_checker.
+        # При followup-запросах мёрджим с предыдущим allowed_tables (не перезаписываем).
+        new_allowed = [f"{s}.{t}" for s, t in validated_tables]
+        prev_allowed = state.get("allowed_tables") or []
+        if prev_allowed and state.get("intent", {}).get("intent") == "followup":
+            merged = list(dict.fromkeys(prev_allowed + new_allowed))
+        else:
+            merged = new_allowed
+
         return {
             "selected_tables": validated_tables,
+            "allowed_tables": merged,
             "plan": plan_steps,
             "current_step": 0,
             "retry_count": 0,
@@ -592,6 +681,7 @@ class IntentNodes:
                 {"role": "assistant", "content": (
                     f"Таблицы: {', '.join(f'{s}.{t}' for s, t in validated_tables)}\n"
                     f"Уверенность: {table_confidences}\n"
+                    f"Разрешённые таблицы (белый список): {merged}\n"
                     f"План:\n" + "\n".join(plan_steps) + low_confidence_warning
                 )},
             ],

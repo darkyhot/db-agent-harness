@@ -72,6 +72,28 @@ _METRIC_SUFFIXES = ('_qty', '_amt', '_sum', '_cnt', '_perc', '_pct', '_amount', 
 _LABEL_SUFFIXES = ('_name', '_label', '_title')
 _DATE_HINTS = frozenset({'date', 'dt', 'dttm', 'timestamp', 'data'})
 _COUNT_HINTS = frozenset({'count', 'kolichestvo', 'qty', 'cnt'})
+_JOIN_KEY_TOKEN_HINTS = frozenset({
+    'inn', 'kpp', 'ogrn', 'snils', 'okato', 'oktmo', 'bik', 'date',
+    'инн', 'кпп', 'огрн', 'снилс', 'окато', 'октмо', 'бик', 'дата',
+})
+_DIMENSION_SLOT_ALIASES: dict[str, frozenset[str]] = {
+    'date': frozenset({
+        'date', 'dt', 'data',
+        'дата', 'дате', 'дату', 'датой', 'датам', 'датах',
+    }),
+    'segment_name': frozenset({
+        'segment', 'segments',
+        'сегмент', 'сегмента', 'сегменту', 'сегментом', 'сегменте', 'сегменты',
+    }),
+    'region_name': frozenset({
+        'region', 'regions',
+        'регион', 'региона', 'региону', 'регионом', 'регионе', 'регионы',
+    }),
+    'channel_name': frozenset({
+        'channel', 'channels',
+        'канал', 'канала', 'каналу', 'каналом', 'канале', 'каналы',
+    }),
+}
 _TRANSLIT_TABLE = str.maketrans({
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
     'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
@@ -139,6 +161,15 @@ def _looks_like_explicit_column(token: str) -> bool:
     return "_" in lower or lower.endswith(_METRIC_SUFFIXES + _LABEL_SUFFIXES + ('_id', '_code'))
 
 
+def _looks_like_join_key_token(token: str) -> bool:
+    lower = token.lower().strip()
+    if not lower:
+        return False
+    if _looks_like_explicit_column(lower):
+        return True
+    return lower in _JOIN_KEY_TOKEN_HINTS
+
+
 def _is_label_slot(slot: str) -> bool:
     return slot.endswith(_LABEL_SUFFIXES) or slot in {'name', 'label'}
 
@@ -172,24 +203,55 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
     dimensions: list[str] = []
 
     explicit_cols = [
-        t for t in re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', query)
+        t for t in re.findall(r'\b[a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*\b', query)
         if _looks_like_explicit_column(t)
     ]
+
+    def _normalize_dimension_slot(raw: str) -> str | None:
+        term = (raw or '').strip().strip(" .,:;!?\"'()[]{}")
+        if not term:
+            return None
+        lower = term.lower()
+        if _looks_like_explicit_column(lower):
+            return lower
+
+        parts = _tokenize(term)
+        for part in parts:
+            if part in _DATE_HINTS:
+                return 'date'
+            for slot, aliases in _DIMENSION_SLOT_ALIASES.items():
+                if part in aliases:
+                    return slot
+
+        concept = _normalize_concept(term)
+        if not concept:
+            return None
+        if any(tok in _DATE_HINTS for tok in concept.split('_')):
+            return 'date'
+        return f'{concept}_name'
+
+    def _split_dimensions(chunk: str) -> list[str]:
+        normalized = re.sub(r'\s+', ' ', chunk or '').strip()
+        if not normalized:
+            return []
+        return [
+            part.strip()
+            for part in re.split(r'\s*(?:,|;|\s+и\s+)\s*', normalized)
+            if part.strip()
+        ]
     for col in explicit_cols:
         lower = col.lower()
         if lower.endswith(_LABEL_SUFFIXES) or any(tok in _DATE_HINTS for tok in lower.split('_')):
             dimensions.append(lower)
 
-    for m in re.finditer(r'(?:по|в разбивке по)\s+([a-zA-Zа-яА-ЯёЁ_]+)', query):
-        concept = _normalize_concept(m.group(1))
-        if not concept:
-            continue
-        if any(tok in _DATE_HINTS for tok in concept.split('_')):
-            dimensions.append('date')
-        elif _looks_like_explicit_column(m.group(1)):
-            dimensions.append(m.group(1).lower())
-        else:
-            dimensions.append(f'{concept}_name')
+    for m in re.finditer(
+        r'(?:в\s+разбивке\s+по|по)\s+([a-zA-Zа-яА-ЯёЁ0-9_\s,;]+?)(?=(?:\s+(?:в\s+разбивке\s+по|за|с|на|где|через|join|using|ключ)\b|$))',
+        query,
+    ):
+        for part in _split_dimensions(m.group(1)):
+            slot = _normalize_dimension_slot(part)
+            if slot:
+                dimensions.append(slot)
 
     for m in re.finditer(r'(?:названи[еяю]|наименовани[еяю])\s+([a-zA-Zа-яА-ЯёЁ_]+)', query):
         concept = _normalize_concept(m.group(1))
@@ -216,10 +278,16 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
         token.lower() for token in explicit_cols
         if token.lower().endswith(('_id', '_code', '_num', '_no'))
     ]
-    for m in re.finditer(r'(?:по|через|join|using|ключ[ауеом]?)\s+([a-zA-Z_][a-zA-Z0-9_]*)', query):
+    for m in re.finditer(
+        r'(?:по|через|join|using|ключ[ауеом]?)\s+(?:ключ[ауеом]?\s+)?([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)',
+        query,
+    ):
         token = m.group(1).lower()
-        if _looks_like_explicit_column(token) or re.fullmatch(r'[a-z]{3,10}', token):
+        if _looks_like_join_key_token(token):
             join_key_hints.append(token)
+            translit = _translit(token)
+            if translit and translit != token:
+                join_key_hints.append(translit)
 
     return {
         'dimensions': list(dict.fromkeys(dimensions)),

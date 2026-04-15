@@ -149,6 +149,61 @@ class TestBudgetTrimming:
         assert "ТЕКУЩИЙ ШАГ" in result_usr or len(result_usr) < 500
 
 
+class TestSqlContractValidation:
+    """Тесты контрактной проверки SQL перед execute_query."""
+
+    @pytest.fixture
+    def nodes(self):
+        from graph.nodes import GraphNodes
+
+        llm = MockLLM()
+        db = MagicMock()
+        schema = MagicMock()
+        schema.tables_df = MagicMock()
+        schema.tables_df.empty = True
+        memory = MagicMock()
+        memory.get_memory_list.return_value = []
+        memory.get_all_memory.return_value = {}
+        memory.get_sessions_context.return_value = ""
+        memory.get_session_messages.return_value = []
+        validator = MagicMock()
+        tools = []
+        return GraphNodes(llm, db, schema, memory, validator, tools)
+
+    def test_sql_contract_blocks_query_with_wrong_aggregation_metric(self, nodes):
+        sql = (
+            "SELECT task_category, SUM(task_type) AS bogus_metric "
+            "FROM dm.tasks GROUP BY task_category"
+        )
+        state = create_initial_state("Покажи отток по категориям задач")
+        state.update({
+            "messages": [],
+            "sql_to_validate": sql,
+            "pending_sql_tool_call": {"tool": "execute_query", "args": {"sql": sql}},
+            "sql_blueprint": {
+                "required_output": [],
+                "aggregation": {"function": "sum", "column": "outflow_cnt", "alias": "outflow_cnt"},
+                "group_by": ["task_category"],
+            },
+            "intent": {"required_output": [], "entities": ["отток"], "aggregation_hint": "sum"},
+        })
+
+        validation_result = MagicMock()
+        validation_result.is_valid = True
+        validation_result.needs_confirmation = False
+        validation_result.join_checks = []
+        validation_result.warnings = []
+        nodes.validator.validate.return_value = validation_result
+        nodes._call_tool = MagicMock()
+
+        result = nodes.sql_validator_node(state)
+
+        assert result["needs_replan"] is True
+        assert "missing_metric" in result["last_error"]
+        assert "missing_metric" in result["replan_context"]
+        nodes._call_tool.assert_not_called()
+
+
 class TestQualityMetrics:
     """Тесты метрик качества."""
 

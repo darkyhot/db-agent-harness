@@ -183,6 +183,124 @@ def _build_join_rule(strategy: str, join_spec: list[dict]) -> str:
     return "\nПРАВИЛА JOIN (на основе проверенных ключей):\n" + "\n".join(parts) + "\n"
 
 
+def _normalize_token(value: str) -> str:
+    return re.sub(r"[^a-zа-я0-9_]+", " ", str(value).lower(), flags=re.IGNORECASE).strip()
+
+
+def _extract_sql_sections(sql: str) -> dict[str, str]:
+    text = str(sql or "")
+    select_match = re.search(r"\bselect\b(?P<body>.*?)\bfrom\b", text, flags=re.IGNORECASE | re.DOTALL)
+    group_match = re.search(
+        r"\bgroup\s+by\b(?P<body>.*?)(?:\bhaving\b|\border\s+by\b|\blimit\b|;|$)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    where_match = re.search(
+        r"\bwhere\b(?P<body>.*?)(?:\bgroup\s+by\b|\bhaving\b|\border\s+by\b|\blimit\b|;|$)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return {
+        "select": (select_match.group("body") if select_match else "").lower(),
+        "group_by": (group_match.group("body") if group_match else "").lower(),
+        "where": (where_match.group("body") if where_match else "").lower(),
+    }
+
+
+def _infer_date_grain(intent: dict[str, Any], blueprint: dict[str, Any], user_input: str) -> str | None:
+    haystack = " ".join(
+        [
+            str(user_input or ""),
+            " ".join(str(x) for x in (intent.get("entities") or [])),
+            " ".join(str(x) for x in (intent.get("required_output") or [])),
+            " ".join(str(x) for x in (blueprint.get("group_by") or [])),
+        ]
+    ).lower()
+    grain_rules = [
+        ("quarter", ("квартал", "quarter", "qtr")),
+        ("month", ("месяц", "monthly", "month", "yyyy-mm")),
+        ("week", ("недел", "week")),
+        ("year", ("год", "year", "yyyy")),
+        ("day", ("день", "дата", "date", "daily", "day")),
+    ]
+    for grain, tokens in grain_rules:
+        if any(token in haystack for token in tokens):
+            return grain
+    return None
+
+
+def _build_sql_contract(state: AgentState) -> dict[str, Any]:
+    intent = state.get("intent", {}) or {}
+    blueprint = state.get("sql_blueprint", {}) or {}
+    aggregation = blueprint.get("aggregation") or {}
+    target_metrics: list[dict[str, str]] = []
+    if aggregation:
+        target_metrics.append(
+            {
+                "function": str(aggregation.get("function") or "").lower(),
+                "column": str(aggregation.get("column") or ""),
+                "alias": str(aggregation.get("alias") or ""),
+            }
+        )
+    return {
+        "required_output": list(blueprint.get("required_output") or intent.get("required_output") or []),
+        "target_metrics": target_metrics,
+        "date_grain": _infer_date_grain(intent, blueprint, state.get("user_input", "")),
+    }
+
+
+def _validate_sql_against_contract(sql: str, contract: dict[str, Any]) -> tuple[bool, str | None, str]:
+    sections = _extract_sql_sections(sql)
+    select_part = sections["select"]
+    group_part = sections["group_by"]
+    where_part = sections["where"]
+    has_aggregation = bool(contract.get("target_metrics"))
+
+    for req in contract.get("required_output") or []:
+        req_tokens = [tok for tok in _normalize_token(req).split() if len(tok) >= 3]
+        if req_tokens and not any(tok in select_part for tok in req_tokens):
+            return False, "missing_required_dimension", f"required_output='{req}' отсутствует в SELECT"
+        if has_aggregation and req_tokens and not any(tok in group_part for tok in req_tokens):
+            return False, "missing_required_dimension", f"required_output='{req}' отсутствует в GROUP BY"
+
+    for metric in contract.get("target_metrics") or []:
+        fn = str(metric.get("function") or "").lower()
+        col = str(metric.get("column") or "").lower()
+        alias = str(metric.get("alias") or "").lower()
+        if not fn:
+            continue
+        if col in {"", "*"}:
+            metric_ok = bool(re.search(rf"\b{re.escape(fn)}\s*\(\s*\*\s*\)", select_part))
+        else:
+            metric_ok = bool(
+                re.search(
+                    rf"\b{re.escape(fn)}\s*\(\s*(?:distinct\s+)?(?:\w+\.)?{re.escape(col)}\s*\)",
+                    select_part,
+                    flags=re.IGNORECASE,
+                )
+            )
+        if not metric_ok and alias:
+            metric_ok = alias in select_part
+        if not metric_ok:
+            return False, "missing_metric", f"target_metric='{fn}({col})' отсутствует в SELECT"
+
+    date_grain = str(contract.get("date_grain") or "").lower().strip()
+    if date_grain:
+        grain_tokens = {
+            "day": ("date_trunc('day'", "date_trunc(\"day\"", "::date", " date ", "_dt", "_date", "дата"),
+            "month": ("date_trunc('month'", "date_trunc(\"month\"", "extract(month", "to_char(", "yyyy-mm", "month"),
+            "quarter": ("date_trunc('quarter'", "date_trunc(\"quarter\"", "extract(quarter", "quarter"),
+            "week": ("date_trunc('week'", "date_trunc(\"week\"", "extract(week", "week"),
+            "year": ("date_trunc('year'", "date_trunc(\"year\"", "extract(year", " year "),
+        }
+        probes = grain_tokens.get(date_grain, ())
+        merged = f"{select_part} {group_part} {where_part}"
+        if probes and not any(p in merged for p in probes):
+            return False, "missing_required_dimension", f"date_grain='{date_grain}' не отражён в SQL"
+
+    return True, None, ""
+
+
 class SqlPipelineNodes:
     """Миксин с узлами sql_planner, sql_writer и sql_validator_node для GraphNodes."""
 
@@ -692,14 +810,44 @@ class SqlPipelineNodes:
                 ],
             }
 
-        # SQL валиден — выполняем
+        # Контрактная проверка перед execute_query
         tool_calls = state.get("tool_calls", [])
         last_tool = tool_calls[-1] if tool_calls else {}
         tool_name = (pending_call or {}).get("tool") or last_tool.get("tool", "execute_query")
         tool_args = dict((pending_call or {}).get("args", {}))
         if not tool_args:
             tool_args = {"sql": sql}
+        if tool_name == "execute_query":
+            sql_contract = _build_sql_contract(state)
+            ok, reason, details = _validate_sql_against_contract(sql, sql_contract)
+            if not ok:
+                replan_count = state.get("replan_count", 0)
+                replan_reason = f"{reason}: {details}"
+                logger.warning("Validator: контракт не пройден, replanning: %s", replan_reason)
+                return {
+                    "sql_to_validate": None,
+                    "pending_sql_tool_call": None,
+                    "last_error": replan_reason,
+                    "needs_replan": True,
+                    "replan_count": replan_count + 1,
+                    "replan_context": (
+                        "SQL отклонён перед исполнением из-за нарушения контракта.\n"
+                        f"reason={reason}\n"
+                        f"details={details}\n"
+                        f"contract={json.dumps(sql_contract, ensure_ascii=False)}"
+                    ),
+                    "messages": state["messages"] + [
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "⚠ SQL не выполнен: нарушен обязательный контракт.\n"
+                                f"Причина: {reason}\n{details}"
+                            ),
+                        }
+                    ],
+                }
 
+        # SQL валиден — выполняем
         t0 = time.monotonic()
         tool_result = self._call_tool(tool_name, tool_args)
         duration_ms = int((time.monotonic() - t0) * 1000)

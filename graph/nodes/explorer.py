@@ -423,6 +423,7 @@ class ExplorerNodes:
             join_analysis_data=join_analysis_data,
             schema_loader=self.schema,
             user_input=user_input,
+            user_hints=state.get("user_hints", {}) or {},
         )
         _det_conf = _det_result.get("confidence", 0.0)
         logger.info(

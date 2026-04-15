@@ -173,6 +173,64 @@ class TestGroupByCompleteness:
         gb_warnings = [w for w in result.warnings if "GROUP BY completeness" in w]
         assert not gb_warnings
 
+    def test_extra_col_in_group_by_warns(self):
+        """GROUP BY содержит колонку, отсутствующую в SELECT — типичный баг «filter утёк в GROUP BY»."""
+        sql = (
+            "SELECT region, COUNT(*) AS cnt "
+            "FROM dm.sales "
+            "WHERE event_dt >= '2024-01-01' "
+            "GROUP BY region, event_dt"
+        )
+        result = check_sql(sql, check_columns=False)
+        # event_dt есть в GROUP BY, но нет в SELECT
+        extra_warnings = [
+            w for w in result.warnings
+            if "GROUP BY" in w and "event_dt" in w and "отсутствующие в SELECT" in w
+        ]
+        assert extra_warnings, (
+            "Должно быть предупреждение: event_dt в GROUP BY отсутствует в SELECT. "
+            f"Warnings: {result.warnings}"
+        )
+
+    def test_extra_col_multiple_leaked(self):
+        sql = (
+            "SELECT client_id, SUM(amount) AS total "
+            "FROM dm.sales "
+            "GROUP BY client_id, task_created_dt, task_plan_closed_dt"
+        )
+        result = check_sql(sql, check_columns=False)
+        extra_warnings = [
+            w for w in result.warnings
+            if "GROUP BY" in w and "отсутствующие в SELECT" in w
+        ]
+        assert extra_warnings
+        assert (
+            "task_created_dt" in extra_warnings[0]
+            or "task_plan_closed_dt" in extra_warnings[0]
+        )
+
+    def test_group_by_equal_to_select_no_extra_warning(self):
+        sql = "SELECT region, segment, COUNT(*) AS cnt FROM dm.sales GROUP BY region, segment"
+        result = check_sql(sql, check_columns=False)
+        extra_warnings = [
+            w for w in result.warnings
+            if "отсутствующие в SELECT" in w
+        ]
+        assert not extra_warnings
+
+    def test_group_by_alias_in_select_not_flagged(self):
+        """GROUP BY по алиасу, объявленному в SELECT — не должно флагаться."""
+        sql = (
+            "SELECT date_trunc('month', event_dt) AS month_bucket, COUNT(*) AS cnt "
+            "FROM dm.sales GROUP BY month_bucket"
+        )
+        result = check_sql(sql, check_columns=False)
+        extra_warnings = [
+            w for w in result.warnings
+            if "отсутствующие в SELECT" in w and "month_bucket" in w
+        ]
+        assert not extra_warnings
+
 
 # ---------------------------------------------------------------------------
 # ORDER BY алиасы

@@ -232,6 +232,8 @@ class SqlPipelineNodes:
             table_types=table_types,
             join_analysis_data=join_analysis_data,
             user_input=state.get("user_input", ""),
+            user_hints=state.get("user_hints", {}) or {},
+            schema_loader=self.schema,
         )
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))

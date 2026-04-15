@@ -118,6 +118,9 @@ def _compute_group_by(
 
     Логика: все колонки из select-роли, которые НЕ являются агрегируемыми,
     плюс явно указанные в group_by-роли. Дедупликация сохраняет порядок.
+
+    Колонки с ролью filter (например, дата для WHERE) НЕ попадают в GROUP BY:
+    иначе они дают «GROUP BY содержит колонки, отсутствующие в SELECT».
     """
     agg_col = aggregation.get("column") if aggregation else None
 
@@ -125,23 +128,108 @@ def _compute_group_by(
     seen: set[str] = set()
 
     for _table, roles in selected_columns.items():
-        # Явный group_by
+        filter_set = set(roles.get("filter", []))
+        agg_set = set(roles.get("aggregate", []))
+        select_set = set(roles.get("select", []))
+
+        # Явный group_by — но только если колонка действительно в SELECT
+        # или будет добавлена как dimension. Filter-only колонки не включаем.
         for col in roles.get("group_by", []):
-            if col not in seen:
-                group_by.append(col)
-                seen.add(col)
+            if col in seen:
+                continue
+            # filter-only (нет в select и не в group_by вручную из dim) → пропуск
+            if col in filter_set and col not in select_set:
+                continue
+            group_by.append(col)
+            seen.add(col)
 
         # select-роль: добавляем всё кроме агрегируемой колонки
         for col in roles.get("select", []):
             if col == agg_col:
                 continue
-            if col in roles.get("aggregate", []):
+            if col in agg_set:
                 continue
             if col not in seen:
                 group_by.append(col)
                 seen.add(col)
 
     return group_by
+
+
+# ---------------------------------------------------------------------------
+# 2b. HAVING (постагрегатные фильтры из user_hints)
+# ---------------------------------------------------------------------------
+
+def _compute_having(
+    user_hints: dict | None,
+    selected_columns: dict[str, dict],
+    schema_loader,
+    main_table: str,
+) -> list[dict]:
+    """Сформировать список HAVING-условий из user_hints.having_hints.
+
+    Преобразует подсказки вида «от 3 человек» в:
+        [{"expr": "COUNT(DISTINCT employee_id)", "op": ">=", "value": 3}]
+
+    Колонка для unit подбирается из main_table через
+    user_hint_extractor.match_unit_column. Если подобрать не удалось — берём
+    первую PK-колонку main_table; если и её нет — пропускаем подсказку.
+    """
+    if not user_hints:
+        return []
+    hints = user_hints.get("having_hints", []) or []
+    if not hints:
+        return []
+    if not main_table or not schema_loader:
+        return []
+
+    # Импорт здесь, чтобы избежать кругов и зависеть только при наличии хинтов.
+    try:
+        from core.user_hint_extractor import match_unit_column
+    except Exception:  # noqa: BLE001
+        return []
+
+    parts = main_table.split(".", 1)
+    if len(parts) != 2:
+        return []
+    main_cols = schema_loader.get_table_columns(parts[0], parts[1])
+
+    result: list[dict] = []
+    for hint in hints:
+        if not isinstance(hint, dict):
+            continue
+        op = hint.get("op", ">=")
+        value = hint.get("value")
+        if value is None:
+            continue
+        unit = hint.get("unit_hint", "") or ""
+        col = match_unit_column(unit, main_table, schema_loader) if unit else None
+        if not col and not main_cols.empty:
+            try:
+                pk_mask = main_cols.get(
+                    "is_primary_key",
+                ).astype(bool)
+                pk_cols = main_cols.loc[pk_mask, "column_name"].tolist()
+                if pk_cols:
+                    col = pk_cols[0]
+            except Exception:  # noqa: BLE001
+                col = None
+        if not col:
+            logger.info(
+                "Planner: HAVING-подсказка %s проигнорирована — колонка не подобрана",
+                hint,
+            )
+            continue
+        result.append({
+            "expr": f"COUNT(DISTINCT {col})",
+            "op": op,
+            "value": value,
+        })
+        logger.info(
+            "Planner: HAVING %s %s %s (из user_hint unit=%r)",
+            f"COUNT(DISTINCT {col})", op, value, unit,
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +493,8 @@ def build_blueprint(
     table_types: dict[str, str],
     join_analysis_data: dict,
     user_input: str = "",
+    user_hints: dict | None = None,
+    schema_loader=None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -414,6 +504,9 @@ def build_blueprint(
         join_spec: JOIN-спецификация (из column_selector).
         table_types: Тип каждой таблицы — fact/dim/ref/unknown.
         join_analysis_data: Результаты join_analysis (для совместимости).
+        user_input: Текст запроса (для derive date filters).
+        user_hints: Подсказки из hint_extractor (having_hints используются здесь).
+        schema_loader: SchemaLoader для подбора unit_col в HAVING.
 
     Returns:
         dict совместимый с форматом sql_blueprint из AgentState.
@@ -519,6 +612,14 @@ def build_blueprint(
     # LIMIT: только если явно задан в intent; без умолчания
     limit: int | None = intent.get("limit") or None
 
+    # HAVING-условия из user_hints (пост-агрегатный фильтр).
+    having_clauses = _compute_having(
+        user_hints=user_hints,
+        selected_columns=selected_columns,
+        schema_loader=schema_loader,
+        main_table=main_table,
+    )
+
     blueprint = {
         "strategy": strategy,
         "main_table": main_table,
@@ -527,6 +628,7 @@ def build_blueprint(
         "where_conditions": where_conditions,
         "aggregation": aggregation,
         "group_by": group_by,
+        "having": having_clauses,
         "order_by": order_by,
         "limit": limit,
         "join_by_axis": join_by_axis,

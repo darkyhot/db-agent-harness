@@ -99,3 +99,17 @@ class AgentState(TypedDict):
     # При followup-запросах — мёрджится (не перезаписывается).
     # sql_writer и sql_static_checker используют его для проверки.
     allowed_tables: list[str]
+
+    # === Подсказки пользователя (детерминированный экстрактор) ===
+    # Заполняется в hint_extractor (между intent_classifier и table_resolver).
+    # Без LLM, без хардкода таблиц/колонок — только regex + валидация по каталогу.
+    # Структура:
+    #   {
+    #     "must_keep_tables": [(schema, table), ...],
+    #     "join_fields": ["inn", "customer_id", ...],
+    #     "dim_sources": {"segment": {"table": "schema.t", "join_col": "inn"}},
+    #     "having_hints": [{"op": ">=", "value": 3, "unit_hint": "человек"}],
+    #   }
+    # Используется в table_resolver (hard-lock must_keep_tables),
+    # column_selector (dim_sources/join_fields), sql_planner (HAVING).
+    user_hints: dict[str, Any]

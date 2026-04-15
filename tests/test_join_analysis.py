@@ -654,3 +654,127 @@ class TestSmartJoinKeyDetection:
         )
         # gosb_id должен сопоставляться с old_gosb_id
         assert "gosb_id" in on_text
+
+
+# ---------------------------------------------------------------------------
+# user_hints.join_fields побеждает PK-normalized (column_selector._pick_join_candidate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synthetic_two_table_loader(tmp_path):
+    """Синтетические fact_a + dim_b:
+    - fact_a: event_id (PK), inn, client_id (нет PK, но 50% unique)
+    - dim_b:  client_pk (PK), inn, client_id
+
+    У обеих таблиц общие поля `inn` и `client_id`.
+    `client_id` — key-like по имени и по normalized_pk (client_pk),
+    `inn` — бизнес-ключ, не PK.
+    """
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["syn", "syn"],
+        "table_name": ["fact_a", "dim_b"],
+        "description": ["Синт. факт-таблица", "Синт. справочник клиентов"],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+
+    attrs_df = pd.DataFrame({
+        "schema_name": ["syn"] * 6,
+        "table_name": [
+            "fact_a", "fact_a", "fact_a",
+            "dim_b",  "dim_b",  "dim_b",
+        ],
+        "column_name": [
+            "event_id", "inn", "client_id",
+            "client_pk", "inn", "client_id",
+        ],
+        "dType": [
+            "bigint", "varchar", "bigint",
+            "bigint", "varchar", "bigint",
+        ],
+        "description": [
+            "PK события", "ИНН", "ID клиента",
+            "PK клиента", "ИНН", "ID клиента",
+        ],
+        "is_primary_key": [
+            True, False, False,
+            True, False, False,
+        ],
+        "unique_perc": [100.0, 80.0, 50.0, 100.0, 80.0, 100.0],
+        "not_null_perc": [100.0, 90.0, 80.0, 100.0, 90.0, 95.0],
+    })
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+
+    return SchemaLoader(data_dir=tmp_path)
+
+
+class TestUserHintJoinFieldsWins:
+    """`user_hints.join_fields` должен побеждать PK-normalized выбор join-колонки."""
+
+    def test_hint_inn_overrides_pk_default(self, synthetic_two_table_loader):
+        """Без подсказки алгоритм мог бы выбрать client_id/client_pk,
+        но с hint_join_fields=['inn'] должен взять `inn`."""
+        from core.column_selector_deterministic import _pick_join_candidate
+
+        pick = _pick_join_candidate(
+            text="",
+            t1="syn.fact_a",
+            t2="syn.dim_b",
+            schema_loader=synthetic_two_table_loader,
+            user_input="соедини по инн",
+            hint_join_fields=["inn"],
+        )
+        assert pick is not None
+        assert pick["col1"] == "inn"
+        assert pick["col2"] == "inn"
+
+    def test_hint_client_id_wins_even_non_pk(self, synthetic_two_table_loader):
+        """Даже если в fact_a client_id не PK и всего 50% unique, hint должен
+        заставить выбрать именно его, а не fallback на какой-то другой ключ."""
+        from core.column_selector_deterministic import _pick_join_candidate
+
+        pick = _pick_join_candidate(
+            text="",
+            t1="syn.fact_a",
+            t2="syn.dim_b",
+            schema_loader=synthetic_two_table_loader,
+            user_input="",
+            hint_join_fields=["client_id"],
+        )
+        assert pick is not None
+        assert pick["col1"] == "client_id"
+        assert pick["col2"] == "client_id"
+
+    def test_no_hint_falls_back_to_key_like(self, synthetic_two_table_loader):
+        """Без user_hints алгоритм опирается на упоминание в тексте + key-like.
+        Здесь текст явно упоминает client_id — он key-like и должен быть выбран."""
+        from core.column_selector_deterministic import _pick_join_candidate
+
+        pick = _pick_join_candidate(
+            text="",
+            t1="syn.fact_a",
+            t2="syn.dim_b",
+            schema_loader=synthetic_two_table_loader,
+            user_input="джойн через client_id",
+            hint_join_fields=None,
+        )
+        assert pick is not None
+        assert pick["col1"] == "client_id"
+
+    def test_hint_missing_column_graceful(self, synthetic_two_table_loader):
+        """Если hint_join_fields указывает на несуществующую в обеих таблицах
+        колонку — hint не применяется, используется обычный fallback."""
+        from core.column_selector_deterministic import _pick_join_candidate
+
+        pick = _pick_join_candidate(
+            text="",
+            t1="syn.fact_a",
+            t2="syn.dim_b",
+            schema_loader=synthetic_two_table_loader,
+            user_input="через client_id",
+            hint_join_fields=["nonexistent_col"],
+        )
+        # Не падает, fallback работает
+        assert pick is None or pick["col1"] in {"client_id", "inn"}

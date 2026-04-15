@@ -463,6 +463,26 @@ class IntentNodes:
         requested = _derive_requested_slots(user_input, intent)
         tables_df = self.schema.tables_df
 
+        # === Подсказки пользователя (hint_extractor) ===
+        user_hints = state.get("user_hints", {}) or {}
+        hint_must_keep: list[tuple[str, str]] = list(
+            user_hints.get("must_keep_tables", []) or []
+        )
+        hint_dim_sources: dict[str, dict[str, str]] = (
+            user_hints.get("dim_sources", {}) or {}
+        )
+        hint_join_fields: list[str] = list(user_hints.get("join_fields", []) or [])
+
+        # Таблицы, упомянутые через dim_sources, тоже считаются must_keep.
+        for slot_key, binding in hint_dim_sources.items():
+            tbl_full = binding.get("table") if isinstance(binding, dict) else None
+            if not tbl_full or "." not in tbl_full:
+                continue
+            s_part, t_part = tbl_full.split(".", 1)
+            tup = (s_part, t_part)
+            if tup not in hint_must_keep:
+                hint_must_keep.append(tup)
+
         # Кэш get_table_columns в пределах вызова: каждая таблица загружается ровно один раз,
         # даже если её запрашивают _table_type, _score_table_for_slot и _joinability_score.
         _col_cache: dict[tuple[str, str], object] = {}
@@ -479,6 +499,28 @@ class IntentNodes:
         def _table_type(schema_name: str, table_name: str) -> str:
             cols = _get_cols(schema_name, table_name)
             return detect_table_type(table_name, cols)
+
+        def _table_name_match_score(
+            schema_name: str, table_name: str, slot: str,
+        ) -> float:
+            """Семантическая близость имени/описания таблицы к слоту.
+
+            Используется для штрафа «dim-в-факте»: если таблица типа fact, но
+            её имя/описание не пересекаются со словами метрики — это значит,
+            что метрика, скорее всего, реализована флагом, и есть более
+            подходящая фактовая таблица.
+            """
+            try:
+                row_df = tables_df[
+                    (tables_df["schema_name"].astype(str).str.lower() == schema_name.lower())
+                    & (tables_df["table_name"].astype(str).str.lower() == table_name.lower())
+                ]
+                if row_df.empty:
+                    return 0.0
+                table_descr = str(row_df.iloc[0].get("description", "") or "")
+            except Exception:  # noqa: BLE001
+                table_descr = ""
+            return _semantic_match_score(table_name, table_descr, slot)
 
         def _score_table_for_slot(schema_name: str, table_name: str, slot: str) -> float:
             cols = _get_cols(schema_name, table_name)
@@ -505,6 +547,15 @@ class IntentNodes:
                         score += 35
                     else:
                         score -= 20
+                    # Штраф «dim-в-факте»: фактовая таблица, чьё имя/описание
+                    # не близко к метрике — наверняка метрика тут флаг. Снижаем
+                    # вес, чтобы не выиграть у настоящей фактовой таблицы.
+                    if t_type == "fact":
+                        tbl_match = _table_name_match_score(
+                            schema_name, table_name, slot,
+                        )
+                        if tbl_match <= 0:
+                            score *= 0.5
                 best = max(best, score)
             return best
 
@@ -541,6 +592,17 @@ class IntentNodes:
             full = f"{schema_name}.{table_name}".lower()
             if table_name.lower() in query_norm or full in query_norm:
                 explicit_tables.append((schema_name, table_name))
+
+        # Hard-lock: must_keep = explicit_tables ∪ user_hints.must_keep_tables.
+        # Эти таблицы НЕ могут быть исключены детерминированной коррекцией.
+        locked_tables: list[tuple[str, str]] = list(dict.fromkeys(
+            explicit_tables + hint_must_keep,
+        ))
+        if hint_must_keep:
+            logger.info(
+                "TableResolver: must_keep из user_hints: %s",
+                hint_must_keep,
+            )
 
         metric_slot = requested.get("metric")
         dimension_slots = list(requested.get("dimensions", []))
@@ -581,37 +643,83 @@ class IntentNodes:
                 for _, row in tables_df.iterrows()
             ]
 
-        main_table: tuple[str, str] | None = explicit_tables[0] if explicit_tables else None
-        if metric_slot and not explicit_tables:
+        # === Metric-first выбор main_table ===
+        # Принцип: main_table выбирается СТРОГО по метрическому слоту с приоритетом
+        # фактовых таблиц. Lock'нутые таблицы получают сильный бонус. Димовые
+        # скоры (label-слоты) НЕ учитываются — иначе таблица с высоким not_null
+        # по измерению может перебить настоящую фактовую таблицу.
+        main_table: tuple[str, str] | None = None
+        if metric_slot:
             metric_candidates: list[tuple[float, tuple[str, str]]] = []
             for st in candidate_tables:
                 score = _score_table_for_slot(st[0], st[1], metric_slot)
-                if score > 0:
-                    if st in explicit_tables:
-                        score += 120
-                    metric_candidates.append((score, st))
+                if score <= 0:
+                    continue
+                # Бонусы за lock'нутость
+                if st in hint_must_keep:
+                    score += 200  # пользователь явно требует
+                if st in explicit_tables:
+                    score += 120
+                metric_candidates.append((score, st))
             if metric_candidates:
                 metric_candidates.sort(reverse=True)
                 main_table = metric_candidates[0][1]
+        if main_table is None:
+            # Fallback: первая lock'нутая или первая explicit
+            if hint_must_keep:
+                main_table = hint_must_keep[0]
+            elif explicit_tables:
+                main_table = explicit_tables[0]
 
-        deterministic_tables: list[tuple[str, str]] = list(dict.fromkeys(explicit_tables))
+        deterministic_tables: list[tuple[str, str]] = list(dict.fromkeys(locked_tables))
         if main_table and main_table not in deterministic_tables:
             deterministic_tables.insert(0, main_table)
 
         preserve_single_explicit = (
-            len(explicit_tables) == 1
+            len(locked_tables) == 1
             and not join_requested
             and str(intent.get("complexity", "")).lower() == "single_table"
+            and not hint_dim_sources
         )
 
+        # Для каждого dim-слота: сначала смотрим в dim_sources binding,
+        # потом в main_table, потом ищем joinable dim-партнёра.
         for slot in dimension_slots:
             if preserve_single_explicit:
                 continue
+
+            # 1. Если для слота есть прямой биндинг через user_hints.dim_sources —
+            #    таблица уже в locked_tables (см. выше), пропускаем поиск.
+            slot_lower = slot.lower() if isinstance(slot, str) else ""
+            bound_table: tuple[str, str] | None = None
+            for binding_key, binding in hint_dim_sources.items():
+                if (
+                    binding_key.lower() == slot_lower
+                    or slot_lower in binding_key.lower()
+                    or binding_key.lower() in slot_lower
+                ):
+                    tbl_full = binding.get("table") if isinstance(binding, dict) else None
+                    if tbl_full and "." in tbl_full:
+                        s_part, t_part = tbl_full.split(".", 1)
+                        bound_table = (s_part, t_part)
+                        break
+            if bound_table:
+                if bound_table not in deterministic_tables:
+                    deterministic_tables.append(bound_table)
+                logger.info(
+                    "TableResolver: dim '%s' → таблица %s.%s (user_hints.dim_sources)",
+                    slot, bound_table[0], bound_table[1],
+                )
+                continue
+
+            # 2. date обычно есть в main_table — не плодим dim-таблицы.
             if slot == "date" and main_table:
                 if _score_table_for_slot(main_table[0], main_table[1], slot) > 0:
                     if main_table not in deterministic_tables:
                         deterministic_tables.append(main_table)
                     continue
+
+            # 3. Иначе ищем лучшую dim-партнёршу для main_table.
             dim_candidates: list[tuple[float, tuple[str, str]]] = []
             for st in candidate_tables:
                 score = _score_table_for_slot(st[0], st[1], slot)
@@ -620,6 +728,19 @@ class IntentNodes:
                 score += _joinability_score(main_table, st)
                 if st in explicit_tables:
                     score += 90
+                if st in hint_must_keep:
+                    score += 150
+                # Бонус за наличие колонки из user_hints.join_fields
+                if hint_join_fields:
+                    cols = _get_cols(st[0], st[1])
+                    if not cols.empty:
+                        col_names = {
+                            str(c).lower() for c in cols["column_name"].astype(str)
+                        }
+                        for hf in hint_join_fields:
+                            if hf.lower() in col_names:
+                                score += 60
+                                break
                 dim_candidates.append((score, st))
             if dim_candidates:
                 dim_candidates.sort(reverse=True)
@@ -628,7 +749,17 @@ class IntentNodes:
                     deterministic_tables.append(best_table)
 
         if not deterministic_tables:
-            deterministic_tables = validated_tables
+            deterministic_tables = list(validated_tables)
+
+        # Hard-lock: гарантируем, что все must_keep-таблицы присутствуют.
+        # Они никогда не должны быть удалены детерминированной коррекцией.
+        for tup in locked_tables:
+            if tup not in deterministic_tables:
+                deterministic_tables.append(tup)
+                logger.info(
+                    "TableResolver: locked-таблица %s.%s принудительно добавлена",
+                    tup[0], tup[1],
+                )
 
         if deterministic_tables:
             deterministic_tables = list(dict.fromkeys(deterministic_tables))
@@ -640,7 +771,10 @@ class IntentNodes:
                 )
                 validated_tables = deterministic_tables
                 table_confidences = {
-                    f"{s}.{t}": 100 if (s, t) in explicit_tables else 85
+                    f"{s}.{t}": (
+                        100 if (s, t) in locked_tables
+                        else (85 if (s, t) in explicit_tables else 70)
+                    )
                     for s, t in deterministic_tables
                 }
 

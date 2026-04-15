@@ -296,9 +296,25 @@ def _choose_best_column(
     allowed_tables: set[str] | None = None,
     require_numeric: bool = False,
     agg_hint: str | None = None,
+    dim_source_table: str | None = None,
 ) -> tuple[str, str] | None:
-    """Выбрать лучший источник атрибута/метрики по имени, описанию и метаданным."""
+    """Выбрать лучший источник атрибута/метрики по имени, описанию и метаданным.
+
+    Если задан dim_source_table — поиск ограничивается этой таблицей
+    (приходит из user_hints.dim_sources). Это даёт пользователю явный
+    контроль: «сегмент возьми в TABLE» — и колонка строго оттуда.
+    """
     best: tuple[float, str, str] | None = None
+
+    # Приоритет user_hints.dim_sources: ограничиваем поиск указанной таблицей.
+    if dim_source_table:
+        bound_allowed = {dim_source_table}
+        if allowed_tables:
+            bound_allowed = bound_allowed & allowed_tables
+        if bound_allowed:
+            allowed_tables = bound_allowed
+        else:
+            allowed_tables = {dim_source_table}
 
     for table_key in table_structures:
         if allowed_tables and table_key not in allowed_tables:
@@ -411,6 +427,7 @@ def select_columns(
     join_analysis_data: dict[str, Any],
     schema_loader: Any,
     user_input: str = "",
+    user_hints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Детерминированно выбрать колонки и JOIN-спецификацию.
 
@@ -420,6 +437,7 @@ def select_columns(
         table_types:       dict schema.table → "fact"/"dim"/"ref"/"unknown"
         join_analysis_data: dict из table_explorer (pre-computed join candidates)
         schema_loader:     SchemaLoader для доступа к колонкам и check_key_uniqueness
+        user_hints:        dict из hint_extractor (dim_sources, join_fields, having_hints)
 
     Returns:
         dict с ключами: selected_columns, join_spec, confidence, reason
@@ -429,6 +447,31 @@ def select_columns(
     date_filters: dict = intent.get('date_filters') or {}
     filter_conditions: list[dict] = intent.get('filter_conditions') or []
     requested = _derive_requested_slots(user_input, intent)
+
+    # Подсказки пользователя: связки «слот → таблица», JOIN-поля, HAVING-хинты.
+    user_hints = user_hints or {}
+    hint_dim_sources: dict[str, dict[str, str]] = user_hints.get('dim_sources', {}) or {}
+    hint_join_fields: list[str] = list(user_hints.get('join_fields', []) or [])
+    hint_having: list[dict[str, Any]] = list(user_hints.get('having_hints', []) or [])
+
+    def _slot_dim_source(slot_name: str) -> str | None:
+        """Найти dim-источник для слота через user_hints (с учётом синонимов)."""
+        if not hint_dim_sources or not slot_name:
+            return None
+        slot_lower = slot_name.lower()
+        for key, binding in hint_dim_sources.items():
+            if not isinstance(binding, dict):
+                continue
+            key_lower = key.lower()
+            if (
+                key_lower == slot_lower
+                or key_lower in slot_lower
+                or slot_lower in key_lower
+            ):
+                tbl = binding.get('table')
+                if tbl:
+                    return tbl
+        return None
 
     has_date_filter = bool(
         date_filters.get('from') or date_filters.get('to') or requested['has_date_filter']
@@ -588,9 +631,22 @@ def select_columns(
     # ---- JOIN-спецификация из join_analysis_data ----
     if requested['dimensions']:
         for slot in requested['dimensions']:
+            bound_table = _slot_dim_source(slot)
             choice = _choose_best_column(
-                table_structures, table_types, schema_loader, slot
+                table_structures, table_types, schema_loader, slot,
+                dim_source_table=bound_table,
             )
+            # Fallback: если dim_source указан, но колонки в нём нет —
+            # предупреждаем и берём из любой таблицы.
+            if not choice and bound_table:
+                logger.warning(
+                    "ColumnSelectorDet: dim_source '%s' для слота '%s' "
+                    "не содержит подходящей колонки — fallback на общий поиск",
+                    bound_table, slot,
+                )
+                choice = _choose_best_column(
+                    table_structures, table_types, schema_loader, slot,
+                )
             if not choice:
                 continue
             table_key, col_name = choice
@@ -680,9 +736,15 @@ def select_columns(
     if requested['dimensions']:
         allowed_refs: set[tuple[str, str]] = set()
         for slot in requested['dimensions']:
+            bound_table = _slot_dim_source(slot)
             choice = _choose_best_column(
-                table_structures, table_types, schema_loader, slot
+                table_structures, table_types, schema_loader, slot,
+                dim_source_table=bound_table,
             )
+            if not choice and bound_table:
+                choice = _choose_best_column(
+                    table_structures, table_types, schema_loader, slot,
+                )
             if choice:
                 allowed_refs.add(choice)
         if has_date_filter:
@@ -736,6 +798,7 @@ def select_columns(
         schema_loader,
         table_types,
         user_input=user_input,
+        hint_join_fields=hint_join_fields,
     )
 
     # ---- Итоговая confidence ----
@@ -775,6 +838,9 @@ def select_columns(
         'join_spec': join_spec,
         'confidence': round(overall, 2),
         'reason': reason,
+        # Прокидываем HAVING-хинты дальше — sql_planner превратит их в
+        # HAVING COUNT(DISTINCT <col>) >= N с подбором колонки по unit_hint.
+        'having_hints': hint_having,
     }
 
 
@@ -893,10 +959,13 @@ def _build_join_spec(
     schema_loader: Any,
     table_types: dict[str, str],
     user_input: str = "",
+    hint_join_fields: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Построить join_spec из pre-computed join_analysis_data (детерминированно).
 
     Выбирает top-1 кандидата для каждой пары. safe определяется из CSV.
+    Если задан hint_join_fields (из user_hints), кандидат с exact-match
+    именем из подсказок выбирается с высоким приоритетом.
     """
     join_spec: list[dict[str, Any]] = []
     processed: set[frozenset] = set()
@@ -919,7 +988,11 @@ def _build_join_spec(
             continue
 
         text = data.get('text', '')
-        cand = _pick_join_candidate(text, t1, t2, schema_loader, user_input=user_input)
+        cand = _pick_join_candidate(
+            text, t1, t2, schema_loader,
+            user_input=user_input,
+            hint_join_fields=hint_join_fields,
+        )
         if not cand:
             continue
 
@@ -996,12 +1069,22 @@ def _pick_join_candidate(
     t2: str,
     schema_loader: Any,
     user_input: str = "",
+    hint_join_fields: list[str] | None = None,
 ) -> dict[str, str] | None:
-    """Выбрать join-кандидат с учётом явного ключа из запроса пользователя."""
+    """Выбрать join-кандидат с учётом явного ключа из запроса пользователя.
+
+    Приоритеты:
+    1. exact-match имени из user_hints.join_fields, существующего в обеих таблицах
+       (даже если не key-like — пользователь явно указал)
+    2. exact-match имени, упомянутого в тексте запроса, key-like
+    3. normalized-match имени, упомянутого в тексте запроса
+    4. fallback на _parse_top_candidate (статистика join_analysis)
+    """
     query = _normalize_query_text(user_input)
+    hint_join_fields = hint_join_fields or []
     t1_parts = t1.split('.', 1)
     t2_parts = t2.split('.', 1)
-    if query and len(t1_parts) == 2 and len(t2_parts) == 2:
+    if (query or hint_join_fields) and len(t1_parts) == 2 and len(t2_parts) == 2:
         cols1 = schema_loader.get_table_columns(t1_parts[0], t1_parts[1])
         cols2 = schema_loader.get_table_columns(t2_parts[0], t2_parts[1])
         if cols1.empty or cols2.empty:
@@ -1018,6 +1101,20 @@ def _pick_join_candidate(
         }
         names1 = set(rows1)
         names2 = set(rows2)
+        names1_lower = {n.lower(): n for n in names1}
+        names2_lower = {n.lower(): n for n in names2}
+
+        # 1. Подсказка пользователя (user_hints.join_fields) — высший приоритет.
+        for hf in hint_join_fields:
+            hf_lower = hf.lower()
+            if hf_lower in names1_lower and hf_lower in names2_lower:
+                logger.info(
+                    "ColumnSelectorDet: JOIN по '%s' (user_hints.join_fields)", hf,
+                )
+                return {
+                    'col1': names1_lower[hf_lower],
+                    'col2': names2_lower[hf_lower],
+                }
 
         def _is_key_like(row: Any) -> bool:
             name = str(row.get('column_name', '')).lower()

@@ -72,8 +72,8 @@ def _route_after_intent_classifier(state: AgentState) -> str:
     if intent.get("needs_search"):
         return "tool_dispatcher"
 
-    # Обычный путь — к table_resolver
-    return "table_resolver"
+    # Обычный путь — через hint_extractor к table_resolver
+    return "hint_extractor"
 
 
 def _route_after_tool_dispatcher(state: AgentState) -> str:
@@ -249,8 +249,9 @@ def build_graph(
 
     graph = StateGraph(AgentState)
 
-    # Добавляем все 12 узлов
+    # Добавляем все 13 узлов
     graph.add_node("intent_classifier", nodes.intent_classifier)
+    graph.add_node("hint_extractor", nodes.hint_extractor)
     graph.add_node("table_resolver", nodes.table_resolver)
     graph.add_node("table_explorer", nodes.table_explorer)
     graph.add_node("column_selector", nodes.column_selector)
@@ -272,8 +273,11 @@ def build_graph(
         END: END,
         "summarizer": "summarizer",
         "tool_dispatcher": "tool_dispatcher",
-        "table_resolver": "table_resolver",
+        "hint_extractor": "hint_extractor",
     })
+
+    # hint_extractor (детерминированный) → table_resolver
+    graph.add_edge("hint_extractor", "table_resolver")
 
     # tool_dispatcher → conditional routing (back to resolver or diagnoser)
     graph.add_conditional_edges("tool_dispatcher", _route_after_tool_dispatcher, {
@@ -340,7 +344,7 @@ def build_graph(
     # summarizer → END
     graph.add_edge("summarizer", END)
 
-    logger.info("Граф агента собран (12 узлов)")
+    logger.info("Граф агента собран (13 узлов)")
     return graph.compile()
 
 
@@ -390,4 +394,13 @@ def create_initial_state(
         # Multi-turn context
         prev_sql=prev_sql,
         prev_result_summary=prev_result_summary,
+        # Подсказки пользователя (детерминированный экстрактор)
+        user_hints={
+            "must_keep_tables": [],
+            "join_fields": [],
+            "dim_sources": {},
+            "having_hints": [],
+        },
+        # Белый список таблиц (заполняется в table_resolver)
+        allowed_tables=[],
     )

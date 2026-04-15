@@ -183,6 +183,28 @@ def _build_limit(limit: int | None) -> str:
     return f"LIMIT {limit}"
 
 
+def _build_having_clause(having: list[dict] | None) -> str:
+    """Сформировать HAVING-клаузу из списка условий blueprint["having"].
+
+    Каждый элемент: {"expr": "COUNT(DISTINCT col)", "op": ">=", "value": N}.
+    """
+    if not having:
+        return ""
+    parts: list[str] = []
+    for h in having:
+        if not isinstance(h, dict):
+            continue
+        expr = str(h.get("expr", "")).strip()
+        op = str(h.get("op", ">=")).strip()
+        value = h.get("value")
+        if not expr or value is None:
+            continue
+        parts.append(f"{expr} {op} {value}")
+    if not parts:
+        return ""
+    return "HAVING " + "\n  AND ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Стратегии
 # ---------------------------------------------------------------------------
@@ -207,6 +229,7 @@ def _build_simple_select(
     group_by_cols = blueprint.get("group_by", [])
     where_clause = _build_where_clause(blueprint.get("where_conditions", []))
     group_by_clause = _build_group_by(group_by_cols, alias)
+    having_clause = _build_having_clause(blueprint.get("having", []))
     order_by_clause = _build_order_by(blueprint.get("order_by"))
     limit_clause = _build_limit(blueprint.get("limit"))
 
@@ -218,6 +241,8 @@ def _build_simple_select(
         parts.append(where_clause)
     if group_by_clause:
         parts.append(group_by_clause)
+    if having_clause:
+        parts.append(having_clause)
     if order_by_clause:
         parts.append(order_by_clause)
     if limit_clause:
@@ -441,15 +466,61 @@ def _build_fact_dim_join(
     fact_gb_items: list[str] = []
     dim_gb_items: list[str] = []
     other_gb_items: list[str] = []
+    fact_select_set = set(fact_roles.get("select", []) + fact_roles.get("group_by", []))
+    dim_select_set = set(dim_roles.get("select", []))
     for col in group_by_cols:
-        if col in (fact_roles.get("select", []) + fact_roles.get("group_by", [])):
+        if col in fact_select_set:
             fact_gb_items.append(col if use_full_refs else f"{f_alias}.{col}")
-        elif col in dim_roles.get("select", []):
+        elif col in dim_select_set:
             dim_gb_items.append(col if use_full_refs else f"{d_alias}.{col}")
         else:
-            other_gb_items.append(col)
+            # Колонка GROUP BY, не упомянутая ни в одном SELECT, нарушает
+            # PostgreSQL-инвариант «GROUP BY ⊆ SELECT». Добавляем её в SELECT
+            # автоматически. Определяем сторону по принадлежности к таблицам.
+            owner_alias: str | None = None
+            owner_table: str | None = None
+            fact_cols_all = set(
+                fact_roles.get("select", [])
+                + fact_roles.get("group_by", [])
+                + fact_roles.get("filter", [])
+                + fact_roles.get("aggregate", [])
+            )
+            dim_cols_all = set(
+                dim_roles.get("select", [])
+                + dim_roles.get("group_by", [])
+                + dim_roles.get("filter", [])
+                + dim_roles.get("aggregate", [])
+            )
+            if col in fact_cols_all:
+                owner_alias = f_alias
+                owner_table = main_table
+                fact_gb_items.append(col if use_full_refs else f"{f_alias}.{col}")
+            elif col in dim_cols_all:
+                owner_alias = d_alias
+                owner_table = dim_table
+                dim_gb_items.append(col if use_full_refs else f"{d_alias}.{col}")
+            else:
+                # Совсем неизвестная колонка — оставляем как есть, но в SELECT
+                # автоматически добавлять небезопасно (имя может быть
+                # неполностью квалифицированным). Логируем и пропускаем GROUP BY.
+                logger.warning(
+                    "_build_fact_dim_join: GROUP BY колонка %r не относится "
+                    "ни к одной таблице, исключаем из GROUP BY",
+                    col,
+                )
+                continue
+            ref = col if use_full_refs else f"{owner_alias}.{col}"
+            if ref not in select_items and col not in seen:
+                select_items.append(ref)
+                seen.add(col)
+                logger.warning(
+                    "_build_fact_dim_join: колонка %r из GROUP BY автоматически "
+                    "добавлена в SELECT (была только в filter/group_by, не в select)",
+                    col,
+                )
     gb_items = fact_gb_items + dim_gb_items + other_gb_items
     group_by_clause = ("GROUP BY " + ", ".join(gb_items)) if gb_items else ""
+    having_clause = _build_having_clause(blueprint.get("having", []))
 
     parts = [
         cte_sql.rstrip() if cte_sql else "",
@@ -462,6 +533,8 @@ def _build_fact_dim_join(
         parts.append(where_clause)
     if group_by_clause:
         parts.append(group_by_clause)
+    if having_clause:
+        parts.append(having_clause)
     if order_by_clause:
         parts.append(order_by_clause)
     if limit_clause:
@@ -656,6 +729,7 @@ def _build_fact_fact_join(
 
     limit_clause = _build_limit(blueprint.get("limit"))
     order_by_clause = _build_order_by(blueprint.get("order_by"))
+    having_clause = _build_having_clause(blueprint.get("having", []))
 
     parts = [
         f"WITH {cte1_sql},\n{cte2_sql}",
@@ -663,6 +737,8 @@ def _build_fact_fact_join(
         f"FROM {cte1} c1",
         f"JOIN {cte2} c2 ON c2.{join_key_2} = c1.{join_key_1}",
     ]
+    if having_clause:
+        parts.append(having_clause)
     if order_by_clause:
         parts.append(order_by_clause)
     if limit_clause:

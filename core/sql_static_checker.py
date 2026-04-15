@@ -413,9 +413,10 @@ def _check_group_by_completeness(sql: str, result: StaticCheckResult) -> None:
     if not select_cols:
         return  # Не смогли распарсить — не блокируем
 
+    _KNOWN_CONSTANTS = {"true", "false", "null", "current_date", "current_timestamp"}
+
     missing = select_cols - group_by_cols
     # Исключаем известные константы и псевдоколонки
-    _KNOWN_CONSTANTS = {"true", "false", "null", "current_date", "current_timestamp"}
     missing -= _KNOWN_CONSTANTS
 
     if missing:
@@ -428,6 +429,18 @@ def _check_group_by_completeness(sql: str, result: StaticCheckResult) -> None:
             result.add_error(msg + " При наличии агрегатов это вызовет ошибку БД.")
         else:
             result.add_warning(msg + " Возможна ошибка агрегации.")
+
+    # Симметричная проверка: GROUP BY ⊆ SELECT (включая алиасы).
+    # PostgreSQL не упадёт на «лишних» колонках в GROUP BY, но это типичная ошибка
+    # планировщика — означает, что filter-колонка утекла в GROUP BY и пропала из SELECT.
+    select_aliases = {a.lower() for a in _extract_select_aliases(outer_sql)}
+    extra = group_by_cols - select_cols - _KNOWN_CONSTANTS - select_aliases
+    if extra:
+        msg = (
+            f"GROUP BY содержит колонки {sorted(extra)}, отсутствующие в SELECT — "
+            "это часто признак того, что filter-колонка ошибочно утекла в GROUP BY."
+        )
+        result.add_warning(msg)
 
 
 def _extract_select_aliases(sql: str) -> set[str]:

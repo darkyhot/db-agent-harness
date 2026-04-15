@@ -29,6 +29,8 @@ def _apply_explicit_join_override(
     join_spec: list[dict[str, Any]],
     selected_columns: dict[str, Any],
     intent: dict[str, Any],
+    schema_loader: Any | None = None,
+    selected_tables: list[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Применить explicit_join из интента как override join_spec.
 
@@ -39,62 +41,22 @@ def _apply_explicit_join_override(
     Returns:
         Обновлённый join_spec (исходный если explicit_join пуст или не нашли совпадений).
     """
-    explicit_joins = intent.get("explicit_join") or []
-    if not explicit_joins:
+    pairs, _ = _resolve_explicit_join_pairs(
+        intent=intent,
+        selected_columns=selected_columns,
+        schema_loader=schema_loader,
+        selected_tables=selected_tables,
+    )
+    if not pairs:
         return join_spec
 
     result_spec = list(join_spec)
-
-    for ej in explicit_joins:
-        if not isinstance(ej, dict):
-            continue
-        col_hint = str(ej.get("column_hint") or "").lower().strip()
-        tbl_hint = str(ej.get("table_hint") or "").lower().strip()
-        if not col_hint:
-            continue
-
-        # Ищем колонку по col_hint во всех таблицах selected_columns
-        _candidates: list[tuple[float, str, str]] = []  # (score, tbl, col)
-        for tbl, roles in selected_columns.items():
-            tbl_lower = tbl.lower()
-            all_cols = (
-                roles.get("select", [])
-                + roles.get("filter", [])
-                + roles.get("group_by", [])
-                + roles.get("aggregate", [])
-            )
-            for c in dict.fromkeys(all_cols):  # уникальные, порядок сохранён
-                c_lower = c.lower()
-                if col_hint in c_lower or c_lower in col_hint:
-                    score = len(col_hint) / max(len(c_lower), 1) * 100
-                    if tbl_hint and (tbl_hint in tbl_lower or tbl_lower.endswith(tbl_hint)):
-                        score += 50
-                    _candidates.append((score, tbl, c))
-
-        if len(_candidates) < 2:
-            if _candidates:
-                logger.warning(
-                    "_apply_explicit_join_override: col_hint=%r найден только в одной таблице — "
-                    "недостаточно для JOIN-пары",
-                    col_hint,
-                )
-            continue
-
-        _candidates.sort(reverse=True)
-        # Берём лучшего с tbl_hint (правая сторона JOIN) и лучшего без (левая)
-        right_tbl, right_col = _candidates[0][1], _candidates[0][2]
-        left_tbl, left_col = None, None
-        for _, tbl, col in _candidates[1:]:
-            if tbl != right_tbl:
-                left_tbl, left_col = tbl, col
-                break
-
-        if left_tbl is None:
-            logger.warning(
-                "_apply_explicit_join_override: col_hint=%r только в одной таблице %s — пропускаем",
-                col_hint, right_tbl,
-            )
-            continue
+    for pair in pairs:
+        left_tbl = pair["left_table"]
+        left_col = pair["left_col"]
+        right_tbl = pair["right_table"]
+        right_col = pair["right_col"]
+        col_hint = pair["col_hint"]
 
         override = {
             "left": f"{left_tbl}.{left_col}",
@@ -121,6 +83,159 @@ def _apply_explicit_join_override(
         )
 
     return result_spec
+
+
+def _resolve_explicit_join_pairs(
+    intent: dict[str, Any],
+    selected_columns: dict[str, Any],
+    schema_loader: Any | None = None,
+    selected_tables: list[tuple[str, str]] | None = None,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Разрешить explicit_join в пары таблиц/колонок + вернуть диагностику."""
+    explicit_joins = intent.get("explicit_join") or []
+    if not explicit_joins:
+        return [], []
+
+    candidate_tables = set(selected_columns.keys())
+    for item in selected_tables or []:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            candidate_tables.add(f"{item[0]}.{item[1]}")
+
+    if not candidate_tables:
+        return [], ["explicit_join: нет таблиц-кандидатов для построения JOIN"]
+
+    meta_cache: dict[str, set[str]] = {}
+
+    def _table_parts(table_key: str) -> tuple[str, str] | None:
+        parts = table_key.split(".", 1)
+        if len(parts) != 2:
+            return None
+        return parts[0], parts[1]
+
+    def _meta_cols(table_key: str) -> set[str]:
+        if table_key in meta_cache:
+            return meta_cache[table_key]
+        parts = _table_parts(table_key)
+        if parts is None or schema_loader is None:
+            meta_cache[table_key] = set()
+            return meta_cache[table_key]
+        try:
+            df = schema_loader.get_table_columns(parts[0], parts[1])
+            if df.empty or "column_name" not in df.columns:
+                cols: set[str] = set()
+            else:
+                cols = {str(c) for c in df["column_name"].astype(str).tolist()}
+            meta_cache[table_key] = cols
+            return cols
+        except Exception:
+            meta_cache[table_key] = set()
+            return meta_cache[table_key]
+
+    pairs: list[dict[str, str]] = []
+    diagnostics: list[str] = []
+
+    for ej in explicit_joins:
+        if not isinstance(ej, dict):
+            continue
+        col_hint = str(ej.get("column_hint") or "").strip().lower()
+        tbl_hint = str(ej.get("table_hint") or "").strip().lower()
+        if not col_hint:
+            continue
+
+        candidates: list[tuple[float, str, str]] = []  # (score, table, column)
+        for table_key in sorted(candidate_tables):
+            tbl_lower = table_key.lower()
+            roles = selected_columns.get(table_key, {})
+            role_cols: list[str] = []
+            if isinstance(roles, dict):
+                role_cols = (
+                    roles.get("select", [])
+                    + roles.get("filter", [])
+                    + roles.get("group_by", [])
+                    + roles.get("aggregate", [])
+                )
+            if not isinstance(role_cols, list):
+                role_cols = []
+            columns = list(dict.fromkeys([str(c) for c in role_cols if c]))
+            # Fallback: если колонки нет в ролях, ищем в metadata таблицы.
+            columns += [c for c in sorted(_meta_cols(table_key)) if c not in columns]
+
+            for col in columns:
+                c_lower = col.lower()
+                if col_hint in c_lower or c_lower in col_hint:
+                    score = len(col_hint) / max(len(c_lower), 1) * 100
+                    if tbl_hint and (tbl_hint in tbl_lower or tbl_lower.endswith(tbl_hint)):
+                        score += 50
+                    if col in role_cols:
+                        score += 20
+                    candidates.append((score, table_key, col))
+
+        if not candidates:
+            diagnostics.append(
+                f"explicit_join(col='{col_hint}', table='{tbl_hint or '*'}'): "
+                "не найдена колонка в metadata таблиц-кандидатов"
+            )
+            continue
+
+        candidates.sort(reverse=True)
+        right_table, right_col = candidates[0][1], candidates[0][2]
+        left_table, left_col = None, None
+        for _, table_key, col in candidates[1:]:
+            if table_key != right_table:
+                left_table, left_col = table_key, col
+                break
+
+        if left_table is None:
+            diagnostics.append(
+                f"explicit_join(col='{col_hint}', table='{tbl_hint or '*'}'): "
+                f"нет второй таблицы с колонкой '{right_col}'"
+            )
+            continue
+
+        pairs.append({
+            "left_table": left_table,
+            "left_col": left_col,
+            "right_table": right_table,
+            "right_col": right_col,
+            "col_hint": col_hint,
+        })
+
+    return pairs, diagnostics
+
+
+def _enforce_explicit_join_columns(
+    selected_columns: dict[str, Any],
+    intent: dict[str, Any],
+    schema_loader: Any | None = None,
+    selected_tables: list[tuple[str, str]] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Принудительно добавить explicit_join колонки в роли select/filter."""
+    patched: dict[str, Any] = {
+        t: dict(v) if isinstance(v, dict) else {}
+        for t, v in selected_columns.items()
+    }
+    pairs, diagnostics = _resolve_explicit_join_pairs(
+        intent=intent,
+        selected_columns=patched,
+        schema_loader=schema_loader,
+        selected_tables=selected_tables,
+    )
+
+    for pair in pairs:
+        for table_key, col in (
+            (pair["left_table"], pair["left_col"]),
+            (pair["right_table"], pair["right_col"]),
+        ):
+            roles = patched.setdefault(table_key, {})
+            for role in ("select", "filter"):
+                role_list = roles.get(role, [])
+                if not isinstance(role_list, list):
+                    role_list = [str(role_list)] if role_list else []
+                if col not in role_list:
+                    role_list.append(col)
+                roles[role] = role_list
+
+    return patched, diagnostics
 
 
 class ExplorerNodes:
@@ -439,10 +554,18 @@ class ExplorerNodes:
                 _DET_CONFIDENCE_THRESHOLD,
             )
             # Применяем explicit_join override (Блок B) к детерминированному результату
-            _det_join_spec = _apply_explicit_join_override(
-                _det_result["join_spec"],
+            _det_selected_columns, _ej_diag = _enforce_explicit_join_columns(
                 _det_result["selected_columns"],
                 intent,
+                schema_loader=self.schema,
+                selected_tables=state.get("selected_tables", []),
+            )
+            _det_join_spec = _apply_explicit_join_override(
+                _det_result["join_spec"],
+                _det_selected_columns,
+                intent,
+                schema_loader=self.schema,
+                selected_tables=state.get("selected_tables", []),
             )
             self.memory.add_message(
                 "assistant",
@@ -451,7 +574,7 @@ class ExplorerNodes:
                 f"join-ключей: {len(_det_join_spec)}",
             )
             return {
-                "selected_columns": _det_result["selected_columns"],
+                "selected_columns": _det_selected_columns,
                 "join_spec": _det_join_spec,
                 "column_selector_hint": "",
                 "messages": state["messages"] + [
@@ -459,11 +582,16 @@ class ExplorerNodes:
                         "role": "assistant",
                         "content": (
                             f"[det] Колонки выбраны детерминированно (conf={_det_conf:.2f}): "
-                            f"{', '.join(_det_result['selected_columns'].keys())}"
+                            f"{', '.join(_det_selected_columns.keys())}"
+                            + (
+                                "\nДиагностика explicit_join:\n- " + "\n- ".join(_ej_diag)
+                                if _ej_diag else ""
+                            )
                         ),
                     }
                 ],
                 "graph_iterations": state.get("graph_iterations", 0) + 1,
+                "last_error": "; ".join(_ej_diag) if _ej_diag else state.get("last_error"),
             }
 
         logger.info(
@@ -729,8 +857,20 @@ class ExplorerNodes:
 
                 join_spec.append(entry)
 
-        # --- Блок B: explicit_join override (LLM путь) ---
-        join_spec = _apply_explicit_join_override(join_spec, selected_columns, intent)
+        # --- Блок B: explicit_join contract (LLM путь) ---
+        selected_columns, _ej_diag = _enforce_explicit_join_columns(
+            selected_columns,
+            intent,
+            schema_loader=self.schema,
+            selected_tables=state.get("selected_tables", []),
+        )
+        join_spec = _apply_explicit_join_override(
+            join_spec,
+            selected_columns,
+            intent,
+            schema_loader=self.schema,
+            selected_tables=state.get("selected_tables", []),
+        )
 
         # Hardening: дополнить LLM join_spec составными парами PK, которые LLM мог пропустить.
         # Если dim-таблица имеет составной PK, но LLM вернул только одну пару — добавляем остальные.
@@ -786,8 +926,13 @@ class ExplorerNodes:
                         f"Выбраны колонки для таблиц: "
                         f"{', '.join(selected_columns.keys())}\n"
                         f"JOIN-ключей: {len(join_spec)}"
+                        + (
+                            "\nДиагностика explicit_join:\n- " + "\n- ".join(_ej_diag)
+                            if _ej_diag else ""
+                        )
                     ),
                 }
             ],
             "graph_iterations": state.get("graph_iterations", 0) + 1,
+            "last_error": "; ".join(_ej_diag) if _ej_diag else state.get("last_error"),
         }

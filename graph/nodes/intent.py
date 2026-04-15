@@ -462,6 +462,10 @@ class IntentNodes:
         query_norm = _normalize_query_text(user_input)
         requested = _derive_requested_slots(user_input, intent)
         tables_df = self.schema.tables_df
+        explicit_joins = [
+            ej for ej in (intent.get("explicit_join") or [])
+            if isinstance(ej, dict)
+        ]
 
         # Кэш get_table_columns в пределах вызова: каждая таблица загружается ровно один раз,
         # даже если её запрашивают _table_type, _score_table_for_slot и _joinability_score.
@@ -479,6 +483,31 @@ class IntentNodes:
         def _table_type(schema_name: str, table_name: str) -> str:
             cols = _get_cols(schema_name, table_name)
             return detect_table_type(table_name, cols)
+
+        def _table_matches_hint(schema_name: str, table_name: str, hint: str) -> bool:
+            h = (hint or "").strip().lower()
+            if not h:
+                return False
+            full = f"{schema_name}.{table_name}".lower()
+            return h in table_name.lower() or h in full or full.endswith(h)
+
+        def _find_col_by_hint(schema_name: str, table_name: str, hint: str) -> str | None:
+            h = (hint or "").strip().lower()
+            if not h:
+                return None
+            cols = _get_cols(schema_name, table_name)
+            if cols.empty or "column_name" not in cols.columns:
+                return None
+            best: str | None = None
+            best_score = -1.0
+            for col in cols["column_name"].astype(str).tolist():
+                cl = col.lower()
+                if h in cl or cl in h:
+                    score = len(h) / max(len(cl), 1)
+                    if score > best_score:
+                        best_score = score
+                        best = col
+            return best
 
         def _score_table_for_slot(schema_name: str, table_name: str, slot: str) -> float:
             cols = _get_cols(schema_name, table_name)
@@ -532,7 +561,25 @@ class IntentNodes:
             else:
                 right_pks = set()
             matched_pk = sum(1 for pk in right_pks if _norm_key(pk) in norm_left)
-            return matched_pk * 80 + len(exact_common) * 20 + len(normalized_common) * 12
+            score = matched_pk * 80 + len(exact_common) * 20 + len(normalized_common) * 12
+
+            # Сквозной контракт explicit_join:
+            # если есть table_hint + column_hint, повышаем релевантность пары таблиц.
+            for ej in explicit_joins:
+                col_hint = str(ej.get("column_hint") or "").strip()
+                tbl_hint = str(ej.get("table_hint") or "").strip()
+                if not col_hint or not tbl_hint:
+                    continue
+                base_has = _find_col_by_hint(bs, bt, col_hint)
+                cand_has = _find_col_by_hint(cs, ct, col_hint)
+                if not base_has or not cand_has:
+                    continue
+                if _table_matches_hint(bs, bt, tbl_hint) or _table_matches_hint(cs, ct, tbl_hint):
+                    score += 220
+                else:
+                    score += 90
+
+            return score
 
         explicit_tables: list[tuple[str, str]] = []
         for _, row in tables_df.iterrows():

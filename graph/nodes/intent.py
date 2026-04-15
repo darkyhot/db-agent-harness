@@ -544,6 +544,12 @@ class IntentNodes:
 
         metric_slot = requested.get("metric")
         dimension_slots = list(requested.get("dimensions", []))
+        required_output_slots = [str(v).strip().lower() for v in intent.get("required_output", []) if str(v).strip()]
+        explicit_join_hints = [
+            str(item.get("column_hint", "")).strip().lower()
+            for item in intent.get("explicit_join", [])
+            if isinstance(item, dict) and str(item.get("column_hint", "")).strip()
+        ]
         join_requested = (
             str(intent.get("complexity", "")).lower() in {"join", "subquery", "multi_table"}
             or any(phrase in query_norm for phrase in ("подтяни", "дотяни", "возьми из", "join", "по ключу"))
@@ -581,20 +587,48 @@ class IntentNodes:
                 for _, row in tables_df.iterrows()
             ]
 
-        main_table: tuple[str, str] | None = explicit_tables[0] if explicit_tables else None
-        if metric_slot and not explicit_tables:
-            metric_candidates: list[tuple[float, tuple[str, str]]] = []
-            for st in candidate_tables:
-                score = _score_table_for_slot(st[0], st[1], metric_slot)
-                if score > 0:
-                    if st in explicit_tables:
-                        score += 120
-                    metric_candidates.append((score, st))
-            if metric_candidates:
-                metric_candidates.sort(reverse=True)
-                main_table = metric_candidates[0][1]
+        def _coverage_score(tables: list[tuple[str, str]]) -> dict[str, float]:
+            unique_tables = list(dict.fromkeys(tables))
+            metric_cov = 0.0
+            if metric_slot:
+                metric_cov = max(
+                    (_score_table_for_slot(s, t, metric_slot) for s, t in unique_tables),
+                    default=0.0,
+                )
+            dim_cov = 0.0
+            for slot in dimension_slots + required_output_slots:
+                dim_cov += max(
+                    (_score_table_for_slot(s, t, slot) for s, t in unique_tables),
+                    default=0.0,
+                )
+            join_cov = 0.0
+            for hint in explicit_join_hints:
+                join_cov += max(
+                    (_score_table_for_slot(s, t, hint) for s, t in unique_tables),
+                    default=0.0,
+                )
+            return {
+                "metric_coverage": metric_cov,
+                "dimension_coverage": dim_cov,
+                "joinability": join_cov,
+            }
 
-        deterministic_tables: list[tuple[str, str]] = list(dict.fromkeys(explicit_tables))
+        metric_candidates: list[tuple[float, tuple[str, str]]] = []
+        for st in candidate_tables:
+            if not metric_slot:
+                continue
+            score = _score_table_for_slot(st[0], st[1], metric_slot)
+            if score > 0:
+                metric_candidates.append((score, st))
+
+        main_table: tuple[str, str] | None = None
+        if metric_candidates:
+            metric_candidates.sort(reverse=True)
+            main_table = metric_candidates[0][1]
+        elif explicit_tables:
+            main_table = explicit_tables[0]
+
+        deterministic_tables: list[tuple[str, str]] = []
         if main_table and main_table not in deterministic_tables:
             deterministic_tables.insert(0, main_table)
 
@@ -617,9 +651,12 @@ class IntentNodes:
                 score = _score_table_for_slot(st[0], st[1], slot)
                 if score <= 0:
                     continue
-                score += _joinability_score(main_table, st)
+                joinability = _joinability_score(main_table, st)
+                score += joinability
+                explicit_boost = 0.0
                 if st in explicit_tables:
-                    score += 90
+                    explicit_boost = 90.0
+                    score += explicit_boost
                 dim_candidates.append((score, st))
             if dim_candidates:
                 dim_candidates.sort(reverse=True)
@@ -627,11 +664,55 @@ class IntentNodes:
                 if best_table not in deterministic_tables:
                     deterministic_tables.append(best_table)
 
+        for st in explicit_tables:
+            if st not in deterministic_tables:
+                deterministic_tables.append(st)
+
         if not deterministic_tables:
             deterministic_tables = validated_tables
 
         if deterministic_tables:
             deterministic_tables = list(dict.fromkeys(deterministic_tables))
+            llm_high_conf_fact: tuple[str, str] | None = None
+            for st in validated_tables:
+                key = f"{st[0].lower()}.{st[1].lower()}"
+                conf = table_confidences.get(key, 0)
+                if conf >= 85 and _table_type(st[0], st[1]) == "fact":
+                    llm_high_conf_fact = st
+                    break
+
+            deterministic_reason = _coverage_score(deterministic_tables)
+            explicit_boost_value = float(
+                sum(1 for st in deterministic_tables if st in explicit_tables) * 90
+            )
+            deterministic_reason["explicit_boost"] = explicit_boost_value
+
+            if (
+                llm_high_conf_fact
+                and deterministic_tables
+                and deterministic_tables[0] != llm_high_conf_fact
+            ):
+                llm_reason = _coverage_score([llm_high_conf_fact] + explicit_tables)
+                improves_required = (
+                    deterministic_reason["dimension_coverage"] > llm_reason["dimension_coverage"]
+                )
+                improves_explicit_join = (
+                    deterministic_reason["joinability"] > llm_reason["joinability"]
+                )
+                if not (improves_required or improves_explicit_join):
+                    penalty = 140.0
+                    deterministic_reason["metric_coverage"] -= penalty
+                    deterministic_tables = [llm_high_conf_fact] + [
+                        st for st in deterministic_tables if st != llm_high_conf_fact
+                    ]
+                    deterministic_reason["switch_penalty"] = penalty
+                else:
+                    deterministic_reason["switch_penalty"] = 0.0
+            else:
+                deterministic_reason["switch_penalty"] = 0.0
+
+            logger.info("TableResolver: deterministic_reason=%s", deterministic_reason)
+
             if deterministic_tables != validated_tables:
                 logger.info(
                     "TableResolver: семантически корректирую выбор таблиц: %s -> %s",

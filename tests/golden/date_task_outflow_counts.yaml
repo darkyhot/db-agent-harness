@@ -1,0 +1,12 @@
+query: "Покажи по дате количество задач и количество оттока"
+intent_must_be: analytics
+complexity_must_be: single_table
+patch_sql_writer: true
+sql_must_contain:
+  - "REPORT_DT AS DATE"
+  - "TASK_CNT"
+  - "OUTFLOW_CNT"
+  - "GROUP BY REPORT_DT"
+sql_must_not_contain:
+  - "SELECT *"
+max_retries: 1

@@ -104,6 +104,8 @@ class MockLLM:
 
     def _scenario(self, query: str) -> str:
         q = query.lower()
+        if ("task" in q or "задач" in q) and ("outflow" in q or "отток" in q):
+            return "task_outflow_by_date"
         if "какие таблицы" in q or "схеме schema" in q:
             return "schema_question"
         if ("дате" in q or "report_dt" in q) and ("госб" in q or "new_gosb_name" in q):
@@ -114,6 +116,8 @@ class MockLLM:
             return "outflow_sum_by_segment_month"
         if ("task_code" in q or "задач" in q) and ("segment_name" in q or "сегмент" in q):
             return "tasks_by_segment"
+        if ("task" in q or "задач" in q) and ("outflow" in q or "отток" in q) and ("date" in q or "дате" in q or "report_dt" in q):
+            return "task_outflow_by_date"
         if ("segment_name" in q or "сегмент" in q) and ("epk" in q or "uzp_data_epk_consolidation" in q):
             return "payroll_epk_join"
         if ("segment_name" in q or "по сегмент" in q) and ("колич" in q or "count(" in q):
@@ -279,6 +283,13 @@ class MockLLM:
                     "JOIN schema.uzp_data_epk_consolidation e ON p.inn = CAST(e.inn AS text) "
                     "GROUP BY e.segment_name"
                 ),
+                "task_outflow_by_date": (
+                    "SELECT report_dt AS date, "
+                    "COUNT(gosb_id) AS task_cnt, "
+                    "COUNT(outflow_qty) AS outflow_cnt "
+                    "FROM schema.uzp_dwh_fact_outflow "
+                    "GROUP BY report_dt"
+                ),
             }
             sql = sql_map.get(scenario, sql_map["outflow_count"])
             return f'{{"tool": "execute_query", "args": {{"sql": "{sql}"}}}}'
@@ -360,6 +371,13 @@ class MockLLM:
                 "FROM schema.uzp_data_payroll_m p "
                 "JOIN schema.uzp_data_epk_consolidation e ON p.inn = CAST(e.inn AS text) "
                 "GROUP BY e.segment_name"
+            ),
+            "task_outflow_by_date": (
+                "SELECT report_dt AS date, "
+                "COUNT(gosb_id) AS task_cnt, "
+                "COUNT(outflow_qty) AS outflow_cnt "
+                "FROM schema.uzp_dwh_fact_outflow "
+                "GROUP BY report_dt"
             ),
         }
         return sql_map.get(scenario, sql_map["outflow_count"])

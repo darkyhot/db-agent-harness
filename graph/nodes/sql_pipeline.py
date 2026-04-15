@@ -422,11 +422,23 @@ class SqlPipelineNodes:
         # Формируем секцию обязательных колонок в SELECT
         _required_section = ""
         _required_output = blueprint.get("required_output") or []
+        _metrics = blueprint.get("aggregations") or ([] if not blueprint.get("aggregation") else [blueprint.get("aggregation")])
+        _metric_checklist = [
+            m.get("alias") or f"{m.get('function', 'AGG')}({m.get('column', '*')})"
+            for m in _metrics if isinstance(m, dict)
+        ]
         if _required_output:
             _required_section = (
                 "\n\n⚠ ОБЯЗАТЕЛЬНО в SELECT (пользователь явно запросил):\n"
                 + "\n".join(f"  - {r}" for r in _required_output)
                 + "\nЭти измерения ДОЛЖНЫ присутствовать в SELECT и GROUP BY финального запроса.\n"
+            )
+        _metrics_section = ""
+        if _metric_checklist:
+            _metrics_section = (
+                "\n\n⚠ ОБЯЗАТЕЛЬНЫЕ МЕТРИКИ в SELECT:\n"
+                + "\n".join(f"  - {m}" for m in _metric_checklist)
+                + "\nКаждая метрика должна быть выражена в SELECT с корректным алиасом.\n"
             )
 
         system_prompt = (
@@ -444,17 +456,19 @@ class SqlPipelineNodes:
             "объединяй ВСЕ условия через AND в одном ON-клаузе\n"
             f"{_allowed_section}"
             f"{_required_section}"
+            f"{_metrics_section}"
             f"{join_subquery_warning}\n"
             f"{relevant_examples}\n\n"
             "Чеклист:\n"
             "1. Использую ТОЛЬКО таблицы из разрешённого списка?\n"
             "2. Все required_output-атрибуты есть в SELECT и GROUP BY?\n"
-            "3. Формат дат соответствует данным?\n"
-            "4. NULL обработан для колонок с высоким % NULL?\n"
-            "5. JOIN НЕ множит данные (по стратегии из blueprint)?\n"
-            "6. GROUP BY содержит все не-агрегированные колонки?\n"
-            "7. Алиасы на английском?\n"
-            "8. Если join_keys составной (несколько пар) — все условия объединены через AND?\n\n"
+            "3. Все метрики из blueprint.aggregations присутствуют в SELECT?\n"
+            "4. Формат дат соответствует данным?\n"
+            "5. NULL обработан для колонок с высоким % NULL?\n"
+            "6. JOIN НЕ множит данные (по стратегии из blueprint)?\n"
+            "7. GROUP BY содержит все не-агрегированные колонки?\n"
+            "8. Алиасы на английском?\n"
+            "9. Если join_keys составной (несколько пар) — все условия объединены через AND?\n\n"
             "Верни ТОЛЬКО JSON:\n"
             '{"tool": "execute_query", "args": {"sql": "SELECT ..."}}'
         )

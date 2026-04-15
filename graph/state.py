@@ -73,7 +73,7 @@ class AgentState(TypedDict):
     sql_blueprint: dict[str, Any]
     # {"strategy": "fact_dim_join", "main_table": "dm.sales",
     #  "cte_needed": False, "subquery_for": ["dm.managers"],
-    #  "where_conditions": [...], "aggregation": {...}, ...}
+    #  "where_conditions": [...], "aggregations": [{...}, ...], ...}
 
     # error_diagnoser → диагноз ошибки
     error_diagnosis: dict[str, Any]

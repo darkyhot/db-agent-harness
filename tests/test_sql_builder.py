@@ -598,3 +598,49 @@ class TestMultiPKCountDistinct:
         assert "GROUP BY" not in n, f"GROUP BY не должен появляться: {sql}"
         # Вторая колонка также агрегирована (не bare)
         assert "COUNT_OLD_GOSB_ID" in n or "COUNT(DISTINCT" in n
+
+
+class TestAggregationsContract:
+    def test_multiple_metrics_in_one_select(self):
+        cols = {
+            "dm.funnel": {
+                "select": ["report_dt", "task_code", "outflow_id"],
+                "aggregate": ["task_code", "outflow_id"],
+                "group_by": ["report_dt"],
+            }
+        }
+        bp = {
+            "strategy": "simple_select",
+            "main_table": "dm.funnel",
+            "aggregations": [
+                {"function": "COUNT", "column": "task_code", "alias": "task_cnt"},
+                {"function": "COUNT", "column": "outflow_id", "alias": "outflow_cnt"},
+            ],
+            "group_by": ["report_dt"],
+            "where_conditions": [],
+            "order_by": None,
+            "limit": None,
+        }
+        sql = builder.build("simple_select", cols, [], bp, {"dm.funnel": "fact"})
+        assert sql is not None
+        n = norm(sql)
+        assert "TASK_CNT" in n
+        assert "OUTFLOW_CNT" in n
+        assert "GROUP BY" in n
+
+    def test_conditional_aggregate_filter_where(self):
+        cols = {"dm.fact": {"select": ["report_dt"], "aggregate": [], "group_by": ["report_dt"]}}
+        bp = {
+            "strategy": "simple_select",
+            "main_table": "dm.fact",
+            "aggregations": [
+                {"function": "COUNT", "column": "*", "alias": "task_cnt", "filter_where": "task_code IS NOT NULL"}
+            ],
+            "group_by": ["report_dt"],
+            "where_conditions": [],
+            "order_by": None,
+            "limit": None,
+        }
+        sql = builder.build("simple_select", cols, [], bp, {"dm.fact": "fact"})
+        assert sql is not None
+        assert "FILTER (WHERE task_code IS NOT NULL)" in sql

@@ -6,6 +6,7 @@ from core.sql_planner_deterministic import (
     _determine_strategy,
     _compute_group_by,
     _compute_aggregation,
+    _compute_aggregations,
     _compute_where_from_intent,
     _find_date_column,
 )
@@ -104,6 +105,14 @@ class TestComputeAggregation:
         intent = {"aggregation_hint": "max"}
         agg = _compute_aggregation(intent, self._cols(["score"]))
         assert agg == {"function": "MAX", "column": "score", "alias": "max_score"}
+
+    def test_multiple_metrics_from_aggregate_role(self):
+        intent = {"aggregation_hint": "count"}
+        cols = {"dm.t": {"select": [], "filter": [], "aggregate": ["task_code", "outflow_id"], "group_by": []}}
+        aggs = _compute_aggregations(intent, cols)
+        assert len(aggs) == 2
+        assert aggs[0]["alias"] == "task_cnt"
+
 
 
 # ---------------------------------------------------------------------------
@@ -340,10 +349,10 @@ class TestBuildBlueprint:
             {"dm.sales": "fact"},
             {},
         )
-        assert bp["aggregation"] is not None
-        assert bp["aggregation"]["function"] == "SUM"
-        assert bp["aggregation"]["column"] == "amount"
-        assert bp["aggregation"]["alias"] == "sum_amount"
+        assert bp["aggregations"]
+        assert bp["aggregations"][0]["function"] == "SUM"
+        assert bp["aggregations"][0]["column"] == "amount"
+        assert bp["aggregations"][0]["alias"] == "sum_amount"
 
     def test_group_by_excludes_agg_col(self):
         bp = build_blueprint(
@@ -384,7 +393,7 @@ class TestBuildBlueprint:
             {"dm.sales": "fact"},
             {},
         )
-        assert bp["aggregation"] is None
+        assert bp["aggregations"] == []
         assert bp["order_by"] is None
 
     def test_no_default_limit(self):

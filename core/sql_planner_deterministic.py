@@ -112,14 +112,20 @@ def _determine_strategy(
 
 def _compute_group_by(
     selected_columns: dict[str, dict],
-    aggregation: dict | None,
+    aggregations: list[dict] | dict | None,
 ) -> list[str]:
     """Вычислить список колонок для GROUP BY.
 
     Логика: все колонки из select-роли, которые НЕ являются агрегируемыми,
     плюс явно указанные в group_by-роли. Дедупликация сохраняет порядок.
     """
-    agg_col = aggregation.get("column") if aggregation else None
+    if isinstance(aggregations, dict):
+        aggregations = [aggregations]
+    agg_cols = {
+        str(a.get("column"))
+        for a in (aggregations or [])
+        if isinstance(a, dict) and a.get("column") and a.get("column") != "*"
+    }
 
     group_by: list[str] = []
     seen: set[str] = set()
@@ -133,7 +139,7 @@ def _compute_group_by(
 
         # select-роль: добавляем всё кроме агрегируемой колонки
         for col in roles.get("select", []):
-            if col == agg_col:
+            if col in agg_cols:
                 continue
             if col in roles.get("aggregate", []):
                 continue
@@ -148,39 +154,87 @@ def _compute_group_by(
 # 3. Агрегация
 # ---------------------------------------------------------------------------
 
+def _metric_alias(func: str, column: str, index: int = 0) -> str:
+    """Построить читаемый алиас метрики."""
+    col = (column or "").lower()
+    if func == "COUNT":
+        if "task" in col:
+            return "task_cnt"
+        if "outflow" in col:
+            return "outflow_cnt"
+        if col and col != "*":
+            return f"{col}_cnt"
+        return "cnt" if index == 0 else f"cnt_{index + 1}"
+    base = "agg" if column == "*" else column
+    return f"{func.lower()}_{base}" if index == 0 else f"{func.lower()}_{base}_{index + 1}"
+
+
+def _compute_aggregations(
+    intent: dict,
+    selected_columns: dict[str, dict],
+) -> list[dict]:
+    """Вычислить список агрегаций из intent + aggregate-ролей колонок."""
+    hint = (intent.get("aggregation_hint") or "").lower().strip()
+    func = _HINT_TO_FUNC.get(hint)
+    if not func:
+        return []
+
+    metric_cols: list[str] = []
+    seen: set[str] = set()
+
+    for _table, roles in selected_columns.items():
+        for col in roles.get("aggregate", []):
+            if col not in seen:
+                metric_cols.append(col)
+                seen.add(col)
+
+    entities = [str(e).lower() for e in (intent.get("entities") or [])]
+    if entities:
+        for _table, roles in selected_columns.items():
+            candidates = roles.get("aggregate", []) + roles.get("select", [])
+            for col in candidates:
+                low = str(col).lower()
+                if col in seen:
+                    continue
+                if any(ent in low or low in ent for ent in entities):
+                    metric_cols.append(col)
+                    seen.add(col)
+
+    if not metric_cols and hint == "count":
+        metric_cols = ["*"]
+
+    aggregations: list[dict] = []
+    for idx, col in enumerate(metric_cols):
+        distinct = bool(hint == "count" and col != "*")
+        agg: dict = {"function": func, "column": col, "alias": _metric_alias(func, col, idx)}
+        if distinct:
+            agg["distinct"] = True
+        aggregations.append(agg)
+
+    # Явно заданные условные агрегаты из intent (если есть).
+    for idx, item in enumerate(intent.get("conditional_aggregations") or []):
+        if not isinstance(item, dict):
+            continue
+        c_func = str(item.get("function") or "COUNT").upper()
+        c_col = item.get("column", "*")
+        alias = item.get("alias") or _metric_alias(c_func, str(c_col), len(aggregations) + idx)
+        agg = {"function": c_func, "column": c_col, "alias": alias}
+        if item.get("filter_where"):
+            agg["filter_where"] = item["filter_where"]
+        if item.get("case_when"):
+            agg["case_when"] = item["case_when"]
+        aggregations.append(agg)
+
+    return aggregations
+
+
 def _compute_aggregation(
     intent: dict,
     selected_columns: dict[str, dict],
 ) -> dict | None:
-    """Вычислить агрегацию из intent.aggregation_hint + aggregate-роли колонок."""
-    hint = (intent.get("aggregation_hint") or "").lower().strip()
-    func = _HINT_TO_FUNC.get(hint)
-
-    if not func:
-        # Нет агрегации или «list» — просто выборка без агрегата
-        return None
-
-    # Находим первую колонку с ролью aggregate
-    for _table, roles in selected_columns.items():
-        agg_cols = roles.get("aggregate", [])
-        if agg_cols:
-            col = agg_cols[0]
-            alias = f"{func.lower()}_{col}"
-            # COUNT DISTINCT: если агрегируемая колонка явно помечена (_count_distinct)
-            # или если hint=count и колонка выглядит как PK (имя оканчивается на _id/_num)
-            distinct = False
-            if hint == "count" and col != "*":
-                distinct = True
-            result: dict = {"function": func, "column": col, "alias": alias}
-            if distinct:
-                result["distinct"] = True
-            return result
-
-    # Нет явной aggregate-роли — COUNT(*) как fallback для count
-    if hint == "count":
-        return {"function": "COUNT", "column": "*", "alias": "cnt"}
-
-    return None
+    """Legacy-wrapper: вернуть первую агрегацию для обратной совместимости тестов."""
+    aggregations = _compute_aggregations(intent, selected_columns)
+    return aggregations[0] if aggregations else None
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +472,7 @@ def build_blueprint(
     Returns:
         dict совместимый с форматом sql_blueprint из AgentState.
     """
-    aggregation = _compute_aggregation(intent, selected_columns)
+    aggregations = _compute_aggregations(intent, selected_columns)
     strategy, main_table = _determine_strategy(table_types, join_spec)
 
     # --- Блок C: date-aligned JOIN (axis-join по дате) ---
@@ -455,13 +509,13 @@ def build_blueprint(
             if other_tables and other_tables[0] in attribute_tables:
                 strategy = "fact_dim_join"
 
-    group_by    = _compute_group_by(selected_columns, aggregation)
+    group_by    = _compute_group_by(selected_columns, aggregations)
     where_conditions = _compute_where_from_intent(intent, selected_columns, user_input=user_input)
 
     # --- Блок D: required_output enforcement ---
     # Колонки из required_output (обязательные в SELECT) добавляем в group_by если их нет.
     required_output: list[str] = list(intent.get("required_output") or [])
-    if required_output and aggregation:
+    if required_output and aggregations:
         _gb_lower = {c.lower() for c in group_by}
         for _req in required_output:
             _req_norm = _req.lower().strip()
@@ -487,7 +541,7 @@ def build_blueprint(
     # Если есть агрегация — filter-колонки без WHERE-условия нужны в GROUP BY.
     # Типичный случай: column_selector кладёт report_dt в filter, но пользователь
     # хочет группировку «по дате» — и явного фильтра по дате нет.
-    if aggregation:
+    if aggregations:
         where_str = " ".join(where_conditions).lower()
         seen_gb: set[str] = set(group_by)
         for _table, roles in selected_columns.items():
@@ -513,8 +567,8 @@ def build_blueprint(
 
     # ORDER BY: по агрегатному алиасу DESC, или нет
     order_by: str | None = None
-    if aggregation and aggregation.get("alias"):
-        order_by = f"{aggregation['alias']} DESC"
+    if aggregations and aggregations[0].get("alias"):
+        order_by = f"{aggregations[0]['alias']} DESC"
 
     # LIMIT: только если явно задан в intent; без умолчания
     limit: int | None = intent.get("limit") or None
@@ -525,7 +579,7 @@ def build_blueprint(
         "cte_needed": cte_needed,
         "subquery_for": subquery_for,
         "where_conditions": where_conditions,
-        "aggregation": aggregation,
+        "aggregations": aggregations,
         "group_by": group_by,
         "order_by": order_by,
         "limit": limit,
@@ -538,7 +592,7 @@ def build_blueprint(
     logger.info(
         "DeterministicPlanner: strategy=%s, main=%s, cte=%s, group_by=%s, agg=%s",
         strategy, main_table, cte_needed, group_by,
-        aggregation.get("function") if aggregation else None,
+        [a.get("function") for a in aggregations] if aggregations else None,
     )
 
     return blueprint

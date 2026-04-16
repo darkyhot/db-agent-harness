@@ -12,6 +12,19 @@ logger = logging.getLogger(__name__)
 class SummarizerNodes:
     """Mixin с узлом summarizer."""
 
+    def _extract_preview_markdown(self, tool_calls: list[dict[str, Any]]) -> str:
+        """Достать markdown-preview из последнего execute_query."""
+        for tc in reversed(tool_calls or []):
+            if tc.get("tool") != "execute_query":
+                continue
+            payload = self._parse_sql_tool_payload(tc.get("result", ""))
+            if not payload:
+                continue
+            preview = str(payload.get("preview_markdown", "") or "").strip()
+            if preview:
+                return preview
+        return ""
+
     def _get_summarizer_system_prompt(self) -> str:
         """Системный промпт для формирования финального ответа."""
         return (
@@ -101,6 +114,12 @@ class SummarizerNodes:
                   f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
 
         answer = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.2)
+        preview_markdown = self._extract_preview_markdown(capped_tool_calls)
+        if preview_markdown and preview_markdown not in answer:
+            answer = (
+                f"{answer.rstrip()}\n\n"
+                f"Предварительный результат:\n{preview_markdown}"
+            ).strip()
         self.memory.add_message("assistant", answer)
 
         logger.info("Summarizer: ответ сформирован")

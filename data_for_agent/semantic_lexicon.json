@@ -1,0 +1,1803 @@
+{
+  "subjects": {},
+  "dimensions": {
+    "отчетная_дата": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.report_dt",
+        "schema.uzp_data_split_mzp_sale_funnel.report_dt",
+        "schema.uzp_data_payroll_m.report_dt",
+        "schema.uzp_dwh_sap_staff_emp.report_dt"
+      ],
+      "aliases": [
+        "report dt",
+        "отчетн дата",
+        "отчетная дата"
+      ],
+      "semantic_class": "date"
+    },
+    "наименование_сегмента": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.segment_name",
+        "schema.uzp_data_split_mzp_sale_funnel.segment_name",
+        "schema.uzp_data_epk_consolidation.segment_name"
+      ],
+      "aliases": [
+        "segment",
+        "сегмента",
+        "сегмент"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "фио_закрепленного_мзп": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.mzp_fio"
+      ],
+      "aliases": [
+        "mzp fio",
+        "фио закрепленн мзп",
+        "фио закрепленного мзп"
+      ],
+      "semantic_class": "label"
+    },
+    "краткое_наименование_тб": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.tb_short_name"
+      ],
+      "aliases": [
+        "tb short",
+        "кратк тб",
+        "краткое тб"
+      ],
+      "semantic_class": "label"
+    },
+    "полное_наименование_тб": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.tb_full_name"
+      ],
+      "aliases": [
+        "tb full",
+        "полн тб",
+        "полное тб"
+      ],
+      "semantic_class": "label"
+    },
+    "старое_наименование_госб": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.old_gosb_name"
+      ],
+      "aliases": [
+        "old gosb",
+        "старое госб",
+        "стар госб"
+      ],
+      "semantic_class": "label"
+    },
+    "новое_наименование_госб": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.new_gosb_name"
+      ],
+      "aliases": [
+        "new gosb",
+        "ново госб",
+        "новое госб"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_филиала_для_ису": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.isu_branch_name"
+      ],
+      "aliases": [
+        "isu branch",
+        "филиал ису",
+        "филиала ису"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_госб_в_ас_пирс": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.pirs_gosb_name"
+      ],
+      "aliases": [
+        "pirs gosb",
+        "госб ас пирс"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_региона": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.region_name"
+      ],
+      "aliases": [
+        "region",
+        "регион",
+        "региона"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_тб": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.tb_name"
+      ],
+      "aliases": [
+        "tb",
+        "тб"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_госб": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.gosb_name"
+      ],
+      "aliases": [
+        "gosb",
+        "госб"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_начальника_отдела": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.department_manager_saphr_fio"
+      ],
+      "aliases": [
+        "department manager saphr fio",
+        "фио начальник отдел",
+        "фио начальника отдела"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_руководителя_направления": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_manager_saphr_fio"
+      ],
+      "aliases": [
+        "task manager saphr fio",
+        "фио руководител направлени",
+        "фио руководителя направления"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_начальника_управления": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.manager_saphr_fio"
+      ],
+      "aliases": [
+        "manager saphr fio",
+        "фио начальника управления",
+        "фио начальник управлени"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_сотрудника": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.fio"
+      ],
+      "aliases": [
+        "fio",
+        "фио сотрудника",
+        "фио сотрудник"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_клиентского_менеджера": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.km_fio"
+      ],
+      "aliases": [
+        "km fio",
+        "фио клиентск менеджер",
+        "фио клиентского менеджера"
+      ],
+      "semantic_class": "label"
+    },
+    "должность_сотрудника": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.post_name"
+      ],
+      "aliases": [
+        "post",
+        "должность сотрудник",
+        "должность сотрудника"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_роли_сотрудника_по_задаче": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_role_name"
+      ],
+      "aliases": [
+        "task role",
+        "роли сотрудник задач",
+        "роли сотрудника задаче"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_лидера_по_задаче": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_leader_fio"
+      ],
+      "aliases": [
+        "task leader fio",
+        "фио лидера задаче",
+        "фио лидер задач"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_компании": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.company_name",
+        "schema.uzp_data_epk_consolidation.company_name"
+      ],
+      "aliases": [
+        "company",
+        "компани",
+        "компании"
+      ],
+      "semantic_class": "label"
+    },
+    "плановая_дата_закрытия_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_plan_closed_dt"
+      ],
+      "aliases": [
+        "task plan closed dt",
+        "планов дата закрыти задач",
+        "плановая дата закрытия задачи"
+      ],
+      "semantic_class": "date"
+    },
+    "фактическая_дата_закрытия_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_fact_closed_dt"
+      ],
+      "aliases": [
+        "task fact closed dt",
+        "фактическ дата закрыти задач",
+        "фактическая дата закрытия задачи"
+      ],
+      "semantic_class": "date"
+    },
+    "категория_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_category"
+      ],
+      "aliases": [
+        "task category",
+        "категори задач",
+        "категория задачи"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "тип_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_type"
+      ],
+      "aliases": [
+        "task",
+        "задач",
+        "задачи"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "подтип_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_subtype"
+      ],
+      "aliases": [
+        "task subtype",
+        "подтип задачи",
+        "подтип задач"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "инфоповод": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.reason_comment"
+      ],
+      "aliases": [
+        "reason comment",
+        "инфоповод"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "тип_последней_активности": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.last_activity_type"
+      ],
+      "aliases": [
+        "last activity",
+        "последн активност",
+        "последней активности"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "дата_последней_активности": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.last_activity_dt"
+      ],
+      "aliases": [
+        "last activity dt",
+        "дата последн активност",
+        "дата последней активности"
+      ],
+      "semantic_class": "date"
+    },
+    "статус_последней_активности": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.last_activity_status"
+      ],
+      "aliases": [
+        "last activity status",
+        "статус последней активности",
+        "статус последн активност"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_холдинга": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.holding_name",
+        "schema.uzp_data_epk_consolidation.holding_name"
+      ],
+      "aliases": [
+        "holding",
+        "холдинга",
+        "холдинг"
+      ],
+      "semantic_class": "label"
+    },
+    "месяц_создания_сделки": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.deal_m_dt"
+      ],
+      "aliases": [
+        "deal dt",
+        "месяц создания сделки",
+        "месяц создани сделк"
+      ],
+      "semantic_class": "date"
+    },
+    "дата_открытия_счета": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.acc_open_dt"
+      ],
+      "aliases": [
+        "acc open dt",
+        "дата открытия счета",
+        "дата открыти счет"
+      ],
+      "semantic_class": "date"
+    },
+    "подтип_кода_счета": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.acc_subtype"
+      ],
+      "aliases": [
+        "acc subtype",
+        "подтип кода счет",
+        "подтип кода счета"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "тип_агрегирования_по_периодам_sum_сумма_avg_средневзешенное_last_последний_период": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.acc_type"
+      ],
+      "aliases": [
+        "acc",
+        "агрегировани период sum сумм avg средневзешенн last последн период",
+        "агрегирования периодам sum сумма avg средневзешенное last последний период"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "категория_клиента": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.client_category"
+      ],
+      "aliases": [
+        "client category",
+        "категори клиент",
+        "категория клиента"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_компании_заключившей_зп_договор": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.company_name"
+      ],
+      "aliases": [
+        "company",
+        "компани заключивш зп договор",
+        "компании заключившей зп договор"
+      ],
+      "semantic_class": "label"
+    },
+    "дата_заключения_договора": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.agrmnt_dt"
+      ],
+      "aliases": [
+        "agrmnt dt",
+        "дата заключения договора",
+        "дата заключени договор"
+      ],
+      "semantic_class": "date"
+    },
+    "тип_зачисления": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.enrollment_type"
+      ],
+      "aliases": [
+        "enrollment",
+        "зачислени",
+        "зачисления"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "системный_номер_осб": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.ipt_name"
+      ],
+      "aliases": [
+        "ipt",
+        "системн номер осб",
+        "системный номер осб"
+      ],
+      "semantic_class": "label"
+    },
+    "тип_карты": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.card_type"
+      ],
+      "aliases": [
+        "card",
+        "карты",
+        "карт"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_сегмента_клиента_юл": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.segment_name"
+      ],
+      "aliases": [
+        "segment",
+        "сегмента клиента юл",
+        "сегмент клиент юл"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_системы_источника": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.src_system_name"
+      ],
+      "aliases": [
+        "src system",
+        "системы источника",
+        "систем источник"
+      ],
+      "semantic_class": "label"
+    },
+    "дата_и_время_начала_закрепления": {
+      "column_keys": [
+        "schema.uzp_data_emp_epk_assignment.start_dttm"
+      ],
+      "aliases": [
+        "start dttm",
+        "дата время начала закрепления",
+        "дата врем начал закреплени"
+      ],
+      "semantic_class": "date"
+    },
+    "дата_и_время_окончания_закрепления": {
+      "column_keys": [
+        "schema.uzp_data_emp_epk_assignment.end_dttm"
+      ],
+      "aliases": [
+        "end dttm",
+        "дата время окончания закрепления",
+        "дата врем окончани закреплени"
+      ],
+      "semantic_class": "date"
+    },
+    "дата_создания_карточки_епк": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.epk_create_dttm"
+      ],
+      "aliases": [
+        "epk create dttm",
+        "дата создани карточк епк",
+        "дата создания карточки епк"
+      ],
+      "semantic_class": "date"
+    },
+    "идентификатор_типа_клиента": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.client_type_id"
+      ],
+      "aliases": [
+        "client id",
+        "идентификатор типа клиент",
+        "идентификатор типа клиента"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_типа_клиента": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.client_type_name"
+      ],
+      "aliases": [
+        "client",
+        "типа клиента",
+        "типа клиент"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_отрасли": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.industry_name"
+      ],
+      "aliases": [
+        "industry",
+        "отрасл",
+        "отрасли"
+      ],
+      "semantic_class": "label"
+    },
+    "идентификатор_сегмента": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.segment_id"
+      ],
+      "aliases": [
+        "segment id",
+        "идентификатор сегмент",
+        "идентификатор сегмента"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_приоритета": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.priority_name"
+      ],
+      "aliases": [
+        "priority",
+        "приоритета",
+        "приоритет"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_эталонного_холдинга": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.reference_holding_name"
+      ],
+      "aliases": [
+        "reference holding",
+        "эталонн холдинг",
+        "эталонного холдинга"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_головного_холдинга": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.head_holding_name"
+      ],
+      "aliases": [
+        "head holding",
+        "головного холдинга",
+        "головн холдинг"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_эталонного_головного_холдинга": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.reference_head_holding_name"
+      ],
+      "aliases": [
+        "reference head holding",
+        "эталонн головн холдинг",
+        "эталонного головного холдинга"
+      ],
+      "semantic_class": "label"
+    },
+    "идентификатор_статуса_организации": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.status_id"
+      ],
+      "aliases": [
+        "status id",
+        "идентификатор статуса организации",
+        "идентификатор статус организаци"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_статуса_для_организации": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.status_name"
+      ],
+      "aliases": [
+        "status",
+        "статус организаци",
+        "статуса организации"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "фио": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.fio"
+      ],
+      "aliases": [
+        "fio",
+        "фио"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_эталонной_должности": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.post_name"
+      ],
+      "aliases": [
+        "post",
+        "эталонн должност",
+        "эталонной должности"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_штатной_должности": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.pos_name"
+      ],
+      "aliases": [
+        "pos",
+        "штатной должности",
+        "штатн должност"
+      ],
+      "semantic_class": "label"
+    },
+    "дата_образования_вакансии": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.pos_vacancy_dt"
+      ],
+      "aliases": [
+        "pos vacancy dt",
+        "дата образовани ваканси",
+        "дата образования вакансии"
+      ],
+      "semantic_class": "date"
+    },
+    "дата_вступления_в_должность": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.post_start_dt"
+      ],
+      "aliases": [
+        "post start dt",
+        "дата вступлени должность",
+        "дата вступления должность"
+      ],
+      "semantic_class": "date"
+    },
+    "наименование_должности_руководителя_первого_уровня": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_name"
+      ],
+      "aliases": [
+        "manager lvl",
+        "должности руководителя первого уровня",
+        "должност руководител перв уровн"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_руководителя_первого_уровня": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_fio"
+      ],
+      "aliases": [
+        "manager lvl fio",
+        "фио руководителя первого уровня",
+        "фио руководител перв уровн"
+      ],
+      "semantic_class": "label"
+    }
+  },
+  "filter_phrases": {
+    "наименование_сегмента": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.segment_name",
+        "schema.uzp_data_split_mzp_sale_funnel.segment_name",
+        "schema.uzp_data_epk_consolidation.segment_name"
+      ],
+      "aliases": [
+        "segment",
+        "сегмента",
+        "сегмент"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "признак_силовой_организации": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.is_force",
+        "schema.uzp_data_epk_consolidation.is_military"
+      ],
+      "aliases": [
+        "is force",
+        "силов организаци",
+        "силовой организации",
+        "is military"
+      ],
+      "semantic_class": "flag"
+    },
+    "фио_закрепленного_мзп": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.mzp_fio"
+      ],
+      "aliases": [
+        "mzp fio",
+        "фио закрепленн мзп",
+        "фио закрепленного мзп"
+      ],
+      "semantic_class": "label"
+    },
+    "признак_выставленной_задачи": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.is_task"
+      ],
+      "aliases": [
+        "is task",
+        "выставленной задачи",
+        "выставленн задач"
+      ],
+      "semantic_class": "flag"
+    },
+    "инфоповод_для_общения_с_клиентами": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.client_communication_infopovod"
+      ],
+      "aliases": [
+        "client communication infopovod",
+        "инфоповод общения клиентами",
+        "инфоповод общени клиентам"
+      ],
+      "semantic_class": "free_text"
+    },
+    "признак_октмо_организации_принадлежит_госб_эмиссии_карт": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.is_oktmo"
+      ],
+      "aliases": [
+        "is oktmo",
+        "октм организаци принадлежит госб эмисси карт",
+        "октмо организации принадлежит госб эмиссии карт"
+      ],
+      "semantic_class": "flag"
+    },
+    "код_субъекта_рф_согласно_справочнику_октмо": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.oktmo_subject_code"
+      ],
+      "aliases": [
+        "oktmo subject",
+        "субъекта рф согласно справочнику октмо",
+        "субъект рф согласн справочник октм"
+      ],
+      "semantic_class": "free_text"
+    },
+    "код_субъекта_рф_муниципального_района_или_округа_согласно_справочнику_октмо": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.oktmo_subject_district_code"
+      ],
+      "aliases": [
+        "oktmo subject district",
+        "субъект рф муниципальн район округ согласн справочник октм",
+        "субъекта рф муниципального района округа согласно справочнику октмо"
+      ],
+      "semantic_class": "free_text"
+    },
+    "код_октмо_субъекта_рф_муниципального_района_или_округа_городского_или_сельского_поселения_согласно_справочнику_октмо": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.oktmo_subject_district_city_code"
+      ],
+      "aliases": [
+        "oktmo subject district city",
+        "октм субъект рф муниципальн район округ городск сельск поселени согласн справочник октм",
+        "октмо субъекта рф муниципального района округа городского сельского поселения согласно справочнику октмо"
+      ],
+      "semantic_class": "free_text"
+    },
+    "код_октмо": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.oktmo"
+      ],
+      "aliases": [
+        "oktmo",
+        "октмо",
+        "октм"
+      ],
+      "semantic_class": "free_text"
+    },
+    "логин_автора_записи": {
+      "column_keys": [
+        "schema.uzp_dwh_fact_outflow.author_login",
+        "schema.uzp_dim_gosb.author_login"
+      ],
+      "aliases": [
+        "author login",
+        "логин автор запис",
+        "логин автора записи"
+      ],
+      "semantic_class": "free_text"
+    },
+    "краткое_наименование_тб": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.tb_short_name"
+      ],
+      "aliases": [
+        "tb short",
+        "кратк тб",
+        "краткое тб"
+      ],
+      "semantic_class": "label"
+    },
+    "полное_наименование_тб": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.tb_full_name"
+      ],
+      "aliases": [
+        "tb full",
+        "полн тб",
+        "полное тб"
+      ],
+      "semantic_class": "label"
+    },
+    "старое_наименование_госб": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.old_gosb_name"
+      ],
+      "aliases": [
+        "old gosb",
+        "старое госб",
+        "стар госб"
+      ],
+      "semantic_class": "label"
+    },
+    "новое_наименование_госб": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.new_gosb_name"
+      ],
+      "aliases": [
+        "new gosb",
+        "ново госб",
+        "новое госб"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_филиала_для_ису": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.isu_branch_name"
+      ],
+      "aliases": [
+        "isu branch",
+        "филиал ису",
+        "филиала ису"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_госб_в_ас_пирс": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.pirs_gosb_name"
+      ],
+      "aliases": [
+        "pirs gosb",
+        "госб ас пирс"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_региона": {
+      "column_keys": [
+        "schema.uzp_dim_gosb.region_name"
+      ],
+      "aliases": [
+        "region",
+        "регион",
+        "региона"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_тб": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.tb_name"
+      ],
+      "aliases": [
+        "tb",
+        "тб"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_госб": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.gosb_name"
+      ],
+      "aliases": [
+        "gosb",
+        "госб"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_начальника_отдела": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.department_manager_saphr_fio"
+      ],
+      "aliases": [
+        "department manager saphr fio",
+        "фио начальник отдел",
+        "фио начальника отдела"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_руководителя_направления": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_manager_saphr_fio"
+      ],
+      "aliases": [
+        "task manager saphr fio",
+        "фио руководител направлени",
+        "фио руководителя направления"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_начальника_управления": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.manager_saphr_fio"
+      ],
+      "aliases": [
+        "manager saphr fio",
+        "фио начальника управления",
+        "фио начальник управлени"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_сотрудника": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.fio"
+      ],
+      "aliases": [
+        "fio",
+        "фио сотрудника",
+        "фио сотрудник"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_клиентского_менеджера": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.km_fio"
+      ],
+      "aliases": [
+        "km fio",
+        "фио клиентск менеджер",
+        "фио клиентского менеджера"
+      ],
+      "semantic_class": "label"
+    },
+    "должность_сотрудника": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.post_name"
+      ],
+      "aliases": [
+        "post",
+        "должность сотрудник",
+        "должность сотрудника"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_роли_сотрудника_по_задаче": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_role_name"
+      ],
+      "aliases": [
+        "task role",
+        "роли сотрудник задач",
+        "роли сотрудника задаче"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_лидера_по_задаче": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_leader_fio"
+      ],
+      "aliases": [
+        "task leader fio",
+        "фио лидера задаче",
+        "фио лидер задач"
+      ],
+      "semantic_class": "label"
+    },
+    "признак_лидера_по_задаче": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_task_leader"
+      ],
+      "aliases": [
+        "is task leader",
+        "лидера задаче",
+        "лидер задач"
+      ],
+      "semantic_class": "flag"
+    },
+    "наименование_компании": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.company_name",
+        "schema.uzp_data_epk_consolidation.company_name"
+      ],
+      "aliases": [
+        "company",
+        "компани",
+        "компании"
+      ],
+      "semantic_class": "label"
+    },
+    "код_задачи_узп": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.uzp_task_code"
+      ],
+      "aliases": [
+        "uzp task",
+        "задачи узп",
+        "задач узп"
+      ],
+      "semantic_class": "free_text"
+    },
+    "код_кампании_продаж": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.campaign_code"
+      ],
+      "aliases": [
+        "campaign",
+        "кампани продаж",
+        "кампании продаж"
+      ],
+      "semantic_class": "free_text"
+    },
+    "сценарий_продажи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.sale_scenario"
+      ],
+      "aliases": [
+        "sale scenario",
+        "сценарий продажи",
+        "сценар продаж"
+      ],
+      "semantic_class": "free_text"
+    },
+    "категория_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_category"
+      ],
+      "aliases": [
+        "task category",
+        "категори задач",
+        "категория задачи"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "тип_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_type"
+      ],
+      "aliases": [
+        "task",
+        "задач",
+        "задачи"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "подтип_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_subtype"
+      ],
+      "aliases": [
+        "task subtype",
+        "подтип задачи",
+        "подтип задач"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "инфоповод": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.reason_comment"
+      ],
+      "aliases": [
+        "reason comment",
+        "инфоповод"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "тип_последней_активности": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.last_activity_type"
+      ],
+      "aliases": [
+        "last activity",
+        "последн активност",
+        "последней активности"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "статус_последней_активности": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.last_activity_status"
+      ],
+      "aliases": [
+        "last activity status",
+        "статус последней активности",
+        "статус последн активност"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "источник_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.task_source_code"
+      ],
+      "aliases": [
+        "task source",
+        "источник задач",
+        "источник задачи"
+      ],
+      "semantic_class": "free_text"
+    },
+    "признак_закрытия_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_closed"
+      ],
+      "aliases": [
+        "is closed",
+        "закрытия задачи",
+        "закрыти задач"
+      ],
+      "semantic_class": "flag"
+    },
+    "признак_успешного_закрытия_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_success_closed"
+      ],
+      "aliases": [
+        "is success closed",
+        "успешного закрытия задачи",
+        "успешн закрыти задач"
+      ],
+      "semantic_class": "flag"
+    },
+    "признак_задача_выполняется": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_worked"
+      ],
+      "aliases": [
+        "is worked",
+        "задач выполняетс",
+        "задача выполняется"
+      ],
+      "semantic_class": "flag"
+    },
+    "признак_наличия_задачи_на_привлечение_новых_получателей": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_np_task"
+      ],
+      "aliases": [
+        "is np task",
+        "наличия задачи привлечение новых получателей",
+        "наличи задач привлечен новых получател"
+      ],
+      "semantic_class": "flag"
+    },
+    "признак_просроченной_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_overdue_task"
+      ],
+      "aliases": [
+        "is overdue task",
+        "просроченн задач",
+        "просроченной задачи"
+      ],
+      "semantic_class": "flag"
+    },
+    "признак_обязательной_или_необязательной_задачи": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_required_task"
+      ],
+      "aliases": [
+        "is required task",
+        "обязательн необязательн задач",
+        "обязательной необязательной задачи"
+      ],
+      "semantic_class": "flag"
+    },
+    "признак_оформления_сделки": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_deal_created"
+      ],
+      "aliases": [
+        "is deal created",
+        "оформления сделки",
+        "оформлени сделк"
+      ],
+      "semantic_class": "flag"
+    },
+    "признак_проявления_интереса_к_предложению": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_interest_offer"
+      ],
+      "aliases": [
+        "is interest offer",
+        "проявления интереса предложению",
+        "проявлени интерес предложени"
+      ],
+      "semantic_class": "flag"
+    },
+    "признак_подтверждения_оттока": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.is_outflow"
+      ],
+      "aliases": [
+        "is outflow",
+        "подтверждения оттока",
+        "подтверждени отток"
+      ],
+      "semantic_class": "flag"
+    },
+    "наименование_холдинга": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.holding_name",
+        "schema.uzp_data_epk_consolidation.holding_name"
+      ],
+      "aliases": [
+        "holding",
+        "холдинга",
+        "холдинг"
+      ],
+      "semantic_class": "label"
+    },
+    "код_сделки": {
+      "column_keys": [
+        "schema.uzp_data_split_mzp_sale_funnel.deal_code"
+      ],
+      "aliases": [
+        "deal",
+        "сделк",
+        "сделки"
+      ],
+      "semantic_class": "free_text"
+    },
+    "подтип_кода_счета": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.acc_subtype"
+      ],
+      "aliases": [
+        "acc subtype",
+        "подтип кода счет",
+        "подтип кода счета"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "тип_агрегирования_по_периодам_sum_сумма_avg_средневзешенное_last_последний_период": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.acc_type"
+      ],
+      "aliases": [
+        "acc",
+        "агрегировани период sum сумм avg средневзешенн last последн период",
+        "агрегирования периодам sum сумма avg средневзешенное last последний период"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "категория_клиента": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.client_category"
+      ],
+      "aliases": [
+        "client category",
+        "категори клиент",
+        "категория клиента"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_компании_заключившей_зп_договор": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.company_name"
+      ],
+      "aliases": [
+        "company",
+        "компани заключивш зп договор",
+        "компании заключившей зп договор"
+      ],
+      "semantic_class": "label"
+    },
+    "номер_договора": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.agrmnt_num"
+      ],
+      "aliases": [
+        "agrmnt num",
+        "номер договора",
+        "номер договор"
+      ],
+      "semantic_class": "free_text"
+    },
+    "вид_зачисления": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.enrollment_transcription"
+      ],
+      "aliases": [
+        "enrollment transcription",
+        "вид зачисления",
+        "вид зачислени"
+      ],
+      "semantic_class": "free_text"
+    },
+    "тип_зачисления": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.enrollment_type"
+      ],
+      "aliases": [
+        "enrollment",
+        "зачислени",
+        "зачисления"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "инн": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.inn",
+        "schema.uzp_data_payroll_m.inn_parsing"
+      ],
+      "aliases": [
+        "inn",
+        "инн",
+        "inn parsing"
+      ],
+      "semantic_class": "free_text"
+    },
+    "системный_номер_осб": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.ipt_name"
+      ],
+      "aliases": [
+        "ipt",
+        "системн номер осб",
+        "системный номер осб"
+      ],
+      "semantic_class": "label"
+    },
+    "тип_карты": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.card_type"
+      ],
+      "aliases": [
+        "card",
+        "карты",
+        "карт"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "признак_силовой_структуры": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.is_security_force"
+      ],
+      "aliases": [
+        "is security force",
+        "силовой структуры",
+        "силов структур"
+      ],
+      "semantic_class": "flag"
+    },
+    "наименование_сегмента_клиента_юл": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.segment_name"
+      ],
+      "aliases": [
+        "segment",
+        "сегмента клиента юл",
+        "сегмент клиент юл"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "описание_рода_выплаты_основные_прочие": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.enrollment_kind_descr"
+      ],
+      "aliases": [
+        "enrollment kind descr",
+        "описан рода выплат основн проч",
+        "описание рода выплаты основные прочие"
+      ],
+      "semantic_class": "free_text"
+    },
+    "наименование_признака_участия_в_доле_рынка": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.market_share_flag_name"
+      ],
+      "aliases": [
+        "market share",
+        "признак участи доле рынк",
+        "признака участия доле рынка"
+      ],
+      "semantic_class": "flag"
+    },
+    "наименование_системы_источника": {
+      "column_keys": [
+        "schema.uzp_data_payroll_m.src_system_name"
+      ],
+      "aliases": [
+        "src system",
+        "системы источника",
+        "систем источник"
+      ],
+      "semantic_class": "label"
+    },
+    "код_балансовой_единицы": {
+      "column_keys": [
+        "schema.uzp_data_emp_epk_assignment.balance_unit_code"
+      ],
+      "aliases": [
+        "balance unit",
+        "балансовой единицы",
+        "балансов единиц"
+      ],
+      "semantic_class": "free_text"
+    },
+    "код_госб": {
+      "column_keys": [
+        "schema.uzp_data_emp_epk_assignment.gosb_code",
+        "schema.uzp_dwh_sap_staff_emp.gosb_code"
+      ],
+      "aliases": [
+        "gosb",
+        "госб"
+      ],
+      "semantic_class": "free_text"
+    },
+    "исходный_код_госб_из_sap": {
+      "column_keys": [
+        "schema.uzp_data_emp_epk_assignment.sap_gosb_code",
+        "schema.uzp_dwh_sap_staff_emp.sap_gosb_code"
+      ],
+      "aliases": [
+        "sap gosb",
+        "исходн госб sap",
+        "исходный госб sap"
+      ],
+      "semantic_class": "free_text"
+    },
+    "код_всп": {
+      "column_keys": [
+        "schema.uzp_data_emp_epk_assignment.vsp_code"
+      ],
+      "aliases": [
+        "vsp",
+        "всп"
+      ],
+      "semantic_class": "free_text"
+    },
+    "идентификатор_типа_клиента": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.client_type_id"
+      ],
+      "aliases": [
+        "client id",
+        "идентификатор типа клиент",
+        "идентификатор типа клиента"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_типа_клиента": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.client_type_name"
+      ],
+      "aliases": [
+        "client",
+        "типа клиента",
+        "типа клиент"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_отрасли": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.industry_name"
+      ],
+      "aliases": [
+        "industry",
+        "отрасл",
+        "отрасли"
+      ],
+      "semantic_class": "label"
+    },
+    "история_изменений_епк": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.old_epk_id"
+      ],
+      "aliases": [
+        "old epk id",
+        "история изменений епк",
+        "истори изменен епк"
+      ],
+      "semantic_class": "free_text"
+    },
+    "идентификатор_сегмента": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.segment_id"
+      ],
+      "aliases": [
+        "segment id",
+        "идентификатор сегмент",
+        "идентификатор сегмента"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_приоритета": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.priority_name"
+      ],
+      "aliases": [
+        "priority",
+        "приоритета",
+        "приоритет"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_эталонного_холдинга": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.reference_holding_name"
+      ],
+      "aliases": [
+        "reference holding",
+        "эталонн холдинг",
+        "эталонного холдинга"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_головного_холдинга": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.head_holding_name"
+      ],
+      "aliases": [
+        "head holding",
+        "головного холдинга",
+        "головн холдинг"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_эталонного_головного_холдинга": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.reference_head_holding_name"
+      ],
+      "aliases": [
+        "reference head holding",
+        "эталонн головн холдинг",
+        "эталонного головного холдинга"
+      ],
+      "semantic_class": "label"
+    },
+    "признак_головной_организации": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.is_parent"
+      ],
+      "aliases": [
+        "is parent",
+        "головной организации",
+        "головн организаци"
+      ],
+      "semantic_class": "flag"
+    },
+    "признак_ключевого_клиента": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.is_key_client"
+      ],
+      "aliases": [
+        "is key client",
+        "ключевого клиента",
+        "ключев клиент"
+      ],
+      "semantic_class": "flag"
+    },
+    "идентификатор_статуса_организации": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.status_id"
+      ],
+      "aliases": [
+        "status id",
+        "идентификатор статуса организации",
+        "идентификатор статус организаци"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "наименование_статуса_для_организации": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.status_name"
+      ],
+      "aliases": [
+        "status",
+        "статус организаци",
+        "статуса организации"
+      ],
+      "semantic_class": "enum_like"
+    },
+    "признак_вуз": {
+      "column_keys": [
+        "schema.uzp_data_epk_consolidation.is_educational"
+      ],
+      "aliases": [
+        "is educational",
+        "вуз"
+      ],
+      "semantic_class": "flag"
+    },
+    "фио": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.fio"
+      ],
+      "aliases": [
+        "fio",
+        "фио"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_эталонной_должности": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.post_name"
+      ],
+      "aliases": [
+        "post",
+        "эталонн должност",
+        "эталонной должности"
+      ],
+      "semantic_class": "label"
+    },
+    "наименование_штатной_должности": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.pos_name"
+      ],
+      "aliases": [
+        "pos",
+        "штатной должности",
+        "штатн должност"
+      ],
+      "semantic_class": "label"
+    },
+    "код_тб": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.tb_code"
+      ],
+      "aliases": [
+        "tb",
+        "тб"
+      ],
+      "semantic_class": "free_text"
+    },
+    "город": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.city"
+      ],
+      "aliases": [
+        "city",
+        "город"
+      ],
+      "semantic_class": "free_text"
+    },
+    "стаж_в_должности_общий_лет_мес": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.post_total_experience_ym"
+      ],
+      "aliases": [
+        "post total experience ym",
+        "стаж должности общий лет мес",
+        "стаж должност общий лет мес"
+      ],
+      "semantic_class": "free_text"
+    },
+    "стаж_в_должности_непрерывный_лет_мес": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.post_continuous_experience_ym"
+      ],
+      "aliases": [
+        "post continuous experience ym",
+        "стаж должност непрерывн лет мес",
+        "стаж должности непрерывный лет мес"
+      ],
+      "semantic_class": "free_text"
+    },
+    "стаж_в_сб_общий_лет_мес": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.sb_total_experience_ym"
+      ],
+      "aliases": [
+        "sb total experience ym",
+        "стаж сб общий лет мес"
+      ],
+      "semantic_class": "free_text"
+    },
+    "стаж_в_сб_непрерывный_лет_мес": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.sb_continuous_experience_ym"
+      ],
+      "aliases": [
+        "sb continuous experience ym",
+        "стаж сб непрерывный лет мес",
+        "стаж сб непрерывн лет мес"
+      ],
+      "semantic_class": "free_text"
+    },
+    "наименование_должности_руководителя_первого_уровня": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_name"
+      ],
+      "aliases": [
+        "manager lvl",
+        "должности руководителя первого уровня",
+        "должност руководител перв уровн"
+      ],
+      "semantic_class": "label"
+    },
+    "фио_руководителя_первого_уровня": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_fio"
+      ],
+      "aliases": [
+        "manager lvl fio",
+        "фио руководителя первого уровня",
+        "фио руководител перв уровн"
+      ],
+      "semantic_class": "label"
+    },
+    "код_роли": {
+      "column_keys": [
+        "schema.uzp_dwh_sap_staff_emp.role_code"
+      ],
+      "aliases": [
+        "role",
+        "роли"
+      ],
+      "semantic_class": "free_text"
+    }
+  },
+  "time_phrases": {
+    "date": {
+      "aliases": [
+        "report dt",
+        "отчетн дата",
+        "отчетная дата",
+        "period",
+        "date",
+        "период",
+        "report",
+        "дата",
+        "task plan closed dt",
+        "планов дата закрыти задач",
+        "плановая дата закрытия задачи",
+        "task fact closed dt",
+        "фактическ дата закрыти задач",
+        "фактическая дата закрытия задачи",
+        "last activity dt",
+        "дата последн активност",
+        "дата последней активности",
+        "deal dt",
+        "месяц создания сделки",
+        "месяц создани сделк",
+        "acc open dt",
+        "дата открытия счета",
+        "дата открыти счет",
+        "agrmnt dt",
+        "дата заключения договора",
+        "дата заключени договор",
+        "start dttm",
+        "дата время начала закрепления",
+        "дата врем начал закреплени",
+        "end dttm",
+        "дата время окончания закрепления",
+        "дата врем окончани закреплени",
+        "epk create dttm",
+        "дата создани карточк епк",
+        "дата создания карточки епк",
+        "pos vacancy dt",
+        "дата образовани ваканси",
+        "дата образования вакансии",
+        "post start dt",
+        "дата вступлени должность",
+        "дата вступления должность"
+      ]
+    }
+  }
+}

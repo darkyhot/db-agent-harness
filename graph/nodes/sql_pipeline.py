@@ -13,6 +13,12 @@ import re
 import time
 from typing import Any
 
+from core.confidence import (
+    build_fallback_policy,
+    build_planning_confidence,
+    evaluate_filter_confidence,
+    evaluate_join_confidence,
+)
 from core.sql_static_checker import check_sql
 from core.sql_planner_deterministic import build_blueprint as _deterministic_blueprint
 from core.sql_builder import SqlBuilder as _SqlBuilder
@@ -234,9 +240,43 @@ class SqlPipelineNodes:
             user_input=state.get("user_input", ""),
             user_hints=state.get("user_hints", {}) or {},
             schema_loader=self.schema,
+            semantic_frame=state.get("semantic_frame", {}) or {},
         )
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
+
+        where_resolution = blueprint.get("where_resolution", {}) or {}
+        filter_confidence = evaluate_filter_confidence(
+            where_resolution,
+            semantic_frame=state.get("semantic_frame", {}) or {},
+            intent=intent,
+        )
+        previous_planning = state.get("planning_confidence", {}) or {}
+        previous_components = previous_planning.get("components", {}) if isinstance(previous_planning, dict) else {}
+        planning_confidence = build_planning_confidence(
+            table_confidence=previous_components.get("table_confidence") or previous_planning,
+            filter_confidence=filter_confidence,
+            join_confidence=previous_components.get("join_confidence")
+            or evaluate_join_confidence(state.get("join_decision", {}) or {}),
+        )
+        evidence_trace = dict(state.get("evidence_trace") or {})
+        evidence_trace["where_resolution"] = {
+            "applied_rules": where_resolution.get("applied_rules", []),
+            "reasoning": where_resolution.get("reasoning", []),
+            "filter_candidates": {
+                k: [
+                    {
+                        "column": c.get("column"),
+                        "condition": c.get("condition"),
+                        "score": c.get("score"),
+                        "confidence": c.get("confidence"),
+                    }
+                    for c in (v or [])[:3]
+                ]
+                for k, v in (where_resolution.get("filter_candidates", {}) or {}).items()
+            },
+        }
+        evidence_trace["planning_confidence"] = planning_confidence
 
         # --- Блок C: NEEDS_YEAR guard ---
         # Если intent_classifier уже поставил month_without_year=True, pipeline должен
@@ -259,6 +299,42 @@ class SqlPipelineNodes:
                 "needs_clarification": True,
                 "clarification_message": _clarif,
                 "sql_blueprint": blueprint,
+                "where_resolution": where_resolution,
+                "planning_confidence": planning_confidence,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": _clarif}
+                ],
+            }
+
+        if where_resolution.get("needs_clarification"):
+            _clarif = str(where_resolution.get("clarification_message") or "").strip()
+            return {
+                "needs_clarification": True,
+                "clarification_message": _clarif,
+                "sql_blueprint": blueprint,
+                "where_resolution": where_resolution,
+                "planning_confidence": planning_confidence,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": _clarif}
+                ],
+            }
+
+        if planning_confidence.get("action") != "execute":
+            _clarif = (
+                "Нужна короткая уточняющая деталь по источнику данных или фильтру, "
+                "чтобы построить корректный SQL."
+            )
+            return {
+                "needs_clarification": True,
+                "clarification_message": _clarif,
+                "sql_blueprint": blueprint,
+                "where_resolution": where_resolution,
+                "planning_confidence": planning_confidence,
+                "evidence_trace": evidence_trace,
                 "graph_iterations": iterations,
                 "messages": state["messages"] + [
                     {"role": "assistant", "content": _clarif}
@@ -308,6 +384,9 @@ class SqlPipelineNodes:
 
         return {
             "sql_blueprint": blueprint,
+            "where_resolution": where_resolution,
+            "planning_confidence": planning_confidence,
+            "evidence_trace": evidence_trace,
             "column_selector_hint": new_hint,
             "graph_iterations": iterations,
             "messages": state["messages"] + [
@@ -357,6 +436,8 @@ class SqlPipelineNodes:
         # --- Попытка детерминированной генерации SQL через SqlBuilder ---
         table_types = state.get("table_types", {})
         allowed_tables: list[str] = state.get("allowed_tables") or []
+        planning_confidence = state.get("planning_confidence", {}) or {}
+        evidence_trace = dict(state.get("evidence_trace") or {})
         _builder = _SqlBuilder()
         template_sql = _builder.build(
             strategy=strategy,
@@ -373,9 +454,19 @@ class SqlPipelineNodes:
                 schema_loader=self.schema,
                 allowed_tables=allowed_tables if allowed_tables else None,
             )
+            fallback_policy = build_fallback_policy(
+                planning_confidence=planning_confidence,
+                deterministic_sql_valid=check_result.is_valid,
+                has_template_sql=True,
+            )
             if check_result.is_valid:
                 logger.info("SqlWriter: SQL сгенерирован детерминированно, минуем LLM")
                 step_idx = state["current_step"]
+                evidence_trace["sql_generation"] = {
+                    "mode": "deterministic",
+                    "strategy": strategy,
+                    "fallback_policy": fallback_policy,
+                }
                 return {
                     "sql_to_validate": template_sql,
                     "pending_sql_tool_call": {
@@ -384,6 +475,8 @@ class SqlPipelineNodes:
                         "step_idx": step_idx,
                     },
                     "graph_iterations": iterations,
+                    "fallback_policy": fallback_policy,
+                    "evidence_trace": evidence_trace,
                     "tool_calls": state.get("tool_calls", []) + [
                         {"tool": "execute_query", "args": {"sql": template_sql},
                          "result": "awaiting_validation"}
@@ -397,6 +490,54 @@ class SqlPipelineNodes:
                     "SqlWriter: шаблонный SQL не прошёл статический чекер (%s) — передаём LLM",
                     check_result.summary()[:200],
                 )
+                if not fallback_policy.get("allow_llm_fallback"):
+                    msg = str(fallback_policy.get("message") or "Генерация SQL остановлена по policy.")
+                    evidence_trace["sql_generation"] = {
+                        "mode": "blocked_before_llm",
+                        "strategy": strategy,
+                        "fallback_policy": fallback_policy,
+                    }
+                    result: dict[str, Any] = {
+                        "graph_iterations": iterations,
+                        "fallback_policy": fallback_policy,
+                        "evidence_trace": evidence_trace,
+                        "messages": state["messages"] + [
+                            {"role": "assistant", "content": msg}
+                        ],
+                    }
+                    if fallback_policy.get("action") == "clarify":
+                        result["needs_clarification"] = True
+                        result["clarification_message"] = msg
+                    else:
+                        result["last_error"] = msg
+                    return result
+        else:
+            fallback_policy = build_fallback_policy(
+                planning_confidence=planning_confidence,
+                deterministic_sql_valid=False,
+                has_template_sql=False,
+            )
+            if not fallback_policy.get("allow_llm_fallback"):
+                msg = str(fallback_policy.get("message") or "Генерация SQL через LLM остановлена по policy.")
+                evidence_trace["sql_generation"] = {
+                    "mode": "blocked_before_llm",
+                    "strategy": strategy,
+                    "fallback_policy": fallback_policy,
+                }
+                result = {
+                    "graph_iterations": iterations,
+                    "fallback_policy": fallback_policy,
+                    "evidence_trace": evidence_trace,
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": msg}
+                    ],
+                }
+                if fallback_policy.get("action") == "clarify":
+                    result["needs_clarification"] = True
+                    result["clarification_message"] = msg
+                else:
+                    result["last_error"] = msg
+                return result
 
         # --- System prompt (~3K) ---
         # Выбираем 1-2 релевантных примера по стратегии
@@ -518,6 +659,11 @@ class SqlPipelineNodes:
         if sql and tool_name in self.SQL_TOOL_NAMES:
             logger.info("SqlWriter: SQL готов, отправляю на валидацию")
             step_idx = state["current_step"]
+            evidence_trace["sql_generation"] = {
+                "mode": "llm_fallback",
+                "strategy": strategy,
+                "fallback_policy": fallback_policy,
+            }
             return {
                 "sql_to_validate": sql,
                 "pending_sql_tool_call": {
@@ -526,6 +672,8 @@ class SqlPipelineNodes:
                     "step_idx": step_idx,
                 },
                 "graph_iterations": iterations,
+                "fallback_policy": fallback_policy,
+                "evidence_trace": evidence_trace,
                 "tool_calls": state.get("tool_calls", []) + [
                     {"tool": tool_name, "args": tool_call.get("args", {}),
                      "result": "awaiting_validation"}

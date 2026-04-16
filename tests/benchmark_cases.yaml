@@ -1,0 +1,20 @@
+- query: "Посчитай количество задач с подтвержденным оттоком за февраль 2026"
+  expected:
+    subject: "task"
+    requested_grain: "task"
+- query: "Посчитай количество задач по фактическому оттоку за февраль 2026"
+  expected:
+    subject: "task"
+    requested_grain: "task"
+- query: "Покажи сумму оттока по дате и сегменту"
+  expected:
+    metric_intent: "sum"
+    period_kind: null
+- query: "Покажи список клиентов по региону"
+  expected:
+    subject: "client"
+    requires_listing: true
+- query: "Сколько сотрудников с подтвержденным оттоком"
+  expected:
+    subject: "employee"
+    metric_intent: "count"

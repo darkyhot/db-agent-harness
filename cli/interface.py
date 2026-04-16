@@ -13,6 +13,7 @@ from core.database import DatabaseManager
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.query_cache import QueryCache
+from core.enrichment_pipeline import EnrichmentPipeline
 from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
 from graph.graph import build_graph, create_initial_state
@@ -104,6 +105,7 @@ class CLIInterface:
         self.llm = RateLimitedLLM()
         self.memory = MemoryManager()
         self.schema = SchemaLoader()
+        EnrichmentPipeline(self.schema, llm=self.llm, db_manager=self.db).run()
         self.validator = SQLValidator(self.db, schema_loader=self.schema)
 
         # Создание tools через DI (замыкания)

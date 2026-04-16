@@ -1,16 +1,63 @@
 """Загрузка и индексирование CSV-файлов со схемой БД."""
 
+import json
 import logging
 import re
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
+from core.column_semantics import build_column_semantics
+from core.semantic_registry import (
+    build_rule_registry,
+    build_semantic_lexicon,
+    find_best_subject,
+)
 from core.synonym_map import expand_with_synonyms
+from core.table_semantics import build_table_semantics
+from core.value_profiler import (
+    build_db_profile,
+    build_metadata_profile,
+    discover_profile_candidates,
+    merge_profiles,
+)
 
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data_for_agent"
+_TABLES_CSV = "tables_list.csv"
+_VALUE_PROFILES_JSON = "column_value_profiles.json"
+_COLUMN_SEMANTICS_JSON = "column_semantics.json"
+_TABLE_SEMANTICS_JSON = "table_semantics.json"
+_SEMANTIC_LEXICON_JSON = "semantic_lexicon.json"
+_RULE_REGISTRY_JSON = "rule_registry.json"
+
+_TABLE_COLUMNS = ["schema_name", "table_name", "description", "grain"]
+_ATTR_COLUMNS = [
+    "schema_name", "table_name", "column_name", "dType",
+    "is_not_null", "description", "is_primary_key",
+    "not_null_perc", "unique_perc",
+]
+
+_GRAIN_ENUM = (
+    "task", "client", "employee", "organization", "event", "transaction",
+    "snapshot", "dictionary", "document", "payment", "account", "product", "other",
+)
+_GRAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "task": ("task", "ticket", "issue", "задач", "воронка", "funnel"),
+    "client": ("client", "customer", "cust", "клиент", "inn", "инн"),
+    "employee": ("employee", "emp", "staff", "worker", "сотрудник"),
+    "organization": ("org", "organization", "branch", "gosb", "tb", "госб", "тб"),
+    "event": ("event", "history", "log", "отток", "событ", "истори"),
+    "transaction": ("transaction", "txn", "order", "sale", "заказ", "продаж"),
+    "snapshot": ("snapshot", "report", "report_dt", "period", "срез", "отчет"),
+    "dictionary": ("dim", "dict", "lookup", "reference", "справочник"),
+    "document": ("document", "doc", "ведомост", "файл"),
+    "payment": ("payment", "payroll", "salary", "зп", "платеж"),
+    "account": ("account", "acc", "balance", "счет"),
+    "product": ("product", "sku", "товар", "продукт"),
+}
 
 # TF-IDF опционально (scikit-learn может быть не установлен)
 try:
@@ -59,21 +106,28 @@ class SchemaLoader:
         self._tfidf_vectorizer: "TfidfVectorizer | None" = None
         self._tfidf_matrix = None
         self._tfidf_index: list[tuple[str, str]] = []  # [(schema, table), ...]
+        self._value_profiles: dict[str, dict[str, Any]] | None = None
+        self._column_semantics: dict[str, dict[str, Any]] | None = None
+        self._table_semantics: dict[str, dict[str, Any]] | None = None
+        self._semantic_lexicon: dict[str, Any] | None = None
+        self._rule_registry: dict[str, Any] | None = None
 
     def _load_tables(self) -> pd.DataFrame:
         """Загрузить и закешировать tables_list.csv."""
         if self._tables_df is not None:
             return self._tables_df
 
-        path = self._data_dir / "tables_list.csv"
+        path = self._data_dir / _TABLES_CSV
         if not path.exists():
             logger.warning("Файл не найден: %s", path)
-            self._tables_df = pd.DataFrame(
-                columns=["schema_name", "table_name", "description"]
-            )
+            self._tables_df = pd.DataFrame(columns=_TABLE_COLUMNS)
             return self._tables_df
 
         self._tables_df = pd.read_csv(path, encoding="utf-8")
+        for col in _TABLE_COLUMNS:
+            if col not in self._tables_df.columns:
+                self._tables_df[col] = ""
+        self._tables_df["grain"] = self._tables_df["grain"].fillna("").astype(str)
         logger.info("Загружено таблиц: %d", len(self._tables_df))
         return self._tables_df
 
@@ -85,16 +139,13 @@ class SchemaLoader:
         path = self._data_dir / "attr_list.csv"
         if not path.exists():
             logger.warning("Файл не найден: %s", path)
-            self._attrs_df = pd.DataFrame(
-                columns=[
-                    "schema_name", "table_name", "column_name", "dType",
-                    "is_not_null", "description", "is_primary_key",
-                    "not_null_perc", "unique_perc",
-                ]
-            )
+            self._attrs_df = pd.DataFrame(columns=_ATTR_COLUMNS)
             return self._attrs_df
 
         self._attrs_df = pd.read_csv(path, encoding="utf-8")
+        for col in _ATTR_COLUMNS:
+            if col not in self._attrs_df.columns:
+                self._attrs_df[col] = ""
         logger.info("Загружено атрибутов: %d", len(self._attrs_df))
         return self._attrs_df
 
@@ -133,10 +184,11 @@ class SchemaLoader:
             schema = str(row.get("schema_name", ""))
             table = str(row.get("table_name", ""))
             desc = str(row.get("description", ""))
+            grain = str(row.get("grain", ""))
             # Разбиваем snake_case на слова для лучшего матчинга
             table_words = table.replace("_", " ")
             schema_words = schema.replace("_", " ")
-            text = f"{schema_words} {table_words} {table_words} {desc}"
+            text = f"{schema_words} {table_words} {table_words} {desc} {grain}"
             docs.append(text.lower())
             index.append((schema, table))
 
@@ -259,6 +311,378 @@ class SchemaLoader:
             query, len(result), len(keyword_result), len(tfidf_hits),
         )
         return result.reset_index(drop=True)
+
+    def _persist_tables_df(self, df: pd.DataFrame) -> None:
+        """Сохранить tables_list.csv и обновить кеш/индексы."""
+        for col in _TABLE_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        path = self._data_dir / _TABLES_CSV
+        df.to_csv(path, index=False, encoding="utf-8")
+        self._tables_df = df.copy()
+        self._tfidf_vectorizer = None
+        self._tfidf_matrix = None
+        self._tfidf_index = []
+
+    @staticmethod
+    def _profile_key(schema: str, table: str, column: str) -> str:
+        return f"{schema}.{table}.{column}".lower()
+
+    def _value_profiles_path(self) -> Path:
+        return self._data_dir / _VALUE_PROFILES_JSON
+
+    def _column_semantics_path(self) -> Path:
+        return self._data_dir / _COLUMN_SEMANTICS_JSON
+
+    def _table_semantics_path(self) -> Path:
+        return self._data_dir / _TABLE_SEMANTICS_JSON
+
+    def _semantic_lexicon_path(self) -> Path:
+        return self._data_dir / _SEMANTIC_LEXICON_JSON
+
+    def _rule_registry_path(self) -> Path:
+        return self._data_dir / _RULE_REGISTRY_JSON
+
+    @staticmethod
+    def _table_key(schema: str, table: str) -> str:
+        return f"{schema}.{table}".lower()
+
+    def ensure_column_semantics(self) -> None:
+        """Построить и закешировать semantics колонок."""
+        if self._column_semantics is not None:
+            return
+
+        path = self._column_semantics_path()
+        generated = build_column_semantics(self.attrs_df)
+        persisted: dict[str, dict[str, Any]] = {}
+        if path.exists():
+            try:
+                persisted = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                persisted = {}
+
+        merged = dict(generated)
+        merged.update(persisted)
+        self._column_semantics = merged
+        path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def ensure_table_semantics(self) -> None:
+        """Построить и закешировать semantics таблиц."""
+        if self._table_semantics is not None:
+            return
+
+        self.ensure_column_semantics()
+        path = self._table_semantics_path()
+        generated = build_table_semantics(self.tables_df, self.attrs_df, self._column_semantics or {})
+        persisted: dict[str, dict[str, Any]] = {}
+        if path.exists():
+            try:
+                persisted = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                persisted = {}
+
+        merged = dict(generated)
+        merged.update(persisted)
+        self._table_semantics = merged
+        path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def ensure_value_profiles(self, db_manager: Any | None = None) -> None:
+        """Построить и закешировать value profiles для фильтровых колонок."""
+        if self._value_profiles is not None and db_manager is None:
+            return
+
+        self.ensure_column_semantics()
+        path = self._value_profiles_path()
+        persisted: dict[str, dict[str, Any]] = {}
+        if path.exists():
+            try:
+                persisted = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                persisted = {}
+
+        profiles: dict[str, dict[str, Any]] = {}
+        candidates = discover_profile_candidates(self.attrs_df, self._column_semantics or {})
+        for row in candidates:
+            schema = str(row.get("schema_name", "") or "")
+            table = str(row.get("table_name", "") or "")
+            column = str(row.get("column_name", "") or "")
+            key = self._profile_key(schema, table, column)
+            semantics = (self._column_semantics or {}).get(key, {})
+            metadata_profile = build_metadata_profile(row, semantics)
+            db_profile = build_db_profile(
+                db_manager,
+                schema=schema,
+                table=table,
+                column=column,
+            ) if db_manager is not None else {}
+            profiles[key] = merge_profiles(metadata_profile, db_profile)
+
+        merged = dict(profiles)
+        merged.update(persisted)
+        # Если db_manager передан — локально пересчитываем кандидатов и даём им приоритет над старым кешем.
+        if db_manager is not None:
+            merged.update(profiles)
+        self._value_profiles = merged
+        path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def ensure_semantic_registry(self) -> None:
+        """Построить и закешировать semantic lexicon и rule registry."""
+        if self._semantic_lexicon is not None and self._rule_registry is not None:
+            return
+
+        self.ensure_column_semantics()
+        self.ensure_table_semantics()
+        self.ensure_value_profiles()
+
+        lex_path = self._semantic_lexicon_path()
+        rule_path = self._rule_registry_path()
+        persisted_lex: dict[str, Any] = {}
+        persisted_rules: dict[str, Any] = {}
+        if lex_path.exists():
+            try:
+                persisted_lex = json.loads(lex_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                persisted_lex = {}
+        if rule_path.exists():
+            try:
+                persisted_rules = json.loads(rule_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                persisted_rules = {}
+
+        generated_lex = build_semantic_lexicon(
+            self.tables_df,
+            self.attrs_df,
+            table_semantics=self._table_semantics or {},
+            column_semantics=self._column_semantics or {},
+            value_profiles=self._value_profiles or {},
+        )
+        generated_rules = build_rule_registry(
+            self.attrs_df,
+            column_semantics=self._column_semantics or {},
+            value_profiles=self._value_profiles or {},
+        )
+        merged_lex = dict(generated_lex)
+        merged_lex.update(persisted_lex)
+        merged_rules = dict(generated_rules)
+        merged_rules.update(persisted_rules)
+        self._semantic_lexicon = merged_lex
+        self._rule_registry = merged_rules
+        lex_path.write_text(json.dumps(merged_lex, ensure_ascii=False, indent=2), encoding="utf-8")
+        rule_path.write_text(json.dumps(merged_rules, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def get_value_profile(self, schema: str, table: str, column: str) -> dict[str, Any]:
+        """Получить value profile для колонки."""
+        self.ensure_value_profiles()
+        return dict((self._value_profiles or {}).get(self._profile_key(schema, table, column), {}))
+
+    def get_column_semantics(self, schema: str, table: str, column: str) -> dict[str, Any]:
+        """Получить semantics колонки."""
+        self.ensure_column_semantics()
+        key = self._profile_key(schema, table, column)
+        return dict((self._column_semantics or {}).get(key, {}))
+
+    def get_table_semantics(self, schema: str, table: str) -> dict[str, Any]:
+        """Получить semantics таблицы."""
+        self.ensure_table_semantics()
+        key = self._table_key(schema, table)
+        return dict((self._table_semantics or {}).get(key, {}))
+
+    def get_semantic_lexicon(self) -> dict[str, Any]:
+        self.ensure_semantic_registry()
+        return dict(self._semantic_lexicon or {})
+
+    def get_rule_registry(self) -> dict[str, Any]:
+        self.ensure_semantic_registry()
+        return dict(self._rule_registry or {})
+
+    def get_table_grain(self, schema: str, table: str) -> str:
+        """Вернуть grain таблицы или пустую строку, если он не задан."""
+        tbl_sem = self.get_table_semantics(schema, table)
+        if tbl_sem.get("grain"):
+            return str(tbl_sem.get("grain") or "").strip().lower()
+        df = self.tables_df
+        mask = (df["schema_name"] == schema) & (df["table_name"] == table)
+        rows = df[mask]
+        if rows.empty:
+            return ""
+        return str(rows.iloc[0].get("grain", "") or "").strip().lower()
+
+    def infer_query_grain(
+        self,
+        query: str,
+        entities: list[str] | None = None,
+    ) -> str | None:
+        """Оценить grain запроса по тексту пользователя и entities."""
+        haystack = " ".join(
+            p for p in [query or ""] + [str(e) for e in (entities or []) if e]
+            if p
+        ).lower()
+        if not haystack.strip():
+            return None
+
+        try:
+            subject = find_best_subject(haystack, self.get_semantic_lexicon())
+            if subject:
+                return subject
+        except Exception:  # noqa: BLE001
+            pass
+
+        scored: list[tuple[int, str]] = []
+        for grain, keywords in _GRAIN_KEYWORDS.items():
+            score = 0
+            for kw in keywords:
+                if kw and kw in haystack:
+                    score += 1
+            if score > 0:
+                scored.append((score, grain))
+
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        return scored[0][1]
+
+    def _fallback_infer_table_grain(self, schema: str, table: str) -> str:
+        """Эвристический fallback для grain, если LLM не дал ответ."""
+        table_info = self.get_table_info(schema, table).lower()
+        best_grain = "other"
+        best_score = 0
+        for grain, keywords in _GRAIN_KEYWORDS.items():
+            score = sum(1 for kw in keywords if kw in table_info)
+            if score > best_score:
+                best_score = score
+                best_grain = grain
+        return best_grain
+
+    def _build_grain_prompt_payload(self, batch: pd.DataFrame) -> list[dict[str, Any]]:
+        """Собрать компактный контекст по таблицам для генерации grain."""
+        payload: list[dict[str, Any]] = []
+        for _, row in batch.iterrows():
+            schema = str(row.get("schema_name", "") or "")
+            table = str(row.get("table_name", "") or "")
+            cols_df = self.get_table_columns(schema, table)
+            informative_cols: list[str] = []
+            if not cols_df.empty:
+                ranked = cols_df.copy()
+                ranked["__pk"] = ranked.get("is_primary_key", False).astype(bool)
+                ranked["__nn"] = ranked.get("not_null_perc", 0).fillna(0)
+                ranked = ranked.sort_values(["__pk", "__nn"], ascending=[False, False])
+                for _, c_row in ranked.head(12).iterrows():
+                    c_name = str(c_row.get("column_name", "") or "")
+                    c_desc = str(c_row.get("description", "") or "")
+                    c_type = str(c_row.get("dType", "") or "")
+                    informative_cols.append(f"{c_name} ({c_type}) — {c_desc}".strip())
+
+            payload.append({
+                "schema": schema,
+                "table": table,
+                "description": str(row.get("description", "") or ""),
+                "columns": informative_cols,
+            })
+        return payload
+
+    def _parse_grain_response(self, response: str) -> dict[tuple[str, str], str]:
+        """Распарсить ответ LLM с grain-метаданными."""
+        cleaned = re.sub(r'```(?:json)?\s*\n?', '', response)
+        cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.MULTILINE)
+        match = re.search(r'\{.*\}|\[.*\]', cleaned, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            parsed = json.loads(match.group())
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+        if isinstance(parsed, dict):
+            items = parsed.get("tables", [])
+        elif isinstance(parsed, list):
+            items = parsed
+        else:
+            items = []
+
+        result: dict[tuple[str, str], str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            schema = str(item.get("schema", "") or "").strip()
+            table = str(item.get("table", "") or "").strip()
+            grain = str(item.get("grain", "") or "").strip().lower()
+            if grain not in _GRAIN_ENUM:
+                continue
+            if schema and table:
+                result[(schema, table)] = grain
+        return result
+
+    def ensure_table_grains(
+        self,
+        llm: Any | None = None,
+        batch_size: int = 25,
+    ) -> int:
+        """Гарантировать, что у всех таблиц заполнен grain.
+
+        Если столбец отсутствует или есть пустые значения, а `llm` передан,
+        значения догенерируются батчами и сохраняются обратно в CSV.
+        """
+        df = self.tables_df.copy()
+        if "grain" not in df.columns:
+            df["grain"] = ""
+        df["grain"] = df["grain"].fillna("").astype(str)
+
+        missing_mask = df["grain"].str.strip() == ""
+        missing_count = int(missing_mask.sum())
+        if missing_count == 0:
+            return 0
+
+        if llm is None:
+            logger.info(
+                "Grain metadata: найдено %d таблиц без grain, но LLM не передан",
+                missing_count,
+            )
+            return missing_count
+
+        logger.info("Grain metadata: требуется генерация для %d таблиц", missing_count)
+        system_prompt = (
+            "Ты определяешь grain таблиц для аналитического агента.\n"
+            "Grain — это сущность одной строки таблицы.\n"
+            f"Используй ТОЛЬКО одно значение из списка: {', '.join(_GRAIN_ENUM)}.\n"
+            "Верни ТОЛЬКО JSON формата:\n"
+            '{\n  "tables": [\n'
+            '    {"schema": "...", "table": "...", "grain": "task"}\n'
+            "  ]\n}\n"
+            "Правила:\n"
+            "- task: одна строка на задачу/тикет/элемент воронки\n"
+            "- client: одна строка на клиента\n"
+            "- employee: одна строка на сотрудника\n"
+            "- organization: одна строка на орг-единицу/ГОСБ/ТБ\n"
+            "- event: одна строка на событие/факт наступления\n"
+            "- transaction: одна строка на транзакцию/заказ/продажу\n"
+            "- snapshot: одна строка на периодический срез состояния\n"
+            "- dictionary: справочник/lookup/reference\n"
+            "- document/payment/account/product/other — по смыслу\n"
+        )
+
+        missing_df = df[missing_mask].copy()
+        for start in range(0, len(missing_df), batch_size):
+            batch = missing_df.iloc[start:start + batch_size]
+            payload = self._build_grain_prompt_payload(batch)
+            user_prompt = (
+                "Определи grain для таблиц:\n"
+                f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+            )
+            response = llm.invoke_with_system(system_prompt, user_prompt, temperature=0.0)
+            generated = self._parse_grain_response(str(response))
+
+            for _, row in batch.iterrows():
+                schema = str(row.get("schema_name", "") or "")
+                table = str(row.get("table_name", "") or "")
+                grain = generated.get((schema, table)) or self._fallback_infer_table_grain(schema, table)
+                df.loc[
+                    (df["schema_name"] == schema) & (df["table_name"] == table),
+                    "grain",
+                ] = grain
+
+        self._persist_tables_df(df)
+        logger.info("Grain metadata: генерация завершена")
+        return 0
 
     def get_table_columns(self, schema: str, table: str) -> pd.DataFrame:
         """Получить атрибуты конкретной таблицы.

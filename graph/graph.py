@@ -99,6 +99,18 @@ def _route_after_tool_dispatcher(state: AgentState) -> str:
     return "table_resolver"
 
 
+def _route_after_table_resolver(state: AgentState) -> str:
+    """Маршрутизация после table_resolver."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("needs_disambiguation") or state.get("needs_clarification"):
+        return END
+
+    return "table_explorer"
+
+
 def _route_after_sql_writer(state: AgentState) -> str:
     """Маршрутизация после sql_writer."""
     limit = _check_limits(state)
@@ -106,6 +118,9 @@ def _route_after_sql_writer(state: AgentState) -> str:
         return limit
 
     if state.get("needs_disambiguation"):
+        return END
+
+    if state.get("needs_clarification"):
         return END
 
     if state.get("sql_to_validate"):
@@ -147,6 +162,9 @@ def _route_after_validator(state: AgentState) -> str:
     if state.get("needs_confirmation"):
         return END
 
+    if state.get("needs_clarification"):
+        return END
+
     if _is_timed_out(state):
         return "summarizer"
 
@@ -172,6 +190,9 @@ def _route_after_sql_planner(state: AgentState) -> str:
 
     if state.get("column_selector_hint", ""):
         return "column_selector"
+
+    if state.get("needs_clarification"):
+        return END
 
     return "sql_writer"
 
@@ -295,8 +316,12 @@ def build_graph(
         "summarizer": "summarizer",
     })
 
-    # table_resolver → table_explorer → column_selector → sql_planner
-    graph.add_edge("table_resolver", "table_explorer")
+    # table_resolver → table_explorer или END, если нужно уточнение источника
+    graph.add_conditional_edges("table_resolver", _route_after_table_resolver, {
+        END: END,
+        "table_explorer": "table_explorer",
+        "summarizer": "summarizer",
+    })
     graph.add_edge("table_explorer", "column_selector")
     graph.add_edge("column_selector", "sql_planner")
 
@@ -410,6 +435,12 @@ def create_initial_state(
             "dim_sources": {},
             "having_hints": [],
         },
+        semantic_frame={},
+        where_resolution={},
+        join_decision={},
+        planning_confidence={},
+        evidence_trace={},
+        fallback_policy={},
         # Белый список таблиц (заполняется в table_resolver)
         allowed_tables=[],
     )

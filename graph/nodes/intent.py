@@ -22,6 +22,11 @@ from core.column_selector_deterministic import (
     _semantic_match_score,
 )
 from core.join_analysis import detect_table_type
+from core.sql_planner_deterministic import _derive_date_filters_from_text
+from core.semantic_frame import derive_semantic_frame
+from core.domain_rules import table_bonus_for_frame, table_can_satisfy_frame
+from core.join_governor import decide_join_plan
+from core.confidence import evaluate_join_confidence, evaluate_table_confidence, build_planning_confidence
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -249,6 +254,25 @@ class IntentNodes:
         logger.info("IntentClassifier: intent=%s, entities=%s",
                      intent.get("intent"), intent.get("entities"))
 
+        # Детерминированная коррекция периода:
+        # если пользователь написал "февраль 26" или ответил "Уточнение пользователя: 26",
+        # не переспросим год повторно даже если LLM ошибся.
+        derived_dates = _derive_date_filters_from_text(user_input)
+        if (
+            derived_dates.get("from")
+            and derived_dates.get("from") != "NEEDS_YEAR"
+        ):
+            current_dates = dict(intent.get("date_filters") or {})
+            if not current_dates.get("from") or intent.get("month_without_year"):
+                intent["date_filters"] = derived_dates
+                intent["month_without_year"] = False
+                if intent.get("intent") == "clarification":
+                    intent["intent"] = "analytics"
+                logger.info(
+                    "IntentClassifier: детерминированно распознан период %s..%s",
+                    derived_dates.get("from"), derived_dates.get("to"),
+                )
+
         needs_clarification = intent.get("intent") == "clarification"
         clarification_message = str(intent.get("clarification_question") or "").strip()
 
@@ -288,6 +312,9 @@ class IntentNodes:
                 "Не хватает деталей, чтобы корректно продолжить. Уточните, пожалуйста, запрос."
             )
 
+        semantic_frame = derive_semantic_frame(user_input, intent, schema_loader=self.schema)
+        logger.info("IntentClassifier: semantic_frame=%s", semantic_frame)
+
         self.memory.add_message(
             "assistant",
             f"[intent_classifier] Интент: {intent.get('intent')}, "
@@ -302,6 +329,7 @@ class IntentNodes:
             ],
             "needs_clarification": needs_clarification,
             "clarification_message": clarification_message,
+            "semantic_frame": semantic_frame,
             "graph_iterations": state.get("graph_iterations", 0) + 1,
         }
 
@@ -464,6 +492,7 @@ class IntentNodes:
         # --- Детерминированная коррекция по семантике запроса и каталогу ---
         query_norm = _normalize_query_text(user_input)
         requested = _derive_requested_slots(user_input, intent)
+        semantic_frame = state.get("semantic_frame", {}) or derive_semantic_frame(user_input, intent, schema_loader=self.schema)
         tables_df = self.schema.tables_df
 
         # === Подсказки пользователя (hint_extractor) ===
@@ -536,6 +565,29 @@ class IntentNodes:
                 return str(row_df.iloc[0].get("description", "") or "")
             except Exception:  # noqa: BLE001
                 return ""
+
+        def _table_grain(schema_name: str, table_name: str) -> str:
+            try:
+                return self.schema.get_table_grain(schema_name, table_name)
+            except Exception:  # noqa: BLE001
+                return ""
+
+        def _grain_bonus(schema_name: str, table_name: str, requested_grain: str | None) -> float:
+            if not requested_grain:
+                return 0.0
+            table_grain = _table_grain(schema_name, table_name)
+            if not table_grain:
+                return 0.0
+            if table_grain == requested_grain:
+                return 240.0
+            mismatched_but_related = {
+                ("event", "snapshot"), ("snapshot", "event"),
+                ("client", "task"), ("task", "client"),
+                ("dictionary", "organization"), ("organization", "dictionary"),
+            }
+            if (table_grain, requested_grain) in mismatched_but_related:
+                return -60.0
+            return -140.0
 
         def _score_table_for_slot(
             schema_name: str,
@@ -679,7 +731,14 @@ class IntentNodes:
             )
 
         metric_slot = requested.get("metric")
-        dimension_slots = list(requested.get("dimensions", []))
+        dimension_slots = list(dict.fromkeys(
+            list(requested.get("dimensions", []))
+            + list(semantic_frame.get("output_dimensions", []) or [])
+        ))
+        requested_grain = (
+            semantic_frame.get("requested_grain")
+            or self.schema.infer_query_grain(user_input, list(intent.get("entities") or []))
+        )
         metric_entities = list(dict.fromkeys(
             [str(metric_slot)] if metric_slot else []
             + [str(entity) for entity in (intent.get("entities") or []) if entity]
@@ -727,38 +786,33 @@ class IntentNodes:
         # скоры (label-слоты) НЕ учитываются — иначе таблица с высоким not_null
         # по измерению может перебить настоящую фактовую таблицу.
         main_table: tuple[str, str] | None = None
-        if metric_slot:
-            metric_choice = None
-            metric_search_groups = []
-            if validated_tables:
-                metric_search_groups.append(list(dict.fromkeys(validated_tables)))
-            metric_search_groups.append(list(dict.fromkeys(candidate_tables)))
-            for metric_candidates in metric_search_groups:
-                candidate_keys = {f"{s}.{t}" for s, t in metric_candidates}
-                metric_table_structures = {
-                    f"{s}.{t}": _table_description(s, t)
-                    for s, t in metric_candidates
-                }
-                metric_table_types = {
-                    f"{s}.{t}": _table_type(s, t)
-                    for s, t in metric_candidates
-                }
-                metric_choice = _choose_best_column(
-                    table_structures=metric_table_structures,
-                    table_types=metric_table_types,
-                    schema_loader=self.schema,
-                    slot=metric_slot,
-                    allowed_tables=candidate_keys,
-                    require_numeric=True,
-                    agg_hint=str(intent.get("aggregation_hint") or "").lower().strip(),
+        ranked_main_candidates: list[dict[str, Any]] = []
+        for st in candidate_tables:
+            score = 0.0
+            if metric_slot:
+                metric_score = _score_table_for_slot(
+                    st[0], st[1], metric_slot, metric_entities=metric_entities,
                 )
-                if metric_choice:
-                    break
-            if metric_choice:
-                table_key, _ = metric_choice
-                if "." in table_key:
-                    s_part, t_part = table_key.split(".", 1)
-                    main_table = (s_part, t_part)
+                if metric_score > 0:
+                    score += metric_score
+            score += _grain_bonus(st[0], st[1], requested_grain)
+            score += table_bonus_for_frame(self.schema, st[0], st[1], semantic_frame)
+            if st in explicit_tables:
+                score += 90
+            if st in hint_must_keep:
+                score += 150
+            if st in validated_tables:
+                score += 70
+            ranked_main_candidates.append({
+                "table": st,
+                "score": score,
+                "grain": _table_grain(st[0], st[1]),
+                "description": _table_description(st[0], st[1]),
+            })
+
+        ranked_main_candidates.sort(key=lambda item: item["score"], reverse=True)
+        if ranked_main_candidates and ranked_main_candidates[0]["score"] > 0:
+            main_table = ranked_main_candidates[0]["table"]
         if main_table is None:
             # Fallback: первая lock'нутая или первая explicit
             if hint_must_keep:
@@ -877,6 +931,34 @@ class IntentNodes:
         if not deterministic_tables:
             deterministic_tables = list(validated_tables)
 
+        # Если main_table может закрыть запрос сама, не тянем лишние JOIN.
+        if (
+            main_table
+            and not explicit_tables
+            and not hint_must_keep
+            and not hint_dim_sources
+            and str(intent.get("complexity", "")).lower() in {"single_table", "", "multi_table"}
+            and table_can_satisfy_frame(self.schema, main_table[0], main_table[1], semantic_frame)
+        ):
+            main_ok_for_dims = True
+            for slot in dimension_slots:
+                if slot == "date":
+                    continue
+                slot_profile = _best_slot_profile(main_table[0], main_table[1], slot)
+                slot_not_null = float(slot_profile.get("not_null", 0.0)) if slot_profile else 0.0
+                if (
+                    _score_table_for_slot(main_table[0], main_table[1], slot, metric_entities=metric_entities) <= 0
+                    or slot_not_null < 50.0
+                ):
+                    main_ok_for_dims = False
+                    break
+            if main_ok_for_dims:
+                deterministic_tables = [main_table]
+                logger.info(
+                    "TableResolver: защищаем от лишнего JOIN — оставляем только main_table %s.%s",
+                    main_table[0], main_table[1],
+                )
+
         # Hard-lock: гарантируем, что все must_keep-таблицы присутствуют.
         # Они никогда не должны быть удалены детерминированной коррекцией.
         for tup in locked_tables:
@@ -904,13 +986,125 @@ class IntentNodes:
                     for s, t in deterministic_tables
                 }
 
+        # Универсальный join-governor: single vs multi-table и pruning.
+        slot_scores: dict[str, dict[str, float]] = {}
+        for st in deterministic_tables:
+            table_key = f"{st[0]}.{st[1]}"
+            slot_scores[table_key] = {}
+            if metric_slot:
+                slot_scores[table_key][str(metric_slot)] = _score_table_for_slot(
+                    st[0], st[1], str(metric_slot), metric_entities=metric_entities,
+                )
+            for slot in dimension_slots:
+                slot_scores[table_key][str(slot)] = _score_table_for_slot(
+                    st[0], st[1], str(slot), metric_entities=metric_entities,
+                )
+
+        join_decision = decide_join_plan(
+            selected_tables=validated_tables,
+            main_table=main_table,
+            locked_tables=locked_tables,
+            join_requested=join_requested,
+            semantic_frame=semantic_frame,
+            requested_grain=requested_grain,
+            dimension_slots=dimension_slots,
+            slot_scores=slot_scores,
+            schema_loader=self.schema,
+        )
+        governed_tables = list(join_decision.get("selected_tables") or validated_tables)
+        if governed_tables != validated_tables:
+            logger.info(
+                "TableResolver: join_governor скорректировал таблицы: %s -> %s (%s)",
+                validated_tables,
+                governed_tables,
+                join_decision.get("reason"),
+            )
+            validated_tables = governed_tables
+
+        # Если top-кандидаты близки и пользователь не зафиксировал таблицу явно,
+        # безопаснее уточнить источник у пользователя вместо молчаливого выбора.
+        disambiguation_options: list[dict[str, Any]] = []
+        if (
+            not explicit_tables
+            and not hint_must_keep
+            and len(ranked_main_candidates) >= 2
+        ):
+            top_1 = ranked_main_candidates[0]
+            top_2 = ranked_main_candidates[1]
+            score_gap = float(top_1["score"]) - float(top_2["score"])
+            top_tables = [top_1, top_2]
+            ambiguous = (
+                bool(requested_grain)
+                and bool(top_1.get("grain"))
+                and bool(top_2.get("grain"))
+                and top_1.get("grain") != top_2.get("grain")
+                and score_gap < 120.0
+            )
+            if ambiguous:
+                for candidate in top_tables:
+                    s_name, t_name = candidate["table"]
+                    description = candidate.get("description") or "без описания"
+                    grain = candidate.get("grain") or "unknown"
+                    disambiguation_options.append({
+                        "schema": s_name,
+                        "table": t_name,
+                        "description": f"{description} | grain={grain}",
+                        "key_columns": self.schema.get_primary_keys(s_name, t_name),
+                    })
+
+        table_confidence_summary = evaluate_table_confidence(
+            table_confidences,
+            disambiguation_options=disambiguation_options,
+        )
+        join_confidence_summary = evaluate_join_confidence(join_decision)
+        planning_confidence = build_planning_confidence(
+            table_confidence=table_confidence_summary,
+            filter_confidence=None,
+            join_confidence=join_confidence_summary,
+        )
+        evidence_trace = dict(state.get("evidence_trace") or {})
+        evidence_trace.update({
+            "semantic_frame": semantic_frame,
+            "table_selection": {
+                "candidates": ranked_main_candidates[:5],
+                "winner": f"{validated_tables[0][0]}.{validated_tables[0][1]}" if validated_tables else "",
+                "table_confidences": table_confidences,
+            },
+            "join_decision": join_decision,
+            "planning_confidence": planning_confidence,
+        })
+
         logger.info(
-            "TableResolver: выбрано %d таблиц: %s, план из %d шагов, confidence=%s",
+            "TableResolver: выбрано %d таблиц: %s, план из %d шагов, confidence=%s, requested_grain=%s, semantic_frame=%s, planning_confidence=%s",
             len(validated_tables),
             ", ".join(f"{s}.{t}" for s, t in validated_tables),
             len(plan_steps),
             table_confidences,
+            requested_grain,
+            semantic_frame,
+            planning_confidence,
         )
+
+        if disambiguation_options:
+            question = "Для запроса подходят несколько таблиц. Какую использовать?"
+            logger.info(
+                "TableResolver: запрашиваю disambiguation по таблицам: %s",
+                [f"{o['schema']}.{o['table']}" for o in disambiguation_options],
+            )
+            return {
+                "needs_disambiguation": True,
+                "disambiguation_options": disambiguation_options,
+                "confirmation_message": question,
+                "selected_tables": validated_tables,
+                "join_decision": join_decision,
+                "planning_confidence": planning_confidence,
+                "evidence_trace": evidence_trace,
+                "allowed_tables": [f"{s}.{t}" for s, t in validated_tables],
+                "graph_iterations": state.get("graph_iterations", 0) + 1,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": question},
+                ],
+            }
 
         self.memory.add_message(
             "assistant",
@@ -931,6 +1125,9 @@ class IntentNodes:
         return {
             "selected_tables": validated_tables,
             "allowed_tables": merged,
+            "join_decision": join_decision,
+            "planning_confidence": planning_confidence,
+            "evidence_trace": evidence_trace,
             "plan": plan_steps,
             "current_step": 0,
             "retry_count": 0,
@@ -941,6 +1138,8 @@ class IntentNodes:
                 {"role": "assistant", "content": (
                     f"Таблицы: {', '.join(f'{s}.{t}' for s, t in validated_tables)}\n"
                     f"Уверенность: {table_confidences}\n"
+                    f"JOIN decision: {join_decision}\n"
+                    f"Planning confidence: {planning_confidence}\n"
                     f"Разрешённые таблицы (белый список): {merged}\n"
                     f"План:\n" + "\n".join(plan_steps) + low_confidence_warning
                 )},

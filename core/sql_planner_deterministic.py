@@ -10,6 +10,8 @@
 import logging
 import re
 
+from core.where_resolver import resolve_where
+
 logger = logging.getLogger(__name__)
 
 # Суффиксы date-колонок для определения axis-join по дате
@@ -406,8 +408,6 @@ def _derive_date_filters_from_text(user_input: str) -> dict[str, str | None]:
     sql_planner мог прервать pipeline и запросить уточнение у пользователя.
     """
     q = (user_input or "").lower()
-    year_match = re.search(r"\b(20\d{2})\b", q)
-
     # Проверяем наличие месяца
     month = None
     for stem, num in _RU_MONTHS.items():
@@ -417,6 +417,21 @@ def _derive_date_filters_from_text(user_input: str) -> dict[str, str | None]:
 
     if month is None:
         return {"from": None, "to": None}
+
+    year_match = re.search(r"\b(20\d{2})\b", q)
+    if not year_match:
+        short_year_match = re.search(
+            r"(?:уточнение пользователя:\s*|\b)(\d{2})\b",
+            q,
+        )
+        if short_year_match:
+            year = 2000 + int(short_year_match.group(1))
+            next_year = year + 1 if month == 12 else year
+            next_month = 1 if month == 12 else month + 1
+            return {
+                "from": f"{year:04d}-{month:02d}-01",
+                "to": f"{next_year:04d}-{next_month:02d}-01",
+            }
 
     if not year_match:
         # Месяц есть, года нет → маркер для запроса уточнения
@@ -495,6 +510,7 @@ def build_blueprint(
     user_input: str = "",
     user_hints: dict | None = None,
     schema_loader=None,
+    semantic_frame: dict | None = None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -549,7 +565,17 @@ def build_blueprint(
                 strategy = "fact_dim_join"
 
     group_by    = _compute_group_by(selected_columns, aggregation)
-    where_conditions = _compute_where_from_intent(intent, selected_columns, user_input=user_input)
+    base_where_conditions = _compute_where_from_intent(intent, selected_columns, user_input=user_input)
+    where_resolution = resolve_where(
+        user_input=user_input,
+        intent=intent,
+        selected_columns=selected_columns,
+        selected_tables=list(selected_columns.keys()),
+        schema_loader=schema_loader,
+        semantic_frame=semantic_frame,
+        base_conditions=base_where_conditions,
+    )
+    where_conditions = where_resolution.get("conditions", base_where_conditions)
 
     # --- Блок D: required_output enforcement ---
     # Колонки из required_output (обязательные в SELECT) добавляем в group_by если их нет.
@@ -634,13 +660,15 @@ def build_blueprint(
         "join_by_axis": join_by_axis,
         "axis_column": axis_column,
         "required_output": required_output,
+        "where_resolution": where_resolution,
         "notes": f"[deterministic] strategy={strategy}, tables={list(table_types.keys())}",
     }
 
     logger.info(
-        "DeterministicPlanner: strategy=%s, main=%s, cte=%s, group_by=%s, agg=%s",
+        "DeterministicPlanner: strategy=%s, main=%s, cte=%s, group_by=%s, agg=%s, where_rules=%s",
         strategy, main_table, cte_needed, group_by,
         aggregation.get("function") if aggregation else None,
+        where_resolution.get("applied_rules", []),
     )
 
     return blueprint

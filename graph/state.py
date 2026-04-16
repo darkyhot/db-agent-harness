@@ -113,3 +113,11 @@ class AgentState(TypedDict):
     # Используется в table_resolver (hard-lock must_keep_tables),
     # column_selector (dim_sources/join_fields), sql_planner (HAVING).
     user_hints: dict[str, Any]
+
+    # semantic frame запроса и результат where_resolver
+    semantic_frame: dict[str, Any]
+    where_resolution: dict[str, Any]
+    join_decision: dict[str, Any]
+    planning_confidence: dict[str, Any]
+    evidence_trace: dict[str, Any]
+    fallback_policy: dict[str, Any]

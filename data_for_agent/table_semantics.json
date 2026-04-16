@@ -1,0 +1,170 @@
+{
+  "schema.uzp_dwh_fact_outflow": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "grain": "",
+    "table_role": "fact",
+    "primary_subjects": [],
+    "time_axis_columns": [
+      "report_dt"
+    ],
+    "filter_friendliness": 0.207,
+    "join_richness": 0.069,
+    "column_class_counts": {
+      "date": 1,
+      "metric": 14,
+      "identifier": 1,
+      "enum_like": 1,
+      "flag": 3,
+      "label": 1,
+      "join_key": 1,
+      "free_text": 6,
+      "system_timestamp": 1
+    }
+  },
+  "schema.uzp_dim_gosb": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "grain": "",
+    "table_role": "reference",
+    "primary_subjects": [
+      "organization"
+    ],
+    "time_axis_columns": [],
+    "filter_friendliness": 0.389,
+    "join_richness": 0.111,
+    "column_class_counts": {
+      "join_key": 1,
+      "label": 7,
+      "identifier": 1,
+      "metric": 7,
+      "system_timestamp": 1,
+      "free_text": 1
+    }
+  },
+  "schema.uzp_data_split_mzp_sale_funnel": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "grain": "",
+    "table_role": "fact",
+    "primary_subjects": [
+      "task"
+    ],
+    "time_axis_columns": [
+      "deal_m_dt",
+      "last_activity_dt",
+      "report_dt",
+      "task_fact_closed_dt",
+      "task_plan_closed_dt"
+    ],
+    "filter_friendliness": 0.567,
+    "join_richness": 0.033,
+    "column_class_counts": {
+      "date": 5,
+      "metric": 16,
+      "label": 12,
+      "flag": 10,
+      "enum_like": 7,
+      "join_key": 1,
+      "identifier": 1,
+      "free_text": 5,
+      "system_timestamp": 3
+    }
+  },
+  "schema.uzp_data_payroll_m": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "grain": "",
+    "table_role": "fact",
+    "primary_subjects": [],
+    "time_axis_columns": [
+      "acc_open_dt",
+      "agrmnt_dt",
+      "report_dt"
+    ],
+    "filter_friendliness": 0.4,
+    "join_richness": 0.086,
+    "column_class_counts": {
+      "identifier": 2,
+      "date": 3,
+      "enum_like": 6,
+      "metric": 12,
+      "join_key": 1,
+      "label": 3,
+      "free_text": 5,
+      "system_timestamp": 1,
+      "flag": 2
+    }
+  },
+  "schema.uzp_data_emp_epk_assignment": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "grain": "",
+    "table_role": "fact",
+    "primary_subjects": [
+      "employee",
+      "organization"
+    ],
+    "time_axis_columns": [
+      "end_dttm",
+      "start_dttm"
+    ],
+    "filter_friendliness": 0.143,
+    "join_richness": 0.071,
+    "column_class_counts": {
+      "identifier": 1,
+      "metric": 6,
+      "date": 2,
+      "free_text": 4,
+      "system_timestamp": 1
+    }
+  },
+  "schema.uzp_data_epk_consolidation": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "grain": "",
+    "table_role": "fact",
+    "primary_subjects": [
+      "organization"
+    ],
+    "time_axis_columns": [
+      "epk_create_dttm"
+    ],
+    "filter_friendliness": 0.419,
+    "join_richness": 0.023,
+    "column_class_counts": {
+      "identifier": 1,
+      "date": 1,
+      "enum_like": 6,
+      "metric": 22,
+      "label": 7,
+      "free_text": 1,
+      "flag": 4,
+      "system_timestamp": 1
+    }
+  },
+  "schema.uzp_dwh_sap_staff_emp": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "grain": "",
+    "table_role": "fact",
+    "primary_subjects": [
+      "employee"
+    ],
+    "time_axis_columns": [
+      "pos_vacancy_dt",
+      "post_start_dt",
+      "report_dt"
+    ],
+    "filter_friendliness": 0.286,
+    "join_richness": 0.107,
+    "column_class_counts": {
+      "date": 3,
+      "join_key": 3,
+      "label": 5,
+      "metric": 7,
+      "free_text": 9,
+      "system_timestamp": 1
+    }
+  }
+}

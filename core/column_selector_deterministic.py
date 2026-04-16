@@ -221,6 +221,20 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
         if _looks_like_explicit_column(token) or re.fullmatch(r'[a-z]{3,10}', token):
             join_key_hints.append(token)
 
+    # ---- Дополняем из LLM-поля required_output (уже распознанные измерения) ----
+    # Надёжнее regex: LLM понимает "по X и Y", "по X, Y", "X и Y" одинаково.
+    # Добавляем без суффикса _name, чтобы не активировать label-slot фильтр
+    # в _choose_best_column (иначе пропустятся колонки без 'name' в токенах).
+    for ro_item in (intent.get('required_output') or []):
+        concept = _normalize_concept(str(ro_item))
+        if not concept:
+            continue
+        if any(tok in _DATE_HINTS for tok in concept.split('_')):
+            if 'date' not in dimensions:
+                dimensions.append('date')
+        elif concept not in dimensions and f'{concept}_name' not in dimensions:
+            dimensions.append(concept)
+
     return {
         'dimensions': list(dict.fromkeys(dimensions)),
         'metric': metric,
@@ -538,6 +552,17 @@ def select_columns(
                         gb_s = max(gb_s, 0.95)
                     else:
                         gb_s = min(gb_s, 0.2)
+                    # Подавляем дата-колонки в таблицах, которые выступают dim-источником
+                    # для нечасовых слотов. Дата берётся из фактовой таблицы; справочник
+                    # нужен только ради своего атрибута (сегмент, регион и т.п.).
+                    if gb_s > 0.05 and hint_dim_sources:
+                        _is_nondated_dim_src = any(
+                            b.get('table') == table_key and sk != 'date'
+                            for sk, b in hint_dim_sources.items()
+                            if isinstance(b, dict)
+                        )
+                        if _is_nondated_dim_src:
+                            gb_s = 0.05
             if gb_s > 0:
                 gb_candidates.append((col_name, round(gb_s, 3)))
 
@@ -661,6 +686,57 @@ def select_columns(
                 roles.setdefault('filter', [])
                 if col_name not in roles['filter'] and has_date_filter:
                     roles['filter'].append(col_name)
+
+    # ---- Safety-net: dim_source-слоты, не попавшие в requested['dimensions'] ----
+    # Срабатывает, если required_output от LLM пустой или не содержит нужного измерения.
+    # Используем сырой slot_key (напр. "segment"), а не производный с суффиксом _name —
+    # это критично: без суффикса _name не активируется label-slot фильтр в _choose_best_column.
+    if hint_dim_sources:
+        _matched_dim_keys: set[str] = set()
+        for slot in requested['dimensions']:
+            slot_lower = slot.lower()
+            for key in hint_dim_sources:
+                key_lower = key.lower()
+                if key_lower == slot_lower or key_lower in slot_lower or slot_lower in key_lower:
+                    _matched_dim_keys.add(key)
+
+        for slot_key, binding in hint_dim_sources.items():
+            if slot_key in _matched_dim_keys:
+                continue
+            if not isinstance(binding, dict):
+                continue
+            bound_table = binding.get('table')
+            choice = _choose_best_column(
+                table_structures, table_types, schema_loader, slot_key,
+                dim_source_table=bound_table,
+            )
+            if not choice and bound_table:
+                logger.warning(
+                    "ColumnSelectorDet: dim_source '%s' для слота '%s' "
+                    "не содержит подходящей колонки — fallback на общий поиск",
+                    bound_table, slot_key,
+                )
+                choice = _choose_best_column(
+                    table_structures, table_types, schema_loader, slot_key,
+                )
+            if not choice:
+                logger.warning(
+                    "ColumnSelectorDet: слот '%s' из dim_sources не удалось разрешить",
+                    slot_key,
+                )
+                continue
+            t_key, col_name = choice
+            roles = selected_columns.setdefault(t_key, {})
+            roles.setdefault('select', [])
+            roles.setdefault('group_by', [])
+            if col_name not in roles['select']:
+                roles['select'].append(col_name)
+            if col_name not in roles['group_by']:
+                roles['group_by'].append(col_name)
+            logger.info(
+                "ColumnSelectorDet: dim_source-слот '%s' → %s.%s",
+                slot_key, t_key, col_name,
+            )
 
     if wants_aggregation and agg_hint != 'count' and requested['metric']:
         metric_choice = _choose_best_column(

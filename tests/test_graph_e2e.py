@@ -304,6 +304,70 @@ class TestGoldenCase1SegmentSource:
         assert pick["col1"] == "inn"
         assert pick["col2"] == "inn"
 
+    def test_segment_column_selected_not_date_column(self, golden_loader):
+        """Регрессия: «по дате и сегменту, сегмент возьми в dim_segments по инн».
+
+        Баг: агент клал epk_create_dttm (дата) в GROUP BY вместо сегментной колонки.
+        Ожидаемое поведение:
+          - group_by для gold.dim_segments содержит segment_name (или segment_id)
+          - group_by для gold.dim_segments НЕ содержит date/dt/dttm колонок
+        """
+        from core.column_selector_deterministic import select_columns
+
+        table_structures = {
+            "gold.fact_metric_a": "fact_metric_a columns: report_dt, inn, amount_val, emp_ref_id",
+            "gold.dim_segments": "dim_segments columns: segment_id, inn, segment_name, emp_ref_id",
+        }
+        table_types = {
+            "gold.fact_metric_a": "fact",
+            "gold.dim_segments": "dim",
+        }
+        intent = {
+            "aggregation_hint": "sum",
+            "entities": ["метрика", "дата", "сегмент"],
+            "required_output": ["дата", "сегмент"],
+            "date_filters": {"from": None, "to": None},
+            "filter_conditions": [],
+        }
+        user_hints = {
+            "must_keep_tables": [("gold", "dim_segments")],
+            "join_fields": ["inn"],
+            "dim_sources": {
+                "segment": {"table": "gold.dim_segments", "join_col": "inn"}
+            },
+            "having_hints": [],
+        }
+        user_input = "сумма метрики по дате и сегменту, сегмент возьми в dim_segments по инн"
+
+        result = select_columns(
+            intent=intent,
+            table_structures=table_structures,
+            table_types=table_types,
+            join_analysis_data={},
+            schema_loader=golden_loader,
+            user_input=user_input,
+            user_hints=user_hints,
+        )
+
+        selected = result.get("selected_columns", {})
+        dim_roles = selected.get("gold.dim_segments", {})
+        dim_gb = dim_roles.get("group_by", [])
+
+        # В group_by для dim_segments должна быть сегментная колонка
+        assert any(
+            "segment" in c.lower() for c in dim_gb
+        ), f"Ожидали segment-колонку в group_by dim_segments, получили: {dim_gb}"
+
+        # В group_by для dim_segments НЕ должно быть дата-колонок
+        date_cols_in_gb = [
+            c for c in dim_gb
+            if any(tok in c.lower() for tok in ("dt", "dttm", "date", "create"))
+        ]
+        assert not date_cols_in_gb, (
+            f"В group_by dim_segments оказались дата-колонки: {date_cols_in_gb}. "
+            f"Весь group_by: {dim_gb}"
+        )
+
 
 class TestGoldenCase2HavingFromPhrase:
     """Кейс 2: «...от 3 <unit>» → HAVING COUNT(DISTINCT unit_col) >= 3."""

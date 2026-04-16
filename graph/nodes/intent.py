@@ -12,7 +12,9 @@ import re
 from typing import Any
 
 from core.column_selector_deterministic import (
+    _choose_best_column,
     _derive_requested_slots,
+    _is_dimension_slot,
     _is_numeric,
     _is_label_slot,
     _is_metric_slot,
@@ -523,6 +525,18 @@ class IntentNodes:
                 table_descr = ""
             return _semantic_match_score(table_name, table_descr, slot)
 
+        def _table_description(schema_name: str, table_name: str) -> str:
+            try:
+                row_df = tables_df[
+                    (tables_df["schema_name"].astype(str).str.lower() == schema_name.lower())
+                    & (tables_df["table_name"].astype(str).str.lower() == table_name.lower())
+                ]
+                if row_df.empty:
+                    return ""
+                return str(row_df.iloc[0].get("description", "") or "")
+            except Exception:  # noqa: BLE001
+                return ""
+
         def _score_table_for_slot(
             schema_name: str,
             table_name: str,
@@ -533,6 +547,7 @@ class IntentNodes:
             if cols.empty:
                 return -1.0
             t_type = _table_type(schema_name, table_name)
+            is_dimension_slot = _is_dimension_slot(slot)
             best = -1.0
             for _, row in cols.iterrows():
                 col_name = str(row.get("column_name", "") or "")
@@ -548,6 +563,11 @@ class IntentNodes:
                         score += 35
                     if t_type == "fact":
                         score -= 25
+                elif is_dimension_slot:
+                    if t_type in ("dim", "ref", "unknown"):
+                        score += 25
+                    if t_type == "fact":
+                        score -= 20
                 elif _is_metric_slot(slot):
                     if t_type == "fact":
                         score += 35
@@ -562,7 +582,7 @@ class IntentNodes:
                         )
                         if tbl_match <= 0:
                             score *= 0.5
-                if _is_label_slot(slot) and metric_entities:
+                if is_dimension_slot and metric_entities:
                     competing_fact = False
                     for _, metric_row in cols.iterrows():
                         metric_name = str(metric_row.get("column_name", "") or "")
@@ -580,9 +600,38 @@ class IntentNodes:
                             competing_fact = True
                             break
                     if competing_fact:
-                        score -= 150
+                        score -= 200
                 best = max(best, score)
             return best
+
+        def _best_slot_profile(
+            schema_name: str,
+            table_name: str,
+            slot: str,
+        ) -> dict[str, Any] | None:
+            cols = _get_cols(schema_name, table_name)
+            if cols.empty:
+                return None
+
+            best_profile: dict[str, Any] | None = None
+            for _, row in cols.iterrows():
+                col_name = str(row.get("column_name", "") or "")
+                desc = str(row.get("description", "") or "")
+                semantic = _semantic_match_score(col_name, desc, slot)
+                if semantic <= 0:
+                    continue
+                not_null = float(row.get("not_null_perc", 0) or 0)
+                unique = float(row.get("unique_perc", 0) or 0)
+                candidate = {
+                    "column_name": col_name,
+                    "semantic": semantic,
+                    "not_null": not_null,
+                    "unique": unique,
+                    "score": semantic * 1000 + not_null * 1.5 + min(unique, 100.0) * 0.1,
+                }
+                if best_profile is None or candidate["score"] > best_profile["score"]:
+                    best_profile = candidate
+            return best_profile
 
         def _joinability_score(base: tuple[str, str] | None, candidate: tuple[str, str]) -> float:
             if base is None or base == candidate:
@@ -679,26 +728,45 @@ class IntentNodes:
         # по измерению может перебить настоящую фактовую таблицу.
         main_table: tuple[str, str] | None = None
         if metric_slot:
-            metric_candidates: list[tuple[float, tuple[str, str]]] = []
-            for st in candidate_tables:
-                score = _score_table_for_slot(st[0], st[1], metric_slot)
-                if score <= 0:
-                    continue
-                # Бонусы за lock'нутость
-                if st in hint_must_keep:
-                    score += 200  # пользователь явно требует
-                if st in explicit_tables:
-                    score += 120
-                metric_candidates.append((score, st))
-            if metric_candidates:
-                metric_candidates.sort(reverse=True)
-                main_table = metric_candidates[0][1]
+            metric_choice = None
+            metric_search_groups = []
+            if validated_tables:
+                metric_search_groups.append(list(dict.fromkeys(validated_tables)))
+            metric_search_groups.append(list(dict.fromkeys(candidate_tables)))
+            for metric_candidates in metric_search_groups:
+                candidate_keys = {f"{s}.{t}" for s, t in metric_candidates}
+                metric_table_structures = {
+                    f"{s}.{t}": _table_description(s, t)
+                    for s, t in metric_candidates
+                }
+                metric_table_types = {
+                    f"{s}.{t}": _table_type(s, t)
+                    for s, t in metric_candidates
+                }
+                metric_choice = _choose_best_column(
+                    table_structures=metric_table_structures,
+                    table_types=metric_table_types,
+                    schema_loader=self.schema,
+                    slot=metric_slot,
+                    allowed_tables=candidate_keys,
+                    require_numeric=True,
+                    agg_hint=str(intent.get("aggregation_hint") or "").lower().strip(),
+                )
+                if metric_choice:
+                    break
+            if metric_choice:
+                table_key, _ = metric_choice
+                if "." in table_key:
+                    s_part, t_part = table_key.split(".", 1)
+                    main_table = (s_part, t_part)
         if main_table is None:
             # Fallback: первая lock'нутая или первая explicit
             if hint_must_keep:
                 main_table = hint_must_keep[0]
             elif explicit_tables:
                 main_table = explicit_tables[0]
+            elif validated_tables:
+                main_table = validated_tables[0]
 
         deterministic_tables: list[tuple[str, str]] = list(dict.fromkeys(locked_tables))
         if main_table and main_table not in deterministic_tables:
@@ -749,6 +817,15 @@ class IntentNodes:
                     continue
 
             # 3. Иначе ищем лучшую dim-партнёршу для main_table.
+            main_slot_profile = (
+                _best_slot_profile(main_table[0], main_table[1], slot)
+                if main_table else None
+            )
+            local_slot_sparse = (
+                _is_dimension_slot(slot)
+                and main_slot_profile is not None
+                and float(main_slot_profile.get("not_null", 0.0)) < 25.0
+            )
             dim_candidates: list[tuple[float, tuple[str, str]]] = []
             for st in candidate_tables:
                 score = _score_table_for_slot(
@@ -756,11 +833,29 @@ class IntentNodes:
                 )
                 if score <= 0:
                     continue
+                candidate_profile = _best_slot_profile(st[0], st[1], slot)
+                candidate_not_null = (
+                    float(candidate_profile.get("not_null", 0.0))
+                    if candidate_profile else 0.0
+                )
+                candidate_type = _table_type(st[0], st[1])
                 score += _joinability_score(main_table, st)
                 if st in explicit_tables:
                     score += 90
                 if st in hint_must_keep:
                     score += 150
+                if _is_dimension_slot(slot):
+                    if st != main_table and candidate_type in {"dim", "ref"}:
+                        score += 60
+                    if st != main_table and candidate_type == "unknown":
+                        score += 20
+                    if local_slot_sparse:
+                        if st == main_table:
+                            score -= 220
+                        elif candidate_not_null >= 70.0:
+                            score += 220
+                        elif candidate_not_null >= 45.0:
+                            score += 120
                 # Бонус за наличие колонки из user_hints.join_fields
                 if hint_join_fields:
                     cols = _get_cols(st[0], st[1])

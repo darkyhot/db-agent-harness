@@ -17,8 +17,11 @@ from core.database import DatabaseManager
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.schema_loader import SchemaLoader
+import core.column_selector_deterministic as column_selector_module
+import core.sql_planner_deterministic as sql_planner_module
 from core.sql_validator import SQLValidator
 from graph.nodes import GraphNodes
+import graph.nodes.intent as intent_module
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -242,6 +245,12 @@ def build_graph(
           → [ошибка] → error_diagnoser → sql_fixer → sql_validator
           → [успех] → summarizer → END
     """
+    logger.info(
+        "Runtime modules: column_selector=%s, intent=%s, sql_planner=%s",
+        getattr(column_selector_module, "__file__", "<unknown>"),
+        getattr(intent_module, "__file__", "<unknown>"),
+        getattr(sql_planner_module, "__file__", "<unknown>"),
+    )
     nodes = GraphNodes(
         llm, db_manager, schema_loader, memory, sql_validator, tools,
         debug_prompt=debug_prompt,

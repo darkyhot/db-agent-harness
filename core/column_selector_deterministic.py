@@ -147,6 +147,11 @@ def _is_metric_slot(slot: str) -> bool:
     return slot.endswith(_METRIC_SUFFIXES) or slot.endswith(('_code', '_score'))
 
 
+def _is_dimension_slot(slot: str) -> bool:
+    lower = (slot or '').lower().strip()
+    return bool(lower) and lower != 'date' and not _is_metric_slot(lower)
+
+
 def _fuzzy_overlap_score(slot_tokens: set[str], source_tokens: set[str]) -> float:
     matched = 0.0
     for st in slot_tokens:
@@ -330,6 +335,8 @@ def _choose_best_column(
         else:
             allowed_tables = {dim_source_table}
 
+    is_dimension_slot = _is_dimension_slot(slot)
+
     for table_key in table_structures:
         if allowed_tables and table_key not in allowed_tables:
             continue
@@ -382,6 +389,14 @@ def _choose_best_column(
                     score += 40
                 if t_type == 'fact':
                     score -= 30
+            elif is_dimension_slot:
+                # Для обычных dimension-slot'ов вроде "сегмент" или "регион"
+                # также слегка предпочитаем dim/ref-источники, даже если slot
+                # не был выражен как явный *_name.
+                if t_type in ('dim', 'ref', 'unknown'):
+                    score += 25
+                if t_type == 'fact':
+                    score -= 20
             elif _is_metric_slot(slot) and t_type == 'fact':
                 score += 25
             if (agg_hint or '').lower() == 'sum' and any(

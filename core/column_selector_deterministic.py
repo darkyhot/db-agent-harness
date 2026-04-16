@@ -654,12 +654,30 @@ def select_columns(
             selected_columns[table_key] = roles
 
     # ---- JOIN-спецификация из join_analysis_data ----
+    # Таблицы, уже занятые другими dim_source-слотами, — предварительно вычислим
+    # для фильтрации при поиске «свободных» слотов (таких как 'date').
+    _dim_src_tables: set[str] = {
+        b.get('table')
+        for b in hint_dim_sources.values()
+        if isinstance(b, dict) and b.get('table')
+    }
+
     if requested['dimensions']:
         for slot in requested['dimensions']:
             bound_table = _slot_dim_source(slot)
+
+            # Для слотов без явного dim_source-биндинга (например 'date') запрещаем
+            # выбирать колонку из таблиц, которые выступают dim_source для других
+            # слотов. Иначе epk_create_dttm из справочника бьёт report_dt из факта
+            # за счёт более высокого unique_perc (timestamp vs агрегированная дата).
+            _allowed: set[str] | None = None
+            if not bound_table and _dim_src_tables:
+                _allowed = set(table_structures.keys()) - _dim_src_tables
+
             choice = _choose_best_column(
                 table_structures, table_types, schema_loader, slot,
                 dim_source_table=bound_table,
+                allowed_tables=_allowed,
             )
             # Fallback: если dim_source указан, но колонки в нём нет —
             # предупреждаем и берём из любой таблицы.

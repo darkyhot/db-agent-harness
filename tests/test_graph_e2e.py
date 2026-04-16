@@ -304,19 +304,78 @@ class TestGoldenCase1SegmentSource:
         assert pick["col1"] == "inn"
         assert pick["col2"] == "inn"
 
-    def test_segment_column_selected_not_date_column(self, golden_loader):
+    def test_segment_column_selected_not_date_column(self, tmp_path):
         """Регрессия: «по дате и сегменту, сегмент возьми в dim_segments по инн».
 
-        Баг: агент клал epk_create_dttm (дата) в GROUP BY вместо сегментной колонки.
+        Баг-1: segment_name не попадал в GROUP BY (required_output игнорировался).
+        Баг-2: epk_create_dttm (дата создания в справочнике) попадала в GROUP BY
+               из-за высокого unique_perc/not_null_perc, перебивая report_dt факта.
+
         Ожидаемое поведение:
-          - group_by для gold.dim_segments содержит segment_name (или segment_id)
-          - group_by для gold.dim_segments НЕ содержит date/dt/dttm колонок
+          - group_by для gold.dim_segments содержит segment_name
+          - group_by для gold.dim_segments НЕ содержит дата-колонок
+          - дата-колонка (report_dt) выбирается из фактовой таблицы, не из справочника
         """
         from core.column_selector_deterministic import select_columns
+        from core.schema_loader import SchemaLoader
+
+        # Воспроизводим prod-структуру: в dim_segments есть create_dttm с высоким
+        # unique_perc (timestamp), что в оригинальном баге перебивало report_dt факта.
+        tables_df = pd.DataFrame({
+            "schema_name": ["gold", "gold"],
+            "table_name": ["fact_metric_a", "dim_segments"],
+            "description": [
+                "Факт-таблица метрики",
+                "Справочник сегментов клиентов",
+            ],
+        })
+        attrs_df = pd.DataFrame({
+            "schema_name": ["gold"] * 9,
+            "table_name": [
+                "fact_metric_a", "fact_metric_a", "fact_metric_a",
+                "dim_segments", "dim_segments", "dim_segments",
+                "dim_segments", "dim_segments", "dim_segments",
+            ],
+            "column_name": [
+                "report_dt", "inn", "amount_val",
+                "segment_id", "inn", "segment_name",
+                "create_dttm", "update_dttm", "emp_ref_id",
+            ],
+            "dType": [
+                "date", "varchar", "numeric",
+                "bigint", "varchar", "varchar",
+                "timestamp", "timestamp", "bigint",
+            ],
+            "description": [
+                "Отчётная дата", "ИНН клиента", "Сумма метрики",
+                "PK сегмента", "ИНН клиента", "Название сегмента",
+                "Дата создания записи", "Дата обновления записи", "ID сотрудника",
+            ],
+            "is_primary_key": [
+                False, False, False,
+                True, False, False, False, False, False,
+            ],
+            "unique_perc": [
+                # report_dt — мало уникальных значений (несколько дат)
+                1.0, 90.0, 10.0,
+                100.0, 90.0, 5.0,
+                # create_dttm и update_dttm — почти уникальные (timestamp), именно
+                # это в продакшене перебивало report_dt при выборе date-колонки
+                99.0, 99.0, 40.0,
+            ],
+            "not_null_perc": [
+                99.0, 95.0, 95.0,
+                100.0, 95.0, 99.99,
+                100.0, 100.0, 90.0,
+            ],
+        })
+        tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+        attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+        loader = SchemaLoader(data_dir=tmp_path)
 
         table_structures = {
-            "gold.fact_metric_a": "fact_metric_a columns: report_dt, inn, amount_val, emp_ref_id",
-            "gold.dim_segments": "dim_segments columns: segment_id, inn, segment_name, emp_ref_id",
+            "gold.fact_metric_a": "fact_metric_a columns: report_dt, inn, amount_val",
+            "gold.dim_segments": "dim_segments columns: segment_id, inn, segment_name, create_dttm",
         }
         table_types = {
             "gold.fact_metric_a": "fact",
@@ -344,7 +403,7 @@ class TestGoldenCase1SegmentSource:
             table_structures=table_structures,
             table_types=table_types,
             join_analysis_data={},
-            schema_loader=golden_loader,
+            schema_loader=loader,
             user_input=user_input,
             user_hints=user_hints,
         )
@@ -352,6 +411,8 @@ class TestGoldenCase1SegmentSource:
         selected = result.get("selected_columns", {})
         dim_roles = selected.get("gold.dim_segments", {})
         dim_gb = dim_roles.get("group_by", [])
+        fact_roles = selected.get("gold.fact_metric_a", {})
+        fact_gb = fact_roles.get("group_by", [])
 
         # В group_by для dim_segments должна быть сегментная колонка
         assert any(
@@ -359,13 +420,21 @@ class TestGoldenCase1SegmentSource:
         ), f"Ожидали segment-колонку в group_by dim_segments, получили: {dim_gb}"
 
         # В group_by для dim_segments НЕ должно быть дата-колонок
-        date_cols_in_gb = [
+        date_cols_in_dim_gb = [
             c for c in dim_gb
-            if any(tok in c.lower() for tok in ("dt", "dttm", "date", "create"))
+            if any(tok in c.lower() for tok in ("dt", "dttm", "date", "create", "update"))
         ]
-        assert not date_cols_in_gb, (
-            f"В group_by dim_segments оказались дата-колонки: {date_cols_in_gb}. "
-            f"Весь group_by: {dim_gb}"
+        assert not date_cols_in_dim_gb, (
+            f"В group_by dim_segments оказались дата-колонки: {date_cols_in_dim_gb}. "
+            f"Весь group_by dim: {dim_gb}"
+        )
+
+        # Дата-колонка должна быть из фактовой таблицы (report_dt), а не из справочника
+        assert any(
+            "report" in c.lower() or c.lower() in ("report_dt",) for c in fact_gb
+        ), (
+            f"report_dt не найден в group_by фактовой таблицы. "
+            f"fact group_by: {fact_gb}, dim group_by: {dim_gb}"
         )
 
 

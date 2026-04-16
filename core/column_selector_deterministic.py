@@ -346,11 +346,18 @@ def _choose_best_column(
             if not col_name:
                 continue
             dtype = str(row.get('dType', '') or '').lower().strip()
+            is_pk = bool(row.get('is_primary_key', False))
             if require_numeric and not _is_numeric(dtype):
                 continue
 
             desc = str(row.get('description', '') or '')
             semantic = _semantic_match_score(col_name, desc, slot)
+            if semantic <= 0 and require_numeric and _is_numeric(dtype) and not is_pk:
+                # Fallback для англоязычных metric-name колонок, когда
+                # описание не повторяет термин сущности из пользовательского запроса.
+                metric_semantic = _metric_score(col_name, [slot])
+                if metric_semantic >= 0.4:
+                    semantic = metric_semantic * 0.35
             if semantic <= 0:
                 continue
             col_tokens = set(_tokenize(col_name))
@@ -381,6 +388,10 @@ def _choose_best_column(
                 marker in lower_name for marker in ('perc', 'pct', 'rate', 'avg')
             ):
                 score -= 320
+            if (agg_hint or '').lower() == 'sum' and re.match(
+                r'^(is_|has_|was_|are_)', lower_name,
+            ):
+                score -= 200
 
             candidate = (score, table_key, col_name)
             if best is None or candidate > best:

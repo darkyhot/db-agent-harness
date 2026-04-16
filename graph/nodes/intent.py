@@ -13,6 +13,7 @@ from typing import Any
 
 from core.column_selector_deterministic import (
     _derive_requested_slots,
+    _is_numeric,
     _is_label_slot,
     _is_metric_slot,
     _normalize_query_text,
@@ -522,7 +523,12 @@ class IntentNodes:
                 table_descr = ""
             return _semantic_match_score(table_name, table_descr, slot)
 
-        def _score_table_for_slot(schema_name: str, table_name: str, slot: str) -> float:
+        def _score_table_for_slot(
+            schema_name: str,
+            table_name: str,
+            slot: str,
+            metric_entities: list[str] | None = None,
+        ) -> float:
             cols = _get_cols(schema_name, table_name)
             if cols.empty:
                 return -1.0
@@ -556,6 +562,25 @@ class IntentNodes:
                         )
                         if tbl_match <= 0:
                             score *= 0.5
+                if _is_label_slot(slot) and metric_entities:
+                    competing_fact = False
+                    for _, metric_row in cols.iterrows():
+                        metric_name = str(metric_row.get("column_name", "") or "")
+                        metric_dtype = str(metric_row.get("dType", "") or "").lower()
+                        metric_desc = str(metric_row.get("description", "") or "")
+                        if (
+                            not _is_numeric(metric_dtype)
+                            or bool(metric_row.get("is_primary_key", False))
+                        ):
+                            continue
+                        if any(
+                            _semantic_match_score(metric_name, metric_desc, entity) > 0.2
+                            for entity in metric_entities
+                        ):
+                            competing_fact = True
+                            break
+                    if competing_fact:
+                        score -= 150
                 best = max(best, score)
             return best
 
@@ -606,6 +631,10 @@ class IntentNodes:
 
         metric_slot = requested.get("metric")
         dimension_slots = list(requested.get("dimensions", []))
+        metric_entities = list(dict.fromkeys(
+            [str(metric_slot)] if metric_slot else []
+            + [str(entity) for entity in (intent.get("entities") or []) if entity]
+        ))
         join_requested = (
             str(intent.get("complexity", "")).lower() in {"join", "subquery", "multi_table"}
             or any(phrase in query_norm for phrase in ("подтяни", "дотяни", "возьми из", "join", "по ключу"))
@@ -722,7 +751,9 @@ class IntentNodes:
             # 3. Иначе ищем лучшую dim-партнёршу для main_table.
             dim_candidates: list[tuple[float, tuple[str, str]]] = []
             for st in candidate_tables:
-                score = _score_table_for_slot(st[0], st[1], slot)
+                score = _score_table_for_slot(
+                    st[0], st[1], slot, metric_entities=metric_entities,
+                )
                 if score <= 0:
                     continue
                 score += _joinability_score(main_table, st)

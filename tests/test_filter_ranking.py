@@ -107,3 +107,30 @@ def test_filter_ranking_prefers_explicit_column_reference(tmp_path):
 
     top = next(iter(ranked.values()))[0]
     assert top["column"] == "task_subtype"
+    assert top["confidence"] == "high"
+
+
+def test_filter_ranking_matches_known_terms_semantically(tmp_path):
+    loader = _loader(tmp_path)
+    loader._value_profiles = {
+        "dm.sale_funnel.task_subtype": {
+            "known_terms": ["фактический отток"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        }
+    }
+    frame = derive_semantic_frame(
+        "Посчитай количество задач по фактическому оттоку",
+        schema_loader=loader,
+    )
+    ranked = rank_filter_candidates(
+        user_input="Посчитай количество задач по фактическому оттоку",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+
+    top = next(iter(ranked.values()))[0]
+    assert top["column"] == "task_subtype"
+    assert any("value_match=фактический отток" == ev for ev in top["evidence"])

@@ -56,6 +56,26 @@ def _profile_value_match(profile: dict[str, Any], query_text: str) -> tuple[str 
     return best_value, best_score
 
 
+def _known_terms_overlap_score(profile: dict[str, Any], query_text: str) -> float:
+    """Сильный бонус, если в known_terms/top_values есть хорошее смысловое совпадение."""
+    query_stems = _stem_set(query_text)
+    if not query_stems:
+        return 0.0
+    best_overlap = 0
+    for value in list(profile.get("top_values", []) or []) + list(profile.get("known_terms", []) or []):
+        value_str = str(value).strip()
+        if not value_str:
+            continue
+        overlap = len(query_stems & _stem_set(value_str))
+        if overlap > best_overlap:
+            best_overlap = overlap
+    if best_overlap >= 2:
+        return 42.0
+    if best_overlap == 1:
+        return 18.0
+    return 0.0
+
+
 def _column_reference_score(user_input: str, column: str, description: str) -> float:
     """Высокий бонус, если пользователь явно назвал колонку или её описание."""
     normalized = _normalize_text(user_input)
@@ -213,6 +233,7 @@ def rank_filter_candidates(
                                     score -= 12.0
                     matched_value, value_score = _profile_value_match(profile, query_text)
                     score += value_score
+                    score += _known_terms_overlap_score(profile, query_text)
                     if matched_value:
                         candidate_value = matched_value
                         evidence.append(f"value_match={matched_value}")
@@ -225,6 +246,10 @@ def rank_filter_candidates(
                 if score <= 0 or candidate_value in (None, ""):
                     continue
 
+                explicit_column_choice = _column_reference_score(user_input, column, description) >= 120.0
+                final_confidence = "high" if explicit_column_choice else (
+                    "high" if score >= 75.0 else ("medium" if score >= 45.0 else "low")
+                )
                 ranked[str(request.get("request_id"))].append({
                     "request_id": str(request.get("request_id")),
                     "request_kind": kind,
@@ -246,7 +271,7 @@ def rank_filter_candidates(
                     "score": round(score, 3),
                     "evidence": evidence,
                     "value_source": "profile" if evidence else "query",
-                    "confidence": "high" if score >= 75.0 else ("medium" if score >= 45.0 else "low"),
+                    "confidence": final_confidence,
                     "column_key": key,
                 })
 

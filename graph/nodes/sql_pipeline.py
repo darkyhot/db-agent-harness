@@ -190,6 +190,37 @@ def _build_join_rule(strategy: str, join_spec: list[dict]) -> str:
     return "\nПРАВИЛА JOIN (на основе проверенных ключей):\n" + "\n".join(parts) + "\n"
 
 
+def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> str:
+    """Построить конкретный вопрос по фильтру из кандидатов where_resolution."""
+    where_resolution = where_resolution or {}
+    filter_candidates = where_resolution.get("filter_candidates", {}) or {}
+    for _, candidates in filter_candidates.items():
+        if not candidates:
+            continue
+        top = candidates[0]
+        second = candidates[1] if len(candidates) > 1 else None
+        if second:
+            left = f"`{top.get('column')}`"
+            right = f"`{second.get('column')}`"
+            if top.get("description"):
+                left += f" ({top.get('description')})"
+            if second.get("description"):
+                right += f" ({second.get('description')})"
+            return (
+                "Найдено несколько близких вариантов фильтра. "
+                f"Уточните, пожалуйста, по какому признаку фильтровать: {left} или {right}?"
+            )
+        if top.get("column"):
+            label = f"`{top.get('column')}`"
+            if top.get("description"):
+                label += f" ({top.get('description')})"
+            return (
+                "Уточните, пожалуйста, фильтр: "
+                f"нужно отфильтровать именно по полю {label}?"
+            )
+    return "Уточните, пожалуйста, источник данных или конкретный фильтр, который нужно применить."
+
+
 class SqlPipelineNodes:
     """Миксин с узлами sql_planner, sql_writer и sql_validator_node для GraphNodes."""
 
@@ -325,10 +356,7 @@ class SqlPipelineNodes:
             }
 
         if planning_confidence.get("action") != "execute":
-            _clarif = (
-                "Нужна короткая уточняющая деталь по источнику данных или фильтру, "
-                "чтобы построить корректный SQL."
-            )
+            _clarif = _build_specific_clarification(where_resolution)
             return {
                 "needs_clarification": True,
                 "clarification_message": _clarif,

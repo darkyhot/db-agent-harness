@@ -488,9 +488,29 @@ class SchemaLoader:
         rule_path.write_text(json.dumps(merged_rules, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def get_value_profile(self, schema: str, table: str, column: str) -> dict[str, Any]:
-        """Получить value profile для колонки."""
+        """Получить value profile для колонки.
+
+        К основным полям (top_values, known_terms, value_mode) добавляем
+        sample_values из attr_list.csv (Direction 5.3): where_resolver
+        использует их как детерминированный источник значений для enum_like
+        колонок, даже если value_profiles.json ещё не наполнен.
+        """
         self.ensure_value_profiles()
-        return dict((self._value_profiles or {}).get(self._profile_key(schema, table, column), {}))
+        profile = dict(
+            (self._value_profiles or {}).get(self._profile_key(schema, table, column), {})
+        )
+        try:
+            samples = self.get_column_sample_values(schema, table, column)
+        except Exception:
+            samples = []
+        if samples:
+            merged = list(profile.get("known_terms", []) or [])
+            for s in samples:
+                if s not in merged:
+                    merged.append(s)
+            profile["known_terms"] = merged
+            profile.setdefault("sample_values", list(samples))
+        return profile
 
     def get_column_semantics(self, schema: str, table: str, column: str) -> dict[str, Any]:
         """Получить semantics колонки."""

@@ -8,6 +8,30 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
+# 0. Причины решения (decision_reason) — для агрегации метрик качества.
+# `JoinCandidate.match_type` гарантированно принимает одно из этих значений.
+# ---------------------------------------------------------------------------
+
+class DecisionReason:
+    """Enum-подобный контейнер для `JoinCandidate.match_type`."""
+
+    EXPLICIT_FK = "explicit_fk"
+    EXACT_NAME = "exact_name"
+    FK_PATTERN = "fk_pattern"
+    NORMALIZED_PK = "normalized_pk"
+    SUFFIX = "suffix"
+
+
+DECISION_REASONS: frozenset[str] = frozenset({
+    DecisionReason.EXPLICIT_FK,
+    DecisionReason.EXACT_NAME,
+    DecisionReason.FK_PATTERN,
+    DecisionReason.NORMALIZED_PK,
+    DecisionReason.SUFFIX,
+})
+
+
+# ---------------------------------------------------------------------------
 # 1. Классификация колонок: key / business_key / attribute
 # ---------------------------------------------------------------------------
 

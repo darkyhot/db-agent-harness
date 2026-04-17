@@ -3,6 +3,8 @@
 import os
 import time
 import logging
+import threading
+from collections import OrderedDict
 from typing import Any
 
 from langchain_gigachat.chat_models import GigaChat
@@ -12,10 +14,22 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimitedLLM:
-    """Обёртка над GigaChat с обязательной паузой между запросами и retry при ошибках."""
+    """Обёртка над GigaChat с обязательной паузой между запросами и retry при ошибках.
+
+    Rate-limit держится ГЛОБАЛЬНЫМ (на уровне класса) — чтобы несколько
+    инстансов RateLimitedLLM в одном процессе не могли параллельно
+    превысить лимит GigaChat API. Кэш инстансов GigaChat ограничен
+    MAX_CACHED_TEMPERATURES (LRU-эвикция).
+    """
 
     MIN_INTERVAL: float = 5.0
     MAX_RETRIES: int = 5
+    MAX_CACHED_TEMPERATURES: int = 3
+
+    # Глобальные (на уровень класса) поля rate-limit — чтобы несколько
+    # инстансов разделяли один таймер.
+    _global_last_call_time: float = 0.0
+    _global_lock: threading.Lock = threading.Lock()
 
     def __init__(self) -> None:
         """Инициализация GigaChat клиента из переменных окружения."""
@@ -28,15 +42,15 @@ class RateLimitedLLM:
             model=self._model,
             timeout=120,
         )
-        self._last_call_time: float = 0.0
-        self._llm_cache: dict[float, GigaChat] = {}
+        self._llm_cache: "OrderedDict[float, GigaChat]" = OrderedDict()
         logger.info("RateLimitedLLM инициализирован (model=%s)", self._model)
 
     def _get_llm(self, temperature: float | None = None) -> GigaChat:
         """Получить экземпляр GigaChat с указанной temperature.
 
-        Кеширует экземпляры по temperature, чтобы не создавать
-        новое соединение на каждый вызов.
+        Кеширует до MAX_CACHED_TEMPERATURES инстансов по temperature,
+        с LRU-эвикцией чтобы не раздувать память при свободном выборе
+        температур из узлов графа.
 
         Args:
             temperature: Температура генерации (0.0-1.0). None — default модели.
@@ -46,23 +60,30 @@ class RateLimitedLLM:
         """
         if temperature is None:
             return self._llm
-        if temperature not in self._llm_cache:
-            self._llm_cache[temperature] = GigaChat(
-                base_url=self._base_url,
-                access_token=self._access_token,
-                model=self._model,
-                timeout=120,
-                temperature=temperature,
-            )
-        return self._llm_cache[temperature]
+        if temperature in self._llm_cache:
+            self._llm_cache.move_to_end(temperature)
+            return self._llm_cache[temperature]
+        llm = GigaChat(
+            base_url=self._base_url,
+            access_token=self._access_token,
+            model=self._model,
+            timeout=120,
+            temperature=temperature,
+        )
+        self._llm_cache[temperature] = llm
+        while len(self._llm_cache) > self.MAX_CACHED_TEMPERATURES:
+            evicted_temp, _ = self._llm_cache.popitem(last=False)
+            logger.debug("LLM cache LRU-эвикция: temperature=%s", evicted_temp)
+        return llm
 
     def _wait_for_rate_limit(self) -> None:
-        """Ожидание до следующего разрешённого времени запроса."""
-        elapsed = time.time() - self._last_call_time
-        if elapsed < self.MIN_INTERVAL:
-            wait = self.MIN_INTERVAL - elapsed
-            logger.debug("Rate-limit: ожидание %.1f сек", wait)
-            time.sleep(wait)
+        """Ожидание до следующего разрешённого времени запроса (глобально)."""
+        with RateLimitedLLM._global_lock:
+            elapsed = time.time() - RateLimitedLLM._global_last_call_time
+            if elapsed < self.MIN_INTERVAL:
+                wait = self.MIN_INTERVAL - elapsed
+                logger.debug("Rate-limit (global): ожидание %.1f сек", wait)
+                time.sleep(wait)
 
     def invoke(
         self,
@@ -88,7 +109,7 @@ class RateLimitedLLM:
         for attempt in range(1, self.MAX_RETRIES + 1):
             self._wait_for_rate_limit()
             try:
-                self._last_call_time = time.time()
+                RateLimitedLLM._global_last_call_time = time.time()
                 response = llm.invoke(messages)
                 logger.info("LLM ответ получен (попытка %d)", attempt)
                 return response.content

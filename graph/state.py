@@ -20,6 +20,10 @@ class AgentState(TypedDict):
     tool_calls: list
     last_error: str | None
     retry_count: int
+    # Direction 6.5: суммарный счётчик retry через все replan-итерации.
+    # retry_count сбрасывается при replanning (локальный счётчик шага),
+    # total_retry_count продолжает копить, чтобы глобальный бюджет retry был виден.
+    total_retry_count: int
     sql_to_validate: str | None
     final_answer: str | None
     user_input: str

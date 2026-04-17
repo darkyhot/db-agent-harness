@@ -39,6 +39,119 @@ _PK_NORM_RE = re.compile(r"^(old|new|prev|cur|current|actual|base|src|tgt)_", re
 
 
 # ---------------------------------------------------------------------------
+# Sanitize (Direction 5.2): корректирует галлюцинированные колонки от LLM
+# через fuzzy-match по allowed-списку (Левенштейн ≤ 2).
+# ---------------------------------------------------------------------------
+
+
+def _levenshtein_le2(a: str, b: str) -> int:
+    """Расстояние Левенштейна с ранним выходом при > 2.
+
+    Возвращает 0/1/2 при точных значениях либо 3 (или больше) — тогда мы
+    считаем такие пары несовместимыми.
+    """
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > 2:
+        return 3
+    m, n = len(a), len(b)
+    if m == 0:
+        return n
+    if n == 0:
+        return m
+    prev = list(range(n + 1))
+    for i in range(1, m + 1):
+        curr = [i] + [0] * n
+        min_row = curr[0]
+        for j in range(1, n + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(
+                prev[j] + 1,         # удаление
+                curr[j - 1] + 1,     # вставка
+                prev[j - 1] + cost,  # замена
+            )
+            if curr[j] < min_row:
+                min_row = curr[j]
+        if min_row > 2:
+            return 3
+        prev = curr
+    return prev[n] if prev[n] <= 2 else 3
+
+
+def sanitize_selected_columns(
+    columns: list[str],
+    allowed: list[str],
+) -> dict[str, Any]:
+    """Отсеять галлюцинированные имена, скорректировать близкие к допустимым.
+
+    Args:
+        columns: Имена колонок, предложенные LLM.
+        allowed: Список реально существующих колонок (lowercase не требуется).
+
+    Returns:
+        {
+          "columns": итоговые валидные колонки (в порядке входа),
+          "coerced": [(original, corrected), ...] — мягкие fuzzy-фиксы,
+          "rejected": [...] — имена, не имеющие пары в allowed,
+          "warnings": [...] — человекочитаемые пояснения.
+        }
+    """
+    allowed_norm: dict[str, str] = {}
+    for a in allowed:
+        a_str = str(a).strip()
+        if a_str:
+            allowed_norm.setdefault(a_str.lower(), a_str)
+
+    out: list[str] = []
+    coerced: list[tuple[str, str]] = []
+    rejected: list[str] = []
+    warnings: list[str] = []
+    seen: set[str] = set()
+
+    for col in columns:
+        raw = str(col or "").strip()
+        if not raw:
+            continue
+        low = raw.lower()
+        if low in allowed_norm:
+            canonical = allowed_norm[low]
+            if canonical not in seen:
+                out.append(canonical)
+                seen.add(canonical)
+            continue
+
+        # Fuzzy match по Levenshtein ≤ 2
+        best: tuple[int, str] | None = None
+        for al_low, al_orig in allowed_norm.items():
+            dist = _levenshtein_le2(low, al_low)
+            if dist <= 2 and (best is None or dist < best[0]):
+                best = (dist, al_orig)
+                if dist == 0:
+                    break
+        if best is not None:
+            canonical = best[1]
+            coerced.append((raw, canonical))
+            warnings.append(
+                f"'{raw}' → '{canonical}' (fuzzy-match, dist={best[0]})"
+            )
+            if canonical not in seen:
+                out.append(canonical)
+                seen.add(canonical)
+        else:
+            rejected.append(raw)
+            warnings.append(
+                f"'{raw}' отклонён: нет в allowed-списке и fuzzy-match не нашёл близких"
+            )
+
+    return {
+        "columns": out,
+        "coerced": coerced,
+        "rejected": rejected,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Паттерны типов колонок
 # ---------------------------------------------------------------------------
 

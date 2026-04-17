@@ -394,6 +394,77 @@ class MemoryManager:
             "error_distribution": error_dist,
         }
 
+    def get_top_problem_queries(
+        self, *, days: int = 30, limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Топ запросов с retry_count > 0 за последние `days` дней.
+
+        Используется в tools/quality_report.py для приоритизации улучшений.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        sessions = self._load_sessions()
+        aggregated: dict[str, dict[str, Any]] = {}
+
+        for data in sessions.values():
+            for entry in data.get("sql_audit", []):
+                if entry.get("timestamp", "") < cutoff:
+                    continue
+                retry = int(entry.get("retry_count", 0))
+                if retry <= 0:
+                    continue
+                key = str(entry.get("user_input") or "").strip()
+                if not key:
+                    continue
+                agg = aggregated.setdefault(key, {
+                    "user_input": key,
+                    "attempts": 0,
+                    "total_retries": 0,
+                    "last_status": "",
+                    "last_error_type": "",
+                    "last_sql": "",
+                })
+                agg["attempts"] += 1
+                agg["total_retries"] += retry
+                agg["last_status"] = entry.get("status", "")
+                agg["last_error_type"] = entry.get("error_type", "")
+                agg["last_sql"] = str(entry.get("sql") or "")[:500]
+
+        problems = list(aggregated.values())
+        problems.sort(key=lambda r: (r["total_retries"], r["attempts"]), reverse=True)
+        return problems[: max(0, int(limit))]
+
+    def get_error_type_breakdown(self, *, days: int = 30) -> dict[str, dict[str, Any]]:
+        """Разбивка ошибок по типам: count, median_retries, пример user_input."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        sessions = self._load_sessions()
+        buckets: dict[str, dict[str, Any]] = {}
+        for data in sessions.values():
+            for entry in data.get("sql_audit", []):
+                if entry.get("timestamp", "") < cutoff:
+                    continue
+                et = str(entry.get("error_type") or "").strip()
+                if not et:
+                    continue
+                bucket = buckets.setdefault(et, {
+                    "count": 0,
+                    "retries": [],
+                    "sample_user_input": "",
+                })
+                bucket["count"] += 1
+                bucket["retries"].append(int(entry.get("retry_count", 0)))
+                if not bucket["sample_user_input"]:
+                    bucket["sample_user_input"] = str(entry.get("user_input") or "")[:200]
+        result: dict[str, dict[str, Any]] = {}
+        for et, bucket in buckets.items():
+            retries = sorted(bucket["retries"])
+            median = retries[len(retries) // 2] if retries else 0
+            result[et] = {
+                "count": bucket["count"],
+                "median_retries": median,
+                "sample_user_input": bucket["sample_user_input"],
+            }
+        return result
+
     # ------------------------------------------------------------------
     # Row-count sanity (Direction 3.3)
     # ------------------------------------------------------------------

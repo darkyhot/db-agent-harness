@@ -133,9 +133,15 @@ class CorrectionNodes:
             # Попробовать replanning один раз перед сдачей (если есть бюджет)
             if replan_count < 1 and _budget_ok:
                 logger.info("ErrorDiagnoser: попытки исчерпаны, запрашиваю replanning")
+                # Direction 6.5: retry_count сбрасывается (другие ноды используют
+                # его как локальный счётчик ретраев текущего шага), но суммарный
+                # `total_retry_count` продолжает копить, чтобы replanning не мог
+                # «скрыто» удвоить бюджет retry.
+                total_retries = int(state.get("total_retry_count", 0)) + int(state.get("retry_count", 0))
                 return {
                     "last_error": None,
                     "retry_count": 0,
+                    "total_retry_count": total_retries,
                     "replan_count": replan_count + 1,
                     "needs_replan": True,
                     "replan_context": (

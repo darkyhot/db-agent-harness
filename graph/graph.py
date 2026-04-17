@@ -395,6 +395,7 @@ def create_initial_state(
         tool_calls=[],
         last_error=None,
         retry_count=0,
+        total_retry_count=0,
         sql_to_validate=None,
         final_answer=None,
         user_input=user_input,

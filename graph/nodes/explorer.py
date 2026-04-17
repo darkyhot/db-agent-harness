@@ -20,7 +20,10 @@ from graph.state import AgentState
 
 # Минимальная confidence для использования детерминированного результата без LLM.
 # При confidence >= порога LLM column_selector не вызывается.
-_DET_CONFIDENCE_THRESHOLD = 0.70
+# Снижен с 0.70 до 0.55 (Direction 5.1): детерминированный селектор стал надёжнее
+# за счёт FK-метаданных/synonyms, поэтому промежуточная полоса 0.55-0.70
+# обрабатывается без LLM-похода.
+_DET_CONFIDENCE_THRESHOLD = 0.55
 
 logger = logging.getLogger(__name__)
 

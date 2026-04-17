@@ -250,6 +250,22 @@ class BaseNodeMixin:
         self.tools_compact = "\n".join(compact_lines)
 
     # ------------------------------------------------------------------
+    # Стандартизированный evidence_trace (Direction 4.1)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def record_evidence(
+        evidence_trace: dict[str, Any] | None,
+        node: str,
+        decision: str,
+        evidence: dict[str, Any] | None = None,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Записать запись в evidence_trace (см. core.evidence_trace.record_evidence)."""
+        from core.evidence_trace import record_evidence as _impl
+        return _impl(evidence_trace, node, decision, evidence, warnings)
+
+    # ------------------------------------------------------------------
     # Ограничение роста state-списков
     # ------------------------------------------------------------------
 

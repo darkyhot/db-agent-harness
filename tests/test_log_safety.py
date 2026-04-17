@@ -11,7 +11,16 @@ def test_summarize_sql_hides_literals_and_keeps_table_names():
     assert "Иван Иванов" not in summary
     assert "1234567890" not in summary
     assert "dm.clients" in summary
+    assert 'preview="SELECT * FROM dm.clients WHERE full_name = ' in summary
     assert "sha=" in summary
+
+
+def test_summarize_sql_supports_quoted_table_names():
+    sql = 'SELECT "task_subtype" FROM "schema"."uzp_data_split_mzp_sale_funnel" WHERE "report_dt" >= 20260201'
+    summary = summarize_sql(sql)
+
+    assert "schema.uzp_data_split_mzp_sale_funnel" in summary
+    assert "20260201" not in summary
 
 
 def test_summarize_text_hides_raw_content():
@@ -47,5 +56,6 @@ def test_sql_validator_does_not_log_raw_sql(caplog):
 
     joined = "\n".join(rec.getMessage() for rec in caplog.records)
     assert "Иван Иванов" not in joined
-    assert "SELECT * FROM dm.clients" not in joined
     assert "dm.clients" in joined
+    assert "SELECT * FROM dm.clients" in joined
+    assert "full_name = '?'" in joined

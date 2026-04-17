@@ -24,7 +24,7 @@ def test_fetch_table_profile_sample_loads_table_once():
     )
 
     assert list(sample["task_subtype"]) == ["фактический отток", "отток"]
-    assert 'SELECT "task_subtype" FROM "dm"."sale_funnel" LIMIT 100000' == db.sql_calls[0]
+    assert 'SELECT "task_subtype" FROM "dm"."sale_funnel" ORDER BY random() LIMIT 100000' == db.sql_calls[0]
 
 
 def test_build_db_profile_counts_values_from_sample_dataframe():

@@ -12,23 +12,11 @@ logger = logging.getLogger(__name__)
 
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _MAX_SAMPLE_VALUES = 12
-_LOW_CARDINALITY_DISTINCT_PCT = 15.0
 _TABLE_SAMPLE_LIMIT = 100_000
 
 
 def _is_identifier(value: str) -> bool:
     return bool(_IDENTIFIER_RE.match(value or ""))
-
-
-def should_use_distinct_profile(metadata_profile: dict[str, Any] | None) -> bool:
-    """Нужно ли строить точный словарь значений через GROUP BY по колонке."""
-    metadata_profile = metadata_profile or {}
-    value_mode = str(metadata_profile.get("value_mode", "") or "")
-    distinct_pct = float(metadata_profile.get("distinct_pct", 0.0) or 0.0)
-    return (
-        value_mode in {"boolean_like", "enum_like", "dictionary_like"}
-        and distinct_pct <= _LOW_CARDINALITY_DISTINCT_PCT
-    )
 
 
 def discover_profile_candidates(
@@ -142,40 +130,13 @@ def fetch_table_profile_sample(
     sql = (
         f"SELECT {projection} "
         f'FROM "{schema}"."{table}" '
+        f"ORDER BY random() "
         f"LIMIT {int(sample_limit)}"
     )
     try:
         return db_manager.execute_query(sql, limit=sample_limit)
     except Exception as exc:  # noqa: BLE001
         logger.info("ValueProfiler: table sample skipped for %s.%s: %s", schema, table, exc)
-        return pd.DataFrame()
-
-
-def fetch_distinct_column_profile(
-    db_manager: Any,
-    *,
-    schema: str,
-    table: str,
-    column: str,
-) -> pd.DataFrame:
-    """Загрузить точный словарь значений low-cardinality колонки."""
-    if db_manager is None:
-        return pd.DataFrame()
-    if not (_is_identifier(schema) and _is_identifier(table) and _is_identifier(column)):
-        return pd.DataFrame()
-
-    sql = (
-        f'SELECT "{column}" AS val, COUNT(*) AS freq '
-        f'FROM "{schema}"."{table}" '
-        f'WHERE "{column}" IS NOT NULL '
-        f'GROUP BY "{column}" '
-        f'ORDER BY freq DESC '
-        f'LIMIT {int(_MAX_SAMPLE_VALUES)}'
-    )
-    try:
-        return db_manager.execute_query(sql, limit=_MAX_SAMPLE_VALUES)
-    except Exception as exc:  # noqa: BLE001
-        logger.info("ValueProfiler: distinct profile skipped for %s.%s.%s: %s", schema, table, column, exc)
         return pd.DataFrame()
 
 
@@ -214,27 +175,6 @@ def build_db_profile(
             pass
 
     return profile
-
-
-def build_distinct_db_profile(distinct_df: pd.DataFrame) -> dict[str, Any]:
-    """Построить value profile из точного GROUP BY-профиля колонки."""
-    if distinct_df.empty or "val" not in distinct_df.columns:
-        return {"top_values": [], "sample_size": 0, "source": "db"}
-
-    top_values = distinct_df["val"].astype(str).tolist()[:_MAX_SAMPLE_VALUES]
-    if "freq" in distinct_df.columns:
-        top_value_freq = [int(v) for v in distinct_df["freq"].tolist()[:_MAX_SAMPLE_VALUES]]
-        sample_size = int(sum(top_value_freq))
-    else:
-        top_value_freq = []
-        sample_size = int(len(top_values))
-
-    return {
-        "top_values": top_values,
-        "top_value_freq": top_value_freq,
-        "sample_size": sample_size,
-        "source": "db",
-    }
 
 
 def merge_profiles(

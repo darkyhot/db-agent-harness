@@ -22,17 +22,9 @@ class StubDB:
     def execute_query(self, sql: str, limit: int = 1000):
         self.calls += 1
         self.sql_calls.append(sql)
-        if 'GROUP BY "task_subtype"' in sql:
-            return pd.DataFrame({
-                "val": ["фактический отток", "новый"],
-                "freq": [12, 7],
-            })
-        if 'GROUP BY "is_outflow"' in sql:
-            return pd.DataFrame({
-                "val": [0, 1],
-                "freq": [20, 5],
-            })
         return pd.DataFrame({
+            "task_subtype": ["фактический отток", "новый", "фактический отток"],
+            "is_outflow": [1, 0, 1],
             "segment_name": ["retail", "vip", "retail"],
         })
 
@@ -67,11 +59,11 @@ def test_enrichment_pipeline_builds_all_artifacts(tmp_path):
     assert loader.get_table_semantics("dm", "sale_funnel")["grain"] == "task"
     profile = loader.get_value_profile("dm", "sale_funnel", "task_subtype")
     assert "фактический отток" in profile.get("known_terms", [])
-    assert any('GROUP BY "task_subtype"' in sql for sql in db.sql_calls)
-    assert any('GROUP BY "is_outflow"' in sql for sql in db.sql_calls)
-    assert any('SELECT "segment_name"' in sql for sql in db.sql_calls)
+    assert any('SELECT "task_subtype", "is_outflow", "segment_name"' in sql for sql in db.sql_calls)
+    assert any("ORDER BY random()" in sql for sql in db.sql_calls)
     assert any("LIMIT 100000" in sql for sql in db.sql_calls)
-    assert db.calls >= 2
+    assert all("GROUP BY" not in sql for sql in db.sql_calls)
+    assert db.calls == 1
 
 
 def test_enrichment_pipeline_reuses_existing_artifacts(tmp_path):

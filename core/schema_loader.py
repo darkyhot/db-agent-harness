@@ -18,13 +18,10 @@ from core.synonym_map import expand_with_synonyms
 from core.table_semantics import build_table_semantics
 from core.value_profiler import (
     build_db_profile,
-    build_distinct_db_profile,
     build_metadata_profile,
     discover_profile_candidates,
-    fetch_distinct_column_profile,
     fetch_table_profile_sample,
     merge_profiles,
-    should_use_distinct_profile,
 )
 
 logger = logging.getLogger(__name__)
@@ -438,7 +435,6 @@ class SchemaLoader:
         for (schema, table), table_rows in by_table.items():
             metadata_profiles: dict[str, dict[str, Any]] = {}
             sample_columns: list[str] = []
-            distinct_columns: set[str] = set()
             for row in table_rows:
                 column = str(row.get("column_name", "") or "")
                 if not column:
@@ -447,10 +443,7 @@ class SchemaLoader:
                 semantics = (self._column_semantics or {}).get(key, {})
                 metadata_profile = build_metadata_profile(row, semantics)
                 metadata_profiles[column] = metadata_profile
-                if should_use_distinct_profile(metadata_profile):
-                    distinct_columns.add(column)
-                else:
-                    sample_columns.append(column)
+                sample_columns.append(column)
             table_sample = (
                 fetch_table_profile_sample(
                     db_manager,
@@ -466,24 +459,15 @@ class SchemaLoader:
                 key = self._profile_key(schema, table, column)
                 semantics = (self._column_semantics or {}).get(key, {})
                 metadata_profile = metadata_profiles.get(column) or build_metadata_profile(row, semantics)
-                if db_manager is not None and column in distinct_columns:
-                    distinct_df = fetch_distinct_column_profile(
-                        db_manager,
-                        schema=schema,
-                        table=table,
+                db_profile = (
+                    build_db_profile(
+                        table_sample,
                         column=column,
+                        metadata_profile=metadata_profile,
                     )
-                    db_profile = build_distinct_db_profile(distinct_df)
-                else:
-                    db_profile = (
-                        build_db_profile(
-                            table_sample,
-                            column=column,
-                            metadata_profile=metadata_profile,
-                        )
-                        if table_sample is not None
-                        else {}
-                    )
+                    if table_sample is not None
+                    else {}
+                )
                 profiles[key] = merge_profiles(metadata_profile, db_profile)
 
         self._value_profiles = dict(profiles)

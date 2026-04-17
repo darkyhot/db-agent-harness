@@ -33,3 +33,21 @@ def test_build_graph_logs_runtime_module_paths(caplog):
     assert "column_selector=" in msg
     assert "intent=" in msg
     assert "sql_planner=" in msg
+
+
+def test_sql_planner_branch_allows_end():
+    from langgraph.graph import END
+
+    from graph.graph import build_graph
+
+    graph = build_graph(
+        llm=MagicMock(),
+        db_manager=MagicMock(),
+        schema_loader=MagicMock(),
+        memory=MagicMock(),
+        sql_validator=MagicMock(),
+        tools=[],
+    )
+
+    branch = graph.builder.branches["sql_planner"]["_route_after_sql_planner"]
+    assert END in branch.ends

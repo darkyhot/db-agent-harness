@@ -328,6 +328,7 @@ def build_graph(
     # sql_planner → conditional routing:
     # если dim-таблица пропущена → column_selector (повтор с hint), иначе → sql_writer
     graph.add_conditional_edges("sql_planner", _route_after_sql_planner, {
+        END: END,
         "column_selector": "column_selector",
         "sql_writer": "sql_writer",
         "summarizer": "summarizer",

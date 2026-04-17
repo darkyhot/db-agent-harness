@@ -176,6 +176,76 @@ def test_filter_ranking_phrase_bonus_breaks_tie_between_similar_columns(tmp_path
     assert subtype_score - type_score >= 40.0
 
 
+def test_filter_ranking_phrase_bonus_tolerates_single_letter_typo(tmp_path):
+    """Опечатка в 1 букву (фоктический → фактический) на слове длины ≥ 5
+    не должна ломать распознавание known_term.
+
+    Проверяем именно phrase-intent (не text_search-правила) — то, что отвечает
+    за семантическое сопоставление пользовательской фразы и значений колонки.
+    """
+    loader = _loader(tmp_path)
+    loader._value_profiles = {
+        "dm.sale_funnel.task_subtype": {
+            "known_terms": ["фактический отток"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        },
+        "dm.sale_funnel.task_type": {
+            "known_terms": ["отток"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        },
+    }
+    frame = derive_semantic_frame(
+        "Посчитай количество задач по фоктическому оттоку",
+        schema_loader=loader,
+    )
+    ranked = rank_filter_candidates(
+        user_input="Посчитай количество задач по фоктическому оттоку",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+    phrase_candidates = next(
+        (cands for rid, cands in ranked.items() if rid.startswith("phrase:") and cands),
+        None,
+    )
+    assert phrase_candidates, "ожидается хотя бы один phrase_filter-кандидат"
+    top = phrase_candidates[0]
+    assert top["column"] == "task_subtype"
+    assert top["matched_example"] == "фактический отток"
+    assert any(ev.startswith("known_term_phrase=") for ev in top["evidence"])
+
+
+def test_filter_ranking_does_not_fuzzy_match_short_different_words(tmp_path):
+    """Короткие слова (< 5 букв) не должны склеиваться по fuzzy — иначе
+    «акт» матчил бы «факт». Проверяем, что отсутствие match'а не выдумывает
+    ложный matched_example."""
+    loader = _loader(tmp_path)
+    loader._value_profiles = {
+        "dm.sale_funnel.task_subtype": {
+            "known_terms": ["акт"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        },
+    }
+    frame = derive_semantic_frame(
+        "Посчитай задачи по факту",
+        schema_loader=loader,
+    )
+    ranked = rank_filter_candidates(
+        user_input="Посчитай задачи по факту",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+    top = next(iter(ranked.values()), [])
+    if top:
+        assert top[0]["matched_example"] != "акт"
+
+
 def test_filter_ranking_records_example_values_for_fallback_label(tmp_path):
     loader = _loader(tmp_path)
     loader._value_profiles = {

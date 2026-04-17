@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from typing import Any
+
+# Порог Левенштейна-подобного ratio для «нечёткого» сравнения стемов.
+# 0.85 покрывает опечатки вида замены/вставки/пропуска одной буквы на словах
+# длины 5+, но не срабатывает на разных словах («факт»/«акт»).
+_FUZZY_STEM_RATIO = 0.85
+_FUZZY_STEM_MIN_LEN = 5
 
 
 def _normalize_text(text: str) -> str:
@@ -33,6 +40,30 @@ def _stem_set(text: str) -> set[str]:
     return {_stem(tok) for tok in _tokenize(text)}
 
 
+def _fuzzy_stem_match(stem: str, candidates: set[str]) -> bool:
+    """Есть ли в множестве candidates стем, достаточно похожий на данный.
+
+    Exact-попадание — fast path. Иначе — SequenceMatcher.ratio ≥ 0.85 на
+    стемах длины ≥ 5 (коротких слов не трогаем, чтобы не ловить ложные
+    срабатывания на «акт»/«факт»).
+    """
+    if stem in candidates:
+        return True
+    if len(stem) < _FUZZY_STEM_MIN_LEN:
+        return False
+    for cand in candidates:
+        if len(cand) < _FUZZY_STEM_MIN_LEN:
+            continue
+        if SequenceMatcher(None, stem, cand).ratio() >= _FUZZY_STEM_RATIO:
+            return True
+    return False
+
+
+def _fuzzy_overlap_count(value_stems: set[str], query_stems: set[str]) -> int:
+    """Сколько value_stems имеют exact- или fuzzy-матч в query_stems."""
+    return sum(1 for vs in value_stems if _fuzzy_stem_match(vs, query_stems))
+
+
 def _text_score(query_text: str, column: str, description: str) -> float:
     q = _stem_set(query_text)
     if not q:
@@ -57,7 +88,11 @@ def _profile_value_match(profile: dict[str, Any], query_text: str) -> tuple[str 
 
 
 def _known_terms_overlap_score(profile: dict[str, Any], query_text: str) -> float:
-    """Сильный бонус, если в known_terms/top_values есть хорошее смысловое совпадение."""
+    """Сильный бонус, если в known_terms/top_values есть хорошее смысловое совпадение.
+
+    Использует fuzzy-матчинг стемов — устойчив к опечаткам в 1 букву на
+    токенах длины ≥ 5 («фоктический» всё ещё попадает в «фактическ»).
+    """
     query_stems = _stem_set(query_text)
     if not query_stems:
         return 0.0
@@ -66,7 +101,7 @@ def _known_terms_overlap_score(profile: dict[str, Any], query_text: str) -> floa
         value_str = str(value).strip()
         if not value_str:
             continue
-        overlap = len(query_stems & _stem_set(value_str))
+        overlap = _fuzzy_overlap_count(_stem_set(value_str), query_stems)
         if overlap > best_overlap:
             best_overlap = overlap
     if best_overlap >= 2:
@@ -79,8 +114,9 @@ def _known_terms_overlap_score(profile: dict[str, Any], query_text: str) -> floa
 def _phrase_in_known_terms(profile: dict[str, Any], query_text: str) -> tuple[str | None, int]:
     """Найти known_term/top_value, стем-токены которого полностью покрываются запросом.
 
-    Возвращает (значение, число стем-токенов) для самой «длинной» такой фразы.
-    Если ни одна фраза не покрывается целиком — (None, 0).
+    Покрытие допускает fuzzy-матч стемов: опечатка в 1 букву на слове длины ≥ 5
+    тоже считается совпадением. Возвращает (значение, число стем-токенов) для
+    самой «длинной» такой фразы или (None, 0), если ни одна не покрылась.
 
     Используется как детерминированный тай-брейкер: если конкретное значение
     колонки ("фактический отток") встречается в пользовательском запросе
@@ -98,7 +134,8 @@ def _phrase_in_known_terms(profile: dict[str, Any], query_text: str) -> tuple[st
         value_stems = _stem_set(value_str)
         if not value_stems:
             continue
-        if value_stems.issubset(query_stems) and len(value_stems) > best_len:
+        covered = all(_fuzzy_stem_match(vs, query_stems) for vs in value_stems)
+        if covered and len(value_stems) > best_len:
             best_value = value_str
             best_len = len(value_stems)
     return best_value, best_len

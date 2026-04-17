@@ -35,6 +35,20 @@ logger = logging.getLogger(__name__)
 class IntentNodes:
     """Миксин с узлами intent_classifier и table_resolver для GraphNodes."""
 
+    @staticmethod
+    def _build_disambiguation_message(disambiguation_options: list[dict[str, Any]]) -> str:
+        """Собрать человекочитаемое сообщение со списком вариантов витрин."""
+        display_lines = ["Для запроса подходят несколько таблиц. Какую использовать?", ""]
+        for idx, option in enumerate(disambiguation_options, 1):
+            display_lines.append(
+                f"{idx}. {option['schema']}.{option['table']} — {option.get('description') or 'без описания'}"
+            )
+            if option.get("key_columns"):
+                display_lines.append(
+                    f"   Ключевые колонки: {', '.join(option['key_columns'])}"
+                )
+        return "\n".join(display_lines)
+
     # --------------------------------------------------------------------------
     # intent_classifier
     # --------------------------------------------------------------------------
@@ -1086,7 +1100,7 @@ class IntentNodes:
         )
 
         if disambiguation_options:
-            question = "Для запроса подходят несколько таблиц. Какую использовать?"
+            question = self._build_disambiguation_message(disambiguation_options)
             logger.info(
                 "TableResolver: запрашиваю disambiguation по таблицам: %s",
                 [f"{o['schema']}.{o['table']}" for o in disambiguation_options],

@@ -246,3 +246,28 @@ def test_table_resolver_uses_grain_to_prefer_task_table(tmp_path):
 
     result = nodes.table_resolver(state)
     assert result["selected_tables"][0] == ("dm", "uzp_data_split_mzp_sale_funnel")
+
+
+def test_table_resolver_disambiguation_message_lists_options():
+    from graph.nodes import GraphNodes
+
+    message = GraphNodes._build_disambiguation_message([
+        {
+            "schema": "dm",
+            "table": "uzp_data_split_mzp_sale_funnel",
+            "description": "Воронка продаж по задачам | grain=task",
+            "key_columns": ["task_id"],
+        },
+        {
+            "schema": "dm",
+            "table": "uzp_dwh_fact_outflow",
+            "description": "Фактические события оттока | grain=event",
+            "key_columns": [],
+        },
+    ])
+
+    assert "1. dm.uzp_data_split_mzp_sale_funnel" in message
+    assert "2. dm.uzp_dwh_fact_outflow" in message
+    assert "Воронка продаж по задачам | grain=task" in message
+    assert "Фактические события оттока | grain=event" in message
+    assert "Ключевые колонки: task_id" in message

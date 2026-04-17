@@ -21,6 +21,7 @@ import logging
 import re
 from typing import Any, Iterable
 
+from core.log_safety import summarize_dict_keys
 from core.synonym_map import SYNONYM_MAP
 
 logger = logging.getLogger(__name__)
@@ -371,9 +372,12 @@ def extract_user_hints(
     result["having_hints"] = having_hints
 
     logger.info(
-        "UserHintExtractor: must_keep=%s, join_fields=%s, dim_sources=%s, "
-        "having_hints=%s",
-        must_keep, join_fields, dim_sources, having_hints,
+        "UserHintExtractor: must_keep=%d, join_fields=%d, dim_sources=%s, "
+        "having_hints=%d",
+        len(must_keep),
+        len(join_fields),
+        summarize_dict_keys(dim_sources, label="dim_sources"),
+        len(having_hints),
     )
 
     return result

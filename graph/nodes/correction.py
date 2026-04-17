@@ -11,6 +11,7 @@ import re
 import time
 from typing import Any
 
+from core.log_safety import summarize_text
 from graph.nodes.common import BaseNodeMixin, ToolResult, SQL_RULES, GIGACHAT_COMMON_ERRORS
 from graph.state import AgentState
 
@@ -111,8 +112,8 @@ class CorrectionNodes:
         iterations = state.get("graph_iterations", 0) + 1
 
         logger.info(
-            "ErrorDiagnoser: попытка %d/%d, ошибка: %s",
-            retry_count + 1, self.MAX_RETRIES, error[:200],
+            "ErrorDiagnoser: попытка %d/%d, ошибка=%s",
+            retry_count + 1, self.MAX_RETRIES, summarize_text(error, label="error"),
         )
 
         # --- Проверка лимита попыток ---
@@ -316,8 +317,8 @@ class CorrectionNodes:
 
             if all_replacements_valid and fixed_sql != last_sql:
                 logger.info(
-                    "ErrorDiagnoser: тривиальное исправление колонок кодом: %s",
-                    diagnosis["replacements"],
+                    "ErrorDiagnoser: тривиальное исправление колонок кодом: replacements=%d",
+                    len(diagnosis["replacements"]),
                 )
                 # Определяем инструмент из последнего вызова
                 tool_name = "execute_query"

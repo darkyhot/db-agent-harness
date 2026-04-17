@@ -11,6 +11,7 @@ import logging
 import re
 from typing import Any
 
+from core.log_safety import summarize_dict_keys, summarize_text
 from core.column_selector_deterministic import (
     _choose_best_column,
     _derive_requested_slots,
@@ -63,7 +64,7 @@ class IntentNodes:
             Обновления состояния с распознанным интентом.
         """
         user_input = state["user_input"]
-        logger.info("IntentClassifier: обработка запроса: %s", user_input[:100])
+        logger.info("IntentClassifier: обработка запроса: %s", summarize_text(user_input, label="user_input"))
 
         self.memory.add_message("user", user_input)
 
@@ -265,8 +266,11 @@ class IntentNodes:
                     "complexity": "single_table",
                 }
 
-        logger.info("IntentClassifier: intent=%s, entities=%s",
-                     intent.get("intent"), intent.get("entities"))
+        logger.info(
+            "IntentClassifier: intent=%s, entities_count=%d",
+            intent.get("intent"),
+            len(intent.get("entities") or []),
+        )
 
         # Детерминированная коррекция периода:
         # если пользователь написал "февраль 26" или ответил "Уточнение пользователя: 26",
@@ -317,8 +321,8 @@ class IntentNodes:
                 month_label = _detected_month or "указанный месяц"
                 clarification_message = f"За какой год считать данные за {month_label}?"
             logger.info(
-                "IntentClassifier: month_without_year=True → принудительно clarification: %r",
-                clarification_message,
+                "IntentClassifier: month_without_year=True → принудительно clarification (%s)",
+                summarize_text(clarification_message, label="clarification_message"),
             )
 
         if needs_clarification and not clarification_message:
@@ -327,7 +331,10 @@ class IntentNodes:
             )
 
         semantic_frame = derive_semantic_frame(user_input, intent, schema_loader=self.schema)
-        logger.info("IntentClassifier: semantic_frame=%s", semantic_frame)
+        logger.info(
+            "IntentClassifier: semantic_frame=%s",
+            summarize_dict_keys(semantic_frame, label="semantic_frame"),
+        )
 
         self.memory.add_message(
             "assistant",
@@ -1095,8 +1102,8 @@ class IntentNodes:
             len(plan_steps),
             table_confidences,
             requested_grain,
-            semantic_frame,
-            planning_confidence,
+            summarize_dict_keys(semantic_frame, label="semantic_frame"),
+            summarize_dict_keys(planning_confidence, label="planning_confidence"),
         )
 
         if disambiguation_options:

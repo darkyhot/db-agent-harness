@@ -7,6 +7,8 @@ from typing import Any
 
 import sqlparse
 
+from core.log_safety import summarize_sql
+
 logger = logging.getLogger(__name__)
 
 
@@ -586,7 +588,7 @@ class SQLValidator:
         mode = detect_mode(sql)
         result = ValidationResult(is_valid=True, mode=mode)
 
-        logger.info("Валидация SQL (режим %s): %s", mode.value, sql[:200])
+        logger.info("Валидация SQL (режим %s): %s", mode.value, summarize_sql(sql))
 
         if mode == SQLMode.READ:
             self._validate_read(sql, result)

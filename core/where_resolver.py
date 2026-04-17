@@ -7,6 +7,7 @@ from typing import Any
 
 from core.domain_rules import table_can_satisfy_frame
 from core.filter_ranking import rank_filter_candidates
+from core.log_safety import summarize_dict_keys
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +82,14 @@ def resolve_where(
         logger.info("WhereResolver: не удалось привязать filter_intents автоматически")
 
     logger.info(
-        "WhereResolver: filter_intents=%s, applied_rules=%s, conditions=%s, candidates=%s",
-        filter_intents, applied_rules, conditions,
-        {k: [c.get('column') for c in v[:3]] for k, v in ranked_candidates.items()},
+        "WhereResolver: filter_intents=%d, applied_rules=%s, conditions=%d, candidates=%s",
+        len(filter_intents),
+        applied_rules,
+        len(conditions),
+        summarize_dict_keys(
+            {k: [c.get('column') for c in v[:3]] for k, v in ranked_candidates.items()},
+            label="candidates",
+        ),
     )
     return {
         "conditions": conditions,

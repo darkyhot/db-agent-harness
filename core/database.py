@@ -11,6 +11,7 @@ import sqlparse
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.engine import Engine
 
+from core.log_safety import summarize_sql
 from tools.path_safety import resolve_workspace_path
 
 logger = logging.getLogger(__name__)
@@ -175,11 +176,11 @@ class DatabaseManager:
         sql_stripped = sql.strip().rstrip(";")
         if not _has_top_level_limit(sql_stripped):
             sql_stripped = f"SELECT * FROM ({sql_stripped}) _sub LIMIT :_limit"
-            logger.info("Выполнение SELECT (с авто-LIMIT): %s", sql_stripped[:200])
+            logger.info("Выполнение SELECT (с авто-LIMIT): %s", summarize_sql(sql_stripped))
             with self.get_engine().connect() as conn:
                 df = pd.read_sql(text(sql_stripped), conn, params={"_limit": limit})
         else:
-            logger.info("Выполнение SELECT: %s", sql_stripped[:200])
+            logger.info("Выполнение SELECT: %s", summarize_sql(sql_stripped))
             with self.get_engine().connect() as conn:
                 df = pd.read_sql(text(sql_stripped), conn)
 
@@ -189,7 +190,7 @@ class DatabaseManager:
     def run_read_query(self, sql: str) -> pd.DataFrame:
         """Выполнить SELECT без авто-LIMIT (full read/export mode)."""
         sql_stripped = sql.strip().rstrip(";")
-        logger.info("Выполнение SELECT без авто-LIMIT: %s", sql_stripped[:200])
+        logger.info("Выполнение SELECT без авто-LIMIT: %s", summarize_sql(sql_stripped))
         with self.get_engine().connect() as conn:
             df = pd.read_sql(text(sql_stripped), conn)
         logger.info("Получено строк (full): %d", len(df))
@@ -230,7 +231,7 @@ class DatabaseManager:
             Количество затронутых строк.
         """
         engine = self.get_engine()
-        logger.info("Выполнение WRITE: %s", sql[:200])
+        logger.info("Выполнение WRITE: %s", summarize_sql(sql))
         with engine.connect() as conn:
             result = conn.execute(text(sql))
             conn.commit()
@@ -248,7 +249,7 @@ class DatabaseManager:
             Сообщение об успешном выполнении.
         """
         engine = self.get_engine()
-        logger.info("Выполнение DDL: %s", sql[:200])
+        logger.info("Выполнение DDL: %s", summarize_sql(sql))
         with engine.connect() as conn:
             conn.execute(text(sql))
             conn.commit()
@@ -266,7 +267,7 @@ class DatabaseManager:
         """
         engine = self.get_engine()
         explain_sql = f"EXPLAIN {sql.strip().rstrip(';')}"
-        logger.debug("EXPLAIN: %s", explain_sql[:200])
+        logger.debug("EXPLAIN: %s", summarize_sql(explain_sql))
         with engine.connect() as conn:
             result = conn.execute(text(explain_sql))
             plan = "\n".join(row[0] for row in result)
@@ -333,7 +334,10 @@ class DatabaseManager:
             "duplicate_pct": dup_pct,
             "is_unique": dup_pct == 0.0,
         }
-        logger.info("Уникальность %s.%s(%s): %s", schema, table, cols, result)
+        logger.info(
+            "Уникальность %s.%s(%s): total_rows=%s unique_keys=%s duplicate_pct=%.2f is_unique=%s",
+            schema, table, cols, total, unique, dup_pct, dup_pct == 0.0,
+        )
         return result
 
     def get_sample(self, schema: str, table: str, n: int = 10) -> pd.DataFrame:

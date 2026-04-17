@@ -19,6 +19,7 @@ from core.confidence import (
     evaluate_filter_confidence,
     evaluate_join_confidence,
 )
+from core.log_safety import summarize_sql, summarize_text
 from core.sql_static_checker import check_sql
 from core.sql_planner_deterministic import build_blueprint as _deterministic_blueprint
 from core.sql_builder import SqlBuilder as _SqlBuilder
@@ -826,7 +827,7 @@ class SqlPipelineNodes:
         if not sql:
             return {"sql_to_validate": None, "pending_sql_tool_call": None}
 
-        logger.info("Validator: проверка SQL: %s", sql[:200])
+        logger.info("Validator: проверка SQL: %s", summarize_sql(sql))
         result = self.validator.validate(sql)
 
         # Требуется подтверждение пользователя
@@ -855,7 +856,7 @@ class SqlPipelineNodes:
         # Невалидный SQL
         if not result.is_valid:
             error_msg = result.summary()
-            logger.warning("Validator: SQL невалиден: %s", error_msg[:200])
+            logger.warning("Validator: SQL невалиден: %s", summarize_text(error_msg, label="validation_error"))
             return {
                 "last_error": error_msg,
                 "sql_to_validate": None,

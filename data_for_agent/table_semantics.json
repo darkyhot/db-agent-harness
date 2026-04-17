@@ -2,9 +2,11 @@
   "schema.uzp_dwh_fact_outflow": {
     "schema": "schema",
     "table": "uzp_dwh_fact_outflow",
-    "grain": "",
+    "grain": "event",
     "table_role": "fact",
-    "primary_subjects": [],
+    "primary_subjects": [
+      "event"
+    ],
     "time_axis_columns": [
       "report_dt"
     ],
@@ -25,7 +27,7 @@
   "schema.uzp_dim_gosb": {
     "schema": "schema",
     "table": "uzp_dim_gosb",
-    "grain": "",
+    "grain": "dictionary",
     "table_role": "reference",
     "primary_subjects": [
       "organization"
@@ -45,7 +47,7 @@
   "schema.uzp_data_split_mzp_sale_funnel": {
     "schema": "schema",
     "table": "uzp_data_split_mzp_sale_funnel",
-    "grain": "",
+    "grain": "task",
     "table_role": "fact",
     "primary_subjects": [
       "task"
@@ -74,9 +76,11 @@
   "schema.uzp_data_payroll_m": {
     "schema": "schema",
     "table": "uzp_data_payroll_m",
-    "grain": "",
+    "grain": "payment",
     "table_role": "fact",
-    "primary_subjects": [],
+    "primary_subjects": [
+      "payment"
+    ],
     "time_axis_columns": [
       "acc_open_dt",
       "agrmnt_dt",
@@ -99,7 +103,7 @@
   "schema.uzp_data_emp_epk_assignment": {
     "schema": "schema",
     "table": "uzp_data_emp_epk_assignment",
-    "grain": "",
+    "grain": "employee",
     "table_role": "fact",
     "primary_subjects": [
       "employee",
@@ -122,7 +126,7 @@
   "schema.uzp_data_epk_consolidation": {
     "schema": "schema",
     "table": "uzp_data_epk_consolidation",
-    "grain": "",
+    "grain": "organization",
     "table_role": "fact",
     "primary_subjects": [
       "organization"
@@ -146,7 +150,7 @@
   "schema.uzp_dwh_sap_staff_emp": {
     "schema": "schema",
     "table": "uzp_dwh_sap_staff_emp",
-    "grain": "",
+    "grain": "employee",
     "table_role": "fact",
     "primary_subjects": [
       "employee"

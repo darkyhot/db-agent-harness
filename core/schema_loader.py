@@ -38,6 +38,13 @@ _ATTR_COLUMNS = [
     "schema_name", "table_name", "column_name", "dType",
     "is_not_null", "description", "is_primary_key",
     "not_null_perc", "unique_perc",
+    # Расширения (опциональные, могут отсутствовать в исторических CSV).
+    # foreign_key_target: "schema.table.column" — при непустом значении используется
+    # как 0-й этап в core/join_analysis.rank_join_candidates.
+    # sample_values: "v1|v2|v3" — типичные значения для value-resolver.
+    # partition_key: bool — помечает колонку-партиционирование (для warnings в dry-run).
+    # synonyms: "syn1,syn2,syn3" — синонимы имени (подсказки для семантического фрейма).
+    "foreign_key_target", "sample_values", "partition_key", "synonyms",
 ]
 
 _GRAIN_ENUM = (
@@ -145,7 +152,17 @@ class SchemaLoader:
         self._attrs_df = pd.read_csv(path, encoding="utf-8")
         for col in _ATTR_COLUMNS:
             if col not in self._attrs_df.columns:
-                self._attrs_df[col] = ""
+                # Для bool-расширений дефолт False; для остальных — пустая строка.
+                default = False if col == "partition_key" else ""
+                self._attrs_df[col] = default
+        # Нормализация опциональных полей — пустые значения NaN → ""/False.
+        for col in ("foreign_key_target", "sample_values", "synonyms"):
+            if col in self._attrs_df.columns:
+                self._attrs_df[col] = self._attrs_df[col].fillna("").astype(str)
+        if "partition_key" in self._attrs_df.columns:
+            self._attrs_df["partition_key"] = (
+                self._attrs_df["partition_key"].fillna(False).astype(bool)
+            )
         logger.info("Загружено атрибутов: %d", len(self._attrs_df))
         return self._attrs_df
 
@@ -553,6 +570,59 @@ class SchemaLoader:
                 best_grain = grain
         return best_grain
 
+    def _deterministic_grain(self, schema: str, table: str, description: str) -> tuple[str, int]:
+        """Детерминированный grain по имени/описанию + минимальная мера уверенности.
+
+        Returns:
+            (grain, score) — где score = число совпавших keywords (>=2 даёт уверенный sign).
+        """
+        haystack = f"{table} {description}".lower()
+        # Split snake_case for keyword matching
+        haystack = haystack.replace("_", " ")
+        scored: list[tuple[int, str]] = []
+        for grain, keywords in _GRAIN_KEYWORDS.items():
+            count = sum(1 for kw in keywords if kw and kw in haystack)
+            if count > 0:
+                scored.append((count, grain))
+        if not scored:
+            return ("", 0)
+        scored.sort(reverse=True)
+        return (scored[0][1], scored[0][0])
+
+    def fill_deterministic_grains(self) -> int:
+        """Заполнить grain для таблиц, где keyword-match даёт уверенный результат.
+
+        Критерий "уверенный": >= 2 совпавших keywords ИЛИ единственный кандидат.
+        Данные пишутся в tables_list.csv и кеш инвалидируется.
+
+        Returns:
+            Количество таблиц, для которых grain был заполнен.
+        """
+        df = self.tables_df.copy()
+        if "grain" not in df.columns:
+            df["grain"] = ""
+        df["grain"] = df["grain"].fillna("").astype(str)
+
+        filled = 0
+        for idx, row in df.iterrows():
+            current = str(row.get("grain", "") or "").strip().lower()
+            if current and current in _GRAIN_ENUM:
+                continue
+            schema = str(row.get("schema_name", "") or "")
+            table = str(row.get("table_name", "") or "")
+            description = str(row.get("description", "") or "")
+            grain, score = self._deterministic_grain(schema, table, description)
+            if grain and grain in _GRAIN_ENUM and score >= 2:
+                df.at[idx, "grain"] = grain
+                filled += 1
+
+        if filled:
+            self._persist_tables_df(df)
+            # Инвалидируем зависимые кеши — их надо пересобрать с новым grain
+            self._table_semantics = None
+            logger.info("Grain metadata: детерминированно заполнено %d таблиц", filled)
+        return filled
+
     def _build_grain_prompt_payload(self, batch: pd.DataFrame) -> list[dict[str, Any]]:
         """Собрать компактный контекст по таблицам для генерации grain."""
         payload: list[dict[str, Any]] = []
@@ -683,6 +753,194 @@ class SchemaLoader:
         self._persist_tables_df(df)
         logger.info("Grain metadata: генерация завершена")
         return 0
+
+    def get_foreign_key_target(
+        self, schema: str, table: str, column: str
+    ) -> tuple[str, str, str] | None:
+        """Получить (ref_schema, ref_table, ref_column) если задан foreign_key_target.
+
+        Формат значения в CSV: "schema.table.column". При отсутствии/ошибке — None.
+        """
+        df = self.attrs_df
+        if "foreign_key_target" not in df.columns:
+            return None
+        mask = (
+            (df["schema_name"] == schema)
+            & (df["table_name"] == table)
+            & (df["column_name"] == column)
+        )
+        rows = df[mask]
+        if rows.empty:
+            return None
+        raw = str(rows.iloc[0].get("foreign_key_target", "") or "").strip()
+        if not raw:
+            return None
+        parts = raw.split(".")
+        if len(parts) != 3:
+            return None
+        ref_schema, ref_table, ref_column = (p.strip() for p in parts)
+        if not (ref_schema and ref_table and ref_column):
+            return None
+        return (ref_schema, ref_table, ref_column)
+
+    def get_column_sample_values(
+        self, schema: str, table: str, column: str
+    ) -> list[str]:
+        """Получить sample_values колонки (разделитель — '|')."""
+        df = self.attrs_df
+        if "sample_values" not in df.columns:
+            return []
+        mask = (
+            (df["schema_name"] == schema)
+            & (df["table_name"] == table)
+            & (df["column_name"] == column)
+        )
+        rows = df[mask]
+        if rows.empty:
+            return []
+        raw = str(rows.iloc[0].get("sample_values", "") or "").strip()
+        if not raw:
+            return []
+        return [part.strip() for part in raw.split("|") if part.strip()]
+
+    def get_column_synonyms(self, schema: str, table: str, column: str) -> list[str]:
+        """Получить synonyms колонки (разделитель — ',')."""
+        df = self.attrs_df
+        if "synonyms" not in df.columns:
+            return []
+        mask = (
+            (df["schema_name"] == schema)
+            & (df["table_name"] == table)
+            & (df["column_name"] == column)
+        )
+        rows = df[mask]
+        if rows.empty:
+            return []
+        raw = str(rows.iloc[0].get("synonyms", "") or "").strip()
+        if not raw:
+            return []
+        return [part.strip().lower() for part in raw.split(",") if part.strip()]
+
+    def is_partition_key(self, schema: str, table: str, column: str) -> bool:
+        """Проверить, помечена ли колонка как partition_key."""
+        df = self.attrs_df
+        if "partition_key" not in df.columns:
+            return False
+        mask = (
+            (df["schema_name"] == schema)
+            & (df["table_name"] == table)
+            & (df["column_name"] == column)
+        )
+        rows = df[mask]
+        if rows.empty:
+            return False
+        return bool(rows.iloc[0].get("partition_key", False))
+
+    def get_column_dtype(self, schema: str, table: str, column: str) -> str:
+        """Получить dtype колонки (пустая строка если не найдена)."""
+        df = self.attrs_df
+        mask = (
+            (df["schema_name"] == schema)
+            & (df["table_name"] == table)
+            & (df["column_name"] == column)
+        )
+        rows = df[mask]
+        if rows.empty:
+            return ""
+        return str(rows.iloc[0].get("dType", "") or "").strip().lower()
+
+    def infer_foreign_keys(self, dry_run: bool = False) -> dict[str, str]:
+        """Детерминированная инференция foreign_key_target.
+
+        Правила (консервативно):
+        - Кандидат-колонка T.c совпадает по имени с PK другой таблицы R.pk
+          (после нормализации через join_analysis._normalize_key_name).
+        - У R.pk unique_perc == 100 (единственное значение — хорошая цель FK).
+        - Типы совпадают (нормализация целых: int2/int4/int8 → int).
+        - T != R (само-ссылок не делаем).
+
+        Если не dry_run — заполняет attr_list.csv и перезагружает кеш.
+
+        Returns:
+            Словарь {T.c_key → "schema.table.column"} для заполненных/предложенных FK.
+        """
+        from core.join_analysis import _normalize_key_name  # lazy import
+
+        df = self.attrs_df.copy()
+        if "foreign_key_target" not in df.columns:
+            df["foreign_key_target"] = ""
+
+        def _dtype_bucket(dtype: str) -> str:
+            d = (dtype or "").lower()
+            if d.startswith("int") or d in {"bigint", "smallint", "integer"}:
+                return "int"
+            if "char" in d or d == "text":
+                return "text"
+            if "num" in d or "float" in d or "double" in d or "decimal" in d:
+                return "num"
+            if "date" in d or "time" in d:
+                return "date"
+            return d
+
+        # Каталог PK с unique_perc=100 — потенциальные цели FK.
+        pk_targets: list[tuple[str, str, str, str]] = []  # (schema, table, column, norm_name)
+        for _, row in df.iterrows():
+            if not bool(row.get("is_primary_key", False)):
+                continue
+            try:
+                up = float(row.get("unique_perc", 0) or 0)
+            except (TypeError, ValueError):
+                up = 0.0
+            if up < 100.0:
+                continue
+            pk_targets.append((
+                str(row.get("schema_name", "")),
+                str(row.get("table_name", "")),
+                str(row.get("column_name", "")),
+                _normalize_key_name(str(row.get("column_name", ""))),
+            ))
+
+        filled: dict[str, str] = {}
+        for idx, row in df.iterrows():
+            existing = str(row.get("foreign_key_target", "") or "").strip()
+            if existing:
+                continue
+            if bool(row.get("is_primary_key", False)):
+                continue  # PK сам — не FK
+            col = str(row.get("column_name", ""))
+            schema = str(row.get("schema_name", ""))
+            table = str(row.get("table_name", ""))
+            norm_col = _normalize_key_name(col)
+            col_bucket = _dtype_bucket(str(row.get("dType", "")))
+            matches = [
+                t for t in pk_targets
+                if t[3] == norm_col
+                and (t[0] != schema or t[1] != table)  # не на себя
+            ]
+            if len(matches) != 1:
+                continue  # требуем однозначность
+            ref_schema, ref_table, ref_column, _ = matches[0]
+            # Типы должны совпадать
+            ref_row = df[
+                (df["schema_name"] == ref_schema)
+                & (df["table_name"] == ref_table)
+                & (df["column_name"] == ref_column)
+            ]
+            if ref_row.empty:
+                continue
+            if _dtype_bucket(str(ref_row.iloc[0].get("dType", ""))) != col_bucket:
+                continue
+            target = f"{ref_schema}.{ref_table}.{ref_column}"
+            filled[f"{schema}.{table}.{col}"] = target
+            if not dry_run:
+                df.at[idx, "foreign_key_target"] = target
+
+        if filled and not dry_run:
+            path = self._data_dir / "attr_list.csv"
+            df.to_csv(path, index=False, encoding="utf-8")
+            self._attrs_df = None  # force reload
+            logger.info("FK inference: заполнено %d foreign_key_target", len(filled))
+        return filled
 
     def get_table_columns(self, schema: str, table: str) -> pd.DataFrame:
         """Получить атрибуты конкретной таблицы.

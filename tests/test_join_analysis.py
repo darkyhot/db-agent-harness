@@ -778,3 +778,164 @@ class TestUserHintJoinFieldsWins:
         )
         # Не падает, fallback работает
         assert pick is None or pick["col1"] in {"client_id", "inn"}
+
+
+class TestExplicitFK:
+    """Direction 2: foreign_key_target метаданные дают приоритетную пару."""
+
+    def test_explicit_fk_wins_over_heuristic(self):
+        """Колонка с foreign_key_target даёт explicit_fk с высшим base score."""
+        df_fact = _make_cols_df([
+            {"column_name": "client_ref", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 0.5, "description": "ссылка на клиента",
+             "foreign_key_target": "s.dim_client.inn"},
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 0.5, "description": ""},
+        ])
+        df_dim = _make_cols_df([
+            {"column_name": "inn", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        candidates = rank_join_candidates("s", "fact", df_fact, "s", "dim_client", df_dim, 1, 1)
+        # Первый (топ) — explicit_fk
+        assert candidates[0].match_type == "explicit_fk"
+        assert candidates[0].col1 == "client_ref"
+        assert candidates[0].col2 == "inn"
+
+    def test_explicit_fk_reverse_direction(self):
+        """foreign_key_target заполнен на стороне 2 → пара тоже находится."""
+        df_dim = _make_cols_df([
+            {"column_name": "inn", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        df_fact = _make_cols_df([
+            {"column_name": "customer", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 0.5, "description": "",
+             "foreign_key_target": "s.dim.inn"},
+        ])
+        candidates = rank_join_candidates("s", "dim", df_dim, "s", "fact", df_fact, 1, 1)
+        assert any(c.match_type == "explicit_fk" for c in candidates)
+
+    def test_explicit_fk_ignored_when_target_elsewhere(self):
+        """foreign_key_target указывает на другую таблицу — не используется."""
+        df1 = _make_cols_df([
+            {"column_name": "x_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 0.5, "description": "",
+             "foreign_key_target": "s.other.id"},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        candidates = rank_join_candidates("s", "a", df1, "s", "b", df2, 1, 1)
+        # Не должно быть explicit_fk — таргет указывает на other
+        assert not any(c.match_type == "explicit_fk" for c in candidates)
+
+
+class TestCardinalityRating:
+    def test_pk_to_pk_is_one_to_one(self):
+        df1 = _make_cols_df([
+            {"column_name": "id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        cands = rank_join_candidates("s", "a", df1, "s", "b", df2, 1, 1)
+        assert cands[0].cardinality_rating == "1:1"
+
+    def test_pk_to_non_unique_is_one_to_n(self):
+        df1 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 5.0, "description": ""},
+        ])
+        cands = rank_join_candidates("s", "dim", df1, "s", "fact", df2, 1, 1)
+        assert cands[0].cardinality_rating == "1:N"
+
+    def test_non_unique_both_is_n_to_m(self):
+        df1 = _make_cols_df([
+            {"column_name": "status", "dType": "int4", "is_primary_key": False,
+             "unique_perc": 5.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "status", "dType": "int4", "is_primary_key": False,
+             "unique_perc": 5.0, "description": ""},
+        ])
+        cands = rank_join_candidates("s", "a", df1, "s", "b", df2, 0, 0)
+        # Может быть отфильтрован по score, но если остался — N:N
+        if cands:
+            assert cands[0].cardinality_rating == "N:N"
+
+
+class TestForeignKeyInference:
+    """Direction 2: SchemaLoader.infer_foreign_keys — детерминированная инференция."""
+
+    def test_dry_run_finds_matching_pk_with_same_dtype(self, tmp_path):
+        import pandas as pd
+        from core.schema_loader import SchemaLoader
+
+        (tmp_path / "tables_list.csv").write_text(
+            "schema_name,table_name,description,grain\n"
+            "s,dim_c,dim,dictionary\n"
+            "s,fact_a,fact,event\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "attr_list.csv").write_text(
+            "schema_name,table_name,column_name,dType,is_not_null,description,is_primary_key,not_null_perc,unique_perc\n"
+            "s,dim_c,inn,int8,True,,True,100.0,100.0\n"
+            "s,fact_a,inn,int8,False,,False,100.0,0.5\n"
+            "s,fact_a,value,numeric,False,,False,100.0,0.5\n",
+            encoding="utf-8",
+        )
+        loader = SchemaLoader(data_dir=tmp_path)
+        result = loader.infer_foreign_keys(dry_run=True)
+        assert result == {"s.fact_a.inn": "s.dim_c.inn"}
+
+    def test_persist_writes_to_csv(self, tmp_path):
+        from core.schema_loader import SchemaLoader
+
+        (tmp_path / "tables_list.csv").write_text(
+            "schema_name,table_name,description,grain\n"
+            "s,dim_c,dim,dictionary\n"
+            "s,fact_a,fact,event\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "attr_list.csv").write_text(
+            "schema_name,table_name,column_name,dType,is_not_null,description,is_primary_key,not_null_perc,unique_perc\n"
+            "s,dim_c,inn,int8,True,,True,100.0,100.0\n"
+            "s,fact_a,inn,int8,False,,False,100.0,0.5\n",
+            encoding="utf-8",
+        )
+        loader = SchemaLoader(data_dir=tmp_path)
+        loader.infer_foreign_keys(dry_run=False)
+
+        # Reload and verify
+        loader2 = SchemaLoader(data_dir=tmp_path)
+        target = loader2.get_foreign_key_target("s", "fact_a", "inn")
+        assert target == ("s", "dim_c", "inn")
+
+    def test_dtype_mismatch_skipped(self, tmp_path):
+        from core.schema_loader import SchemaLoader
+
+        (tmp_path / "tables_list.csv").write_text(
+            "schema_name,table_name,description,grain\n"
+            "s,dim_c,dim,dictionary\n"
+            "s,fact_a,fact,event\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "attr_list.csv").write_text(
+            "schema_name,table_name,column_name,dType,is_not_null,description,is_primary_key,not_null_perc,unique_perc\n"
+            "s,dim_c,inn,int8,True,,True,100.0,100.0\n"
+            "s,fact_a,inn,text,False,,False,100.0,0.5\n",
+            encoding="utf-8",
+        )
+        loader = SchemaLoader(data_dir=tmp_path)
+        result = loader.infer_foreign_keys(dry_run=True)
+        assert result == {}

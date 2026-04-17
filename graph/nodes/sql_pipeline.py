@@ -629,14 +629,38 @@ class SqlPipelineNodes:
 
         # Few-shot примеры из audit log (похожие успешные запросы)
         try:
+            semantic_frame = state.get("semantic_frame") or {}
+            fact_dim_pair: tuple[str, str] | None = None
+            selected_tables = state.get("selected_tables") or []
+            table_types = state.get("table_types") or {}
+            if selected_tables:
+                fact = next(
+                    (f"{s}.{t}" for (s, t) in selected_tables if table_types.get(f"{s}.{t}") == "fact"),
+                    "",
+                )
+                dim = next(
+                    (f"{s}.{t}" for (s, t) in selected_tables if table_types.get(f"{s}.{t}") == "dim"),
+                    "",
+                )
+                if fact or dim:
+                    fact_dim_pair = (fact, dim)
             few_shot_examples = self.few_shot.get_similar(
-                state["user_input"], strategy=strategy, n=2
+                state["user_input"],
+                strategy=strategy,
+                n=2,
+                semantic_frame=semantic_frame,
+                fact_dim_pair=fact_dim_pair,
             )
             if few_shot_examples:
                 user_parts.append(self.few_shot.format_for_prompt(few_shot_examples))
                 logger.debug("SqlWriter: добавлено %d few-shot примеров", len(few_shot_examples))
-        except Exception:
-            pass  # few-shot не критичен — продолжаем без него
+            evidence_trace["few_shot"] = {
+                "count": len(few_shot_examples),
+                "similarities": self.few_shot.last_similarities,
+                "strategy": strategy,
+            }
+        except Exception as _exc:
+            evidence_trace.setdefault("few_shot", {"count": 0, "similarities": [], "error": str(_exc)})
 
         user_prompt = "\n\n".join(user_parts)
 
@@ -920,6 +944,50 @@ class SqlPipelineNodes:
             for sw in sanity_warnings:
                 warnings_text += f"\n⚠ {sw}"
 
+        # Row-count sanity по истории (Direction 3.3):
+        # Сверяем row_count с p95 * 10 по (subject, metric) из semantic_frame.
+        # Запускается только для успешных запросов с непустым результатом.
+        frame = state.get("semantic_frame") or {}
+        subject = str(frame.get("subject") or "")
+        metric_intent = str(frame.get("metric_intent") or "")
+        if (
+            not empty_result
+            and tool_name == "execute_query"
+            and (subject or metric_intent)
+        ):
+            suspicion = self.memory.check_row_count_suspicion(
+                subject, metric_intent, row_count,
+            )
+            if suspicion.get("is_suspect"):
+                p95 = suspicion.get("p95", 0.0)
+                n_hist = suspicion.get("n", 0)
+                ratio = suspicion.get("ratio", 0.0)
+                suspect_msg = (
+                    f"ROW-COUNT SUSPECT: {row_count} строк для (subject={subject or '_'}, "
+                    f"metric={metric_intent or '_'}). "
+                    f"Исторический p95={p95:.0f} по {n_hist} наблюдениям, "
+                    f"текущий результат в {ratio:.1f}× больше p95 (порог: 10×). "
+                    "Вероятно, JOIN множит строки или фильтр слишком широкий."
+                )
+                self.memory.log_sql_execution(
+                    state["user_input"], sql, row_count, "row_explosion_suspect",
+                    duration_ms, retry_count=state.get("retry_count", 0),
+                    error_type="row_count_suspect",
+                )
+                return {
+                    "sql_to_validate": None,
+                    "pending_sql_tool_call": None,
+                    "last_error": suspect_msg,
+                    "retry_count": state.get("retry_count", 0),
+                    "join_risk_info": join_risk_info,
+                    "tool_calls": tool_calls[:-1] + [
+                        {**last_tool, "result": rendered_result}
+                    ],
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": f"⚠ {suspect_msg}"}
+                    ],
+                }
+
         # Row explosion detection
         if not empty_result and join_risk_info and tool_name == "execute_query":
             factor = join_risk_info.get("multiplication_factor", 1.0)
@@ -961,6 +1029,13 @@ class SqlPipelineNodes:
         # Сбрасываем few-shot кэш: новый успешный запрос попадёт в следующую сессию
         if audit_status == "success":
             self.few_shot.invalidate_cache()
+            # Накопление row_count_stats для будущей row-count sanity (Direction 3.3)
+            try:
+                self.memory.record_row_count_sample(
+                    subject, metric_intent, row_count,
+                )
+            except Exception as e:
+                logger.debug("record_row_count_sample failed: %s", e)
 
         # Пустой результат → коррекция
         if empty_result:

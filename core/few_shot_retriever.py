@@ -1,12 +1,13 @@
 """Few-shot retrieval успешных SQL-запросов из audit log.
 
 Находит 2-3 похожих прошлых успешных запроса и возвращает их как
-few-shot примеры для sql_writer. Работает по keyword overlap с user_input.
+few-shot примеры для sql_writer. Работает по keyword overlap с user_input,
+с бонусами за совпадение strategy / subject / metric_intent из semantic_frame.
 """
 
 import logging
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from core.memory import MemoryManager
@@ -28,7 +29,7 @@ _STOP_WORDS = frozenset({
 
 def _tokenize(text: str) -> set[str]:
     """Разбить текст на значимые токены."""
-    words = re.findall(r'[a-zA-Zа-яА-ЯёЁ_]{3,}', text.lower())
+    words = re.findall(r'[a-zA-Zа-яА-ЯёЁ_]{3,}', (text or "").lower())
     return {w for w in words if w not in _STOP_WORDS}
 
 
@@ -47,31 +48,31 @@ class FewShotRetriever:
     def __init__(self, memory: "MemoryManager") -> None:
         self._memory = memory
         self._cache: list[dict] | None = None  # Кэш успешных запросов
+        self._last_similarities: list[float] = []
 
     def _load_successful_queries(self, limit: int = 100) -> list[dict]:
-        """Загрузить успешные запросы из audit log."""
+        """Загрузить успешные запросы из audit log через публичный API memory."""
         if self._cache is not None:
             return self._cache
 
         try:
-            from datetime import datetime, timezone, timedelta
-            cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
-
-            with self._memory._connect() as conn:
-                cursor = conn.execute(
-                    "SELECT user_input, sql FROM sql_audit "
-                    "WHERE status = 'success' AND retry_count = 0 "
-                    "AND timestamp >= ? "
-                    "AND length(sql) > 20 "
-                    "ORDER BY timestamp DESC LIMIT ?",
-                    (cutoff, limit),
-                )
-                rows = cursor.fetchall()
-
+            rows = self._memory.iter_sql_audit(
+                status="success",
+                max_retry_count=0,
+                min_sql_length=20,
+                min_row_count=1,
+                days=90,
+                limit=limit,
+            )
             self._cache = [
-                {"user_input": r[0], "sql": r[1]}
+                {
+                    "user_input": r.get("user_input") or "",
+                    "sql": r.get("sql") or "",
+                    "row_count": int(r.get("row_count", 0) or 0),
+                    "timestamp": r.get("timestamp") or "",
+                }
                 for r in rows
-                if r[0] and r[1]
+                if r.get("user_input") and r.get("sql")
             ]
             logger.info("FewShotRetriever: загружено %d успешных запросов", len(self._cache))
         except Exception as e:
@@ -84,12 +85,59 @@ class FewShotRetriever:
         """Сбросить кэш (вызвать после новых успешных запросов)."""
         self._cache = None
 
+    def _scoring_bonus(
+        self,
+        sql_lower: str,
+        *,
+        strategy: str,
+        semantic_frame: dict[str, Any] | None,
+        fact_dim_pair: tuple[str, str] | None,
+    ) -> float:
+        """Дополнительные бонусы поверх Jaccard."""
+        bonus = 0.0
+        # Структурный бонус по стратегии (CTE / DISTINCT ON / JOIN-паттерны)
+        if strategy:
+            if strategy in ("fact_dim_join", "dim_fact_join"):
+                if "distinct on" in sql_lower or "with " in sql_lower or " join " in sql_lower:
+                    bonus += 0.05
+            elif strategy == "simple_select":
+                if " join " not in sql_lower and "with " not in sql_lower:
+                    bonus += 0.03
+            elif strategy == "cte_preaggregation":
+                if "with " in sql_lower and " join " in sql_lower:
+                    bonus += 0.05
+
+        # Бонус за совпадение пары (fact_table, dim_table)
+        if fact_dim_pair:
+            fact, dim = fact_dim_pair
+            if fact and fact.lower() in sql_lower:
+                bonus += 0.04
+            if dim and dim.lower() in sql_lower:
+                bonus += 0.03
+
+        # Бонус за семантический фрейм
+        if semantic_frame:
+            subject = str(semantic_frame.get("subject") or "").lower()
+            metric = str(semantic_frame.get("metric_intent") or "").lower()
+            if subject and subject in sql_lower:
+                bonus += 0.03
+            if metric == "count" and re.search(r"\bcount\s*\(", sql_lower):
+                bonus += 0.03
+            elif metric == "sum" and re.search(r"\bsum\s*\(", sql_lower):
+                bonus += 0.03
+            elif metric == "avg" and re.search(r"\bavg\s*\(", sql_lower):
+                bonus += 0.03
+        return bonus
+
     def get_similar(
         self,
         user_input: str,
         strategy: str = "",
         n: int = 2,
         min_similarity: float = 0.15,
+        *,
+        semantic_frame: dict[str, Any] | None = None,
+        fact_dim_pair: tuple[str, str] | None = None,
     ) -> list[dict]:
         """Найти n наиболее похожих успешных запросов.
 
@@ -98,10 +146,13 @@ class FewShotRetriever:
             strategy: SQL-стратегия (simple_select, fact_dim_join и т.д.) — для фильтрации.
             n: Количество примеров.
             min_similarity: Минимальный порог similarity (Jaccard).
+            semantic_frame: Семантический фрейм запроса (subject/metric_intent) для бонусов.
+            fact_dim_pair: Пара (fact_table, dim_table) для бонусов.
 
         Returns:
-            Список {"user_input": str, "sql": str} отсортированный по релевантности.
+            Список {"user_input": str, "sql": str, "similarity": float} по релевантности.
         """
+        self._last_similarities = []
         candidates = self._load_successful_queries()
         if not candidates:
             return []
@@ -114,16 +165,29 @@ class FewShotRetriever:
         for entry in candidates:
             entry_tokens = _tokenize(entry["user_input"])
             score = _jaccard_similarity(query_tokens, entry_tokens)
-            if score >= min_similarity:
-                # Небольшой бонус если стратегия соответствует паттернам в SQL
-                if strategy and strategy in ("fact_dim_join", "dim_fact_join"):
-                    sql_lower = entry["sql"].lower()
-                    if "distinct on" in sql_lower or "cte" in sql_lower or "with " in sql_lower:
-                        score += 0.05
-                scored.append((score, entry))
+            if score < min_similarity:
+                continue
+            sql_lower = entry["sql"].lower()
+            score += self._scoring_bonus(
+                sql_lower,
+                strategy=strategy,
+                semantic_frame=semantic_frame,
+                fact_dim_pair=fact_dim_pair,
+            )
+            scored.append((score, entry))
 
         scored.sort(key=lambda x: -x[0])
-        return [entry for _, entry in scored[:n]]
+        top = scored[:n]
+        self._last_similarities = [round(s, 3) for s, _ in top]
+        return [
+            {**entry, "similarity": round(s, 3)}
+            for s, entry in top
+        ]
+
+    @property
+    def last_similarities(self) -> list[float]:
+        """Similarities последнего вызова get_similar — для evidence_trace."""
+        return list(self._last_similarities)
 
     def format_for_prompt(self, examples: list[dict]) -> str:
         """Форматировать примеры для вставки в промпт sql_writer."""

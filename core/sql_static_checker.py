@@ -35,6 +35,9 @@ class StaticCheckResult:
     is_valid: bool = True
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Если soft-fix произвёл изменения — здесь лежит исправленный SQL.
+    # Поле заполняется только при успешном auto-fix (без ошибок).
+    fixed_sql: str | None = None
 
     def add_error(self, msg: str) -> None:
         self.errors.append(msg)
@@ -54,6 +57,61 @@ class StaticCheckResult:
             lines.append("Предупреждения:")
             lines.extend(f"  ⚠ {w}" for w in self.warnings)
         return "\n".join(lines) if lines else "OK"
+
+
+# --- Direction 3: soft-fix транслитерация кириллических алиасов ---
+
+# Упрощённая схема транслитерации ГОСТ-подобная.
+_TRANSLIT_MAP = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def _transliterate_identifier(alias: str) -> str:
+    """Транслитерировать кириллицу в латиницу + очистить небезопасные символы."""
+    out_chars: list[str] = []
+    for ch in alias:
+        lower = ch.lower()
+        if lower in _TRANSLIT_MAP:
+            repl = _TRANSLIT_MAP[lower]
+            if ch.isupper() and repl:
+                repl = repl[0].upper() + repl[1:]
+            out_chars.append(repl)
+        else:
+            out_chars.append(ch)
+    result = "".join(out_chars)
+    result = re.sub(r"[^A-Za-z0-9_]+", "_", result).strip("_")
+    if not result or not re.match(r"[A-Za-z_]", result[0]):
+        result = "alias_" + result
+    return result
+
+
+def _soft_fix_cyrillic_aliases(sql: str) -> tuple[str, list[str]]:
+    """Применить транслитерацию ко всем кириллическим AS-алиасам.
+
+    Returns:
+        (исправленный_sql, список_замен).
+    """
+    replacements: list[str] = []
+    alias_pattern = re.compile(
+        r'\bAS\s+(?:"([^"]+)"|\'([^\']+)\'|([^\s,\)]+))',
+        re.IGNORECASE,
+    )
+
+    def _replace(match: re.Match) -> str:
+        alias_raw = match.group(1) or match.group(2) or match.group(3) or ""
+        if not _CYRILLIC_RE.search(alias_raw):
+            return match.group(0)
+        fixed = _transliterate_identifier(alias_raw)
+        replacements.append(f"{alias_raw} → {fixed}")
+        return f"AS {fixed}"
+
+    new_sql = alias_pattern.sub(_replace, sql)
+    return new_sql, replacements
 
 
 def _extract_table_aliases(parsed) -> dict[str, str]:
@@ -486,6 +544,141 @@ def _check_order_by_aliases(sql: str, result: StaticCheckResult) -> None:
         )
 
 
+def _check_distinct_in_final_select(sql: str, result: StaticCheckResult) -> None:
+    """SELECT DISTINCT в финальной проекции запрещён правилами агента.
+
+    CTE и подзапросы с DISTINCT разрешены (они часто нужны для dim-агрегации).
+    Проверяем только самый внешний SELECT после CTE-блока.
+    """
+    outer = _strip_ctes(sql)
+    # SELECT DISTINCT могут сопровождать whitespace + возможно комментарии.
+    if re.match(r"(?i)^\s*SELECT\s+DISTINCT\b", outer):
+        result.add_error(
+            "SELECT DISTINCT в финальной проекции запрещён. "
+            "Если нужно устранить дубли — используй GROUP BY или CTE с агрегатами."
+        )
+
+
+def _dtype_bucket(dtype: str) -> str:
+    """Свести pg/gp dtype к укрупнённому bucket для сравнения с литералом."""
+    d = (dtype or "").lower().strip()
+    if not d:
+        return ""
+    if d.startswith("int") or d in {"bigint", "smallint", "integer", "serial", "bigserial"}:
+        return "int"
+    if "numeric" in d or "decimal" in d or "float" in d or "double" in d or "real" in d:
+        return "num"
+    if "char" in d or d == "text":
+        return "text"
+    if "date" in d or "time" in d:
+        return "date"
+    if "bool" in d:
+        return "bool"
+    if "json" in d:
+        return "json"
+    return d
+
+
+def _literal_bucket(literal: str) -> str:
+    """Определить тип литерала из WHERE-клаузы."""
+    lit = literal.strip()
+    if not lit:
+        return ""
+    if lit.lower() in {"true", "false"}:
+        return "bool"
+    if lit.lower() == "null":
+        return ""
+    # Строка в одинарных кавычках — может быть text или date
+    if lit.startswith("'") and lit.endswith("'"):
+        inner = lit[1:-1]
+        # ISO-подобная дата YYYY-MM-DD или timestamp
+        if re.match(r"^\d{4}-\d{2}-\d{2}(\s\d{2}:\d{2}:\d{2})?$", inner):
+            return "date"
+        return "text"
+    # Числа
+    if re.match(r"^-?\d+$", lit):
+        return "int"
+    if re.match(r"^-?\d+\.\d+$", lit):
+        return "num"
+    return ""
+
+
+def _check_type_compatibility(
+    sql: str, schema_loader, result: StaticCheckResult
+) -> None:
+    """Быстрая проверка типов в WHERE: dtype колонки vs тип литерала.
+
+    Работает на простых паттернах `<col> <op> <literal>`, где col — qualified
+    alias.col или schema.table.col. Не пытаемся парсить подзапросы.
+    """
+    if schema_loader is None:
+        return
+
+    raw_tables = _extract_tables_from_sql(sql)
+    real_tables: dict[tuple[str, str], dict[str, str]] = {}
+    for schema, table in raw_tables:
+        cols_df = schema_loader.get_table_columns(schema, table)
+        if cols_df.empty:
+            continue
+        real_tables[(schema, table)] = {
+            str(r["column_name"]).lower(): str(r.get("dType", "") or "")
+            for _, r in cols_df.iterrows()
+        }
+
+    if not real_tables:
+        return
+
+    alias_to_table = _build_alias_to_table_map(sql, real_tables)
+
+    # <alias>.<col> <op> <literal>
+    where_match = re.search(
+        r"(?i)\bWHERE\b(.+?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bHAVING\b|;|$)",
+        sql, re.DOTALL,
+    )
+    if not where_match:
+        return
+    where_clause = where_match.group(1)
+
+    pat = re.compile(
+        r"([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\s*"
+        r"(=|!=|<>|<=|>=|<|>)\s*"
+        r"(\'[^\']*\'|-?\d+(?:\.\d+)?|TRUE|FALSE|NULL)",
+        re.IGNORECASE,
+    )
+    issues: list[str] = []
+    for m in pat.finditer(where_clause):
+        alias = m.group(1).lower()
+        col = m.group(2).lower()
+        literal = m.group(4)
+        tbl_key = alias_to_table.get(alias)
+        if not tbl_key:
+            continue
+        dtype = real_tables.get(tbl_key, {}).get(col, "")
+        col_b = _dtype_bucket(dtype)
+        lit_b = _literal_bucket(literal)
+        if not col_b or not lit_b:
+            continue
+        # Допустимые совместимости:
+        compatible_pairs = {
+            ("int", "int"), ("int", "num"),
+            ("num", "int"), ("num", "num"),
+            ("text", "text"),
+            ("date", "date"), ("date", "text"),  # '2024-01-01' → date
+            ("bool", "bool"),
+        }
+        if (col_b, lit_b) not in compatible_pairs:
+            issues.append(
+                f"{alias}.{col} ({dtype}) {m.group(3)} {literal} — несовместимые типы ({col_b} vs {lit_b})"
+            )
+
+    if issues:
+        result.add_error(
+            "Несовместимые типы в WHERE: "
+            + "; ".join(issues[:3])
+            + (". Приведи литерал к типу колонки." if len(issues) <= 3 else f" (+ещё {len(issues)-3}).")
+        )
+
+
 def _check_allowed_tables(
     sql: str,
     allowed_tables: list[str],
@@ -534,6 +727,8 @@ def check_sql(
     schema_loader=None,
     check_columns: bool = True,
     allowed_tables: list[str] | None = None,
+    *,
+    auto_fix_cyrillic: bool = True,
 ) -> StaticCheckResult:
     """Выполнить полный набор статических проверок SQL.
 
@@ -542,6 +737,9 @@ def check_sql(
         schema_loader: SchemaLoader для валидации колонок. None → колонки не проверяются.
         check_columns: Включить проверку колонок против каталога.
         allowed_tables: Белый список "schema.table". None → проверка таблиц пропускается.
+        auto_fix_cyrillic: Если True — кириллические AS-алиасы транслитерируются и
+            сохраняются в `result.fixed_sql` (без ошибки). Если False — возвращается
+            ошибка как прежде.
 
     Returns:
         StaticCheckResult с ошибками и предупреждениями.
@@ -552,6 +750,18 @@ def check_sql(
         result.add_error("SQL пустой.")
         return result
 
+    # Soft-fix: транслитерируем кириллицу до остальных проверок.
+    if auto_fix_cyrillic:
+        fixed_sql, replacements = _soft_fix_cyrillic_aliases(sql)
+        if replacements:
+            result.fixed_sql = fixed_sql
+            result.add_warning(
+                "Кириллические алиасы транслитерированы: "
+                + ", ".join(replacements[:5])
+                + (f" (+ещё {len(replacements) - 5})" if len(replacements) > 5 else "")
+            )
+            sql = fixed_sql  # все дальнейшие проверки работают с исправленной версией
+
     # 0. Белый список таблиц — критическая проверка (до всего остального)
     if allowed_tables:
         try:
@@ -559,11 +769,17 @@ def check_sql(
         except Exception as e:
             logger.warning("StaticChecker: ошибка проверки allowed_tables: %s", e)
 
-    # 1. Кириллические алиасы — жёсткая ошибка
+    # 1. Кириллические алиасы — жёсткая ошибка, если остались
     _check_cyrillic_aliases(sql, result)
 
     # 2. SELECT * — жёсткая ошибка (запрещено правилами агента)
     _check_select_star(sql, result)
+
+    # 2a. SELECT DISTINCT в финальной проекции — жёсткая ошибка
+    try:
+        _check_distinct_in_final_select(sql, result)
+    except Exception as e:
+        logger.warning("StaticChecker: ошибка проверки DISTINCT: %s", e)
 
     # 3. Колонки против каталога — ошибка если найдены галлюцинации
     if check_columns and schema_loader is not None:
@@ -572,6 +788,15 @@ def check_sql(
         except Exception as e:
             logger.warning("StaticChecker: ошибка проверки колонок: %s", e)
             # Не блокируем — каталог мог быть недоступен
+
+    # 3a. Совместимость типов в WHERE — ошибка при явном несоответствии.
+    # Независима от check_columns: type-check опирается только на dtype,
+    # не на полный список колонок.
+    if schema_loader is not None:
+        try:
+            _check_type_compatibility(sql, schema_loader, result)
+        except Exception as e:
+            logger.warning("StaticChecker: ошибка type-check: %s", e)
 
     # 4. GROUP BY completeness — предупреждение/ошибка
     try:

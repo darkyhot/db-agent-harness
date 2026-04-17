@@ -15,16 +15,27 @@ class TestCyrillicAliases:
         assert result.is_valid
         assert not result.errors
 
-    def test_cyrillic_alias_caught(self):
+    def test_cyrillic_alias_autofixed_by_default(self):
+        """Direction 3: soft-fix транслитерирует алиас и не блокирует SQL."""
         sql = "SELECT region AS регион FROM dm.sales"
         result = check_sql(sql, check_columns=False)
+        # По умолчанию — soft-fix: warning + fixed_sql, но is_valid
+        assert result.is_valid
+        assert result.fixed_sql is not None
+        assert "регион" not in result.fixed_sql
+        assert "AS region" in result.fixed_sql
+
+    def test_cyrillic_alias_hard_error_when_autofix_disabled(self):
+        sql = "SELECT region AS регион FROM dm.sales"
+        result = check_sql(sql, check_columns=False, auto_fix_cyrillic=False)
         assert not result.is_valid
         assert any("кириллица" in e.lower() or "алиас" in e.lower() for e in result.errors)
 
-    def test_cyrillic_alias_with_quotes_caught(self):
+    def test_cyrillic_alias_with_quotes_autofixed(self):
         sql = 'SELECT COUNT(*) AS "выручка" FROM dm.sales'
         result = check_sql(sql, check_columns=False)
-        assert not result.is_valid
+        assert result.is_valid
+        assert result.fixed_sql is not None
 
     def test_quoted_cyrillic_table_name_not_flagged(self):
         # Кириллица в значениях WHERE — не алиас, не должна флагаться
@@ -32,11 +43,13 @@ class TestCyrillicAliases:
         result = check_sql(sql, check_columns=False)
         assert result.is_valid
 
-    def test_multiple_cyrillic_aliases_all_caught(self):
+    def test_multiple_cyrillic_aliases_all_autofixed(self):
         sql = "SELECT a AS первый, b AS второй FROM t"
         result = check_sql(sql, check_columns=False)
-        assert not result.is_valid
-        assert len(result.errors) >= 1  # хотя бы одна ошибка
+        assert result.is_valid
+        assert result.fixed_sql is not None
+        assert "первый" not in result.fixed_sql
+        assert "второй" not in result.fixed_sql
 
 
 # ---------------------------------------------------------------------------
@@ -274,3 +287,93 @@ class TestOrderByAliases:
         result = check_sql(sql, check_columns=False)
         ob_errors = [e for e in result.errors if "ORDER BY" in e]
         assert not ob_errors
+
+
+# ---------------------------------------------------------------------------
+# Direction 3: SELECT DISTINCT в финальной проекции
+# ---------------------------------------------------------------------------
+
+class TestDistinctInFinalSelect:
+    def test_distinct_in_outer_select_is_error(self):
+        sql = "SELECT DISTINCT region, SUM(amount) FROM dm.sales GROUP BY region"
+        result = check_sql(sql, check_columns=False)
+        assert not result.is_valid
+        assert any("DISTINCT" in e for e in result.errors)
+
+    def test_distinct_in_cte_is_ok(self):
+        sql = (
+            "WITH agg AS (SELECT DISTINCT client_id FROM dm.sales) "
+            "SELECT client_id FROM agg"
+        )
+        result = check_sql(sql, check_columns=False)
+        assert not any("DISTINCT" in e for e in result.errors)
+
+    def test_plain_select_no_distinct_ok(self):
+        sql = "SELECT region, COUNT(*) AS cnt FROM dm.sales GROUP BY region"
+        result = check_sql(sql, check_columns=False)
+        assert not any("DISTINCT" in e for e in result.errors)
+
+
+# ---------------------------------------------------------------------------
+# Direction 3: Type compatibility в WHERE
+# ---------------------------------------------------------------------------
+
+class _FakeSchemaLoader:
+    """Минимальный schema_loader для type-check."""
+
+    def __init__(self, catalog):
+        # catalog: {("schema","table"): [{"column_name", "dType"}, ...]}
+        import pandas as pd
+        self._catalog = {
+            key: pd.DataFrame(cols) for key, cols in catalog.items()
+        }
+
+    def get_table_columns(self, schema, table):
+        import pandas as pd
+        return self._catalog.get((schema, table), pd.DataFrame(
+            columns=["column_name", "dType"]
+        ))
+
+
+class TestTypeCompatibility:
+    def test_int_col_vs_text_literal_errors(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "clients"): [
+                {"column_name": "id", "dType": "int8"},
+                {"column_name": "name", "dType": "text"},
+            ]
+        })
+        sql = "SELECT c.id FROM dm.clients c WHERE c.id = 'abc'"
+        result = check_sql(sql, schema_loader=loader, check_columns=False)
+        assert not result.is_valid
+        assert any("Несовместимые типы" in e for e in result.errors)
+
+    def test_text_col_vs_text_literal_ok(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "clients"): [
+                {"column_name": "name", "dType": "varchar(255)"},
+            ]
+        })
+        sql = "SELECT c.name FROM dm.clients c WHERE c.name = 'Иванов'"
+        result = check_sql(sql, schema_loader=loader, check_columns=False)
+        assert not any("Несовместимые" in e for e in result.errors)
+
+    def test_date_col_vs_iso_string_ok(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "sales"): [
+                {"column_name": "report_dt", "dType": "date"},
+            ]
+        })
+        sql = "SELECT s.report_dt FROM dm.sales s WHERE s.report_dt = '2024-01-01'"
+        result = check_sql(sql, schema_loader=loader, check_columns=False)
+        assert not any("Несовместимые" in e for e in result.errors)
+
+    def test_int_col_vs_int_literal_ok(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "clients"): [
+                {"column_name": "id", "dType": "int8"},
+            ]
+        })
+        sql = "SELECT c.id FROM dm.clients c WHERE c.id = 42"
+        result = check_sql(sql, schema_loader=loader, check_columns=False)
+        assert not any("Несовместимые" in e for e in result.errors)

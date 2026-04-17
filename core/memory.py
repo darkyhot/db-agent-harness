@@ -272,6 +272,63 @@ class MemoryManager:
         except Exception as e:
             logger.warning("Ошибка записи SQL-аудита: %s", e)
 
+    def iter_sql_audit(
+        self,
+        *,
+        status: str | None = "success",
+        max_retry_count: int | None = 0,
+        min_sql_length: int = 20,
+        min_row_count: int | None = 1,
+        max_row_count: int | None = None,
+        days: int | None = 90,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Перебрать записи sql_audit всех сессий с фильтрами.
+
+        Публичное API поверх JSON-хранилища: заменяет ранее ошибочно
+        использовавшийся `_connect()` (его в JSON-реализации нет).
+
+        Args:
+            status: Требуемый статус ('success', 'empty', 'error'). None — не фильтровать.
+            max_retry_count: Максимум retry_count (0 = только first-try). None — не фильтровать.
+            min_sql_length: Минимальная длина sql (по умолчанию 20).
+            min_row_count: Минимальный row_count. None — не фильтровать.
+            max_row_count: Максимальный row_count. None — не фильтровать.
+            days: Срок давности (от сегодня). None — не фильтровать по времени.
+            limit: Максимум записей в ответе. None — все.
+
+        Returns:
+            Список записей audit, отсортированных по timestamp DESC.
+        """
+        cutoff = ""
+        if days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        sessions = self._load_sessions()
+        entries: list[dict[str, Any]] = []
+        for sid, data in sessions.items():
+            for entry in data.get("sql_audit", []):
+                if status is not None and entry.get("status") != status:
+                    continue
+                if max_retry_count is not None and int(entry.get("retry_count", 0)) > max_retry_count:
+                    continue
+                sql = str(entry.get("sql") or "")
+                if len(sql) < min_sql_length:
+                    continue
+                rc = int(entry.get("row_count", 0))
+                if min_row_count is not None and rc < min_row_count:
+                    continue
+                if max_row_count is not None and rc > max_row_count:
+                    continue
+                if cutoff and entry.get("timestamp", "") < cutoff:
+                    continue
+                entries.append(dict(entry))
+
+        entries.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+        if limit is not None:
+            entries = entries[: max(0, int(limit))]
+        return entries
+
     def get_sql_quality_metrics(self, days: int = 30) -> dict[str, Any]:
         """Получить метрики качества генерации SQL за указанный период.
 
@@ -335,6 +392,123 @@ class MemoryManager:
             "avg_duration_ms": round(total_duration / total, 0),
             "max_duration_ms": max_duration,
             "error_distribution": error_dist,
+        }
+
+    # ------------------------------------------------------------------
+    # Row-count sanity (Direction 3.3)
+    # ------------------------------------------------------------------
+
+    _ROW_COUNT_STATS_KEY = "row_count_stats"
+    _ROW_COUNT_MAX_SAMPLES = 200
+
+    @staticmethod
+    def _row_count_bucket(subject: str | None, metric: str | None) -> str:
+        """Сформировать ключ бакета по (subject, metric) для row_count_stats."""
+        s = (subject or "").strip().lower() or "_"
+        m = (metric or "").strip().lower() or "_"
+        return f"{s}|{m}"
+
+    @staticmethod
+    def _percentile(values: list[int], q: float) -> float:
+        """Линейная интерполяция перцентиля без numpy."""
+        if not values:
+            return 0.0
+        sorted_vals = sorted(values)
+        if len(sorted_vals) == 1:
+            return float(sorted_vals[0])
+        k = (len(sorted_vals) - 1) * q
+        lo = int(k)
+        hi = min(lo + 1, len(sorted_vals) - 1)
+        frac = k - lo
+        return float(sorted_vals[lo]) * (1 - frac) + float(sorted_vals[hi]) * frac
+
+    def record_row_count_sample(
+        self, subject: str | None, metric: str | None, row_count: int,
+    ) -> None:
+        """Записать наблюдение row_count в распределение по (subject, metric).
+
+        Хранится в long_term_memory.json под `row_count_stats`. Скользящее окно
+        из последних `_ROW_COUNT_MAX_SAMPLES` значений.
+        """
+        if row_count is None or row_count < 0:
+            return
+        bucket = self._row_count_bucket(subject, metric)
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            ltm = self._load_ltm()
+            stats_raw = ltm.get(self._ROW_COUNT_STATS_KEY)
+            stats: dict[str, Any]
+            if isinstance(stats_raw, dict) and "value" in stats_raw and isinstance(stats_raw["value"], dict):
+                stats = dict(stats_raw["value"])
+            elif isinstance(stats_raw, dict):
+                stats = dict(stats_raw)
+            else:
+                stats = {}
+
+            entry = stats.get(bucket) or {}
+            samples: list[int] = list(entry.get("samples", []))
+            samples.append(int(row_count))
+            if len(samples) > self._ROW_COUNT_MAX_SAMPLES:
+                samples = samples[-self._ROW_COUNT_MAX_SAMPLES:]
+            entry["samples"] = samples
+            entry["p95"] = self._percentile(samples, 0.95)
+            entry["p50"] = self._percentile(samples, 0.50)
+            entry["n"] = len(samples)
+            entry["updated_at"] = now
+            stats[bucket] = entry
+
+            ltm[self._ROW_COUNT_STATS_KEY] = {"value": stats, "updated_at": now}
+            self._save_ltm(ltm)
+        except Exception as e:
+            logger.warning("row_count_stats: не удалось сохранить наблюдение: %s", e)
+
+    def check_row_count_suspicion(
+        self,
+        subject: str | None,
+        metric: str | None,
+        row_count: int,
+        *,
+        explosion_factor: float = 10.0,
+        min_samples: int = 5,
+    ) -> dict[str, Any]:
+        """Определить, является ли текущий row_count подозрительно большим.
+
+        Args:
+            subject: semantic_frame.subject.
+            metric: semantic_frame.metric_intent.
+            row_count: количество строк из последнего запроса.
+            explosion_factor: во сколько раз больше p95 трактовать как взрыв.
+            min_samples: сколько наблюдений нужно, чтобы доверять p95.
+
+        Returns:
+            dict: {"is_suspect": bool, "p95": float, "n": int, "ratio": float}.
+        """
+        bucket = self._row_count_bucket(subject, metric)
+        try:
+            ltm = self._load_ltm()
+            stats_raw = ltm.get(self._ROW_COUNT_STATS_KEY)
+            if isinstance(stats_raw, dict) and "value" in stats_raw and isinstance(stats_raw["value"], dict):
+                stats = stats_raw["value"]
+            elif isinstance(stats_raw, dict):
+                stats = stats_raw
+            else:
+                stats = {}
+        except Exception as e:
+            logger.warning("row_count_stats: ошибка чтения: %s", e)
+            return {"is_suspect": False, "p95": 0.0, "n": 0, "ratio": 0.0}
+
+        entry = stats.get(bucket) or {}
+        n = int(entry.get("n", 0))
+        p95 = float(entry.get("p95", 0.0))
+        if n < min_samples or p95 <= 0:
+            return {"is_suspect": False, "p95": p95, "n": n, "ratio": 0.0}
+        threshold = p95 * explosion_factor
+        ratio = float(row_count) / max(p95, 1.0)
+        return {
+            "is_suspect": row_count > threshold,
+            "p95": p95,
+            "n": n,
+            "ratio": ratio,
         }
 
     # ------------------------------------------------------------------

@@ -69,3 +69,23 @@ def test_where_resolver_adds_factual_outflow_task_subtype(tmp_path):
     assert any("task_subtype ILIKE '%оттоку%'" in cond for cond in result["conditions"])
     assert result["applied_rules"]
     assert any(cands[0]["column"] == "task_subtype" for cands in result["filter_candidates"].values() if cands)
+
+
+def test_where_resolver_respects_explicit_column_clarification(tmp_path):
+    loader = _loader(tmp_path)
+    loader.ensure_value_profiles()
+    frame = derive_semantic_frame(
+        "Посчитай количество задач по фактическому оттоку",
+        schema_loader=loader,
+    )
+    result = resolve_where(
+        user_input="Посчитай количество задач по фактическому оттоку\nУточнение пользователя: task_subtype",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.uzp_data_split_mzp_sale_funnel": {"select": ["task_code"], "aggregate": ["task_code"]}},
+        selected_tables=["dm.uzp_data_split_mzp_sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+    )
+    assert result["needs_clarification"] is False
+    assert any("task_subtype" in cond for cond in result["conditions"])

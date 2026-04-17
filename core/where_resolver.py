@@ -17,6 +17,16 @@ def _add_unique(conditions: list[str], condition: str) -> None:
         conditions.append(condition)
 
 
+def _explicit_column_choice(user_input: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Если пользователь явно назвал колонку, выбрать соответствующего кандидата."""
+    normalized = str(user_input or "").lower().replace("ё", "е")
+    for candidate in candidates:
+        column = str(candidate.get("column") or "").lower().replace("ё", "е")
+        if column and column in normalized:
+            return candidate
+    return None
+
+
 def resolve_where(
     *,
     user_input: str,
@@ -51,16 +61,28 @@ def resolve_where(
                 continue
             filtered.append(candidate)
         candidates = filtered or candidates
-        best = candidates[0]
-        second = candidates[1] if len(candidates) > 1 else None
-        score_gap = float(best.get("score", 0.0)) - float((second or {}).get("score", 0.0))
+        explicit_choice = _explicit_column_choice(user_input, candidates)
+        if explicit_choice is not None:
+            best = explicit_choice
+            second = None
+            score_gap = 999.0
+        else:
+            best = candidates[0]
+            second = candidates[1] if len(candidates) > 1 else None
+            score_gap = float(best.get("score", 0.0)) - float((second or {}).get("score", 0.0))
         if best.get("confidence") == "low":
             continue
         if second and best.get("confidence") == "medium" and score_gap < 15.0:
+            best_label = f"`{best.get('column')}`"
+            second_label = f"`{second.get('column')}`"
+            if best.get("description"):
+                best_label += f" ({best.get('description')})"
+            if second.get("description"):
+                second_label += f" ({second.get('description')})"
             clarification_message = (
                 "Найдено несколько близких вариантов фильтра. "
                 f"Уточните, пожалуйста, по какому признаку фильтровать: "
-                f"`{best.get('column')}` или `{second.get('column')}`?"
+                f"{best_label} или {second_label}?"
             )
             reasoning.append(f"ambiguity:{request_id}:gap={score_gap:.1f}")
             break

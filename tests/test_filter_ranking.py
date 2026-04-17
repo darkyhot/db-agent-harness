@@ -13,20 +13,22 @@ def _loader(tmp_path):
         "grain": ["task"],
     })
     attrs_df = pd.DataFrame({
-        "schema_name": ["dm"] * 5,
-        "table_name": ["sale_funnel"] * 5,
-        "column_name": ["report_dt", "task_code", "task_subtype", "is_outflow", "segment_name"],
-        "dType": ["date", "text", "text", "int4", "text"],
+        "schema_name": ["dm"] * 7,
+        "table_name": ["sale_funnel"] * 7,
+        "column_name": ["report_dt", "task_code", "task_subtype", "is_outflow", "segment_name", "task_category", "task_type"],
+        "dType": ["date", "text", "text", "int4", "text", "text", "text"],
         "description": [
             "Отчетная дата",
             "Код задачи",
             "Подтип задачи",
             "Признак подтверждения оттока",
             "Сегмент клиента",
+            "Категория задачи",
+            "Тип задачи",
         ],
-        "is_primary_key": [False, False, False, False, False],
-        "unique_perc": [0.5, 90.0, 10.0, 2.0, 5.0],
-        "not_null_perc": [99.0, 100.0, 100.0, 100.0, 99.0],
+        "is_primary_key": [False, False, False, False, False, False, False],
+        "unique_perc": [0.5, 90.0, 10.0, 2.0, 5.0, 0.02, 0.11],
+        "not_null_perc": [99.0, 100.0, 100.0, 100.0, 99.0, 100.0, 100.0],
     })
     tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
     attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
@@ -69,3 +71,39 @@ def test_filter_ranking_supports_generic_explicit_filter(tmp_path):
     top = ranked["explicit:0"][0]
     assert top["column"] == "segment_name"
     assert "retail" in top["condition"].lower()
+
+
+def test_filter_ranking_prefers_task_subtype_over_dense_task_fields(tmp_path):
+    loader = _loader(tmp_path)
+    frame = derive_semantic_frame(
+        "Посчитай количество задач по фактическому оттоку",
+        schema_loader=loader,
+    )
+    ranked = rank_filter_candidates(
+        user_input="Посчитай количество задач по фактическому оттоку",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+
+    top = next(iter(ranked.values()))[0]
+    assert top["column"] == "task_subtype"
+
+
+def test_filter_ranking_prefers_explicit_column_reference(tmp_path):
+    loader = _loader(tmp_path)
+    frame = derive_semantic_frame(
+        "Посчитай количество задач по фактическому оттоку",
+        schema_loader=loader,
+    )
+    ranked = rank_filter_candidates(
+        user_input="Посчитай количество задач по фактическому оттоку Уточнение пользователя: task_subtype",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+
+    top = next(iter(ranked.values()))[0]
+    assert top["column"] == "task_subtype"

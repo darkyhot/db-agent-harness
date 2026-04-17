@@ -56,6 +56,16 @@ def _profile_value_match(profile: dict[str, Any], query_text: str) -> tuple[str 
     return best_value, best_score
 
 
+def _column_reference_score(user_input: str, column: str, description: str) -> float:
+    """Высокий бонус, если пользователь явно назвал колонку или её описание."""
+    normalized = _normalize_text(user_input)
+    column_norm = _normalize_text(column)
+    if column_norm and column_norm in normalized:
+        return 120.0
+    desc_score = _text_score(user_input, "", description)
+    return 35.0 if desc_score >= 14.0 else 0.0
+
+
 def _escape_sql_literal(value: str) -> str:
     return str(value).replace("'", "''")
 
@@ -151,6 +161,10 @@ def rank_filter_candidates(
             semantics = schema_loader.get_column_semantics(schema, table, column)
             semantic_class = str(semantics.get("semantic_class", "") or "")
             semantic_tags = {str(v) for v in (semantics.get("semantic_tags") or [])}
+            try:
+                unique_perc = float(row.get("unique_perc", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                unique_perc = 0.0
 
             for request in requests:
                 query_text = str(request.get("query_text") or request.get("value") or "")
@@ -167,6 +181,7 @@ def rank_filter_candidates(
                         score += 16.0
                     if request.get("column_hint"):
                         score += _text_score(str(request.get("column_hint") or ""), column, description)
+                    score += _column_reference_score(user_input, column, description)
                     matched_value, value_score = _profile_value_match(profile, query_text)
                     score += value_score
                     if matched_value and _stem(request.get("query_text") or "") in _stem(matched_value):
@@ -191,6 +206,11 @@ def rank_filter_candidates(
                             token_count = len([tok for tok in _tokenize(query_text) if len(tok) >= 4])
                             if token_count >= 2:
                                 score += 18.0
+                                # Для узких смысловых фраз предпочитаем более "богатые" categorical-поля.
+                                # dense/низкокардинальные атрибуты вроде category/type обычно слишком грубые.
+                                score += min(unique_perc * 5.0, 18.0)
+                                if "dense" in semantic_tags:
+                                    score -= 12.0
                     matched_value, value_score = _profile_value_match(profile, query_text)
                     score += value_score
                     if matched_value:
@@ -212,6 +232,7 @@ def rank_filter_candidates(
                     "schema": schema,
                     "table": table,
                     "column": column,
+                    "description": description,
                     "semantic_class": semantic_class,
                     "operator": operator,
                     "value": candidate_value,

@@ -119,6 +119,21 @@ class SchemaLoader:
         self._semantic_lexicon: dict[str, Any] | None = None
         self._rule_registry: dict[str, Any] | None = None
 
+    @staticmethod
+    def _load_json_artifact(path: Path) -> dict[str, Any] | None:
+        """Загрузить JSON-артефакт как dict; вернуть None если файла нет/он битый."""
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            logger.warning("Не удалось прочитать JSON-артефакт %s, пересоздаю", path)
+            return None
+        if not isinstance(data, dict):
+            logger.warning("JSON-артефакт %s имеет неожиданный формат, пересоздаю", path)
+            return None
+        return data
+
     def _load_tables(self) -> pd.DataFrame:
         """Загрузить и закешировать tables_list.csv."""
         if self._tables_df is not None:
@@ -370,53 +385,43 @@ class SchemaLoader:
             return
 
         path = self._column_semantics_path()
-        generated = build_column_semantics(self.attrs_df)
-        persisted: dict[str, dict[str, Any]] = {}
-        if path.exists():
-            try:
-                persisted = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
-                persisted = {}
+        persisted = self._load_json_artifact(path)
+        if persisted is not None:
+            self._column_semantics = persisted
+            return
 
-        merged = dict(generated)
-        merged.update(persisted)
-        self._column_semantics = merged
-        path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        generated = build_column_semantics(self.attrs_df)
+        self._column_semantics = dict(generated)
+        path.write_text(json.dumps(self._column_semantics, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def ensure_table_semantics(self) -> None:
         """Построить и закешировать semantics таблиц."""
         if self._table_semantics is not None:
             return
 
-        self.ensure_column_semantics()
         path = self._table_semantics_path()
-        generated = build_table_semantics(self.tables_df, self.attrs_df, self._column_semantics or {})
-        persisted: dict[str, dict[str, Any]] = {}
-        if path.exists():
-            try:
-                persisted = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
-                persisted = {}
+        persisted = self._load_json_artifact(path)
+        if persisted is not None:
+            self._table_semantics = persisted
+            return
 
-        merged = dict(generated)
-        merged.update(persisted)
-        self._table_semantics = merged
-        path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.ensure_column_semantics()
+        generated = build_table_semantics(self.tables_df, self.attrs_df, self._column_semantics or {})
+        self._table_semantics = dict(generated)
+        path.write_text(json.dumps(self._table_semantics, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def ensure_value_profiles(self, db_manager: Any | None = None) -> None:
         """Построить и закешировать value profiles для фильтровых колонок."""
         if self._value_profiles is not None and db_manager is None:
             return
 
-        self.ensure_column_semantics()
         path = self._value_profiles_path()
-        persisted: dict[str, dict[str, Any]] = {}
-        if path.exists():
-            try:
-                persisted = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
-                persisted = {}
+        persisted = self._load_json_artifact(path)
+        if persisted is not None:
+            self._value_profiles = persisted
+            return
 
+        self.ensure_column_semantics()
         profiles: dict[str, dict[str, Any]] = {}
         candidates = discover_profile_candidates(self.attrs_df, self._column_semantics or {})
         for row in candidates:
@@ -434,58 +439,52 @@ class SchemaLoader:
             ) if db_manager is not None else {}
             profiles[key] = merge_profiles(metadata_profile, db_profile)
 
-        merged = dict(profiles)
-        merged.update(persisted)
-        # Если db_manager передан — локально пересчитываем кандидатов и даём им приоритет над старым кешем.
-        if db_manager is not None:
-            merged.update(profiles)
-        self._value_profiles = merged
-        path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._value_profiles = dict(profiles)
+        path.write_text(json.dumps(self._value_profiles, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def ensure_semantic_registry(self) -> None:
         """Построить и закешировать semantic lexicon и rule registry."""
         if self._semantic_lexicon is not None and self._rule_registry is not None:
             return
 
+        lex_path = self._semantic_lexicon_path()
+        rule_path = self._rule_registry_path()
+        persisted_lex = self._load_json_artifact(lex_path)
+        persisted_rules = self._load_json_artifact(rule_path)
+        if persisted_lex is not None:
+            self._semantic_lexicon = persisted_lex
+        if persisted_rules is not None:
+            self._rule_registry = persisted_rules
+        if persisted_lex is not None and persisted_rules is not None:
+            return
+
         self.ensure_column_semantics()
         self.ensure_table_semantics()
         self.ensure_value_profiles()
 
-        lex_path = self._semantic_lexicon_path()
-        rule_path = self._rule_registry_path()
-        persisted_lex: dict[str, Any] = {}
-        persisted_rules: dict[str, Any] = {}
-        if lex_path.exists():
-            try:
-                persisted_lex = json.loads(lex_path.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
-                persisted_lex = {}
-        if rule_path.exists():
-            try:
-                persisted_rules = json.loads(rule_path.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
-                persisted_rules = {}
+        if persisted_lex is None:
+            self._semantic_lexicon = build_semantic_lexicon(
+                self.tables_df,
+                self.attrs_df,
+                table_semantics=self._table_semantics or {},
+                column_semantics=self._column_semantics or {},
+                value_profiles=self._value_profiles or {},
+            )
+            lex_path.write_text(
+                json.dumps(self._semantic_lexicon, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
-        generated_lex = build_semantic_lexicon(
-            self.tables_df,
-            self.attrs_df,
-            table_semantics=self._table_semantics or {},
-            column_semantics=self._column_semantics or {},
-            value_profiles=self._value_profiles or {},
-        )
-        generated_rules = build_rule_registry(
-            self.attrs_df,
-            column_semantics=self._column_semantics or {},
-            value_profiles=self._value_profiles or {},
-        )
-        merged_lex = dict(generated_lex)
-        merged_lex.update(persisted_lex)
-        merged_rules = dict(generated_rules)
-        merged_rules.update(persisted_rules)
-        self._semantic_lexicon = merged_lex
-        self._rule_registry = merged_rules
-        lex_path.write_text(json.dumps(merged_lex, ensure_ascii=False, indent=2), encoding="utf-8")
-        rule_path.write_text(json.dumps(merged_rules, ensure_ascii=False, indent=2), encoding="utf-8")
+        if persisted_rules is None:
+            self._rule_registry = build_rule_registry(
+                self.attrs_df,
+                column_semantics=self._column_semantics or {},
+                value_profiles=self._value_profiles or {},
+            )
+            rule_path.write_text(
+                json.dumps(self._rule_registry, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     def get_value_profile(self, schema: str, table: str, column: str) -> dict[str, Any]:
         """Получить value profile для колонки.

@@ -24,6 +24,7 @@ from core.sql_static_checker import check_sql
 from core.sql_planner_deterministic import build_blueprint as _deterministic_blueprint
 from core.sql_builder import SqlBuilder as _SqlBuilder
 from core.sql_formatter import format_sql_safe as _format_sql
+from core.where_resolver import candidate_label as _candidate_label
 from graph.nodes.common import (
     BaseNodeMixin,
     ToolResult,
@@ -191,29 +192,32 @@ def _build_join_rule(strategy: str, join_spec: list[dict]) -> str:
 
 
 def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> str:
-    """Построить конкретный вопрос по фильтру из кандидатов where_resolution."""
+    """Построить конкретный вопрос по фильтру из кандидатов where_resolution.
+
+    Пропускает request_id, уже закрытые через user_filter_choices, и
+    подхватывает примеры значений (matched_example/example_values) из кандидата
+    через candidate_label(), чтобы пользователю было видно, почему каждая
+    колонка попала в кандидаты.
+    """
     where_resolution = where_resolution or {}
     filter_candidates = where_resolution.get("filter_candidates", {}) or {}
-    for _, candidates in filter_candidates.items():
+    user_choices = where_resolution.get("user_filter_choices", {}) or {}
+    for request_id, candidates in filter_candidates.items():
         if not candidates:
+            continue
+        if str(request_id) in user_choices:
             continue
         top = candidates[0]
         second = candidates[1] if len(candidates) > 1 else None
         if second:
-            left = f"`{top.get('column')}`"
-            right = f"`{second.get('column')}`"
-            if top.get("description"):
-                left += f" ({top.get('description')})"
-            if second.get("description"):
-                right += f" ({second.get('description')})"
+            left = _candidate_label(top)
+            right = _candidate_label(second)
             return (
                 "Найдено несколько близких вариантов фильтра. "
                 f"Уточните, пожалуйста, по какому признаку фильтровать: {left} или {right}?"
             )
         if top.get("column"):
-            label = f"`{top.get('column')}`"
-            if top.get("description"):
-                label += f" ({top.get('description')})"
+            label = _candidate_label(top)
             return (
                 "Уточните, пожалуйста, фильтр: "
                 f"нужно отфильтровать именно по полю {label}?"
@@ -273,6 +277,7 @@ class SqlPipelineNodes:
             user_hints=state.get("user_hints", {}) or {},
             schema_loader=self.schema,
             semantic_frame=state.get("semantic_frame", {}) or {},
+            user_filter_choices=state.get("user_filter_choices", {}) or {},
         )
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))

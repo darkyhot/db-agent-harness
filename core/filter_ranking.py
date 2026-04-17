@@ -76,6 +76,34 @@ def _known_terms_overlap_score(profile: dict[str, Any], query_text: str) -> floa
     return 0.0
 
 
+def _phrase_in_known_terms(profile: dict[str, Any], query_text: str) -> tuple[str | None, int]:
+    """Найти known_term/top_value, стем-токены которого полностью покрываются запросом.
+
+    Возвращает (значение, число стем-токенов) для самой «длинной» такой фразы.
+    Если ни одна фраза не покрывается целиком — (None, 0).
+
+    Используется как детерминированный тай-брейкер: если конкретное значение
+    колонки ("фактический отток") встречается в пользовательском запросе
+    целиком, колонка считается точным кандидатом по семантике значений.
+    """
+    query_stems = _stem_set(query_text)
+    if not query_stems:
+        return None, 0
+    best_value: str | None = None
+    best_len = 0
+    for value in list(profile.get("top_values", []) or []) + list(profile.get("known_terms", []) or []):
+        value_str = str(value).strip()
+        if not value_str:
+            continue
+        value_stems = _stem_set(value_str)
+        if not value_stems:
+            continue
+        if value_stems.issubset(query_stems) and len(value_stems) > best_len:
+            best_value = value_str
+            best_len = len(value_stems)
+    return best_value, best_len
+
+
 def _column_reference_score(user_input: str, column: str, description: str) -> float:
     """Высокий бонус, если пользователь явно назвал колонку или её описание."""
     normalized = _normalize_text(user_input)
@@ -195,6 +223,7 @@ def rank_filter_candidates(
                 candidate_value = request.get("value")
                 operator = str(request.get("operator") or request.get("preferred_operator") or "=").upper()
                 kind = str(request.get("kind") or "")
+                matched_example: str | None = None
 
                 if kind == "explicit_filter":
                     if "filter_candidate" in semantic_tags:
@@ -206,6 +235,7 @@ def rank_filter_candidates(
                     score += value_score
                     if matched_value and _stem(request.get("query_text") or "") in _stem(matched_value):
                         candidate_value = matched_value
+                        matched_example = matched_value
                         evidence.append(f"profile_value={matched_value}")
                     elif candidate_value is None:
                         candidate_value = query_text
@@ -234,8 +264,17 @@ def rank_filter_candidates(
                     matched_value, value_score = _profile_value_match(profile, query_text)
                     score += value_score
                     score += _known_terms_overlap_score(profile, query_text)
+                    phrase_value, phrase_len = _phrase_in_known_terms(profile, query_text)
+                    if phrase_len >= 2:
+                        score += 70.0
+                        evidence.append(f"known_term_phrase={phrase_value}")
+                        if not matched_value:
+                            matched_value = phrase_value
+                    elif phrase_len == 1 and not matched_value:
+                        matched_value = phrase_value
                     if matched_value:
                         candidate_value = matched_value
+                        matched_example = matched_value
                         evidence.append(f"value_match={matched_value}")
                     elif candidate_value is None:
                         candidate_value = query_text
@@ -250,6 +289,16 @@ def rank_filter_candidates(
                 final_confidence = "high" if explicit_column_choice else (
                     "high" if score >= 75.0 else ("medium" if score >= 45.0 else "low")
                 )
+                # Примеры значений колонки для пояснительных подписей в clarification-сообщениях.
+                # Отдельно от matched_example — используется как fallback, когда совпадения
+                # с пользовательской фразой нет, но хочется показать «характер» колонки.
+                example_values: list[str] = []
+                for _val in list(profile.get("top_values", []) or []) + list(profile.get("known_terms", []) or []):
+                    _val_str = str(_val).strip()
+                    if _val_str and _val_str not in example_values:
+                        example_values.append(_val_str)
+                    if len(example_values) >= 2:
+                        break
                 ranked[str(request.get("request_id"))].append({
                     "request_id": str(request.get("request_id")),
                     "request_kind": kind,
@@ -273,6 +322,8 @@ def rank_filter_candidates(
                     "value_source": "profile" if evidence else "query",
                     "confidence": final_confidence,
                     "column_key": key,
+                    "matched_example": matched_example,
+                    "example_values": example_values,
                 })
 
     for request_id, candidates in ranked.items():

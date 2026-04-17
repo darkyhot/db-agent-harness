@@ -33,6 +33,11 @@ class AgentState(TypedDict):
     clarification_message: str
     needs_disambiguation: bool
     disambiguation_options: list
+    # Явные выборы колонок пользователя на уточнения по фильтрам.
+    # {"request_id": "column_name"} — переживают рекурсивный повторный запуск
+    # графа из CLI, чтобы where_resolver закрыл соответствующий request_id без
+    # повторного вопроса.
+    user_filter_choices: dict[str, str]
     graph_iterations: int
     correction_examples: list
     join_risk_info: dict

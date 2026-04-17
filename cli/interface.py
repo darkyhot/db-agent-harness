@@ -62,6 +62,37 @@ def _status_print(msg: str, done: bool = False) -> None:
     sys.stdout.flush()
 
 
+def _match_clarification_to_choice(
+    clarification: str,
+    filter_candidates: dict,
+    already_resolved: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Сопоставить ответ пользователя с конкретным кандидатом из clarification.
+
+    Ищем первый request_id (не закрытый ранее), у которого в топ-2 кандидатах
+    имя колонки или описание совпадает (подстрочно, регистронезависимо) с
+    ответом пользователя. Возвращаем {request_id: column_name} или пустой
+    словарь, если однозначного соответствия не нашлось.
+    """
+    normalized = (clarification or "").strip().lower().replace("ё", "е")
+    if not normalized:
+        return {}
+    already_resolved = already_resolved or {}
+    for request_id, candidates in (filter_candidates or {}).items():
+        if str(request_id) in already_resolved:
+            continue
+        if not candidates:
+            continue
+        for cand in candidates[:2]:
+            column = str(cand.get("column") or "").strip().lower().replace("ё", "е")
+            description = str(cand.get("description") or "").strip().lower().replace("ё", "е")
+            if column and (column in normalized or normalized in column):
+                return {str(request_id): str(cand.get("column") or "")}
+            if description and description in normalized:
+                return {str(request_id): str(cand.get("column") or "")}
+    return {}
+
+
 def setup_logging() -> None:
     """Настройка логирования: только файл, консоль отключена."""
     root = logging.getLogger()
@@ -440,16 +471,24 @@ class CLIInterface:
         self._save_memory_from_llm_response(response)
         logger.info("Долгосрочная память (слои) обновлена")
 
-    def _process_query(self, user_input: str) -> None:
+    def _process_query(
+        self,
+        user_input: str,
+        user_filter_choices: dict[str, str] | None = None,
+    ) -> None:
         """Обработать запрос пользователя через граф агента.
 
         Args:
             user_input: Запрос пользователя.
+            user_filter_choices: Явные выборы колонок от пользователя, собранные
+                при предыдущих уточнениях. Передаются в state нетронутыми —
+                где_resolver использует их, чтобы не задавать тот же вопрос снова.
         """
         # --- Проверка кэша (только для read-запросов без явных write-ключевых слов) ---
         _write_keywords = ("insert", "update", "delete", "drop", "create", "truncate", "alter")
         _is_write = any(kw in user_input.lower() for kw in _write_keywords)
-        if not _is_write:
+        # Не отдаём из кэша, если пользователь уточнил фильтр — ответ может поменяться.
+        if not _is_write and not user_filter_choices:
             cached = self.query_cache.get(user_input)
             if cached:
                 from datetime import datetime, timezone
@@ -467,6 +506,7 @@ class CLIInterface:
             user_input,
             prev_sql=self._prev_sql,
             prev_result_summary=self._prev_result_summary,
+            user_filter_choices=dict(user_filter_choices or {}),
         )
         result = {}
         spinner_idx = 0
@@ -504,8 +544,26 @@ class CLIInterface:
                 clarification = input("\nУточнение: ").strip()
                 if clarification:
                     self.memory.add_message("user", f"Уточнение пользователя: {clarification}")
-                    augmented_input = f"{user_input}\nУточнение пользователя: {clarification}"
-                    self._process_query(augmented_input)
+                    where_resolution = result.get("where_resolution", {}) or {}
+                    filter_candidates = where_resolution.get("filter_candidates", {}) or {}
+                    prev_choices = dict(
+                        (user_filter_choices or {})
+                        | (where_resolution.get("user_filter_choices", {}) or {})
+                    )
+                    new_choices = _match_clarification_to_choice(
+                        clarification,
+                        filter_candidates,
+                        already_resolved=prev_choices,
+                    )
+                    if new_choices:
+                        merged_choices = {**prev_choices, **new_choices}
+                        self._process_query(user_input, user_filter_choices=merged_choices)
+                    else:
+                        # Фолбэк: не смогли сопоставить ответ с кандидатами — как раньше,
+                        # дописываем в сам текст запроса, чтобы explicit-choice в
+                        # where_resolver мог поймать имя колонки напрямую.
+                        augmented_input = f"{user_input}\nУточнение пользователя: {clarification}"
+                        self._process_query(augmented_input, user_filter_choices=prev_choices or None)
                 else:
                     print("Уточнение не получено. Операция отменена.")
                 return

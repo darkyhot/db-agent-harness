@@ -134,3 +134,67 @@ def test_filter_ranking_matches_known_terms_semantically(tmp_path):
     top = next(iter(ranked.values()))[0]
     assert top["column"] == "task_subtype"
     assert any("value_match=фактический отток" == ev for ev in top["evidence"])
+
+
+def test_filter_ranking_phrase_bonus_breaks_tie_between_similar_columns(tmp_path):
+    """Полная фраза «фактический отток» должна склонить выбор к task_subtype
+    даже рядом с очень похожим task_type, у которого в known_terms только
+    «отток» (одно слово)."""
+    loader = _loader(tmp_path)
+    loader._value_profiles = {
+        "dm.sale_funnel.task_subtype": {
+            "known_terms": ["фактический отток"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        },
+        "dm.sale_funnel.task_type": {
+            "known_terms": ["отток"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        },
+    }
+    frame = derive_semantic_frame(
+        "Посчитай количество задач по фактическому оттоку",
+        schema_loader=loader,
+    )
+    ranked = rank_filter_candidates(
+        user_input="Посчитай количество задач по фактическому оттоку",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+    candidates = next(iter(ranked.values()))
+    columns = [c["column"] for c in candidates]
+    assert columns.index("task_subtype") < columns.index("task_type"), columns
+    top = candidates[0]
+    assert top["column"] == "task_subtype"
+    assert top["matched_example"] == "фактический отток"
+    # score gap достаточно большой, чтобы where_resolver не ушёл в ambiguity.
+    subtype_score = next(c["score"] for c in candidates if c["column"] == "task_subtype")
+    type_score = next(c["score"] for c in candidates if c["column"] == "task_type")
+    assert subtype_score - type_score >= 40.0
+
+
+def test_filter_ranking_records_example_values_for_fallback_label(tmp_path):
+    loader = _loader(tmp_path)
+    loader._value_profiles = {
+        "dm.sale_funnel.task_subtype": {
+            "known_terms": ["фактический отток", "новый"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        },
+    }
+    frame = derive_semantic_frame(
+        "Посчитай количество задач по фактическому оттоку",
+        schema_loader=loader,
+    )
+    ranked = rank_filter_candidates(
+        user_input="Посчитай количество задач по фактическому оттоку",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+    top = next(c for c in next(iter(ranked.values())) if c["column"] == "task_subtype")
+    assert top["example_values"][:2] == ["фактический отток", "новый"]

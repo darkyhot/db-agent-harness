@@ -387,6 +387,7 @@ def create_initial_state(
     user_input: str,
     prev_sql: str = "",
     prev_result_summary: str = "",
+    user_filter_choices: dict[str, str] | None = None,
 ) -> AgentState:
     """Создать начальное состояние для запуска графа."""
     return AgentState(
@@ -406,6 +407,7 @@ def create_initial_state(
         clarification_message="",
         needs_disambiguation=False,
         disambiguation_options=[],
+        user_filter_choices=dict(user_filter_choices or {}),
         tables_context="",
         graph_iterations=0,
         correction_examples=[],

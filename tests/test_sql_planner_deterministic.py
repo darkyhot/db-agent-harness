@@ -643,3 +643,52 @@ def test_build_blueprint_for_outflow_tasks_uses_distinct_task_code(tmp_path):
     assert bp["aggregation"]["column"] == "task_code"
     assert bp["aggregation"]["distinct"] is True
     assert bp["group_by"] == []
+
+
+def test_build_blueprint_single_entity_safety_net_rewrites_count_star(tmp_path):
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["sales"],
+        "description": ["Продажи по задачам"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["sales"] * 3,
+        "column_name": ["task_code", "uzp_task_code", "report_dt"],
+        "dType": ["text", "text", "date"],
+        "description": ["Код задачи", "Код задачи УЗП", "Отчетная дата"],
+        "is_primary_key": [True, False, False],
+        "unique_perc": [100.0, 36.68, 0.5],
+        "not_null_perc": [100.0, 36.68, 99.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    bp = build_blueprint(
+        intent={"aggregation_hint": "count", "required_output": []},
+        selected_columns={
+            "dm.sales": {
+                "select": ["uzp_task_code"],
+                "filter": ["report_dt"],
+                "aggregate": ["*"],
+                "group_by": ["uzp_task_code"],
+            }
+        },
+        join_spec=[],
+        table_types={"dm.sales": "fact"},
+        join_analysis_data={},
+        user_input="Сколько задач по фактическому оттоку",
+        schema_loader=loader,
+        semantic_frame={
+            "subject": "task",
+            "requires_single_entity_count": True,
+            "output_dimensions": [],
+        },
+    )
+    assert bp["aggregation"]["column"] == "task_code"
+    assert bp["aggregation"]["distinct"] is True
+    assert bp["group_by"] == []

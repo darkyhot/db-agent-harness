@@ -30,6 +30,7 @@ from typing import Any
 
 import pandas as pd
 
+from core.semantic_frame import sanitize_user_input_for_semantics
 from core.synonym_map import expand_with_synonyms
 
 logger = logging.getLogger(__name__)
@@ -183,8 +184,12 @@ _METRIC_PARTS = frozenset({
 _STATUS_PARTS = frozenset({'status', 'state', 'flag', 'type', 'code', 'category', 'kind'})
 _METRIC_SUFFIXES = ('_qty', '_amt', '_sum', '_cnt', '_perc', '_pct', '_amount', '_value')
 _LABEL_SUFFIXES = ('_name', '_label', '_title')
-_DATE_HINTS = frozenset({'date', 'dt', 'dttm', 'timestamp', 'data'})
+_DATE_HINTS = frozenset({'date', 'dt', 'dttm', 'timestamp'})
 _COUNT_HINTS = frozenset({'count', 'kolichestvo', 'qty', 'cnt'})
+_TABLE_ARTIFACT_TOKENS = frozenset({
+    'schema', 'data', 'dwh', 'fact', 'dim', 'split', 'funnel', 'mart', 'table', 'tbl',
+})
+_DIMENSION_QUERY_STEMS = ('сегмент', 'регион', 'госб', 'тб', 'филиал')
 _TRANSLIT_TABLE = str.maketrans({
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
     'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
@@ -252,6 +257,44 @@ def _looks_like_explicit_column(token: str) -> bool:
     return "_" in lower or lower.endswith(_METRIC_SUFFIXES + _LABEL_SUFFIXES + ('_id', '_code'))
 
 
+def _looks_like_table_artifact(token: str) -> bool:
+    lower = str(token or '').lower().strip()
+    if not lower or '.' in lower:
+        return True if '.' in lower else False
+    parts = [p for p in lower.split('_') if p]
+    if len(parts) < 3:
+        return False
+    hits = sum(1 for part in parts if part in _TABLE_ARTIFACT_TOKENS)
+    return hits >= 2
+
+
+def _is_probable_grouping_token(raw_token: str) -> bool:
+    token = str(raw_token or '').strip().lower()
+    if not token:
+        return False
+    if _looks_like_table_artifact(token):
+        return False
+    if token in {'дата', 'дате', 'date', 'report_dt'}:
+        return True
+    if _looks_like_explicit_column(token):
+        return True
+    return any(token.startswith(stem) for stem in _DIMENSION_QUERY_STEMS)
+
+
+def _is_trustworthy_dimension(slot: str) -> bool:
+    lower = str(slot or '').lower().strip()
+    if not lower:
+        return False
+    if _looks_like_table_artifact(lower):
+        return False
+    parts = [p for p in lower.split('_') if p]
+    if not parts:
+        return False
+    if len(parts) == 1 and not any(parts[0].startswith(stem) for stem in _DIMENSION_QUERY_STEMS) and parts[0] != 'date':
+        return False
+    return True
+
+
 def _is_label_slot(slot: str) -> bool:
     return slot.endswith(_LABEL_SUFFIXES) or slot in {'name', 'label'}
 
@@ -284,14 +327,14 @@ def _fuzzy_overlap_score(slot_tokens: set[str], source_tokens: set[str]) -> floa
 
 def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str, Any]:
     """Вытащить из user_input явные аналитические слоты без LLM."""
-    query = _normalize_query_text(user_input)
+    query = _normalize_query_text(sanitize_user_input_for_semantics(user_input))
     agg_hint = str(intent.get('aggregation_hint') or '').lower().strip()
     query_tokens = _tokenize(query)
     dimensions: list[str] = []
 
     explicit_cols = [
         t for t in re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', query)
-        if _looks_like_explicit_column(t)
+        if _looks_like_explicit_column(t) and not _looks_like_table_artifact(t)
     ]
     for col in explicit_cols:
         lower = col.lower()
@@ -299,19 +342,20 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
             dimensions.append(lower)
 
     for m in re.finditer(r'(?:по|в разбивке по)\s+([a-zA-Zа-яА-ЯёЁ_]+)', query):
-        concept = _normalize_concept(m.group(1))
+        raw_token = str(m.group(1) or "").strip()
+        concept = _normalize_concept(raw_token)
         if not concept:
             continue
         if any(tok in _DATE_HINTS for tok in concept.split('_')):
             dimensions.append('date')
-        elif _looks_like_explicit_column(m.group(1)):
-            dimensions.append(m.group(1).lower())
-        else:
-            dimensions.append(f'{concept}_name')
+        elif _looks_like_explicit_column(raw_token) and not _looks_like_table_artifact(raw_token):
+            dimensions.append(raw_token.lower())
+        elif _is_probable_grouping_token(raw_token):
+            dimensions.append(concept)
 
     for m in re.finditer(r'(?:названи[еяю]|наименовани[еяю])\s+([a-zA-Zа-яА-ЯёЁ_]+)', query):
         concept = _normalize_concept(m.group(1))
-        if concept:
+        if concept and not _looks_like_table_artifact(concept):
             dimensions.append(f'{concept}_name')
 
     metric: str | None = None
@@ -350,7 +394,7 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
         if any(tok in _DATE_HINTS for tok in concept.split('_')):
             if 'date' not in dimensions:
                 dimensions.append('date')
-        elif concept not in dimensions and f'{concept}_name' not in dimensions:
+        elif concept not in dimensions and f'{concept}_name' not in dimensions and not _looks_like_table_artifact(concept):
             dimensions.append(concept)
 
     return {
@@ -686,7 +730,10 @@ def select_columns(
     requested = _derive_requested_slots(user_input, intent)
     frame = dict(semantic_frame or {})
     requires_single_entity_count = bool(frame.get("requires_single_entity_count"))
-    semantic_output_dimensions = list(frame.get("output_dimensions") or [])
+    semantic_output_dimensions = [
+        dim for dim in list(frame.get("output_dimensions") or [])
+        if _is_trustworthy_dimension(dim)
+    ]
     if semantic_output_dimensions:
         requires_single_entity_count = False
     scalar_count_request = _is_scalar_count_request(
@@ -1088,6 +1135,21 @@ def select_columns(
                 roles.setdefault('aggregate', [])
                 if '*' not in roles['aggregate']:
                     roles['aggregate'].append('*')
+            if roles.get('aggregate') == ['*']:
+                count_col = _choose_single_entity_count_column(
+                    main_table,
+                    schema_loader,
+                    entities=entities,
+                    subject=str(frame.get("subject") or requested.get("metric") or ""),
+                )
+                if count_col:
+                    roles['aggregate'] = [count_col]
+                    roles['select'] = [count_col]
+                    roles.pop('group_by', None)
+                    logger.info(
+                        "ColumnSelectorDet: count fallback → %s.%s",
+                        main_table, count_col,
+                    )
 
     if requires_single_entity_count or scalar_count_request:
         main_fact = next((t for t, tp in table_types.items() if tp == 'fact'), None)

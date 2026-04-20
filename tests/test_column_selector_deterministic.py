@@ -195,3 +195,21 @@ def test_select_columns_scalar_count_without_semantic_flag_still_avoids_group_by
     assert roles["aggregate"] == ["task_code"]
     assert roles["select"] == ["task_code"]
     assert "group_by" not in roles or not roles["group_by"]
+
+
+def test_requested_slots_ignore_table_choice_suffix_and_filter_value(tmp_path):
+    from core.column_selector_deterministic import _derive_requested_slots
+
+    requested = _derive_requested_slots(
+        "Сколько задач по фактическому оттоку поставили в феврале 26 "
+        "(использовать таблицу dm.uzp_data_split_mzp_sale_funnel)",
+        {
+            "aggregation_hint": "count",
+            "entities": ["задачи", "отток"],
+            "required_output": [],
+        },
+    )
+
+    assert "uzp_data_split_mzp_sale_funnel" not in requested["dimensions"]
+    assert not any("фактическому" in dim for dim in requested["dimensions"])
+    assert requested["metric"] is not None

@@ -25,6 +25,7 @@ from core.column_selector_deterministic import (
 from core.join_analysis import detect_table_type
 from core.sql_planner_deterministic import _derive_date_filters_from_text
 from core.semantic_frame import derive_semantic_frame
+from core.semantic_frame import sanitize_user_input_for_semantics
 from core.domain_rules import table_bonus_for_frame, table_can_satisfy_frame
 from core.join_governor import decide_join_plan
 from core.confidence import evaluate_join_confidence, evaluate_table_confidence, build_planning_confidence
@@ -358,7 +359,8 @@ class IntentNodes:
                 "Не хватает деталей, чтобы корректно продолжить. Уточните, пожалуйста, запрос."
             )
 
-        semantic_frame = derive_semantic_frame(user_input, intent, schema_loader=self.schema)
+        semantic_input = sanitize_user_input_for_semantics(user_input)
+        semantic_frame = derive_semantic_frame(semantic_input, intent, schema_loader=self.schema)
         logger.info(
             "IntentClassifier: semantic_frame=%s",
             summarize_dict_keys(semantic_frame, label="semantic_frame"),
@@ -544,8 +546,9 @@ class IntentNodes:
 
         # --- Детерминированная коррекция по семантике запроса и каталогу ---
         query_norm = _normalize_query_text(user_input)
-        requested = _derive_requested_slots(user_input, intent)
-        semantic_frame = state.get("semantic_frame", {}) or derive_semantic_frame(user_input, intent, schema_loader=self.schema)
+        semantic_input = sanitize_user_input_for_semantics(user_input)
+        requested = _derive_requested_slots(semantic_input, intent)
+        semantic_frame = state.get("semantic_frame", {}) or derive_semantic_frame(semantic_input, intent, schema_loader=self.schema)
         logger.info("TableResolver: user_input_full=%r", user_input)
         logger.info("TableResolver: semantic_frame_full=%s", semantic_frame)
         tables_df = self.schema.tables_df

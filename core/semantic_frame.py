@@ -15,6 +15,20 @@ _RU_MONTH_STEMS = (
 _PREPOSITIONS = ("с ", "со ", "по ", "без ", "для ")
 _PROJECTION_VERBS = ("подтяни", "дотяни", "возьми", "выведи", "покажи")
 _DIMENSION_WORD_STEMS = ("сегмент", "регион", "госб", "тб", "филиал")
+_SERVICE_SUFFIX_RE = re.compile(
+    r"\(\s*использовать\s+таблицу\s+[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\s*\)",
+    re.IGNORECASE,
+)
+_LOW_SIGNAL_DIM_TOKENS = frozenset({
+    "тип", "задач", "задача", "дат", "фактическ", "фактическая", "фактическому",
+})
+
+
+def sanitize_user_input_for_semantics(user_input: str) -> str:
+    """Убрать служебные CLI-аннотации, не относящиеся к бизнес-смыслу запроса."""
+    text = str(user_input or "")
+    text = _SERVICE_SUFFIX_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _collect_text(user_input: str, intent: dict[str, Any] | None) -> str:
@@ -148,6 +162,25 @@ def _looks_like_output_dimension_filter(item: dict[str, Any], output_dimensions:
     return False
 
 
+def _dimension_shadowed_by_value_filter(
+    dimension: str,
+    filter_intents: list[dict[str, Any]],
+) -> bool:
+    """Если dimension конфликтует с более сильным value_candidate фильтром — убираем её."""
+    dim_norm = str(dimension or "").strip().lower()
+    if not dim_norm:
+        return False
+    for item in filter_intents:
+        if str(item.get("match_source") or "") != "value_candidate":
+            continue
+        phrase = str(item.get("query_text") or item.get("matched_phrase") or "").strip().lower()
+        if not phrase:
+            continue
+        if _token_overlap(dim_norm, phrase) >= 1:
+            return True
+    return False
+
+
 def _extract_output_dimension_hints(user_input: str) -> list[str]:
     """Вытащить явные измерения из phrasing `по X`, `по дате`, `по region_name`."""
     normalized = _normalize_text(user_input)
@@ -156,6 +189,9 @@ def _extract_output_dimension_hints(user_input: str) -> list[str]:
     for match in re.finditer(r"(?:по|в разбивке по)\s+([a-zа-я_]+)", normalized):
         token = str(match.group(1) or "").strip().lower()
         if not token:
+            continue
+        stemmed = _stem(token)
+        if stemmed in _LOW_SIGNAL_DIM_TOKENS:
             continue
         if token in {"дате", "дата", "date", "report_dt"}:
             dimensions.append("date")
@@ -283,7 +319,8 @@ def derive_semantic_frame(
     schema_loader=None,
 ) -> dict[str, Any]:
     """Build semantic frame using metadata-driven lexicon when available."""
-    haystack = _collect_text(user_input, intent)
+    clean_input = sanitize_user_input_for_semantics(user_input)
+    haystack = _collect_text(clean_input, intent)
     lexicon = schema_loader.get_semantic_lexicon() if schema_loader is not None else {}
 
     subject = find_best_subject(haystack, lexicon) if lexicon else None
@@ -297,7 +334,7 @@ def derive_semantic_frame(
         elif any(token in haystack for token in ("organization", "org", "branch", "госб", "тб")):
             subject = "organization"
 
-    raw_filter_intents = _derive_filter_intents(user_input=user_input, intent=intent, schema_loader=schema_loader)
+    raw_filter_intents = _derive_filter_intents(user_input=clean_input, intent=intent, schema_loader=schema_loader)
 
     requested_grain = subject
     period_kind = None
@@ -308,17 +345,9 @@ def derive_semantic_frame(
     output_dimensions = (
         find_matching_dimensions(haystack, lexicon) if lexicon else []
     )
-    output_dimensions = list(dict.fromkeys(output_dimensions + _extract_output_dimension_hints(user_input)))
+    output_dimensions = list(dict.fromkeys(output_dimensions + _extract_output_dimension_hints(clean_input)))
     required_output = [str(v).strip().lower() for v in ((intent or {}).get("required_output") or []) if str(v).strip()]
     output_dimensions = list(dict.fromkeys(required_output + output_dimensions))
-    requires_listing = metric_intent == "list" or any(token in haystack for token in ("список", "перечень"))
-    has_explicit_grouping = _has_explicit_grouping_request(user_input, intent)
-    requires_single_entity_count = (
-        metric_intent == "count"
-        and bool(subject)
-        and not has_explicit_grouping
-        and not requires_listing
-    )
     qualifier = None
     business_event = None
     ambiguities: list[str] = []
@@ -328,6 +357,19 @@ def derive_semantic_frame(
         item for item in filter_intents
         if not _looks_like_output_dimension_filter(item, output_dimensions)
     ]
+    output_dimensions = [
+        dim for dim in output_dimensions
+        if not _dimension_shadowed_by_value_filter(dim, filter_intents)
+    ]
+    requires_listing = metric_intent == "list" or any(token in haystack for token in ("список", "перечень"))
+    has_explicit_grouping = _has_explicit_grouping_request(clean_input, intent)
+    requires_single_entity_count = (
+        metric_intent == "count"
+        and bool(subject)
+        and not output_dimensions
+        and not has_explicit_grouping
+        and not requires_listing
+    )
 
     qualifier = None
     business_event = None

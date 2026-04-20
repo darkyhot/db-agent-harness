@@ -284,10 +284,17 @@ def find_best_subject(query: str, lexicon: dict[str, Any]) -> str | None:
 def find_matching_dimensions(query: str, lexicon: dict[str, Any]) -> list[str]:
     query_tokens = set(_stem_tokens(_tokenize(query)))
     results: list[str] = []
+    low_signal = {"тип", "задач", "задача", "дат", "фактическ", "фактическая", "фактическому"}
     for dim_key, meta in (lexicon.get("dimensions") or {}).items():
         for alias in meta.get("aliases", []) or []:
             alias_tokens = set(_stem_tokens(_tokenize(alias)))
-            if alias_tokens and len(query_tokens & alias_tokens) >= max(1, min(2, len(alias_tokens))):
+            if not alias_tokens:
+                continue
+            if alias_tokens <= low_signal:
+                continue
+            threshold = 1 if len(alias_tokens) == 1 else 2
+            overlap = len(query_tokens & alias_tokens)
+            if overlap >= threshold:
                 results.append(dim_key)
                 break
     return list(dict.fromkeys(results))

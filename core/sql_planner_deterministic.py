@@ -274,6 +274,46 @@ def _count_column_should_be_distinct(
     return False
 
 
+def _choose_count_identifier_column(
+    main_table: str,
+    schema_loader,
+) -> str | None:
+    """Подобрать identifier/PK-колонку для COUNT(DISTINCT ...) safety net."""
+    if not main_table or schema_loader is None or "." not in main_table:
+        return None
+    schema_name, table_name = main_table.split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return None
+
+    best: tuple[float, str] | None = None
+    for _, row in cols_df.iterrows():
+        col_name = str(row.get("column_name", "") or "").strip()
+        if not col_name:
+            continue
+        score = 0.0
+        if bool(row.get("is_primary_key", False)):
+            score += 100.0
+        unique_perc = float(row.get("unique_perc", 0) or 0)
+        if unique_perc >= 95.0:
+            score += 40.0
+        semantics = schema_loader.get_column_semantics(schema_name, table_name, col_name)
+        sem_class = str(semantics.get("semantic_class", "") or "").lower()
+        if sem_class == "identifier":
+            score += 60.0
+        lower_name = col_name.lower()
+        if lower_name.endswith("_code"):
+            score += 20.0
+        if lower_name.endswith("_id"):
+            score += 10.0
+        candidate = (score, col_name)
+        if best is None or candidate > best:
+            best = candidate
+    if best is None or best[0] < 50.0:
+        return None
+    return best[1]
+
+
 def _compute_aggregation(
     intent: dict,
     selected_columns: dict[str, dict],
@@ -601,6 +641,32 @@ def build_blueprint(
             "DeterministicPlanner: date-aligned JOIN по оси '%s' → fact_fact_join",
             axis_column,
         )
+
+    if (
+        str((intent or {}).get("aggregation_hint") or "").lower().strip() == "count"
+        and (semantic_frame or {}).get("requires_single_entity_count")
+        and schema_loader is not None
+        and main_table
+    ):
+        main_roles = selected_columns.setdefault(main_table, {})
+        suspicious_group_by = list(main_roles.get("group_by", []) or [])
+        fallback_col = None
+        if main_roles.get("aggregate") == ["*"] or suspicious_group_by:
+            fallback_col = _choose_count_identifier_column(main_table, schema_loader)
+        if fallback_col:
+            main_roles["aggregate"] = [fallback_col]
+            main_roles["select"] = [fallback_col]
+            main_roles.pop("group_by", None)
+            aggregation = _compute_aggregation(
+                intent,
+                selected_columns,
+                schema_loader=schema_loader,
+                semantic_frame=semantic_frame,
+            )
+            logger.info(
+                "DeterministicPlanner: single-entity safety net → %s.%s",
+                main_table, fallback_col,
+            )
 
     # Если одна таблица даёт метрику, а вторая только атрибуты для группировки/селекта,
     # рассматриваем вторую как dimension-like источник атрибута, даже если её тип unknown/fact.

@@ -569,6 +569,75 @@ def _metric_score(col_name: str, entities: list[str]) -> float:
     return min(base + entity_hit * 0.4, 1.0)
 
 
+def _choose_single_entity_count_column(
+    table_key: str,
+    schema_loader: Any,
+    entities: list[str],
+    subject: str = "",
+) -> str | None:
+    """Подобрать PK/identifier-колонку для single-entity COUNT на факте."""
+    parts = table_key.split(".", 1)
+    if len(parts) != 2:
+        return None
+    schema_name, table_name = parts
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return None
+
+    best: tuple[float, str] | None = None
+    subject = str(subject or "").strip().lower()
+    subject_tokens = [subject] if subject else []
+    query_entities = [str(e).strip() for e in entities if str(e).strip()]
+
+    for _, row in cols_df.iterrows():
+        col_name = str(row.get("column_name", "") or "").strip()
+        if not col_name:
+            continue
+        desc = str(row.get("description", "") or "")
+        is_pk = bool(row.get("is_primary_key", False))
+        dtype = str(row.get("dType", "") or "").lower().strip()
+        unique_perc = float(row.get("unique_perc", 0) or 0)
+        semantics = schema_loader.get_column_semantics(schema_name, table_name, col_name)
+        sem_class = str(semantics.get("semantic_class", "") or "")
+
+        score = 0.0
+        if is_pk:
+            score += 140.0
+        if sem_class == "identifier":
+            score += 80.0
+        if sem_class == "join_key":
+            score += 20.0
+        if unique_perc >= 95.0:
+            score += 45.0
+        elif unique_perc >= 80.0:
+            score += 20.0
+        if _is_numeric(dtype):
+            score -= 40.0
+
+        entity_match = _entity_score(col_name, desc, query_entities + subject_tokens)
+        score += entity_match * 90.0
+
+        lower_name = col_name.lower()
+        if lower_name.endswith("_code"):
+            score += 35.0
+        if lower_name.endswith("_id"):
+            score += 15.0
+        if subject == "task" and "task" in lower_name:
+            score += 25.0
+        if subject == "client" and any(tok in lower_name for tok in ("client", "cust", "inn")):
+            score += 25.0
+        if subject == "employee" and any(tok in lower_name for tok in ("employee", "staff", "emp")):
+            score += 25.0
+
+        candidate = (score, col_name)
+        if best is None or candidate > best:
+            best = candidate
+
+    if best is None or best[0] < 60.0:
+        return None
+    return best[1]
+
+
 # ---------------------------------------------------------------------------
 # Основная функция
 # ---------------------------------------------------------------------------
@@ -581,6 +650,7 @@ def select_columns(
     schema_loader: Any,
     user_input: str = "",
     user_hints: dict[str, Any] | None = None,
+    semantic_frame: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Детерминированно выбрать колонки и JOIN-спецификацию.
 
@@ -590,7 +660,8 @@ def select_columns(
         table_types:       dict schema.table → "fact"/"dim"/"ref"/"unknown"
         join_analysis_data: dict из table_explorer (pre-computed join candidates)
         schema_loader:     SchemaLoader для доступа к колонкам и check_key_uniqueness
-        user_hints:        dict из hint_extractor (dim_sources, join_fields, having_hints)
+    user_hints:        dict из hint_extractor (dim_sources, join_fields, having_hints)
+    semantic_frame:    Семантический фрейм запроса; нужен для requires_single_entity_count
 
     Returns:
         dict с ключами: selected_columns, join_spec, confidence, reason
@@ -600,6 +671,11 @@ def select_columns(
     date_filters: dict = intent.get('date_filters') or {}
     filter_conditions: list[dict] = intent.get('filter_conditions') or []
     requested = _derive_requested_slots(user_input, intent)
+    frame = dict(semantic_frame or {})
+    requires_single_entity_count = bool(frame.get("requires_single_entity_count"))
+    semantic_output_dimensions = list(frame.get("output_dimensions") or [])
+    if semantic_output_dimensions:
+        requires_single_entity_count = False
 
     # Подсказки пользователя: связки «слот → таблица», JOIN-поля, HAVING-хинты.
     user_hints = user_hints or {}
@@ -962,9 +1038,45 @@ def select_columns(
             main_table = next(iter(table_structures), None)
         if main_table:
             roles = selected_columns.setdefault(main_table, {})
-            roles.setdefault('aggregate', [])
-            if '*' not in roles['aggregate']:
-                roles['aggregate'].append('*')
+            if requires_single_entity_count:
+                count_col = _choose_single_entity_count_column(
+                    main_table,
+                    schema_loader,
+                    entities=entities,
+                    subject=str(frame.get("subject") or ""),
+                )
+                if count_col:
+                    roles['aggregate'] = [count_col]
+                    roles['select'] = [count_col]
+                    roles.pop('group_by', None)
+                    logger.info(
+                        "ColumnSelectorDet: single-entity count → %s.%s",
+                        main_table, count_col,
+                    )
+                else:
+                    roles.setdefault('aggregate', [])
+                    if '*' not in roles['aggregate']:
+                        roles['aggregate'].append('*')
+            else:
+                roles.setdefault('aggregate', [])
+                if '*' not in roles['aggregate']:
+                    roles['aggregate'].append('*')
+
+    if requires_single_entity_count:
+        main_fact = next((t for t, tp in table_types.items() if tp == 'fact'), None)
+        for table_key, roles in list(selected_columns.items()):
+            if table_key != main_fact:
+                roles.pop('group_by', None)
+                non_agg_select = [
+                    c for c in roles.get('select', [])
+                    if c in roles.get('aggregate', [])
+                ]
+                if non_agg_select:
+                    roles['select'] = non_agg_select
+                elif not roles.get('filter'):
+                    selected_columns.pop(table_key, None)
+            else:
+                roles.pop('group_by', None)
 
     if requested['dimensions']:
         allowed_refs: set[tuple[str, str]] = set()

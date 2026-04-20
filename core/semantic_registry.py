@@ -299,6 +299,7 @@ def find_matching_rules(query: str, registry: dict[str, Any]) -> list[dict[str, 
     for rule in (registry.get("rules") or []):
         best = 0
         matched_phrase = ""
+        match_source = ""
         for phrase in rule.get("match_phrases", []) or []:
             phrase_tokens = set(_stem_tokens(_tokenize(phrase)))
             overlap = _tokens_overlap(query_tokens, phrase_tokens)
@@ -307,6 +308,7 @@ def find_matching_rules(query: str, registry: dict[str, Any]) -> list[dict[str, 
             if overlap >= threshold and overlap > best:
                 best = overlap
                 matched_phrase = phrase
+                match_source = "match_phrase"
         for value in rule.get("value_candidates", []) or []:
             value_tokens = set(_stem_tokens(_tokenize(value)))
             overlap = _tokens_overlap(query_tokens, value_tokens)
@@ -315,10 +317,12 @@ def find_matching_rules(query: str, registry: dict[str, Any]) -> list[dict[str, 
             if overlap >= threshold and overlap > best:
                 best = overlap
                 matched_phrase = value
+                match_source = "value_candidate"
         if best > 0:
             enriched = dict(rule)
             enriched["match_score"] = float(best)
             enriched["matched_phrase"] = matched_phrase
+            enriched["match_source"] = match_source
             matched.append(enriched)
 
     # Если запрос уже содержит более специфичную фразу, не оставляем рядом

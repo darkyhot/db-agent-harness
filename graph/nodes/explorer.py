@@ -427,6 +427,7 @@ class ExplorerNodes:
             schema_loader=self.schema,
             user_input=user_input,
             user_hints=state.get("user_hints", {}) or {},
+            semantic_frame=state.get("semantic_frame", {}) or {},
         )
         _det_conf = _det_result.get("confidence", 0.0)
         logger.info(

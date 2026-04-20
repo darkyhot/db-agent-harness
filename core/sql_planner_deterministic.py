@@ -633,6 +633,18 @@ def build_blueprint(
                     group_by.append(col)
                     seen_gb.add(col)
 
+    if (
+        aggregation
+        and (semantic_frame or {}).get("requires_single_entity_count")
+        and not list((semantic_frame or {}).get("output_dimensions") or [])
+    ):
+        if group_by:
+            logger.info(
+                "DeterministicPlanner: single-entity count → очищаю group_by=%s",
+                group_by,
+            )
+        group_by = []
+
     # CTE нужен при: fact+fact, dim+dim, или при небезопасном JOIN
     cte_needed = (
         strategy in {"fact_fact_join", "dim_dim_join"}

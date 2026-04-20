@@ -525,3 +525,28 @@ def test_build_blueprint_does_not_leak_filter_only_keys_into_group_by():
     )
     assert "inn" not in bp["group_by"]
     assert "report_dt" not in bp["group_by"]
+
+
+def test_build_blueprint_single_entity_count_clears_spurious_group_by():
+    intent = {"aggregation_hint": "count", "required_output": []}
+    cols = {
+        "dm.sales": {
+            "select": ["uzp_task_code", "task_code"],
+            "filter": ["report_dt"],
+            "aggregate": ["task_code"],
+            "group_by": ["uzp_task_code"],
+        }
+    }
+    bp = build_blueprint(
+        intent,
+        cols,
+        [],
+        {"dm.sales": "fact"},
+        {},
+        semantic_frame={
+            "requires_single_entity_count": True,
+            "output_dimensions": [],
+        },
+    )
+    assert bp["aggregation"]["column"] == "task_code"
+    assert bp["group_by"] == []

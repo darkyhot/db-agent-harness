@@ -129,6 +129,36 @@ def test_explicit_column_after_po_becomes_output_dimension_not_filter(tmp_path):
     assert not frame["filter_intents"]
 
 
+def test_value_candidate_after_po_stays_filter_not_output_dimension(tmp_path):
+    loader = _loader(tmp_path)
+    loader._rule_registry = {
+        "rules": [
+            {
+                "rule_id": "text:dm.sale_funnel.task_subtype",
+                "column_key": "dm.sale_funnel.task_subtype",
+                "semantic_class": "enum_like",
+                "match_kind": "text_search",
+                "match_phrases": ["подтип задачи"],
+                "value_candidates": ["Фактический отток"],
+            }
+        ]
+    }
+    frame = derive_semantic_frame(
+        "Сколько задач по фактическому оттоку за февраль 2026",
+        {
+            "aggregation_hint": "count",
+            "entities": ["задачи", "отток"],
+            "required_output": [],
+        },
+        schema_loader=loader,
+    )
+    assert frame["requires_single_entity_count"] is True
+    assert any(
+        item.get("column_key") == "dm.sale_funnel.task_subtype"
+        for item in frame["filter_intents"]
+    )
+
+
 def test_projection_phrase_does_not_bleed_into_freeform_filter():
     phrases = _extract_freeform_phrases(
         "Покажи сумму outflow_qty по region_name, подтяни region_name из uzp_dim_gosb по gosb_id"

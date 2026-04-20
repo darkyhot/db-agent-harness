@@ -125,6 +125,10 @@ def _looks_like_output_dimension_filter(item: dict[str, Any], output_dimensions:
     """
     if not output_dimensions:
         return False
+    # Если матч произошёл по значению enum-like колонки ("фактический отток"),
+    # трактуем это как фильтр по значению, а не как измерение.
+    if str(item.get("match_source") or "") == "value_candidate":
+        return False
     column_key = str(item.get("column_key") or "")
     column_name = column_key.rsplit(".", 1)[-1] if column_key else ""
     matched_phrase = str(item.get("query_text") or item.get("matched_phrase") or "")
@@ -208,6 +212,7 @@ def _derive_filter_intents(
             "column_key": str(rule.get("column_key") or ""),
             "semantic_class": str(rule.get("semantic_class") or ""),
             "match_score": float(rule.get("match_score", 0.0) or 0.0),
+            "match_source": str(rule.get("match_source") or ""),
         })
 
     for idx, raw in enumerate((intent or {}).get("filter_conditions", []) or []):

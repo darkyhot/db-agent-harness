@@ -252,6 +252,9 @@ def rank_filter_candidates(
                 unique_perc = 0.0
 
             for request in requests:
+                request_column_key = str(request.get("column_key") or "").strip().lower()
+                if request_column_key and key != request_column_key:
+                    continue
                 query_text = str(request.get("query_text") or request.get("value") or "")
                 if not query_text:
                     continue

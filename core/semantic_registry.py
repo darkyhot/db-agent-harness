@@ -30,6 +30,11 @@ def _tokenize(text: str) -> list[str]:
     return [tok for tok in normalized.split() if len(tok) >= 2 and tok not in _STOPWORDS]
 
 
+def _raw_tokenize(text: str) -> list[str]:
+    normalized = _normalize_phrase(text)
+    return [tok for tok in normalized.split() if len(tok) >= 2]
+
+
 def _token_stem(token: str) -> str:
     token = _normalize_phrase(token)
     for suffix in (
@@ -66,8 +71,14 @@ def _tokens_overlap(query_tokens: set[str], candidate_tokens: set[str]) -> int:
 
 
 def _phrase_variants(text: str) -> list[str]:
+    raw_tokens = _raw_tokenize(text)
     tokens = _tokenize(text)
     if not tokens:
+        return []
+    # Если исходная фраза была многословной, но после выкидывания stopwords
+    # схлопнулась в одно слишком общее слово ("Тип задачи" -> "задачи"),
+    # такой alias только засоряет registry и даёт ложные text-match'и.
+    if len(raw_tokens) > 1 and len(tokens) < 2:
         return []
     variants = {
         " ".join(tokens),
@@ -268,14 +279,16 @@ def find_matching_rules(query: str, registry: dict[str, Any]) -> list[dict[str, 
         for phrase in rule.get("match_phrases", []) or []:
             phrase_tokens = set(_stem_tokens(_tokenize(phrase)))
             overlap = _tokens_overlap(query_tokens, phrase_tokens)
-            threshold = 1 if len(phrase_tokens) <= 1 else min(2, len(phrase_tokens))
+            raw_phrase_tokens = _raw_tokenize(phrase)
+            threshold = 1 if len(raw_phrase_tokens) <= 1 else min(2, len(raw_phrase_tokens))
             if overlap >= threshold and overlap > best:
                 best = overlap
                 matched_phrase = phrase
         for value in rule.get("value_candidates", []) or []:
             value_tokens = set(_stem_tokens(_tokenize(value)))
             overlap = _tokens_overlap(query_tokens, value_tokens)
-            threshold = 1 if len(value_tokens) <= 1 else min(2, len(value_tokens))
+            raw_value_tokens = _raw_tokenize(value)
+            threshold = 1 if len(raw_value_tokens) <= 1 else min(2, len(raw_value_tokens))
             if overlap >= threshold and overlap > best:
                 best = overlap
                 matched_phrase = value
@@ -284,5 +297,38 @@ def find_matching_rules(query: str, registry: dict[str, Any]) -> list[dict[str, 
             enriched["match_score"] = float(best)
             enriched["matched_phrase"] = matched_phrase
             matched.append(enriched)
-    matched.sort(key=lambda item: item.get("match_score", 0.0), reverse=True)
-    return matched
+
+    # Если запрос уже содержит более специфичную фразу, не оставляем рядом
+    # общий «вложенный» матч по её подмножеству. Пример:
+    # - "фактический отток" -> task_subtype
+    # - "отток" -> task_type
+    # Для запроса "по фактическому оттоку" второй матч не должен провоцировать
+    # clarification: пользователь уже задал более точный признак.
+    pruned: list[dict[str, Any]] = []
+    matched_token_sets: list[set[str]] = [
+        set(_stem_tokens(_tokenize(str(item.get("matched_phrase") or ""))))
+        for item in matched
+    ]
+    for idx, item in enumerate(matched):
+        current_tokens = matched_token_sets[idx]
+        dominated = False
+        if current_tokens:
+            for other_idx, other in enumerate(matched):
+                if other_idx == idx:
+                    continue
+                other_tokens = matched_token_sets[other_idx]
+                if not other_tokens or current_tokens == other_tokens:
+                    continue
+                if current_tokens < other_tokens:
+                    dominated = True
+                    break
+        if not dominated:
+            pruned.append(item)
+    pruned.sort(
+        key=lambda item: (
+            item.get("match_score", 0.0),
+            len(_stem_tokens(_tokenize(str(item.get("matched_phrase") or "")))),
+        ),
+        reverse=True,
+    )
+    return pruned

@@ -662,13 +662,13 @@ def _build_fact_fact_join(
 
     # Агрегации для каждой таблицы: ищем aggregate-роль, fallback COUNT(*)
     def _agg_for(roles: dict, suffix: str, key_col: str) -> str:
-        agg_cols = [c for c in roles.get("aggregate", []) if c != key_col]
+        agg_cols = [c for c in roles.get("aggregate", []) if c and c not in {key_col, "*"}]
         if agg_cols:
             col = agg_cols[0]
             return f"{agg_func}({col}) AS {agg_func.lower()}_{col}"
         # Попробуем найти числовую метрику в select
         for col in roles.get("select", []):
-            if col == key_col:
+            if not col or col in {key_col, "*"}:
                 continue
             return f"{agg_func}({col}) AS {agg_func.lower()}_{col}"
         return f"COUNT(*) AS cnt_{suffix}"

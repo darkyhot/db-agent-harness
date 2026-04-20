@@ -147,7 +147,16 @@ def _derive_filter_intents(
     for idx, phrase in enumerate(freeform_phrases):
         if phrase in known_query_texts:
             continue
-        if any(_token_overlap(phrase, existing) >= min(2, len(_tokenize(phrase)), len(_tokenize(existing))) for existing in known_query_texts if existing):
+        phrase_token_count = len(_tokenize(phrase))
+        if any(
+            _token_overlap(phrase, existing) >= (
+                1
+                if phrase_token_count == 1 and len(_tokenize(existing)) == 1
+                else 2
+            )
+            for existing in known_query_texts
+            if existing
+        ):
             continue
         intents.append({
             "request_id": f"phrase:{idx}",

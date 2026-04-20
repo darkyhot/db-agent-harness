@@ -238,9 +238,48 @@ def _compute_having(
 # 3. Агрегация
 # ---------------------------------------------------------------------------
 
+def _count_column_should_be_distinct(
+    selected_columns: dict[str, dict],
+    column: str,
+    schema_loader=None,
+    semantic_frame: dict | None = None,
+) -> bool:
+    """Определить, нужно ли считать COUNT по колонке как DISTINCT."""
+    if not column or column == "*":
+        return False
+    if (semantic_frame or {}).get("requires_single_entity_count"):
+        return True
+    if schema_loader is None:
+        return False
+
+    for table_key, roles in selected_columns.items():
+        if column not in roles.get("aggregate", []):
+            continue
+        parts = table_key.split(".", 1)
+        if len(parts) != 2:
+            continue
+        schema_name, table_name = parts
+        cols_df = schema_loader.get_table_columns(schema_name, table_name)
+        if cols_df.empty:
+            continue
+        matched = cols_df[cols_df["column_name"].astype(str).str.lower() == column.lower()]
+        if matched.empty:
+            continue
+        row = matched.iloc[0]
+        if bool(row.get("is_primary_key", False)):
+            return True
+        semantics = schema_loader.get_column_semantics(schema_name, table_name, column)
+        if str(semantics.get("semantic_class", "") or "").lower() == "identifier":
+            return True
+    return False
+
+
 def _compute_aggregation(
     intent: dict,
     selected_columns: dict[str, dict],
+    *,
+    schema_loader=None,
+    semantic_frame: dict | None = None,
 ) -> dict | None:
     """Вычислить агрегацию из intent.aggregation_hint + aggregate-роли колонок."""
     hint = (intent.get("aggregation_hint") or "").lower().strip()
@@ -255,9 +294,17 @@ def _compute_aggregation(
         agg_cols = roles.get("aggregate", [])
         if agg_cols:
             col = agg_cols[0]
-            alias = f"{func.lower()}_{col}"
+            alias = "count_all" if hint == "count" and col == "*" else f"{func.lower()}_{col}"
             distinct = False
-            if hint == "count" and col.lower().endswith("_count_distinct"):
+            if hint == "count" and (
+                col.lower().endswith("_count_distinct")
+                or _count_column_should_be_distinct(
+                    selected_columns,
+                    col,
+                    schema_loader=schema_loader,
+                    semantic_frame=semantic_frame,
+                )
+            ):
                 distinct = True
             result: dict = {"function": func, "column": col, "alias": alias}
             if distinct:
@@ -266,7 +313,7 @@ def _compute_aggregation(
 
     # Нет явной aggregate-роли — COUNT(*) как fallback для count
     if hint == "count":
-        return {"function": "COUNT", "column": "*", "alias": "cnt"}
+        return {"function": "COUNT", "column": "*", "alias": "count_all"}
 
     return None
 
@@ -527,7 +574,12 @@ def build_blueprint(
     Returns:
         dict совместимый с форматом sql_blueprint из AgentState.
     """
-    aggregation = _compute_aggregation(intent, selected_columns)
+    aggregation = _compute_aggregation(
+        intent,
+        selected_columns,
+        schema_loader=schema_loader,
+        semantic_frame=semantic_frame,
+    )
     strategy, main_table = _determine_strategy(table_types, join_spec)
 
     # --- Блок C: date-aligned JOIN (axis-join по дате) ---

@@ -1,5 +1,6 @@
 """Тесты для core/sql_planner_deterministic.py."""
 
+import pandas as pd
 import pytest
 from core.sql_planner_deterministic import (
     build_blueprint,
@@ -83,7 +84,7 @@ class TestComputeAggregation:
     def test_count_no_agg_col_fallback(self):
         intent = {"aggregation_hint": "count"}
         agg = _compute_aggregation(intent, self._cols([]))
-        assert agg == {"function": "COUNT", "column": "*", "alias": "cnt"}
+        assert agg == {"function": "COUNT", "column": "*", "alias": "count_all"}
 
     def test_avg(self):
         intent = {"aggregation_hint": "avg"}
@@ -104,6 +105,38 @@ class TestComputeAggregation:
         intent = {"aggregation_hint": "max"}
         agg = _compute_aggregation(intent, self._cols(["score"]))
         assert agg == {"function": "MAX", "column": "score", "alias": "max_score"}
+
+    def test_count_on_primary_identifier_becomes_distinct(self, tmp_path):
+        from core.schema_loader import SchemaLoader
+
+        tables_df = pd.DataFrame({
+            "schema_name": ["dm"],
+            "table_name": ["sales"],
+            "description": ["Продажи по задачам"],
+        })
+        attrs_df = pd.DataFrame({
+            "schema_name": ["dm"] * 2,
+            "table_name": ["sales"] * 2,
+            "column_name": ["task_code", "report_dt"],
+            "dType": ["text", "date"],
+            "description": ["Код задачи", "Отчетная дата"],
+            "is_primary_key": [True, False],
+            "unique_perc": [100.0, 0.2],
+            "not_null_perc": [100.0, 100.0],
+        })
+        tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+        attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+
+        loader = SchemaLoader(data_dir=tmp_path)
+        agg = _compute_aggregation(
+            {"aggregation_hint": "count"},
+            self._cols(["task_code"]),
+            schema_loader=loader,
+            semantic_frame={"requires_single_entity_count": True},
+        )
+        assert agg["function"] == "COUNT"
+        assert agg["column"] == "task_code"
+        assert agg["distinct"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -549,4 +582,64 @@ def test_build_blueprint_single_entity_count_clears_spurious_group_by():
         },
     )
     assert bp["aggregation"]["column"] == "task_code"
+    assert bp["aggregation"]["distinct"] is True
+    assert bp["group_by"] == []
+
+
+def test_build_blueprint_for_outflow_tasks_uses_distinct_task_code(tmp_path):
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["uzp_data_split_mzp_sale_funnel"],
+        "description": ["Воронка продаж по задачам"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": ["uzp_data_split_mzp_sale_funnel"] * 5,
+        "column_name": ["report_dt", "task_code", "uzp_task_code", "task_subtype", "task_category"],
+        "dType": ["date", "text", "text", "text", "text"],
+        "description": [
+            "Отчетная дата",
+            "Код задачи",
+            "Код задачи УЗП",
+            "Подтип задачи",
+            "Категория задачи",
+        ],
+        "is_primary_key": [False, True, False, False, False],
+        "unique_perc": [0.5, 100.0, 36.68, 2.62, 0.02],
+        "not_null_perc": [99.0, 100.0, 36.68, 37.06, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    bp = build_blueprint(
+        intent={
+            "aggregation_hint": "count",
+            "date_filters": {"from": "2026-02-01", "to": "2026-03-01"},
+            "required_output": [],
+        },
+        selected_columns={
+            "dm.uzp_data_split_mzp_sale_funnel": {
+                "select": ["task_code"],
+                "filter": ["report_dt", "task_subtype", "task_category"],
+                "aggregate": ["task_code"],
+                "group_by": [],
+            }
+        },
+        join_spec=[],
+        table_types={"dm.uzp_data_split_mzp_sale_funnel": "fact"},
+        join_analysis_data={},
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 26",
+        schema_loader=loader,
+        semantic_frame={
+            "subject": "task",
+            "requires_single_entity_count": True,
+            "output_dimensions": [],
+        },
+    )
+    assert bp["aggregation"]["column"] == "task_code"
+    assert bp["aggregation"]["distinct"] is True
     assert bp["group_by"] == []

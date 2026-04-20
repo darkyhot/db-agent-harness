@@ -178,6 +178,16 @@ def _extract_output_dimension_hints(user_input: str) -> list[str]:
     return list(dict.fromkeys(dimensions))
 
 
+def _has_explicit_grouping_request(
+    user_input: str,
+    intent: dict[str, Any] | None,
+) -> bool:
+    """Определить, просит ли пользователь явную разбивку в результате."""
+    if (intent or {}).get("required_output"):
+        return True
+    return bool(_extract_output_dimension_hints(user_input))
+
+
 def _derive_filter_intents(
     *,
     user_input: str,
@@ -302,10 +312,11 @@ def derive_semantic_frame(
     required_output = [str(v).strip().lower() for v in ((intent or {}).get("required_output") or []) if str(v).strip()]
     output_dimensions = list(dict.fromkeys(required_output + output_dimensions))
     requires_listing = metric_intent == "list" or any(token in haystack for token in ("список", "перечень"))
+    has_explicit_grouping = _has_explicit_grouping_request(user_input, intent)
     requires_single_entity_count = (
         metric_intent == "count"
         and bool(subject)
-        and not output_dimensions
+        and not has_explicit_grouping
         and not requires_listing
     )
     qualifier = None

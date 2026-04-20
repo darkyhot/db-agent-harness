@@ -429,6 +429,51 @@ class TestCountDistinct:
         assert "COUNT(DISTINCT" in sql.upper(), f"Ожидали COUNT(DISTINCT ...), получили: {sql}"
         assert "LIMIT" not in sql.upper(), "LIMIT не должен появляться при limit=None"
 
+    def test_legacy_count_distinct_function_is_normalized(self):
+        cols = {
+            "dm.gosb": {
+                "select": ["gosb_id"],
+                "filter": [],
+                "aggregate": ["gosb_id"],
+                "group_by": [],
+            }
+        }
+        bp = {
+            "strategy": "simple_select",
+            "main_table": "dm.gosb",
+            "aggregation": {"function": "count_distinct", "column": "gosb_id", "alias": "cnt_gosb"},
+            "group_by": [],
+            "where_conditions": [],
+            "order_by": None,
+            "limit": None,
+        }
+        sql = builder.build("simple_select", cols, [], bp, {"dm.gosb": "dim"})
+        assert sql is not None
+        assert "COUNT(DISTINCT" in sql.upper(), f"Ожидали COUNT(DISTINCT ...), получили: {sql}"
+
+    def test_count_star_uses_safe_alias(self):
+        cols = {
+            "dm.sales": {
+                "select": ["*"],
+                "filter": [],
+                "aggregate": ["*"],
+                "group_by": [],
+            }
+        }
+        bp = {
+            "strategy": "simple_select",
+            "main_table": "dm.sales",
+            "aggregation": {"function": "COUNT", "column": "*", "alias": "count_all"},
+            "group_by": [],
+            "where_conditions": [],
+            "order_by": None,
+            "limit": None,
+        }
+        sql = builder.build("simple_select", cols, [], bp, {"dm.sales": "fact"})
+        assert sql is not None
+        assert "COUNT(*) AS COUNT_ALL" in sql.upper()
+        assert "COUNT_*" not in sql.upper()
+
     def test_count_without_distinct_flag_has_no_distinct_keyword(self):
         """Когда distinct не задан — в SQL нет слова DISTINCT."""
         cols = {

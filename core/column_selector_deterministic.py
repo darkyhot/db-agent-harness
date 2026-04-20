@@ -638,6 +638,19 @@ def _choose_single_entity_count_column(
     return best[1]
 
 
+def _is_scalar_count_request(
+    agg_hint: str,
+    semantic_output_dimensions: list[str],
+    explicit_count_metric: bool,
+) -> bool:
+    """True для запросов вида «сколько задач ...» без разбивки."""
+    if agg_hint != "count":
+        return False
+    if explicit_count_metric:
+        return False
+    return not semantic_output_dimensions
+
+
 # ---------------------------------------------------------------------------
 # Основная функция
 # ---------------------------------------------------------------------------
@@ -676,6 +689,11 @@ def select_columns(
     semantic_output_dimensions = list(frame.get("output_dimensions") or [])
     if semantic_output_dimensions:
         requires_single_entity_count = False
+    scalar_count_request = _is_scalar_count_request(
+        agg_hint=agg_hint,
+        semantic_output_dimensions=semantic_output_dimensions,
+        explicit_count_metric=bool(requested.get("explicit_count_metric")),
+    )
 
     # Подсказки пользователя: связки «слот → таблица», JOIN-поля, HAVING-хинты.
     user_hints = user_hints or {}
@@ -749,35 +767,38 @@ def select_columns(
             # Не кладём PK и числовые метрики в group_by если они не упомянуты в entities
             gb_s = 0.0
             if not is_pk:
-                entity_hit = _entity_score(col_name, desc, entities)
-                slot_hit = max(
-                    [_semantic_match_score(col_name, desc, slot) for slot in requested['dimensions']],
-                    default=0.0,
-                )
-                if _is_categorical(dtype):
-                    gb_s += 0.25
-                if (entity_hit > 0 or slot_hit > 0) and unique_perc > 0 and unique_perc < 30:
-                    gb_s += 0.20
-                gb_s += max(entity_hit, slot_hit) * 0.75
-                # Числовые — только если явно упомянуты в entities
-                if _is_numeric(dtype) and max(entity_hit, slot_hit) < 0.3:
+                if scalar_count_request:
                     gb_s = 0.0
-                if _is_date(dtype):
-                    if slot_hit >= 0.8:
-                        gb_s = max(gb_s, 0.95)
-                    else:
-                        gb_s = min(gb_s, 0.2)
-                    # Подавляем дата-колонки в таблицах, которые выступают dim-источником
-                    # для нечасовых слотов. Дата берётся из фактовой таблицы; справочник
-                    # нужен только ради своего атрибута (сегмент, регион и т.п.).
-                    if gb_s > 0.05 and hint_dim_sources:
-                        _is_nondated_dim_src = any(
-                            b.get('table') == table_key and sk != 'date'
-                            for sk, b in hint_dim_sources.items()
-                            if isinstance(b, dict)
-                        )
-                        if _is_nondated_dim_src:
-                            gb_s = 0.05
+                else:
+                    entity_hit = _entity_score(col_name, desc, entities)
+                    slot_hit = max(
+                        [_semantic_match_score(col_name, desc, slot) for slot in requested['dimensions']],
+                        default=0.0,
+                    )
+                    if _is_categorical(dtype):
+                        gb_s += 0.25
+                    if (entity_hit > 0 or slot_hit > 0) and unique_perc > 0 and unique_perc < 30:
+                        gb_s += 0.20
+                    gb_s += max(entity_hit, slot_hit) * 0.75
+                    # Числовые — только если явно упомянуты в entities
+                    if _is_numeric(dtype) and max(entity_hit, slot_hit) < 0.3:
+                        gb_s = 0.0
+                    if _is_date(dtype):
+                        if slot_hit >= 0.8:
+                            gb_s = max(gb_s, 0.95)
+                        else:
+                            gb_s = min(gb_s, 0.2)
+                        # Подавляем дата-колонки в таблицах, которые выступают dim-источником
+                        # для нечасовых слотов. Дата берётся из фактовой таблицы; справочник
+                        # нужен только ради своего атрибута (сегмент, регион и т.п.).
+                        if gb_s > 0.05 and hint_dim_sources:
+                            _is_nondated_dim_src = any(
+                                b.get('table') == table_key and sk != 'date'
+                                for sk, b in hint_dim_sources.items()
+                                if isinstance(b, dict)
+                            )
+                            if _is_nondated_dim_src:
+                                gb_s = 0.05
             if gb_s > 0:
                 gb_candidates.append((col_name, round(gb_s, 3)))
 
@@ -827,7 +848,7 @@ def select_columns(
         group_by_cols = [c for c, s in gb_sorted if s > 0.30 and c not in agg_set][:3]
 
         # COUNT DISTINCT на dim-таблице: group_by не нужен (считаем сами PK-сущности)
-        if _use_count_distinct:
+        if _use_count_distinct or scalar_count_request:
             group_by_cols = []
 
         # select = group_by ∪ aggregate (без дублей, порядок: group_by первым)
@@ -1038,12 +1059,12 @@ def select_columns(
             main_table = next(iter(table_structures), None)
         if main_table:
             roles = selected_columns.setdefault(main_table, {})
-            if requires_single_entity_count:
+            if requires_single_entity_count or scalar_count_request:
                 count_col = _choose_single_entity_count_column(
                     main_table,
                     schema_loader,
                     entities=entities,
-                    subject=str(frame.get("subject") or ""),
+                    subject=str(frame.get("subject") or requested.get("metric") or ""),
                 )
                 if count_col:
                     roles['aggregate'] = [count_col]
@@ -1062,7 +1083,7 @@ def select_columns(
                 if '*' not in roles['aggregate']:
                     roles['aggregate'].append('*')
 
-    if requires_single_entity_count:
+    if requires_single_entity_count or scalar_count_request:
         main_fact = next((t for t, tp in table_types.items() if tp == 'fact'), None)
         for table_key, roles in list(selected_columns.items()):
             if table_key != main_fact:

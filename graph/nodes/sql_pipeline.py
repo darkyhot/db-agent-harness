@@ -198,6 +198,10 @@ def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> st
     подхватывает примеры значений (matched_example/example_values) из кандидата
     через candidate_label(), чтобы пользователю было видно, почему каждая
     колонка попала в кандидаты.
+
+    Возвращает пустую строку, когда задавать нечего: либо все request_id
+    закрыты через user_filter_choices, либо filter_candidates пуст. Caller
+    должен интерпретировать это как «уточнение не требуется» и идти дальше.
     """
     where_resolution = where_resolution or {}
     filter_candidates = where_resolution.get("filter_candidates", {}) or {}
@@ -222,7 +226,7 @@ def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> st
                 "Уточните, пожалуйста, фильтр: "
                 f"нужно отфильтровать именно по полю {label}?"
             )
-    return "Уточните, пожалуйста, источник данных или конкретный фильтр, который нужно применить."
+    return ""
 
 
 class SqlPipelineNodes:
@@ -362,18 +366,26 @@ class SqlPipelineNodes:
 
         if planning_confidence.get("action") != "execute":
             _clarif = _build_specific_clarification(where_resolution)
-            return {
-                "needs_clarification": True,
-                "clarification_message": _clarif,
-                "sql_blueprint": blueprint,
-                "where_resolution": where_resolution,
-                "planning_confidence": planning_confidence,
-                "evidence_trace": evidence_trace,
-                "graph_iterations": iterations,
-                "messages": state["messages"] + [
-                    {"role": "assistant", "content": _clarif}
-                ],
-            }
+            # Пустая строка — задавать нечего: все request_id закрыты через
+            # user_filter_choices. Не блокируем пайплайн фейковым clarification.
+            if _clarif:
+                return {
+                    "needs_clarification": True,
+                    "clarification_message": _clarif,
+                    "sql_blueprint": blueprint,
+                    "where_resolution": where_resolution,
+                    "planning_confidence": planning_confidence,
+                    "evidence_trace": evidence_trace,
+                    "graph_iterations": iterations,
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": _clarif}
+                    ],
+                }
+            logger.info(
+                "SqlPlanner: planning_confidence=%s, но все filter request_id закрыты "
+                "через user_filter_choices — продолжаю выполнение",
+                planning_confidence.get("action"),
+            )
 
         # Если dim-таблица пропущена — формируем подсказку для повторного column_selector
         new_hint = ""

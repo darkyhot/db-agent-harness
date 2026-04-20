@@ -50,6 +50,7 @@ def evaluate_filter_confidence(
     qualifier = str((semantic_frame or {}).get("qualifier") or "")
     explicit_filters = list((intent or {}).get("filter_conditions") or [])
     filter_candidates = where_resolution.get("filter_candidates", {}) or {}
+    user_choices = where_resolution.get("user_filter_choices", {}) or {}
 
     if where_resolution.get("needs_clarification"):
         return {
@@ -71,6 +72,15 @@ def evaluate_filter_confidence(
         if not candidates:
             continue
         top = candidates[0]
+        # Если пользователь явно выбрал колонку для этого request_id —
+        # считаем фильтр полностью разрешённым (score=1.0). Без этого
+        # candidate-scores остаются на уровне medium и planning_confidence
+        # продолжает требовать clarification, хотя выбор уже сделан.
+        if str(request_id) in user_choices:
+            chosen_column = str(user_choices[str(request_id)])
+            candidate_scores.append(1.0)
+            evidence.append(f"{request_id}:{chosen_column}:user_choice")
+            continue
         top_score = float(top.get("score", 0.0) or 0.0) / 100.0
         candidate_scores.append(top_score)
         evidence.append(f"{request_id}:{top.get('column')}:{top.get('confidence')}")

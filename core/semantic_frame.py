@@ -13,6 +13,8 @@ _RU_MONTH_STEMS = (
     "июн", "июл", "август", "сентябр", "октябр", "ноябр", "декабр",
 )
 _PREPOSITIONS = ("с ", "со ", "по ", "без ", "для ")
+_PROJECTION_VERBS = ("подтяни", "дотяни", "возьми", "выведи", "покажи")
+_DIMENSION_WORD_STEMS = ("сегмент", "регион", "госб", "тб", "филиал")
 
 
 def _collect_text(user_input: str, intent: dict[str, Any] | None) -> str:
@@ -76,7 +78,15 @@ def _extract_freeform_phrases(user_input: str) -> list[str]:
             for word in words[:4]:
                 if word in {"дате", "дате", "дата", "региону", "регион", "сегменту", "сегмент"} and not phrase_words:
                     break
-                if word in {"и", "или"} and phrase_words:
+                if word in _PROJECTION_VERBS and phrase_words:
+                    break
+                if word == "из" and phrase_words:
+                    break
+                if word in {"и", "или", "за"} and phrase_words:
+                    break
+                if any(word.startswith(stem) for stem in _RU_MONTH_STEMS) and phrase_words:
+                    break
+                if re.fullmatch(r"\d{2,4}", word) and phrase_words:
                     break
                 phrase_words.append(word)
             if phrase_words:
@@ -107,6 +117,63 @@ def _token_overlap(a: str, b: str) -> int:
     return matches
 
 
+def _looks_like_output_dimension_filter(item: dict[str, Any], output_dimensions: list[str]) -> bool:
+    """Не путать `group by`-измерение с filter_intent.
+
+    Пример: запрос `по сегментам` должен давать output dimension `segment`,
+    а не просьбу фильтровать по `segment_name`.
+    """
+    if not output_dimensions:
+        return False
+    column_key = str(item.get("column_key") or "")
+    column_name = column_key.rsplit(".", 1)[-1] if column_key else ""
+    matched_phrase = str(item.get("query_text") or item.get("matched_phrase") or "")
+    haystacks = [column_name, matched_phrase]
+    for dim in output_dimensions:
+        dim_norm = str(dim or "").strip().lower()
+        if not dim_norm:
+            continue
+        for hay in haystacks:
+            hay_norm = str(hay or "").strip().lower()
+            if not hay_norm:
+                continue
+            if dim_norm in hay_norm or hay_norm in dim_norm:
+                return True
+            if _token_overlap(dim_norm, hay_norm) >= 1:
+                return True
+    return False
+
+
+def _extract_output_dimension_hints(user_input: str) -> list[str]:
+    """Вытащить явные измерения из phrasing `по X`, `по дате`, `по region_name`."""
+    normalized = _normalize_text(user_input)
+    dimensions: list[str] = []
+
+    for match in re.finditer(r"(?:по|в разбивке по)\s+([a-zа-я_]+)", normalized):
+        token = str(match.group(1) or "").strip().lower()
+        if not token:
+            continue
+        if token in {"дате", "дата", "date", "report_dt"}:
+            dimensions.append("date")
+            continue
+        if token.endswith(("_name", "_label", "_title")):
+            dimensions.append(token)
+            continue
+        if "_" in token and not token.endswith(("_id", "_code")):
+            dimensions.append(token)
+            continue
+        if any(token.startswith(stem) for stem in _DIMENSION_WORD_STEMS):
+            dimensions.append(token)
+            continue
+
+    for match in re.finditer(r"(?:названи[еяю]|наименовани[еяю])\s+([a-zа-я_]+)", normalized):
+        token = str(match.group(1) or "").strip().lower()
+        if token:
+            dimensions.append(token)
+
+    return list(dict.fromkeys(dimensions))
+
+
 def _derive_filter_intents(
     *,
     user_input: str,
@@ -117,10 +184,27 @@ def _derive_filter_intents(
     registry = schema_loader.get_rule_registry() if schema_loader is not None else {"rules": []}
     matched_rules = find_matching_rules(user_input, registry)
     for idx, rule in enumerate(matched_rules):
+        matched_phrase = str(rule.get("matched_phrase") or "")
+        normalized_input = _normalize_text(user_input)
+        normalized_phrase = _normalize_text(matched_phrase)
+        matched_from_column_phrase = normalized_phrase in {
+            _normalize_text(v) for v in (rule.get("match_phrases") or [])
+        }
+        if (
+            matched_from_column_phrase
+            and normalized_phrase
+            and (
+                f"по {normalized_phrase}" in normalized_input
+                or f"подтяни {normalized_phrase}" in normalized_input
+                or f"выведи {normalized_phrase}" in normalized_input
+                or f"покажи {normalized_phrase}" in normalized_input
+            )
+        ):
+            continue
         intents.append({
             "request_id": rule["rule_id"],
             "kind": str(rule.get("match_kind") or "text_search"),
-            "query_text": str(rule.get("matched_phrase") or ""),
+            "query_text": matched_phrase,
             "column_key": str(rule.get("column_key") or ""),
             "semantic_class": str(rule.get("semantic_class") or ""),
             "match_score": float(rule.get("match_score", 0.0) or 0.0),
@@ -143,11 +227,22 @@ def _derive_filter_intents(
         })
 
     freeform_phrases = _extract_freeform_phrases(user_input)
+    normalized_input = _normalize_text(user_input)
     known_query_texts = {str(item.get("query_text") or "") for item in intents}
     for idx, phrase in enumerate(freeform_phrases):
         if phrase in known_query_texts:
             continue
         phrase_token_count = len(_tokenize(phrase))
+        normalized_phrase = _normalize_text(phrase)
+        if (
+            phrase_token_count == 1
+            and normalized_phrase
+            and (
+                f"по {normalized_phrase}" in normalized_input
+                or f"подтяни {normalized_phrase}" in normalized_input
+            )
+        ):
+            continue
         if any(
             _token_overlap(phrase, existing) >= (
                 1
@@ -187,19 +282,7 @@ def derive_semantic_frame(
         elif any(token in haystack for token in ("organization", "org", "branch", "госб", "тб")):
             subject = "organization"
 
-    matched_rules = find_matching_rules(haystack, schema_loader.get_rule_registry()) if schema_loader is not None else []
-    qualifier = None
-    business_event = None
-    top_rule = matched_rules[0] if matched_rules else None
-    if top_rule:
-        rule_id = str(top_rule.get("rule_id") or "")
-        if str(top_rule.get("match_kind") or "") == "boolean_true":
-            qualifier = rule_id.split(":", 1)[0]
-        else:
-            qualifier = rule_id.split(":", 1)[0]
-        business_event = str(top_rule.get("matched_phrase") or "")
-    elif any(token in haystack for token in ("outflow", "отток", "churn", "attrition")):
-        business_event = "outflow"
+    raw_filter_intents = _derive_filter_intents(user_input=user_input, intent=intent, schema_loader=schema_loader)
 
     requested_grain = subject
     period_kind = None
@@ -210,6 +293,7 @@ def derive_semantic_frame(
     output_dimensions = (
         find_matching_dimensions(haystack, lexicon) if lexicon else []
     )
+    output_dimensions = list(dict.fromkeys(output_dimensions + _extract_output_dimension_hints(user_input)))
     required_output = [str(v).strip().lower() for v in ((intent or {}).get("required_output") or []) if str(v).strip()]
     output_dimensions = list(dict.fromkeys(required_output + output_dimensions))
     requires_listing = metric_intent == "list" or any(token in haystack for token in ("список", "перечень"))
@@ -219,13 +303,33 @@ def derive_semantic_frame(
         and not output_dimensions
         and not requires_listing
     )
+    qualifier = None
+    business_event = None
     ambiguities: list[str] = []
+
+    filter_intents = raw_filter_intents
+    filter_intents = [
+        item for item in filter_intents
+        if not _looks_like_output_dimension_filter(item, output_dimensions)
+    ]
+
+    qualifier = None
+    business_event = None
+    top_filter = filter_intents[0] if filter_intents else None
+    if top_filter:
+        request_id = str(top_filter.get("request_id") or "")
+        if ":" in request_id:
+            qualifier = request_id.split(":", 1)[0]
+        matched_phrase = str(top_filter.get("query_text") or top_filter.get("matched_phrase") or "").strip()
+        if matched_phrase:
+            business_event = matched_phrase
+    elif any(token in haystack for token in ("outflow", "отток", "churn", "attrition")):
+        business_event = "outflow"
+
     if not metric_intent and any(token in haystack for token in ("покажи", "выведи")):
         ambiguities.append("metric_intent")
     if not subject and business_event:
         ambiguities.append("subject")
-
-    filter_intents = _derive_filter_intents(user_input=user_input, intent=intent, schema_loader=schema_loader)
 
     return {
         "subject": subject,

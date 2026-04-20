@@ -20,7 +20,9 @@
     "supports_pattern_match": false,
     "null_pct": 0.0,
     "distinct_pct": 0.5,
-    "known_terms": [],
+    "known_terms": [
+      "Задача"
+    ],
     "source": "metadata"
   },
   "schema.uzp_dwh_fact_outflow.segment_name": {
@@ -41,7 +43,9 @@
     "supports_pattern_match": true,
     "null_pct": 98.39,
     "distinct_pct": 0.04,
-    "known_terms": [],
+    "known_terms": [
+      "сервисная задача по юр-лицу"
+    ],
     "source": "metadata"
   },
   "schema.uzp_dwh_fact_outflow.is_force": {
@@ -61,7 +65,9 @@
     "supports_pattern_match": false,
     "null_pct": 0.0,
     "distinct_pct": 0.02,
-    "known_terms": [],
+    "known_terms": [
+      "фактический отток"
+    ],
     "source": "metadata"
   },
   "schema.uzp_dwh_fact_outflow.mzp_fio": {

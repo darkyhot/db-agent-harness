@@ -135,6 +135,35 @@ class SchemaLoader:
             return None
         return data
 
+    @staticmethod
+    def _sanitize_rule_registry(registry: dict[str, Any] | None) -> dict[str, Any]:
+        """Нормализовать загруженный rule_registry, даже если он был собран старой логикой."""
+        if not isinstance(registry, dict):
+            return {"rules": []}
+        rules = registry.get("rules") or []
+        sanitized_rules: list[dict[str, Any]] = []
+        for raw in rules:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            column_key = str(item.get("column_key") or "")
+            column_name = column_key.rsplit(".", 1)[-1]
+            phrases = [
+                str(phrase).strip()
+                for phrase in (item.get("match_phrases") or [])
+                if str(phrase).strip()
+            ]
+            item["match_phrases"] = [
+                phrase
+                for phrase in phrases
+                if not (
+                    (column_name.endswith("_type") or column_name.endswith("_category"))
+                    and len(re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9_]+", phrase)) < 2
+                )
+            ]
+            sanitized_rules.append(item)
+        return {"rules": sanitized_rules}
+
     def _load_tables(self) -> pd.DataFrame:
         """Загрузить и закешировать tables_list.csv."""
         if self._tables_df is not None:
@@ -485,7 +514,7 @@ class SchemaLoader:
         if persisted_lex is not None:
             self._semantic_lexicon = persisted_lex
         if persisted_rules is not None:
-            self._rule_registry = persisted_rules
+            self._rule_registry = self._sanitize_rule_registry(persisted_rules)
         if persisted_lex is not None and persisted_rules is not None:
             return
 
@@ -512,6 +541,7 @@ class SchemaLoader:
                 column_semantics=self._column_semantics or {},
                 value_profiles=self._value_profiles or {},
             )
+            self._rule_registry = self._sanitize_rule_registry(self._rule_registry)
             rule_path.write_text(
                 json.dumps(self._rule_registry, ensure_ascii=False, indent=2),
                 encoding="utf-8",

@@ -175,12 +175,6 @@ def _build_condition(column: str, operator: str, value: Any, profile: dict[str, 
         return f"{column} = '{_escape_sql_literal(str(value))}'"
 
     if op == "ILIKE":
-        tokens = [tok for tok in _tokenize(str(value)) if len(tok) >= 4]
-        if len(tokens) >= 2:
-            unique_tokens = list(dict.fromkeys(tokens))
-            return " AND ".join(
-                f"{column} ILIKE '%{_escape_sql_literal(token)}%'" for token in unique_tokens
-            )
         return f"{column} ILIKE '%{_escape_sql_literal(str(value))}%'"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return f"{column} {op} {value}"

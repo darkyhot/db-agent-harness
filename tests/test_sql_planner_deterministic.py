@@ -407,13 +407,8 @@ class TestBuildBlueprint:
         assert bp["strategy"] == "dim_dim_join"
         assert bp["cte_needed"] is True
 
-    def test_filter_col_promoted_to_group_by_when_no_where(self):
-        """Лог 1: report_dt в filter без WHERE-условия → должен попасть в group_by.
-
-        Пользователь просит 'по дате и названию ГОСБ' — column_selector кладёт
-        report_dt в filter, но явных date_filters нет. Планировщик должен
-        автоматически перенести report_dt в group_by.
-        """
+    def test_filter_col_promoted_to_group_by_only_when_dimension_requested(self):
+        """Filter-only дата попадает в GROUP BY только если пользователь просил измерение."""
         intent = {
             "aggregation_hint": "sum",
             "date_filters": {"from": None, "to": None},
@@ -437,10 +432,9 @@ class TestBuildBlueprint:
             intent, cols, [],
             {"dm.fact_outflow": "fact", "dm.dim_gosb": "dim"},
             {},
+            semantic_frame={"output_dimensions": ["date"]},
         )
-        assert "report_dt" in bp["group_by"], (
-            "report_dt в filter без WHERE-условия должен быть продвинут в group_by"
-        )
+        assert "report_dt" in bp["group_by"]
 
     def test_filter_col_not_promoted_when_where_exists(self):
         """Если для filter-колонки есть WHERE-условие, в group_by она НЕ добавляется."""
@@ -491,16 +485,16 @@ class TestNoDefaultLimit:
         assert bp.get("limit") == 50
 
 
-class TestCountDistinctAggregation:
-    """_compute_aggregation должен выставлять distinct=True для COUNT по pk-колонке."""
+class TestCountAggregation:
+    """COUNT не должен становиться DISTINCT без явного сигнала."""
 
-    def test_count_with_pk_col_gets_distinct(self):
+    def test_count_with_pk_col_has_no_distinct_by_default(self):
         intent = {"aggregation_hint": "count"}
         cols = {"dm.gosb": {"select": ["gosb_id"], "aggregate": ["gosb_id"], "group_by": []}}
         agg = _compute_aggregation(intent, cols)
         assert agg is not None
         assert agg["function"] == "COUNT"
-        assert agg.get("distinct") is True, "Ожидали distinct=True для COUNT по pk-колонке"
+        assert not agg.get("distinct"), "COUNT по колонке не должен становиться DISTINCT по умолчанию"
 
     def test_count_star_fallback_no_distinct(self):
         intent = {"aggregation_hint": "count"}
@@ -509,3 +503,25 @@ class TestCountDistinctAggregation:
         assert agg is not None
         assert agg["column"] == "*"
         assert not agg.get("distinct"), "COUNT(*) не должен иметь distinct"
+
+
+def test_build_blueprint_does_not_leak_filter_only_keys_into_group_by():
+    intent = {"aggregation_hint": "count", "required_output": []}
+    cols = {
+        "dm.sales": {
+            "select": ["task_code"],
+            "filter": ["inn", "report_dt"],
+            "aggregate": ["task_code"],
+            "group_by": [],
+        }
+    }
+    bp = build_blueprint(
+        intent,
+        cols,
+        [],
+        {"dm.sales": "fact"},
+        {},
+        semantic_frame={"output_dimensions": []},
+    )
+    assert "inn" not in bp["group_by"]
+    assert "report_dt" not in bp["group_by"]

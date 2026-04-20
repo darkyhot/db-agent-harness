@@ -893,6 +893,7 @@ class SqlPipelineNodes:
 
         if not check_result.is_valid:
             error_msg = (
+                "SQL не выполнен: ошибка статической проверки.\n"
                 f"[sql_static_checker] {check_result.summary()}\n"
                 "Исправь SQL перед отправкой в БД."
             )
@@ -962,7 +963,10 @@ class SqlPipelineNodes:
 
         # Невалидный SQL
         if not result.is_valid:
-            error_msg = result.summary()
+            error_msg = (
+                "SQL не выполнен: ошибка валидации.\n"
+                f"{result.summary()}"
+            )
             logger.warning("Validator: SQL невалиден: %s", summarize_text(error_msg, label="validation_error"))
             return {
                 "last_error": error_msg,

@@ -256,10 +256,8 @@ def _compute_aggregation(
         if agg_cols:
             col = agg_cols[0]
             alias = f"{func.lower()}_{col}"
-            # COUNT DISTINCT: если агрегируемая колонка явно помечена (_count_distinct)
-            # или если hint=count и колонка выглядит как PK (имя оканчивается на _id/_num)
             distinct = False
-            if hint == "count" and col != "*":
+            if hint == "count" and col.lower().endswith("_count_distinct"):
                 distinct = True
             result: dict = {"function": func, "column": col, "alias": alias}
             if distinct:
@@ -607,15 +605,31 @@ def build_blueprint(
                             )
                         break
 
-    # Если есть агрегация — filter-колонки без WHERE-условия нужны в GROUP BY.
-    # Типичный случай: column_selector кладёт report_dt в filter, но пользователь
-    # хочет группировку «по дате» — и явного фильтра по дате нет.
+    # Filter-only колонки не должны автоматически утекать в GROUP BY.
+    # Добавляем их только если пользователь действительно просил измерение
+    # в required_output/output_dimensions.
     if aggregation:
         where_str = " ".join(where_conditions).lower()
         seen_gb: set[str] = set(group_by)
+        requested_dimensions = {
+            str(v).strip().lower()
+            for v in list((semantic_frame or {}).get("output_dimensions") or [])
+            + list(required_output)
+            if str(v).strip()
+        }
         for _table, roles in selected_columns.items():
             for col in roles.get("filter", []):
-                if col not in seen_gb and col.lower() not in where_str:
+                col_lower = col.lower()
+                should_group = any(
+                    dim in col_lower or col_lower in dim
+                    for dim in requested_dimensions
+                )
+                if not should_group and "date" in requested_dimensions:
+                    should_group = any(
+                        col_lower.endswith(suf)
+                        for suf in ("_dt", "_date", "_dttm", "_timestamp", "_ts")
+                    ) or "date" in col_lower or "dttm" in col_lower or "timestamp" in col_lower
+                if should_group and col not in seen_gb and col_lower not in where_str:
                     group_by.append(col)
                     seen_gb.add(col)
 

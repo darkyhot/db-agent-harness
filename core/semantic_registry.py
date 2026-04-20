@@ -105,6 +105,23 @@ def _collect_aliases(*parts: str) -> list[str]:
     return result
 
 
+def _is_overly_generic_match_phrase(column: str, phrase: str) -> bool:
+    """Отсечь слишком общие match_phrases для type/category-полей.
+
+    Пример нежелательного поведения: `task_type` начинает матчиться по словам
+    "task"/"задача", из-за чего любой запрос про задачи провоцирует лишний
+    фильтр по типу. Для таких полей оставляем только более специфичные фразы.
+    """
+    column_norm = _normalize_phrase(column)
+    phrase_tokens = _tokenize(phrase)
+    if not phrase_tokens:
+        return True
+
+    if column_norm.endswith("_type") or column_norm.endswith("_category"):
+        return len(phrase_tokens) < 2
+    return False
+
+
 def build_semantic_lexicon(
     tables_df,
     attrs_df,
@@ -211,7 +228,13 @@ def build_rule_registry(
 
         description = str(row.get("description", "") or "")
         aliases = _collect_aliases(column.replace("_", " "), description)
-        match_phrases = [alias for alias in aliases if alias and alias not in _FLAG_WORDS]
+        match_phrases = [
+            alias
+            for alias in aliases
+            if alias
+            and alias not in _FLAG_WORDS
+            and not _is_overly_generic_match_phrase(column, alias)
+        ]
         values = [str(v) for v in list(profile.get("top_values", []) or []) + list(profile.get("known_terms", []) or []) if str(v).strip()]
 
         if sem_class == "flag":

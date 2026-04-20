@@ -197,6 +197,34 @@ def _check_select_star(sql: str, result: StaticCheckResult) -> None:
         )
 
 
+def _check_balanced_delimiters(sql: str, result: StaticCheckResult) -> None:
+    """Проверить баланс круглых скобок и кавычек в простом виде.
+
+    Это не полноценный SQL parser, но хорошо ловит самые частые артефакты
+    генерации: лишнюю `)` или незакрытую `(`, которые иначе всплывают только
+    на этапе EXPLAIN.
+    """
+    paren_depth = 0
+    in_single = False
+    for idx, ch in enumerate(sql):
+        if ch == "'" and (idx == 0 or sql[idx - 1] != "\\"):
+            in_single = not in_single
+            continue
+        if in_single:
+            continue
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+            if paren_depth < 0:
+                result.add_error("SQL содержит лишнюю закрывающую скобку.")
+                return
+    if in_single:
+        result.add_error("SQL содержит незакрытую строковую кавычку.")
+    if paren_depth > 0:
+        result.add_error("SQL содержит незакрытую круглую скобку.")
+
+
 def _build_alias_to_table_map(sql: str, real_tables: dict[tuple[str, str], set[str]]) -> dict[str, tuple[str, str]]:
     """Построить маппинг алиас/имя_таблицы → (schema, table).
 
@@ -875,6 +903,9 @@ def check_sql(
 
     # 1. Кириллические алиасы — жёсткая ошибка, если остались
     _check_cyrillic_aliases(sql, result)
+
+    # 1a. Грубая синтаксическая sanity-проверка скобок/кавычек
+    _check_balanced_delimiters(sql, result)
 
     # 2. SELECT * — жёсткая ошибка (запрещено правилами агента)
     _check_select_star(sql, result)

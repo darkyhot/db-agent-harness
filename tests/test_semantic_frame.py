@@ -1,7 +1,7 @@
 import pandas as pd
 
 from core.schema_loader import SchemaLoader
-from core.semantic_frame import derive_semantic_frame
+from core.semantic_frame import _extract_freeform_phrases, derive_semantic_frame
 
 
 def _loader(tmp_path):
@@ -63,3 +63,74 @@ def test_semantic_frame_detects_listing_and_ambiguity():
 
     assert frame["requires_listing"] is False
     assert "metric_intent" in frame["ambiguities"]
+
+
+def test_extract_freeform_phrases_stops_before_date_tail():
+    phrases = _extract_freeform_phrases("Покажи сумму оттока по сегментам за январь 2024")
+    assert "сегментам за январь 2024" not in phrases
+
+
+def test_output_dimension_not_turned_into_filter_intent(tmp_path):
+    loader = _loader(tmp_path)
+    frame = derive_semantic_frame(
+        "Покажи сумму оттока по сегментам за январь 2024",
+        {
+            "aggregation_hint": "sum",
+            "entities": ["отток", "сегмент"],
+            "required_output": ["сегмент"],
+        },
+        schema_loader=loader,
+    )
+    assert "сегмент" in frame["output_dimensions"]
+    assert not any("segment" in str(item.get("column_key", "")) for item in frame["filter_intents"])
+
+
+def test_single_word_grouping_phrase_not_turned_into_filter_intent(tmp_path):
+    loader = _loader(tmp_path)
+    frame = derive_semantic_frame(
+        "Покажи сумму оттока по сегментам за январь 2024",
+        {
+            "aggregation_hint": "sum",
+            "entities": ["отток"],
+            "required_output": [],
+        },
+        schema_loader=loader,
+    )
+    assert not frame["filter_intents"]
+
+
+def test_explicit_projection_column_not_turned_into_filter_intent(tmp_path):
+    loader = _loader(tmp_path)
+    frame = derive_semantic_frame(
+        "Покажи количество задач по task_subtype",
+        {
+            "aggregation_hint": "count",
+            "entities": ["task_subtype"],
+            "required_output": [],
+        },
+        schema_loader=loader,
+    )
+    assert not any("task_subtype" in str(item.get("column_key", "")) for item in frame["filter_intents"])
+
+
+def test_explicit_column_after_po_becomes_output_dimension_not_filter(tmp_path):
+    loader = _loader(tmp_path)
+    frame = derive_semantic_frame(
+        "Покажи количество задач по task_subtype за февраль 2026",
+        {
+            "aggregation_hint": "count",
+            "entities": ["задачи"],
+            "required_output": [],
+        },
+        schema_loader=loader,
+    )
+    assert "task_subtype" in frame["output_dimensions"]
+    assert frame["qualifier"] is None
+    assert not frame["filter_intents"]
+
+
+def test_projection_phrase_does_not_bleed_into_freeform_filter():
+    phrases = _extract_freeform_phrases(
+        "Покажи сумму outflow_qty по region_name, подтяни region_name из uzp_dim_gosb по gosb_id"
+    )
+    assert "region_name подтяни region_name из" not in phrases

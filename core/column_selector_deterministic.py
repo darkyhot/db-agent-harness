@@ -694,6 +694,12 @@ def select_columns(
         semantic_output_dimensions=semantic_output_dimensions,
         explicit_count_metric=bool(requested.get("explicit_count_metric")),
     )
+    logger.info(
+        "ColumnSelectorDet: requested=%s, requires_single_entity_count=%s, scalar_count_request=%s",
+        requested,
+        requires_single_entity_count,
+        scalar_count_request,
+    )
 
     # Подсказки пользователя: связки «слот → таблица», JOIN-поля, HAVING-хинты.
     user_hints = user_hints or {}
@@ -1198,6 +1204,7 @@ def select_columns(
         overall = min(overall, 0.99)
 
     logger.info('ColumnSelectorDet: %s', reason)
+    logger.info('ColumnSelectorDet: selected_columns=%s', selected_columns)
 
     return {
         'selected_columns': selected_columns,

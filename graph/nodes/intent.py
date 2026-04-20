@@ -363,6 +363,10 @@ class IntentNodes:
             "IntentClassifier: semantic_frame=%s",
             summarize_dict_keys(semantic_frame, label="semantic_frame"),
         )
+        logger.info(
+            "IntentClassifier: semantic_frame_full=%s",
+            semantic_frame,
+        )
 
         self.memory.add_message(
             "assistant",
@@ -542,6 +546,8 @@ class IntentNodes:
         query_norm = _normalize_query_text(user_input)
         requested = _derive_requested_slots(user_input, intent)
         semantic_frame = state.get("semantic_frame", {}) or derive_semantic_frame(user_input, intent, schema_loader=self.schema)
+        logger.info("TableResolver: user_input_full=%r", user_input)
+        logger.info("TableResolver: semantic_frame_full=%s", semantic_frame)
         tables_df = self.schema.tables_df
         forced_single_source = _extract_forced_single_source(query_norm, tables_df)
 

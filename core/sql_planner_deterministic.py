@@ -512,6 +512,7 @@ def build_blueprint(
     schema_loader=None,
     semantic_frame: dict | None = None,
     user_filter_choices: dict[str, str] | None = None,
+    rejected_filter_choices: dict[str, list[str]] | None = None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -576,6 +577,7 @@ def build_blueprint(
         semantic_frame=semantic_frame,
         base_conditions=base_where_conditions,
         user_filter_choices=user_filter_choices,
+        rejected_filter_choices=rejected_filter_choices,
     )
     where_conditions = where_resolution.get("conditions", base_where_conditions)
 

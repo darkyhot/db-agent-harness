@@ -76,6 +76,7 @@ def resolve_where(
     semantic_frame: dict[str, Any] | None,
     base_conditions: list[str] | None = None,
     user_filter_choices: dict[str, str] | None = None,
+    rejected_filter_choices: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Достроить WHERE доменными правилами и value profiles.
 
@@ -89,7 +90,12 @@ def resolve_where(
     reasoning: list[str] = []
     applied_rules: list[str] = []
     clarification_message = ""
+    clarification_spec: dict[str, Any] = {}
     user_filter_choices = dict(user_filter_choices or {})
+    rejected_filter_choices = {
+        str(k): [str(vv).strip().lower() for vv in (v or []) if str(vv).strip()]
+        for k, v in dict(rejected_filter_choices or {}).items()
+    }
     ranked_candidates = rank_filter_candidates(
         user_input=user_input,
         intent=intent,
@@ -101,14 +107,22 @@ def resolve_where(
     for request_id, candidates in ranked_candidates.items():
         if not candidates:
             continue
-        filtered = []
+        compatible_candidates = []
         for candidate in candidates:
             schema = candidate.get("schema")
             table = candidate.get("table")
             if schema and table and not table_can_satisfy_frame(schema_loader, schema, table, semantic_frame):
                 continue
-            filtered.append(candidate)
-        candidates = filtered or candidates
+            compatible_candidates.append(candidate)
+        candidates = compatible_candidates or candidates
+        rejected_columns = set(rejected_filter_choices.get(str(request_id), []))
+        candidates = [
+            cand for cand in candidates
+            if str(cand.get("column") or "").strip().lower() not in rejected_columns
+        ]
+        if not candidates:
+            reasoning.append(f"rejected_all:{request_id}")
+            continue
 
         # 1) Явный выбор пользователя из предыдущего раунда уточнений побеждает всё.
         chosen_by_user: dict[str, Any] | None = None
@@ -144,6 +158,15 @@ def resolve_where(
                 f"Уточните, пожалуйста, по какому признаку фильтровать: "
                 f"{best_label} или {second_label}?"
             )
+            clarification_spec = {
+                "type": "choice",
+                "request_id": str(request_id),
+                "message": clarification_message,
+                "options": [
+                    {"column": str(best.get("column") or ""), "label": best_label},
+                    {"column": str(second.get("column") or ""), "label": second_label},
+                ],
+            }
             reasoning.append(f"ambiguity:{request_id}:gap={score_gap:.1f}")
             break
 
@@ -156,7 +179,17 @@ def resolve_where(
         )
 
     filter_intents = list((semantic_frame or {}).get("filter_intents") or [])
-    if filter_intents and not applied_rules and not clarification_message:
+    all_rejected_request_ids = {
+        str(reason).split(":", 1)[1]
+        for reason in reasoning
+        if str(reason).startswith("rejected_all:")
+    }
+    if (
+        filter_intents
+        and not applied_rules
+        and not clarification_message
+        and len(all_rejected_request_ids) < len(filter_intents)
+    ):
         clarification_message = (
             "Нашёл несколько возможных способов применить фильтр, "
             "но уверенности недостаточно. Уточните, пожалуйста, желаемый признак или значение."
@@ -180,5 +213,7 @@ def resolve_where(
         "filter_candidates": ranked_candidates,
         "needs_clarification": bool(clarification_message),
         "clarification_message": clarification_message,
+        "clarification_spec": clarification_spec,
         "user_filter_choices": user_filter_choices,
+        "rejected_filter_choices": rejected_filter_choices,
     }

@@ -93,6 +93,63 @@ def _match_clarification_to_choice(
     return {}
 
 
+def _is_yes_reply(text: str) -> bool:
+    normalized = (text or "").strip().lower().replace("ё", "е")
+    return normalized in {"да", "ага", "угу", "yes", "y", "ok", "ок", "верно", "подтверждаю"}
+
+
+def _is_no_reply(text: str) -> bool:
+    normalized = (text or "").strip().lower().replace("ё", "е")
+    return normalized in {"нет", "no", "n", "неа", "не", "неверно"}
+
+
+def _interpret_filter_clarification(
+    clarification: str,
+    where_resolution: dict,
+    *,
+    already_resolved: dict[str, str] | None = None,
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Понять ответ пользователя на typed clarification по фильтрам."""
+    already_resolved = already_resolved or {}
+    spec = (where_resolution or {}).get("clarification_spec", {}) or {}
+    request_id = str(spec.get("request_id") or "").strip()
+    options = list(spec.get("options") or [])
+
+    if request_id and request_id not in already_resolved:
+        if spec.get("type") == "confirm" and options:
+            candidate_column = str(options[0].get("column") or "").strip()
+            if candidate_column:
+                if _is_yes_reply(clarification):
+                    return ({request_id: candidate_column}, {})
+                if _is_no_reply(clarification):
+                    return ({}, {request_id: [candidate_column]})
+
+        if spec.get("type") == "choice":
+            choice_candidates = {
+                request_id: [
+                    {
+                        "column": opt.get("column"),
+                        "description": opt.get("label"),
+                    }
+                    for opt in options
+                ]
+            }
+            matched = _match_clarification_to_choice(
+                clarification,
+                choice_candidates,
+                already_resolved=already_resolved,
+            )
+            if matched:
+                return (matched, {})
+
+    matched = _match_clarification_to_choice(
+        clarification,
+        (where_resolution or {}).get("filter_candidates", {}) or {},
+        already_resolved=already_resolved,
+    )
+    return (matched, {})
+
+
 def setup_logging() -> None:
     """Настройка логирования: только файл, консоль отключена."""
     root = logging.getLogger()
@@ -475,6 +532,7 @@ class CLIInterface:
         self,
         user_input: str,
         user_filter_choices: dict[str, str] | None = None,
+        rejected_filter_choices: dict[str, list[str]] | None = None,
     ) -> None:
         """Обработать запрос пользователя через граф агента.
 
@@ -507,6 +565,7 @@ class CLIInterface:
             prev_sql=self._prev_sql,
             prev_result_summary=self._prev_result_summary,
             user_filter_choices=dict(user_filter_choices or {}),
+            rejected_filter_choices={k: list(v) for k, v in dict(rejected_filter_choices or {}).items()},
         )
         result = {}
         spinner_idx = 0
@@ -550,20 +609,43 @@ class CLIInterface:
                         (user_filter_choices or {})
                         | (where_resolution.get("user_filter_choices", {}) or {})
                     )
-                    new_choices = _match_clarification_to_choice(
+                    prev_rejections = dict(
+                        (rejected_filter_choices or {})
+                        | (where_resolution.get("rejected_filter_choices", {}) or {})
+                    )
+                    new_choices, new_rejections = _interpret_filter_clarification(
                         clarification,
-                        filter_candidates,
+                        where_resolution,
                         already_resolved=prev_choices,
                     )
                     if new_choices:
                         merged_choices = {**prev_choices, **new_choices}
-                        self._process_query(user_input, user_filter_choices=merged_choices)
+                        self._process_query(
+                            user_input,
+                            user_filter_choices=merged_choices,
+                            rejected_filter_choices=prev_rejections or None,
+                        )
+                    elif new_rejections:
+                        merged_rejections = dict(prev_rejections)
+                        for request_id, columns in new_rejections.items():
+                            merged_rejections[request_id] = list(
+                                dict.fromkeys((merged_rejections.get(request_id, []) or []) + list(columns))
+                            )
+                        self._process_query(
+                            user_input,
+                            user_filter_choices=prev_choices or None,
+                            rejected_filter_choices=merged_rejections,
+                        )
                     else:
                         # Фолбэк: не смогли сопоставить ответ с кандидатами — как раньше,
                         # дописываем в сам текст запроса, чтобы explicit-choice в
                         # where_resolver мог поймать имя колонки напрямую.
                         augmented_input = f"{user_input}\nУточнение пользователя: {clarification}"
-                        self._process_query(augmented_input, user_filter_choices=prev_choices or None)
+                        self._process_query(
+                            augmented_input,
+                            user_filter_choices=prev_choices or None,
+                            rejected_filter_choices=prev_rejections or None,
+                        )
                 else:
                     print("Уточнение не получено. Операция отменена.")
                 return

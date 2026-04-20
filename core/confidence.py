@@ -51,6 +51,7 @@ def evaluate_filter_confidence(
     explicit_filters = list((intent or {}).get("filter_conditions") or [])
     filter_candidates = where_resolution.get("filter_candidates", {}) or {}
     user_choices = where_resolution.get("user_filter_choices", {}) or {}
+    applied_rules = {str(v) for v in (where_resolution.get("applied_rules", []) or [])}
 
     if where_resolution.get("needs_clarification"):
         return {
@@ -72,6 +73,10 @@ def evaluate_filter_confidence(
         if not candidates:
             continue
         top = candidates[0]
+        if str(request_id) in applied_rules:
+            candidate_scores.append(1.0)
+            evidence.append(f"{request_id}:{top.get('column')}:applied_rule")
+            continue
         # Если пользователь явно выбрал колонку для этого request_id —
         # считаем фильтр полностью разрешённым (score=1.0). Без этого
         # candidate-scores остаются на уровне medium и planning_confidence
@@ -80,6 +85,24 @@ def evaluate_filter_confidence(
             chosen_column = str(user_choices[str(request_id)])
             candidate_scores.append(1.0)
             evidence.append(f"{request_id}:{chosen_column}:user_choice")
+            continue
+        top_evidence = {str(ev) for ev in (top.get("evidence") or [])}
+        second = candidates[1] if len(candidates) > 1 else None
+        if (
+            second is None
+            and (
+                top.get("matched_example")
+                or any(
+                    ev.startswith("known_term_phrase=") or ev.startswith("value_match=")
+                    for ev in top_evidence
+                )
+            )
+        ):
+            candidate_scores.append(1.0)
+            evidence.append(f"{request_id}:{top.get('column')}:semantic_exact")
+            continue
+        if applied_rules and str(top.get("confidence") or "").lower() == "low":
+            evidence.append(f"{request_id}:{top.get('column')}:ignored_low_confidence")
             continue
         top_score = float(top.get("score", 0.0) or 0.0) / 100.0
         candidate_scores.append(top_score)

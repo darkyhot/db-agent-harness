@@ -1,4 +1,4 @@
-from graph.nodes.sql_pipeline import _build_specific_clarification
+from graph.nodes.sql_pipeline import _build_specific_clarification, _build_specific_clarification_spec
 
 
 def test_build_specific_clarification_prefers_candidate_details():
@@ -64,3 +64,34 @@ def test_build_specific_clarification_skips_resolved_and_asks_remaining():
     assert "segment_name" in msg
     assert "region" in msg
     assert "task_subtype" not in msg
+
+
+def test_build_specific_clarification_spec_builds_confirm_for_single_candidate():
+    where_resolution = {
+        "filter_candidates": {
+            "text:dm.t.segment": [
+                {"column": "segment_name", "description": "Сегмент клиента", "evidence": []},
+            ],
+        }
+    }
+    spec = _build_specific_clarification_spec(where_resolution)
+    assert spec["type"] == "confirm"
+    assert spec["request_id"] == "text:dm.t.segment"
+    assert spec["options"][0]["column"] == "segment_name"
+
+
+def test_build_specific_clarification_spec_skips_semantic_exact_confirm():
+    where_resolution = {
+        "filter_candidates": {
+            "text:dm.t.task_subtype": [
+                {
+                    "column": "task_subtype",
+                    "description": "Подтип задачи",
+                    "matched_example": "фактический отток",
+                    "evidence": ["known_term_phrase=фактический отток"],
+                },
+            ],
+        }
+    }
+    spec = _build_specific_clarification_spec(where_resolution)
+    assert spec == {}

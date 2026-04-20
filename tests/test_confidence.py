@@ -91,3 +91,29 @@ def test_filter_confidence_treats_user_choices_as_resolved():
     assert result["level"] == "high"
     assert result["score"] >= 0.95
     assert all("user_choice" in ev for ev in result["evidence"])
+
+
+def test_filter_confidence_treats_semantic_exact_match_as_high():
+    where_resolution = {
+        "needs_clarification": False,
+        "applied_rules": [],
+        "filter_candidates": {
+            "text:dm.t.task_subtype": [
+                {
+                    "column": "task_subtype",
+                    "score": 61.0,
+                    "confidence": "medium",
+                    "matched_example": "фактический отток",
+                    "evidence": ["known_term_phrase=фактический отток"],
+                },
+            ],
+        },
+    }
+    result = evaluate_filter_confidence(
+        where_resolution,
+        semantic_frame={"qualifier": "factual_outflow"},
+        intent={"filter_conditions": []},
+    )
+    assert result["level"] == "high"
+    assert result["score"] >= 0.95
+    assert any("semantic_exact" in ev for ev in result["evidence"])

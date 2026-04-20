@@ -38,6 +38,10 @@ class AgentState(TypedDict):
     # графа из CLI, чтобы where_resolver закрыл соответствующий request_id без
     # повторного вопроса.
     user_filter_choices: dict[str, str]
+    # Явные отказы пользователя по кандидатам фильтров.
+    # {"request_id": ["column_name"]} — нужны, чтобы не задавать
+    # один и тот же вопрос повторно после ответа "нет".
+    rejected_filter_choices: dict[str, list[str]]
     graph_iterations: int
     correction_examples: list
     join_risk_info: dict

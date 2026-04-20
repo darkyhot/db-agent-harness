@@ -8,8 +8,10 @@
 import json
 import logging
 import re
+import time
 from typing import Any
 
+from core.log_safety import summarize_text
 from graph.nodes.common import BaseNodeMixin, ToolResult, SQL_RULES, GIGACHAT_COMMON_ERRORS
 from graph.state import AgentState
 
@@ -61,7 +63,15 @@ _FIX_HINTS: dict[str, str] = {
         "Исправь синтаксис по тексту ошибки. Типичные причины:\n"
         "- Пропущена запятая, скобка, ключевое слово\n"
         "- Кириллица в алиасах или именах колонок\n"
-        "- Несовместимый синтаксис (не PostgreSQL/Greenplum)"
+        "- Несовместимый синтаксис (не PostgreSQL/Greenplum)\n\n"
+        "ВАЖНО — ошибка «must appear in the GROUP BY clause»:\n"
+        "Это НЕ синтаксическая ошибка — это семантическая. Не добавляй GROUP BY механически.\n"
+        "Сначала определи: должна ли проблемная колонка быть агрегирована?\n"
+        "- Если да (колонка является PK/метрикой и запрос считает итог) — "
+        "оберни её в COUNT(DISTINCT ...) или другую агрегацию, а GROUP BY НЕ добавляй.\n"
+        "- Если нет (колонка нужна для разбивки) — добавь её в GROUP BY.\n"
+        "Добавление GROUP BY к PK-колонке при запросе «сколько всего X» "
+        "меняет смысл с «итоговый счётчик» на «разбивка по X» — это НЕВЕРНО."
     ),
     "type_mismatch": (
         "Несовместимые типы данных в сравнении или JOIN.\n"
@@ -102,19 +112,37 @@ class CorrectionNodes:
         iterations = state.get("graph_iterations", 0) + 1
 
         logger.info(
-            "ErrorDiagnoser: попытка %d/%d, ошибка: %s",
-            retry_count + 1, self.MAX_RETRIES, error[:200],
+            "ErrorDiagnoser: попытка %d/%d, ошибка=%s",
+            retry_count + 1, self.MAX_RETRIES, summarize_text(error, label="error"),
         )
 
         # --- Проверка лимита попыток ---
         if retry_count >= self.MAX_RETRIES:
             replan_count = state.get("replan_count", 0)
-            # Попробовать replanning один раз перед сдачей
-            if replan_count < 1:
+            # Budget-aware: если осталось < 60 секунд до wall-clock timeout — пропускаем replanning
+            _budget_ok = True
+            start_t = state.get("start_time", 0)
+            if start_t:
+                from graph.graph import MAX_WALL_CLOCK_SECONDS
+                elapsed = time.monotonic() - start_t
+                if elapsed > MAX_WALL_CLOCK_SECONDS - 60:
+                    _budget_ok = False
+                    logger.warning(
+                        "ErrorDiagnoser: осталось менее 60с до таймаута (elapsed=%.0fs) — пропускаем replanning",
+                        elapsed,
+                    )
+            # Попробовать replanning один раз перед сдачей (если есть бюджет)
+            if replan_count < 1 and _budget_ok:
                 logger.info("ErrorDiagnoser: попытки исчерпаны, запрашиваю replanning")
+                # Direction 6.5: retry_count сбрасывается (другие ноды используют
+                # его как локальный счётчик ретраев текущего шага), но суммарный
+                # `total_retry_count` продолжает копить, чтобы replanning не мог
+                # «скрыто» удвоить бюджет retry.
+                total_retries = int(state.get("total_retry_count", 0)) + int(state.get("retry_count", 0))
                 return {
                     "last_error": None,
                     "retry_count": 0,
+                    "total_retry_count": total_retries,
                     "replan_count": replan_count + 1,
                     "needs_replan": True,
                     "replan_context": (
@@ -198,6 +226,27 @@ class CorrectionNodes:
             "Если ошибка неисправима — установи needs_replan: true."
         )
 
+        # --- Авто-сэмпл для empty_result: показываем реальные значения из таблиц ---
+        auto_sample_text = ""
+        if "0 строк" in error or "empty_result" in error.lower():
+            sample_parts = []
+            for s, t in list(found_tables)[:2]:  # максимум 2 таблицы чтобы не раздувать промпт
+                try:
+                    sample_df = self.db.get_sample(s, t, n=5)
+                    if not sample_df.empty:
+                        sample_md = sample_df.to_markdown(index=False)
+                        sample_parts.append(
+                            f"Образец {s}.{t} (5 строк — проверь форматы значений для фильтров):\n"
+                            f"{sample_md[:600]}"
+                        )
+                except Exception as e:
+                    logger.debug("auto_sample %s.%s: %s", s, t, e)
+            if sample_parts:
+                auto_sample_text = "\n\n".join(sample_parts)
+                logger.info(
+                    "ErrorDiagnoser: авто-сэмпл для empty_result: %d таблиц", len(sample_parts)
+                )
+
         # --- Пользовательский промпт ---
         user_parts = []
         if last_sql:
@@ -205,6 +254,8 @@ class CorrectionNodes:
         user_parts.append(f"[СООБЩЕНИЕ ОБ ОШИБКЕ]\n{error}")
         if column_metadata:
             user_parts.append(f"[МЕТАДАННЫЕ КОЛОНОК]\n{column_metadata}")
+        if auto_sample_text:
+            user_parts.append(f"[ОБРАЗЦЫ ДАННЫХ — для диагностики пустого результата]\n{auto_sample_text}")
         user_parts.append(f"[ПОПЫТКА {retry_count + 1} из {self.MAX_RETRIES}]")
         if prev_attempts:
             user_parts.append(f"[ПРЕДЫДУЩИЕ ПОПЫТКИ ИСПРАВЛЕНИЯ]\n{prev_attempts}")
@@ -266,8 +317,8 @@ class CorrectionNodes:
 
             if all_replacements_valid and fixed_sql != last_sql:
                 logger.info(
-                    "ErrorDiagnoser: тривиальное исправление колонок кодом: %s",
-                    diagnosis["replacements"],
+                    "ErrorDiagnoser: тривиальное исправление колонок кодом: replacements=%d",
+                    len(diagnosis["replacements"]),
                 )
                 # Определяем инструмент из последнего вызова
                 tool_name = "execute_query"

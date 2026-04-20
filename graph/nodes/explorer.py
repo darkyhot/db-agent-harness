@@ -12,9 +12,118 @@ import time
 from typing import Any
 
 from core.join_analysis import detect_table_type, format_join_analysis
+from core.column_selector_deterministic import (
+    select_columns as _det_select_columns,
+    _complete_composite_join,
+)
 from graph.state import AgentState
 
+# Минимальная confidence для использования детерминированного результата без LLM.
+# При confidence >= порога LLM column_selector не вызывается.
+# Снижен с 0.70 до 0.55 (Direction 5.1): детерминированный селектор стал надёжнее
+# за счёт FK-метаданных/synonyms, поэтому промежуточная полоса 0.55-0.70
+# обрабатывается без LLM-похода.
+_DET_CONFIDENCE_THRESHOLD = 0.55
+
 logger = logging.getLogger(__name__)
+
+
+def _apply_explicit_join_override(
+    join_spec: list[dict[str, Any]],
+    selected_columns: dict[str, Any],
+    intent: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Применить explicit_join из интента как override join_spec.
+
+    Когда пользователь явно указал ключ JOIN ("по инн", "по дате") — он имеет
+    абсолютный приоритет. Ищем колонку по col_hint семантически в selected_columns,
+    подставляем в join_spec вместо auto-detected пары.
+
+    Returns:
+        Обновлённый join_spec (исходный если explicit_join пуст или не нашли совпадений).
+    """
+    explicit_joins = intent.get("explicit_join") or []
+    if not explicit_joins:
+        return join_spec
+
+    result_spec = list(join_spec)
+
+    for ej in explicit_joins:
+        if not isinstance(ej, dict):
+            continue
+        col_hint = str(ej.get("column_hint") or "").lower().strip()
+        tbl_hint = str(ej.get("table_hint") or "").lower().strip()
+        if not col_hint:
+            continue
+
+        # Ищем колонку по col_hint во всех таблицах selected_columns
+        _candidates: list[tuple[float, str, str]] = []  # (score, tbl, col)
+        for tbl, roles in selected_columns.items():
+            tbl_lower = tbl.lower()
+            all_cols = (
+                roles.get("select", [])
+                + roles.get("filter", [])
+                + roles.get("group_by", [])
+                + roles.get("aggregate", [])
+            )
+            for c in dict.fromkeys(all_cols):  # уникальные, порядок сохранён
+                c_lower = c.lower()
+                if col_hint in c_lower or c_lower in col_hint:
+                    score = len(col_hint) / max(len(c_lower), 1) * 100
+                    if tbl_hint and (tbl_hint in tbl_lower or tbl_lower.endswith(tbl_hint)):
+                        score += 50
+                    _candidates.append((score, tbl, c))
+
+        if len(_candidates) < 2:
+            if _candidates:
+                logger.warning(
+                    "_apply_explicit_join_override: col_hint=%r найден только в одной таблице — "
+                    "недостаточно для JOIN-пары",
+                    col_hint,
+                )
+            continue
+
+        _candidates.sort(reverse=True)
+        # Берём лучшего с tbl_hint (правая сторона JOIN) и лучшего без (левая)
+        right_tbl, right_col = _candidates[0][1], _candidates[0][2]
+        left_tbl, left_col = None, None
+        for _, tbl, col in _candidates[1:]:
+            if tbl != right_tbl:
+                left_tbl, left_col = tbl, col
+                break
+
+        if left_tbl is None:
+            logger.warning(
+                "_apply_explicit_join_override: col_hint=%r только в одной таблице %s — пропускаем",
+                col_hint, right_tbl,
+            )
+            continue
+
+        override = {
+            "left": f"{left_tbl}.{left_col}",
+            "right": f"{right_tbl}.{right_col}",
+            "safe": False,
+            "strategy": "explicit_user",
+            "risk": "user_specified_key",
+        }
+
+        # Удаляем авто-detected пары между теми же таблицами
+        _left_tbl_prefix = ".".join(left_tbl.split(".")[:2])
+        _right_tbl_prefix = ".".join(right_tbl.split(".")[:2])
+        result_spec = [
+            j for j in result_spec
+            if not (
+                ".".join(j.get("left", "").split(".")[:2]) == _left_tbl_prefix
+                and ".".join(j.get("right", "").split(".")[:2]) == _right_tbl_prefix
+            )
+        ]
+        result_spec.insert(0, override)
+        logger.info(
+            "_apply_explicit_join_override: override join %s.%s = %s.%s (col_hint=%r)",
+            left_tbl, left_col, right_tbl, right_col, col_hint,
+        )
+
+    return result_spec
 
 
 class ExplorerNodes:
@@ -307,6 +416,67 @@ class ExplorerNodes:
                 "graph_iterations": state.get("graph_iterations", 0) + 1,
             }
 
+        # --- Детерминированная попытка (без LLM) ---
+        # Запускаем перед LLM. Если confidence >= порога — возвращаем сразу.
+        # Это экономит один LLM-вызов (5с задержки) для стандартных запросов.
+        _det_result = _det_select_columns(
+            intent=intent,
+            table_structures=table_structures,
+            table_types=state.get("table_types", {}),
+            join_analysis_data=join_analysis_data,
+            schema_loader=self.schema,
+            user_input=user_input,
+            user_hints=state.get("user_hints", {}) or {},
+            semantic_frame=state.get("semantic_frame", {}) or {},
+        )
+        _det_conf = _det_result.get("confidence", 0.0)
+        logger.info(
+            "ColumnSelector: детерминированный результат confidence=%.2f (%s)",
+            _det_conf,
+            _det_result.get("reason", ""),
+        )
+
+        if _det_conf >= _DET_CONFIDENCE_THRESHOLD and not state.get("column_selector_hint", ""):
+            # Достаточная уверенность — пропускаем LLM
+            logger.info(
+                "ColumnSelector: confidence=%.2f >= %.2f → используем детерминированный результат",
+                _det_conf,
+                _DET_CONFIDENCE_THRESHOLD,
+            )
+            # Применяем explicit_join override (Блок B) к детерминированному результату
+            _det_join_spec = _apply_explicit_join_override(
+                _det_result["join_spec"],
+                _det_result["selected_columns"],
+                intent,
+            )
+            self.memory.add_message(
+                "assistant",
+                f"[column_selector/det] confidence={_det_conf:.2f}; "
+                f"таблиц: {len(_det_result['selected_columns'])}, "
+                f"join-ключей: {len(_det_join_spec)}",
+            )
+            return {
+                "selected_columns": _det_result["selected_columns"],
+                "join_spec": _det_join_spec,
+                "column_selector_hint": "",
+                "messages": state["messages"] + [
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"[det] Колонки выбраны детерминированно (conf={_det_conf:.2f}): "
+                            f"{', '.join(_det_result['selected_columns'].keys())}"
+                        ),
+                    }
+                ],
+                "graph_iterations": state.get("graph_iterations", 0) + 1,
+            }
+
+        logger.info(
+            "ColumnSelector: confidence=%.2f < %.2f → запускаем LLM",
+            _det_conf,
+            _DET_CONFIDENCE_THRESHOLD,
+        )
+
         # --- Системный промпт ---
         system_prompt = (
             "Ты — селектор колонок для SQL-запроса в Greenplum (PostgreSQL-совместимая "
@@ -348,6 +518,15 @@ class ExplorerNodes:
             "Числовой идентификатор (_id) из фактовой таблицы НЕ является названием.\n"
             "- КРИТИЧНО: если доступны таблицы нескольких типов (факт + справочник) — "
             "включи ОБЕ таблицы в columns и заполни join_keys между ними.\n"
+            "- КРИТИЧНО: если пользователь говорит «по X», «сгруппируй по X», «в разбивке по X» "
+            "— колонка X должна быть в 'select' И 'group_by', а НЕ в 'filter'. "
+            "Роль 'filter' используется ТОЛЬКО для WHERE-условий с конкретным значением "
+            "(например: 'регион = Москва', 'дата > 2024-01-01').\n"
+            "- КРИТИЧНО: если пользователь спрашивает «сколько всего есть X» или «количество X» "
+            "БЕЗ явной группировки («по Y», «в разбивке по Y») — это COUNT DISTINCT, не GROUP BY. "
+            "Помести PK-колонку(и) в 'aggregate' и оставь 'group_by' пустым. "
+            "Пример: «Сколько клиентов?» → aggregate: [customer_id], group_by: [] "
+            "→ SELECT COUNT(DISTINCT customer_id) AS customer_count FROM ...\n"
         )
 
         # --- Пользовательский промпт ---
@@ -450,6 +629,20 @@ class ExplorerNodes:
         raw_columns = parsed.get("columns", {})
         selected_columns: dict[str, Any] = {}
 
+        # Белый список таблиц: фильтруем LLM-ответ, отбрасываем чужие таблицы.
+        allowed_tables_set: set[str] = set()
+        _allowed_raw = state.get("allowed_tables") or []
+        if _allowed_raw:
+            allowed_tables_set = {t.lower() for t in _allowed_raw}
+            _raw_keys = list(raw_columns.keys())
+            for _tk in _raw_keys:
+                if _tk.lower() not in allowed_tables_set:
+                    logger.warning(
+                        "ColumnSelector: таблица %r не в allowed_tables %s — отбрасываем",
+                        _tk, _allowed_raw,
+                    )
+                    raw_columns.pop(_tk, None)
+
         for table_key, roles in raw_columns.items():
             if not isinstance(roles, dict):
                 continue
@@ -540,6 +733,38 @@ class ExplorerNodes:
                         )
 
                 join_spec.append(entry)
+
+        # --- Блок B: explicit_join override (LLM путь) ---
+        join_spec = _apply_explicit_join_override(join_spec, selected_columns, intent)
+
+        # Hardening: дополнить LLM join_spec составными парами PK, которые LLM мог пропустить.
+        # Если dim-таблица имеет составной PK, но LLM вернул только одну пару — добавляем остальные.
+        _table_types_for_composite = state.get("table_types", {})
+        if join_spec and _table_types_for_composite:
+            _extra: list[dict[str, Any]] = []
+            for _entry in list(join_spec):
+                try:
+                    _extra_pairs = _complete_composite_join(
+                        _entry,
+                        ".".join(_entry["left"].split(".")[:2]),
+                        ".".join(_entry["right"].split(".")[:2]),
+                        _table_types_for_composite,
+                        self.schema,
+                    )
+                    for _ep in _extra_pairs:
+                        # Не добавляем дубли (проверяем по left+right)
+                        if not any(
+                            x["left"] == _ep["left"] and x["right"] == _ep["right"]
+                            for x in join_spec + _extra
+                        ):
+                            _extra.append(_ep)
+                except Exception as _ce:
+                    logger.debug("ColumnSelector composite hardening: %s", _ce)
+            if _extra:
+                join_spec.extend(_extra)
+                logger.info(
+                    "ColumnSelector: дополнено %d составных join-пар после LLM", len(_extra)
+                )
 
         logger.info(
             "ColumnSelector: выбрано колонок для %d таблиц, %d join-ключей",

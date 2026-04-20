@@ -1,0 +1,17 @@
+query: "Покажи сумму outflow_qty по segment_name за январь 2024"
+intent_must_be: analytics
+complexity_must_be: join
+sql_must_contain:
+  - DISTINCT ON
+  - "UZP_DATA_EPK_CONSOLIDATION"
+  - "JOIN EPK_SEG"
+  - SUM
+  - GROUP BY
+  - "2024"
+  - "SEGMENT_NAME"
+  - "E.INN = O.INN"
+sql_must_not_contain:
+  - "SELECT *"
+sql_alias_no_cyrillic: true
+should_reach_node: sql_writer
+max_retries: 0

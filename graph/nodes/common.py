@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from core.few_shot_retriever import FewShotRetriever
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.schema_loader import SchemaLoader
@@ -36,59 +37,59 @@ logger = logging.getLogger(__name__)
 SQL_FEW_SHOT_EXAMPLES = (
     "=== ПРИМЕРЫ SQL (используй как образец стиля) ===\n\n"
     "1. Агрегация + фильтр по дате:\n"
-    "   SELECT region, COUNT(DISTINCT client_id) AS unique_clients\n"
-    "   FROM dm.sales\n"
-    "   WHERE sale_date >= '2024-01-01'::date AND sale_date < '2024-02-01'::date\n"
-    "   GROUP BY region\n"
-    "   ORDER BY unique_clients DESC;\n\n"
+    "   SELECT customer_segment, COUNT(DISTINCT customer_id) AS customer_cnt\n"
+    "   FROM dm.orders\n"
+    "   WHERE order_date >= '2024-01-01'::date AND order_date < '2024-02-01'::date\n"
+    "   GROUP BY customer_segment\n"
+    "   ORDER BY customer_cnt DESC;\n\n"
     "2. СПРАВОЧНИК + ФАКТ (агрегация фактов в подзапросе):\n"
-    "   SELECT c.client_id, c.name, agg.total_sales\n"
-    "   FROM dm.clients c\n"
+    "   SELECT c.customer_id, c.customer_name, agg.total_amount\n"
+    "   FROM dm.customers c\n"
     "   JOIN (\n"
-    "       SELECT client_id, SUM(amount) AS total_sales\n"
-    "       FROM dm.sales GROUP BY client_id\n"
-    "   ) agg ON agg.client_id = c.client_id;\n\n"
+    "       SELECT customer_id, SUM(order_amount) AS total_amount\n"
+    "       FROM dm.orders GROUP BY customer_id\n"
+    "   ) agg ON agg.customer_id = c.customer_id;\n\n"
     "3. ФАКТ + СПРАВОЧНИК (уникальная выборка из справочника):\n"
-    "   SELECT s.sale_id, s.amount, d.name\n"
-    "   FROM dm.sales s\n"
+    "   SELECT o.order_id, o.order_amount, p.product_name\n"
+    "   FROM dm.orders o\n"
     "   JOIN (\n"
-    "       SELECT DISTINCT ON (client_id) client_id, name\n"
-    "       FROM dm.clients ORDER BY client_id, updated_at DESC\n"
-    "   ) d ON d.client_id = s.client_id;\n\n"
+    "       SELECT DISTINCT ON (product_id) product_id, product_name\n"
+    "       FROM dm.products ORDER BY product_id, updated_at DESC\n"
+    "   ) p ON p.product_id = o.product_id;\n\n"
     "4. ФАКТ + ФАКТ (обе стороны агрегированы в CTE):\n"
-    "   WITH sales_agg AS (\n"
-    "       SELECT client_id, SUM(amount) AS total_sales\n"
-    "       FROM dm.sales GROUP BY client_id\n"
+    "   WITH orders_agg AS (\n"
+    "       SELECT customer_id, SUM(order_amount) AS total_orders\n"
+    "       FROM dm.orders GROUP BY customer_id\n"
     "   ), payments_agg AS (\n"
-    "       SELECT client_id, SUM(payment) AS total_paid\n"
-    "       FROM dm.payments GROUP BY client_id\n"
+    "       SELECT customer_id, SUM(payment_amount) AS total_paid\n"
+    "       FROM dm.payments GROUP BY customer_id\n"
     "   )\n"
-    "   SELECT s.client_id, s.total_sales, p.total_paid\n"
-    "   FROM sales_agg s\n"
-    "   JOIN payments_agg p ON p.client_id = s.client_id;\n\n"
+    "   SELECT o.customer_id, o.total_orders, p.total_paid\n"
+    "   FROM orders_agg o\n"
+    "   JOIN payments_agg p ON p.customer_id = o.customer_id;\n\n"
     "5. СПРАВОЧНИК + СПРАВОЧНИК (уникальные выборки из обеих сторон):\n"
     "   WITH d1 AS (\n"
-    "       SELECT DISTINCT ON (org_id) org_id, org_name\n"
-    "       FROM dm.organizations ORDER BY org_id, effective_date DESC\n"
+    "       SELECT DISTINCT ON (contract_id) contract_id, contract_type\n"
+    "       FROM dm.contracts ORDER BY contract_id, effective_date DESC\n"
     "   ), d2 AS (\n"
-    "       SELECT DISTINCT ON (org_id) org_id, region\n"
-    "       FROM dm.org_regions ORDER BY org_id, effective_date DESC\n"
+    "       SELECT DISTINCT ON (contract_id) contract_id, risk_level\n"
+    "       FROM dm.contract_risk ORDER BY contract_id, effective_date DESC\n"
     "   )\n"
-    "   SELECT d1.org_id, d1.org_name, d2.region\n"
-    "   FROM d1 JOIN d2 ON d2.org_id = d1.org_id;\n\n"
+    "   SELECT d1.contract_id, d1.contract_type, d2.risk_level\n"
+    "   FROM d1 JOIN d2 ON d2.contract_id = d1.contract_id;\n\n"
     "6. NULL-обработка и COALESCE:\n"
-    "   SELECT client_id, COALESCE(phone, email, 'нет контакта') AS contact\n"
-    "   FROM dm.clients\n"
-    "   WHERE status IS NOT NULL AND region = 'Москва';\n\n"
+    "   SELECT customer_id, COALESCE(phone, email, 'нет контакта') AS contact\n"
+    "   FROM dm.customers\n"
+    "   WHERE status IS NOT NULL AND region_name = 'North';\n\n"
     "7. Поиск через search_by_description (диагностика):\n"
-    '   {"tool": "search_by_description", "args": {"query": "отток клиентов"}}\n'
+    '   {"tool": "search_by_description", "args": {"query": "заказы клиентов"}}\n'
 )
 
 SQL_RULES = (
     "Правила SQL (Greenplum / PostgreSQL):\n"
     "- Имена таблиц ВСЕГДА в формате schema.table\n"
     "- Алиасы СТРОГО на английском: AS outflow, AS total_cnt\n"
-    '- ЗАПРЕЩЕНО: AS "отток", AS "выручка", кириллица в алиасах и именах колонок\n'
+    '- ЗАПРЕЩЕНО: AS "сумма", AS "выручка", кириллица в алиасах и именах колонок\n'
     "- Изучи РАЗВЕДКУ ТАБЛИЦ (если есть) перед написанием SQL\n"
     "- Пойми гранулярность (что = одна строка) перед COUNT/агрегатами\n"
     "- GROUP BY: перечисли ВСЕ не-агрегированные колонки из SELECT\n"
@@ -180,10 +181,28 @@ class BaseNodeMixin:
     управление контекстом и бюджетом промптов.
     """
 
-    MAX_RETRIES = 3
+    MAX_RETRIES = 4
     SQL_TOOL_NAMES = {"execute_query", "execute_write", "execute_ddl", "export_query"}
     MAX_PROMPT_CHARS = 100_000
     SAMPLE_CACHE_TTL = 600
+    # Лимиты на размер списков в state — предотвращают раздувание промпта summarizer'а
+    MAX_MESSAGES = 30
+    MAX_TOOL_CALLS = 15
+
+    # Бюджет символов для каждой ноды (переопределяет MAX_PROMPT_CHARS если указан)
+    # Маленький бюджет для простых нод, большой — для тех, где нужен полный контекст таблиц
+    NODE_BUDGET: dict[str, int] = {
+        "intent_classifier": 20_000,
+        "table_resolver": 40_000,
+        "table_explorer": 60_000,
+        "column_selector": 80_000,   # нужен полный контекст всех таблиц
+        "sql_planner": 40_000,
+        "sql_writer": 60_000,
+        "sql_static_checker": 20_000,
+        "error_diagnoser": 30_000,
+        "sql_fixer": 50_000,
+        "summarizer": 60_000,
+    }
 
     # Стоп-слова для предфильтрации каталога
     _STOP_WORDS = frozenset({
@@ -198,7 +217,7 @@ class BaseNodeMixin:
         "show", "get", "find", "give", "tell", "make", "how", "many",
     })
 
-    _MAX_TABLES_FOR_FULL_CATALOG = 50
+    _MAX_TABLES_FOR_FULL_CATALOG = 100
 
     def __init__(
         self,
@@ -218,6 +237,7 @@ class BaseNodeMixin:
         self.tools = tools
         self.debug_prompt = debug_prompt
         self.tool_map: dict[str, Any] = {t.name: t for t in tools}
+        self.few_shot = FewShotRetriever(memory)
         self._sample_cache: dict[tuple[str, str], tuple[float, str]] = {}
         self.tools_description = "\n".join(
             f"- {t.name}: {t.description}" for t in tools
@@ -228,6 +248,45 @@ class BaseNodeMixin:
             first_sentence = t.description.split("\n")[0].split(". ")[0]
             compact_lines.append(f"- {t.name}: {first_sentence}")
         self.tools_compact = "\n".join(compact_lines)
+
+    # ------------------------------------------------------------------
+    # Стандартизированный evidence_trace (Direction 4.1)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def record_evidence(
+        evidence_trace: dict[str, Any] | None,
+        node: str,
+        decision: str,
+        evidence: dict[str, Any] | None = None,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Записать запись в evidence_trace (см. core.evidence_trace.record_evidence)."""
+        from core.evidence_trace import record_evidence as _impl
+        return _impl(evidence_trace, node, decision, evidence, warnings)
+
+    # ------------------------------------------------------------------
+    # Ограничение роста state-списков
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cap_messages(messages: list, max_size: int | None = None) -> list:
+        """Обрезать список сообщений до последних max_size элементов.
+
+        Предотвращает раздувание промпта summarizer'а при длинных сессиях с retry.
+        """
+        limit = max_size or BaseNodeMixin.MAX_MESSAGES
+        if len(messages) > limit:
+            return messages[-limit:]
+        return messages
+
+    @staticmethod
+    def _cap_tool_calls(tool_calls: list, max_size: int | None = None) -> list:
+        """Обрезать список tool_calls до последних max_size элементов."""
+        limit = max_size or BaseNodeMixin.MAX_TOOL_CALLS
+        if len(tool_calls) > limit:
+            return tool_calls[-limit:]
+        return tool_calls
 
     # ------------------------------------------------------------------
     # Бюджет промптов
@@ -389,39 +448,15 @@ class BaseNodeMixin:
                 lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
             return "\n".join(lines)
 
-        words = re.findall(r'[a-zA-Zа-яА-ЯёЁ]{3,}', user_input.lower())
-        keywords = [w for w in words if w not in self._STOP_WORDS]
+        # Используем TF-IDF поиск из SchemaLoader (включает synonym expansion + keyword match)
+        filtered = self.schema.search_tables(user_input, top_n=30)
 
-        if expand_with_synonyms is not None and keywords:
-            expanded = expand_with_synonyms(" ".join(keywords))
-            extra_words = re.findall(r'[a-zA-ZА-Яа-яёЁ]{3,}', expanded.lower())
-            for ew in extra_words:
-                if ew not in keywords and ew not in self._STOP_WORDS:
-                    keywords.append(ew)
-
-        if not keywords:
-            lines = ["Доступные таблицы (schema.table — описание):"]
-            for _, row in df.iterrows():
-                desc = row.get("description", "")
-                lines.append(f"  {row['schema_name']}.{row['table_name']} — {desc}")
-            return "\n".join(lines)
-
-        found_indices: set[int] = set()
-        for kw in keywords:
-            mask = (
-                df["table_name"].str.lower().str.contains(kw, na=False)
-                | df["schema_name"].str.lower().str.contains(kw, na=False)
-                | df["description"].str.lower().str.contains(kw, na=False)
-            )
-            found_indices.update(df[mask].index.tolist())
-
-        if not found_indices:
+        if filtered.empty:
             return (
                 f"В каталоге {len(df)} таблиц, но по запросу не найдено прямых совпадений.\n"
                 "Используй search_tables или search_by_description для поиска нужных таблиц."
             )
 
-        filtered = df.loc[sorted(found_indices)]
         lines = [
             f"Релевантные таблицы (найдено {len(filtered)} из {len(df)} по запросу):"
         ]
@@ -538,6 +573,26 @@ class BaseNodeMixin:
                     return parsed
             except (json.JSONDecodeError, ValueError, Exception):
                 pass
+
+        # Эвристика: попробовать извлечь SQL из свободного текста перед LLM retry
+        # Экономит 5с задержки и один LLM-вызов когда GigaChat объясняет SQL вместо JSON
+        sql_in_text = re.search(
+            r'(?:^|\n)\s*(SELECT\s.{10,})',
+            response,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if sql_in_text:
+            extracted = sql_in_text.group(1).strip().rstrip(';')
+            # Обрезаем на первом явном закрытии запроса (пустая строка после SQL)
+            first_break = re.search(r'\n\s*\n', extracted)
+            if first_break:
+                extracted = extracted[:first_break.start()].strip()
+            if len(extracted) > 20:
+                logger.info(
+                    "_parse_tool_call: SQL извлечён через regex (без LLM retry), len=%d",
+                    len(extracted),
+                )
+                return {"tool": "execute_query", "args": {"sql": extracted}}
 
         if retry_on_fail:
             logger.warning("JSON не найден в ответе LLM, retry с уточнением формата")
@@ -656,16 +711,23 @@ class BaseNodeMixin:
         if not isinstance(data, dict):
             return None
 
-        required = {"message", "preview_markdown", "total_rows", "is_empty", "saved_file", "mode"}
-        if not required.issubset(set(data.keys())):
+        required = {"message", "preview_markdown", "is_empty", "saved_file", "mode"}
+        has_new_shape = {"rows_returned", "rows_saved", "is_truncated"}.issubset(set(data.keys()))
+        has_legacy_shape = "total_rows" in data
+        if not required.issubset(set(data.keys())) or not (has_new_shape or has_legacy_shape):
             return None
 
         try:
+            rows_returned = int(data.get("rows_returned", data.get("total_rows", 0)))
+            rows_saved = int(data.get("rows_saved", data.get("total_rows", 0)))
+            is_truncated = bool(data.get("is_truncated", False))
             return {
                 "message": str(data.get("message", "")),
                 "preview_markdown": str(data.get("preview_markdown", "")),
-                "total_rows": int(data.get("total_rows", 0)),
+                "rows_returned": rows_returned,
+                "rows_saved": rows_saved,
                 "is_empty": bool(data.get("is_empty", False)),
+                "is_truncated": is_truncated,
                 "saved_file": data.get("saved_file"),
                 "mode": str(data.get("mode", "")),
             }
@@ -683,6 +745,8 @@ class BaseNodeMixin:
         preview = p.get("preview_markdown", "")
         if preview:
             parts.append(preview)
+        if p.get("mode") == "preview" and p.get("is_truncated"):
+            parts.append("Результат усечён до preview-режима.")
         saved_file = p.get("saved_file")
         if saved_file:
             parts.append(f"Файл: {saved_file}")

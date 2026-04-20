@@ -7,6 +7,7 @@ from core.sql_validator import (
     SQLValidator,
     ValidationResult,
     detect_mode,
+    generate_join_rewrite_suggestion,
     _build_alias_map,
     _extract_join_conditions,
     _find_subquery_join_aliases,
@@ -389,19 +390,20 @@ class TestMultiplicationFactor:
 class TestRewriteSuggestion:
     """Тесты генерации шаблонов переписывания."""
 
-    def test_suggestion_format(self):
+    def test_helper_contract_is_explicit_and_stable(self):
         join = {"schema": "dm", "table": "sales", "column": "manager_id"}
-        suggestion = SQLValidator._generate_rewrite_suggestion(join)
+        suggestion = generate_join_rewrite_suggestion(join)
         assert "ROW EXPLOSION" in suggestion
         assert "dm.sales" in suggestion
         assert "manager_id" in suggestion
         assert "DISTINCT" in suggestion
         assert "ЗАПРЕЩЕНО" in suggestion
 
-    def test_suggestion_contains_template(self):
+    def test_validator_wrapper_uses_same_contract(self):
+        validator = SQLValidator(_MockDB())
         join = {"schema": "hr", "table": "emp", "column": "dept_id"}
-        suggestion = SQLValidator._generate_rewrite_suggestion(join)
-        assert "SELECT DISTINCT" in suggestion
+        suggestion = validator._generate_rewrite_suggestion(join)
+        assert "СТРАТЕГИЯ:" in suggestion
         assert "JOIN" in suggestion
 
 
@@ -425,6 +427,16 @@ class TestValidationResultExplosion:
         result.rewrite_suggestions = ["Use DISTINCT subquery"]
         summary = result.summary()
         assert "Use DISTINCT subquery" in summary
+
+    def test_summary_uses_readable_ascii_status_markers(self):
+        result = ValidationResult(is_valid=False, mode=SQLMode.READ)
+        result.add_error("bad join")
+        result.add_warning("check filter")
+        result.join_checks = [{"join": "a.id = b.id", "cardinality": "one-to-many", "is_safe": False}]
+        summary = result.summary()
+        assert "x bad join" in summary
+        assert "! check filter" in summary
+        assert "(risky)" in summary
 
 
 # ---------------------------------------------------------------------------

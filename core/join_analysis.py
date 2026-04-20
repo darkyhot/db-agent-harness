@@ -8,6 +8,30 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
+# 0. Причины решения (decision_reason) — для агрегации метрик качества.
+# `JoinCandidate.match_type` гарантированно принимает одно из этих значений.
+# ---------------------------------------------------------------------------
+
+class DecisionReason:
+    """Enum-подобный контейнер для `JoinCandidate.match_type`."""
+
+    EXPLICIT_FK = "explicit_fk"
+    EXACT_NAME = "exact_name"
+    FK_PATTERN = "fk_pattern"
+    NORMALIZED_PK = "normalized_pk"
+    SUFFIX = "suffix"
+
+
+DECISION_REASONS: frozenset[str] = frozenset({
+    DecisionReason.EXPLICIT_FK,
+    DecisionReason.EXACT_NAME,
+    DecisionReason.FK_PATTERN,
+    DecisionReason.NORMALIZED_PK,
+    DecisionReason.SUFFIX,
+})
+
+
+# ---------------------------------------------------------------------------
 # 1. Классификация колонок: key / business_key / attribute
 # ---------------------------------------------------------------------------
 
@@ -111,11 +135,18 @@ def detect_table_type(table_name: str, cols_df: pd.DataFrame) -> str:
         return "dim"
     if re.search(r"(^|_)(ref|dict|lookup|directory)($|_)", t):
         return "ref"
+    if t.endswith("_m") or t.endswith("_funnel"):
+        return "fact"
     # Эвристика по структуре колонок
     if not cols_df.empty and "is_primary_key" in cols_df.columns:
         pk_ratio = cols_df["is_primary_key"].astype(bool).mean()
         if pk_ratio > 0.3:
             return "dim"
+        col_names = {str(c).lower() for c in cols_df.get("column_name", [])}
+        if {"report_dt", "amt"} & col_names:
+            return "fact"
+        if any(c.endswith("_qty") or c.endswith("_amt") or c.endswith("_perc") for c in col_names):
+            return "fact"
     return "unknown"
 
 
@@ -151,6 +182,10 @@ class JoinCandidate:
     col1_desc: str = ""
     col2_desc: str = ""
 
+    # Оценка кардинальности пары: "1:1", "1:N", "N:1", "N:M", "unknown".
+    # Используется sql_planner для принятия решения о необходимости CTE-предагрегации.
+    cardinality_rating: str = "unknown"
+
 
 # Минимальный score для включения в вывод
 MIN_CANDIDATE_SCORE = 0.3
@@ -176,7 +211,9 @@ def _compute_score(
     base = 0.0
 
     # Match type bonus
-    if match_type == "exact_name":
+    if match_type == "explicit_fk":
+        base = 0.9  # Метаданные FK — максимум доверия
+    elif match_type == "exact_name":
         base = 0.5
     elif match_type in ("fk_pattern", "normalized_pk"):
         base = 0.55
@@ -205,6 +242,17 @@ def _compute_score(
 
     score = min(base + key_bonus + pk_bonus, 1.0)
 
+    # explicit_fk — метаданные прямо говорят о FK-связи.
+    # Heuristic-штрафы (attribute, non-PK в fact) здесь неприменимы — метаданные
+    # побеждают эвристику. Только penalty за неуникальность dim-стороны остаётся.
+    if match_type == "explicit_fk":
+        # Только penalty за неуникальность PK-стороны (если dim.pk реально не уникален).
+        if raw_pk1 and u1 < 100:
+            score *= max(u1 / 100.0, 0.1)
+        elif raw_pk2 and u2 < 100:
+            score *= max(u2 / 100.0, 0.1)
+        return round(score, 2)
+
     # Штраф за одну attribute-сторону
     if col1_class == "attribute" or col2_class == "attribute":
         score *= 0.4
@@ -212,9 +260,11 @@ def _compute_score(
     # Штраф за non-PK колонку при наличии составного PK в таблице.
     # Если dim имеет составной PK, а join идёт по не-PK колонке — это семантически
     # неверный ключ (например, new_gosb_id вместо tb_id+old_gosb_id).
-    if not raw_pk2 and pk_count2 > 1:
-        score *= 0.2  # жёсткий штраф: составной PK не покрыт
-    elif not raw_pk1 and pk_count1 > 1:
+    # ВАЖНО: штраф НЕ применяется, если другая сторона является PK — это
+    # легитимная пара PK(dim)↔FK(fact), где FK не входит в PK fact-таблицы.
+    if not raw_pk2 and pk_count2 > 1 and not raw_pk1:
+        score *= 0.2  # жёсткий штраф: non-PK в composite-PK таблице (не FK к другому PK)
+    elif not raw_pk1 and pk_count1 > 1 and not raw_pk2:
         score *= 0.2
     elif not raw_pk2 and pk_count2 > 0 and u2 < 100:
         # Обычный штраф за non-PK при одиночном PK
@@ -317,12 +367,26 @@ def _make_candidate(
 
     # Reason
     reason_parts = {
+        "explicit_fk": "метаданные FK (foreign_key_target)",
         "exact_name": "одинаковое имя",
         "fk_pattern": "FK-паттерн",
         "suffix": "suffix-паттерн",
         "normalized_pk": "нормализованное PK-имя (old_/new_-префикс)",
     }
     reason = reason_parts.get(match_type, match_type)
+
+    # Оценка кардинальности по unique_perc каждой стороны:
+    # 100% ↔ "1" (уникальная сторона), < 100% ↔ "N".
+    def _side(unique: float, raw_pk: bool, pk_count: int) -> str:
+        if raw_pk and pk_count == 1:
+            return "1"
+        if unique >= 99.5:
+            return "1"
+        return "N"
+
+    left_side = _side(info1["unique_perc"], info1["raw_pk"], info1["pk_count"])
+    right_side = _side(info2["unique_perc"], info2["raw_pk"], info2["pk_count"])
+    cardinality_rating = f"{left_side}:{right_side}"
 
     return JoinCandidate(
         table1=f"{s1}.{t1}",
@@ -340,6 +404,7 @@ def _make_candidate(
         col2_status=info2["status"],
         col1_desc=info1.get("desc_short", ""),
         col2_desc=info2.get("desc_short", ""),
+        cardinality_rating=cardinality_rating,
     )
 
 
@@ -352,6 +417,10 @@ def rank_join_candidates(
 
     Возвращает список кандидатов с score >= MIN_CANDIDATE_SCORE, отсортированный
     по убыванию score.
+
+    Если у одной из колонок в `cols*_df` заполнен `foreign_key_target` (формат
+    `schema.table.column`) — соответствующая пара добавляется как 0-й этап
+    `explicit_fk` с наивысшим базовым score.
     """
     if cols1_df.empty or cols2_df.empty:
         return []
@@ -366,6 +435,29 @@ def rank_join_candidates(
     for _, r in cols2_df.iterrows():
         name = str(r["column_name"])
         info2_map[name] = _col_info(r, pk_count2)
+
+    # Собрать explicit FK-пары: колонка с foreign_key_target="s2.t2.col" → пара (col, target)
+    def _collect_fk_pairs(
+        src_s: str, src_t: str, src_df: pd.DataFrame,
+        dst_s: str, dst_t: str,
+    ) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        if "foreign_key_target" not in src_df.columns:
+            return pairs
+        for _, r in src_df.iterrows():
+            raw = str(r.get("foreign_key_target", "") or "").strip()
+            if not raw:
+                continue
+            parts = raw.split(".")
+            if len(parts) != 3:
+                continue
+            tgt_schema, tgt_table, tgt_col = (p.strip() for p in parts)
+            if tgt_schema == dst_s and tgt_table == dst_t:
+                pairs.append((str(r["column_name"]), tgt_col))
+        return pairs
+
+    fk_pairs_1to2 = _collect_fk_pairs(s1, t1, cols1_df, s2, t2)
+    fk_pairs_2to1 = _collect_fk_pairs(s2, t2, cols2_df, s1, t1)
 
     candidates: list[JoinCandidate] = []
     seen: set[tuple[str, str]] = set()
@@ -382,6 +474,12 @@ def rank_join_candidates(
         if cand:
             seen.add(key)
             candidates.append(cand)
+
+    # --- 0. Explicit FK из метаданных (приоритет над эвристиками) ---
+    for c1, c2 in fk_pairs_1to2:
+        _add(c1, c2, "explicit_fk")
+    for c2, c1 in fk_pairs_2to1:
+        _add(c1, c2, "explicit_fk")
 
     # --- 1. Совпадающие имена ---
     shared = set(info1_map.keys()) & set(info2_map.keys())
@@ -694,9 +792,18 @@ def suggest_composite_joins(
         if len(pk_side) < 2:
             return []
         matched = []
+        other_col_set = (
+            set(other_df["column_name"].tolist()) if other_df is not None and not other_df.empty
+            else set()
+        )
         for pk_col in pk_side:
-            if pk_col in pair_map:
+            # 1) Exact same-name match — highest priority (e.g. dim.tb_id → fact.tb_id)
+            if pk_col in other_col_set:
+                matched.append((pk_col, pk_col))
+            # 2) pair_map from ranked candidates
+            elif pk_col in pair_map:
                 matched.append((pk_col, pair_map[pk_col]))
+            # 3) Normalized name fallback (old_gosb_id → gosb_id)
             elif other_df is not None:
                 found = _find_normalized_in_df(pk_col, other_df)
                 if found:

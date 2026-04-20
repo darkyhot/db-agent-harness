@@ -1,9 +1,9 @@
 """Сборка графа LangGraph с логикой переходов.
 
-Новая архитектура: 11 узлов вместо 6.
+Новая архитектура: 12 узлов.
 intent_classifier → table_resolver → table_explorer → column_selector
-  → sql_planner → sql_writer → sql_validator
-      → [ошибка] → error_diagnoser → sql_fixer → sql_validator
+  → sql_planner → sql_writer → sql_static_checker → sql_validator
+      → [ошибка] → error_diagnoser → sql_fixer → sql_static_checker → sql_validator
       → [успех] → summarizer → END
 """
 
@@ -17,8 +17,11 @@ from core.database import DatabaseManager
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.schema_loader import SchemaLoader
+import core.column_selector_deterministic as column_selector_module
+import core.sql_planner_deterministic as sql_planner_module
 from core.sql_validator import SQLValidator
 from graph.nodes import GraphNodes
+import graph.nodes.intent as intent_module
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,9 @@ def _route_after_intent_classifier(state: AgentState) -> str:
     if limit:
         return limit
 
+    if state.get("needs_clarification"):
+        return END
+
     intent = state.get("intent", {})
 
     # Вопрос по схеме — сразу к summarizer (ответ из каталога)
@@ -69,8 +75,8 @@ def _route_after_intent_classifier(state: AgentState) -> str:
     if intent.get("needs_search"):
         return "tool_dispatcher"
 
-    # Обычный путь — к table_resolver
-    return "table_resolver"
+    # Обычный путь — через hint_extractor к table_resolver
+    return "hint_extractor"
 
 
 def _route_after_tool_dispatcher(state: AgentState) -> str:
@@ -93,6 +99,18 @@ def _route_after_tool_dispatcher(state: AgentState) -> str:
     return "table_resolver"
 
 
+def _route_after_table_resolver(state: AgentState) -> str:
+    """Маршрутизация после table_resolver."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("needs_disambiguation") or state.get("needs_clarification"):
+        return END
+
+    return "table_explorer"
+
+
 def _route_after_sql_writer(state: AgentState) -> str:
     """Маршрутизация после sql_writer."""
     limit = _check_limits(state)
@@ -102,8 +120,11 @@ def _route_after_sql_writer(state: AgentState) -> str:
     if state.get("needs_disambiguation"):
         return END
 
+    if state.get("needs_clarification"):
+        return END
+
     if state.get("sql_to_validate"):
-        return "sql_validator"
+        return "sql_static_checker"
 
     if state.get("last_error"):
         return "error_diagnoser"
@@ -118,9 +139,30 @@ def _route_after_sql_writer(state: AgentState) -> str:
     return "column_selector"
 
 
+def _route_after_static_checker(state: AgentState) -> str:
+    """Маршрутизация после sql_static_checker."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("last_error"):
+        return "error_diagnoser"
+
+    if state.get("sql_to_validate"):
+        return "sql_validator"
+
+    if state["current_step"] >= len(state["plan"]):
+        return "summarizer"
+
+    return "column_selector"
+
+
 def _route_after_validator(state: AgentState) -> str:
     """Маршрутизация после sql_validator."""
     if state.get("needs_confirmation"):
+        return END
+
+    if state.get("needs_clarification"):
         return END
 
     if _is_timed_out(state):
@@ -148,6 +190,9 @@ def _route_after_sql_planner(state: AgentState) -> str:
 
     if state.get("column_selector_hint", ""):
         return "column_selector"
+
+    if state.get("needs_clarification"):
+        return END
 
     return "sql_writer"
 
@@ -221,6 +266,12 @@ def build_graph(
           → [ошибка] → error_diagnoser → sql_fixer → sql_validator
           → [успех] → summarizer → END
     """
+    logger.info(
+        "Runtime modules: column_selector=%s, intent=%s, sql_planner=%s",
+        getattr(column_selector_module, "__file__", "<unknown>"),
+        getattr(intent_module, "__file__", "<unknown>"),
+        getattr(sql_planner_module, "__file__", "<unknown>"),
+    )
     nodes = GraphNodes(
         llm, db_manager, schema_loader, memory, sql_validator, tools,
         debug_prompt=debug_prompt,
@@ -228,13 +279,15 @@ def build_graph(
 
     graph = StateGraph(AgentState)
 
-    # Добавляем все 11 узлов
+    # Добавляем все 13 узлов
     graph.add_node("intent_classifier", nodes.intent_classifier)
+    graph.add_node("hint_extractor", nodes.hint_extractor)
     graph.add_node("table_resolver", nodes.table_resolver)
     graph.add_node("table_explorer", nodes.table_explorer)
     graph.add_node("column_selector", nodes.column_selector)
     graph.add_node("sql_planner", nodes.sql_planner)
     graph.add_node("sql_writer", nodes.sql_writer)
+    graph.add_node("sql_static_checker", nodes.sql_static_checker)
     graph.add_node("sql_validator", nodes.sql_validator_node)
     graph.add_node("error_diagnoser", nodes.error_diagnoser)
     graph.add_node("sql_fixer", nodes.sql_fixer)
@@ -247,10 +300,14 @@ def build_graph(
     # === Линейная цепочка: intent → tables → explore → columns → plan → write ===
     # intent_classifier → conditional routing
     graph.add_conditional_edges("intent_classifier", _route_after_intent_classifier, {
+        END: END,
         "summarizer": "summarizer",
         "tool_dispatcher": "tool_dispatcher",
-        "table_resolver": "table_resolver",
+        "hint_extractor": "hint_extractor",
     })
+
+    # hint_extractor (детерминированный) → table_resolver
+    graph.add_edge("hint_extractor", "table_resolver")
 
     # tool_dispatcher → conditional routing (back to resolver or diagnoser)
     graph.add_conditional_edges("tool_dispatcher", _route_after_tool_dispatcher, {
@@ -259,22 +316,34 @@ def build_graph(
         "summarizer": "summarizer",
     })
 
-    # table_resolver → table_explorer → column_selector → sql_planner
-    graph.add_edge("table_resolver", "table_explorer")
+    # table_resolver → table_explorer или END, если нужно уточнение источника
+    graph.add_conditional_edges("table_resolver", _route_after_table_resolver, {
+        END: END,
+        "table_explorer": "table_explorer",
+        "summarizer": "summarizer",
+    })
     graph.add_edge("table_explorer", "column_selector")
     graph.add_edge("column_selector", "sql_planner")
 
     # sql_planner → conditional routing:
     # если dim-таблица пропущена → column_selector (повтор с hint), иначе → sql_writer
     graph.add_conditional_edges("sql_planner", _route_after_sql_planner, {
+        END: END,
         "column_selector": "column_selector",
         "sql_writer": "sql_writer",
         "summarizer": "summarizer",
     })
 
-    # sql_writer → conditional routing
+    # sql_writer → sql_static_checker → sql_validator (или error_diagnoser)
     graph.add_conditional_edges("sql_writer", _route_after_sql_writer, {
         END: END,
+        "sql_static_checker": "sql_static_checker",
+        "error_diagnoser": "error_diagnoser",
+        "summarizer": "summarizer",
+        "column_selector": "column_selector",
+    })
+
+    graph.add_conditional_edges("sql_static_checker", _route_after_static_checker, {
         "sql_validator": "sql_validator",
         "error_diagnoser": "error_diagnoser",
         "summarizer": "summarizer",
@@ -299,9 +368,9 @@ def build_graph(
         "summarizer": "summarizer",
     })
 
-    # sql_fixer → conditional routing
+    # sql_fixer → sql_static_checker → sql_validator (через тот же static check)
     graph.add_conditional_edges("sql_fixer", _route_after_sql_fixer, {
-        "sql_validator": "sql_validator",
+        "sql_validator": "sql_static_checker",
         "error_diagnoser": "error_diagnoser",
         "summarizer": "summarizer",
         "column_selector": "column_selector",
@@ -310,11 +379,17 @@ def build_graph(
     # summarizer → END
     graph.add_edge("summarizer", END)
 
-    logger.info("Граф агента собран (11 узлов)")
+    logger.info("Граф агента собран (13 узлов)")
     return graph.compile()
 
 
-def create_initial_state(user_input: str) -> AgentState:
+def create_initial_state(
+    user_input: str,
+    prev_sql: str = "",
+    prev_result_summary: str = "",
+    user_filter_choices: dict[str, str] | None = None,
+    rejected_filter_choices: dict[str, list[str]] | None = None,
+) -> AgentState:
     """Создать начальное состояние для запуска графа."""
     return AgentState(
         messages=[],
@@ -323,13 +398,18 @@ def create_initial_state(user_input: str) -> AgentState:
         tool_calls=[],
         last_error=None,
         retry_count=0,
+        total_retry_count=0,
         sql_to_validate=None,
         final_answer=None,
         user_input=user_input,
         needs_confirmation=False,
         confirmation_message="",
+        needs_clarification=False,
+        clarification_message="",
         needs_disambiguation=False,
         disambiguation_options=[],
+        user_filter_choices=dict(user_filter_choices or {}),
+        rejected_filter_choices={k: list(v) for k, v in dict(rejected_filter_choices or {}).items()},
         tables_context="",
         graph_iterations=0,
         correction_examples=[],
@@ -351,4 +431,22 @@ def create_initial_state(user_input: str) -> AgentState:
         error_diagnosis={},
         pending_sql_tool_call=None,
         column_selector_hint="",
+        # Multi-turn context
+        prev_sql=prev_sql,
+        prev_result_summary=prev_result_summary,
+        # Подсказки пользователя (детерминированный экстрактор)
+        user_hints={
+            "must_keep_tables": [],
+            "join_fields": [],
+            "dim_sources": {},
+            "having_hints": [],
+        },
+        semantic_frame={},
+        where_resolution={},
+        join_decision={},
+        planning_confidence={},
+        evidence_trace={},
+        fallback_policy={},
+        # Белый список таблиц (заполняется в table_resolver)
+        allowed_tables=[],
     )

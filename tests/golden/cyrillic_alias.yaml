@@ -1,0 +1,9 @@
+# SQL не должен содержать кириллицу в алиасах
+query: "Покажи количество task_code по segment_name из uzp_data_split_mzp_sale_funnel"
+intent_must_be: "analytics"
+sql_must_contain:
+  - "COUNT"
+  - "GROUP BY"
+  - "UZP_DATA_SPLIT_MZP_SALE_FUNNEL"
+sql_alias_no_cyrillic: true
+max_retries: 0

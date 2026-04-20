@@ -1,0 +1,18 @@
+query: "Посчитай сумму оттока по дате и названию ГОСБ"
+intent_must_be: analytics
+complexity_must_be: join
+sql_must_contain:
+  - "SUM"
+  - "REPORT_DT"
+  - "NEW_GOSB_NAME"
+  - "JOIN"
+  - "UZP_DIM_GOSB"
+  - "OLD_GOSB_ID = UZP_DWH_FACT_OUTFLOW.GOSB_ID"
+  - "TB_ID = UZP_DWH_FACT_OUTFLOW.TB_ID"
+  - "GROUP BY REPORT_DT, NEW_GOSB_NAME"
+  - "ORDER BY SUM_OUTFLOW_QTY DESC"
+sql_must_not_contain:
+  - "SELECT *"
+sql_alias_no_cyrillic: true
+should_reach_node: sql_writer
+max_retries: 1

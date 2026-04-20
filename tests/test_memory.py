@@ -1,7 +1,6 @@
 """Тесты MemoryManager: сессии, сообщения, долгосрочная память, очистка."""
 
 import json
-import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -12,9 +11,8 @@ from core.memory import MemoryManager
 
 @pytest.fixture
 def memory(tmp_path):
-    """Создать MemoryManager с временной БД."""
-    db_path = tmp_path / "test_memory.db"
-    return MemoryManager(db_path=db_path)
+    """Создать MemoryManager с временной директорией."""
+    return MemoryManager(memory_dir=tmp_path)
 
 
 class TestSessions:
@@ -78,19 +76,17 @@ class TestLongTermMemory:
 
 class TestCleanup:
     def test_cleanup_old_sessions(self, memory):
-        # Создаём «старую» сессию вручную
-        from core.memory import sqlite3
+        # Вставляем «старую» сессию напрямую в JSON
         old_time = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
-
-        with memory._connect() as conn:
-            conn.execute(
-                "INSERT INTO sessions (id, timestamp, summary, user_id) VALUES (?, ?, ?, ?)",
-                ("old-session", old_time, "old summary", "user1"),
-            )
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-                ("old-session", "user", "old message", old_time),
-            )
+        sessions = memory._load_sessions()
+        sessions["old-session"] = {
+            "timestamp": old_time,
+            "summary": "old summary",
+            "user_id": "user1",
+            "messages": [{"role": "user", "content": "old message", "timestamp": old_time}],
+            "sql_audit": [],
+        }
+        memory._save_sessions(sessions)
 
         # Создаём свежую сессию
         memory.start_session("user1")

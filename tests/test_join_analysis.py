@@ -626,3 +626,316 @@ class TestSmartJoinKeyDetection:
         assert "СОСТАВНОЙ JOIN" in output, "Вывод должен содержать рекомендацию составного JOIN"
         assert "old_gosb_id" in output or "gosb_id" in output
         assert "tb_id" in output
+
+    def test_composite_on_uses_same_name_priority(self):
+        """_build_composite должен использовать точное совпадение имён в приоритете.
+
+        Для dim.tb_id должна быть выбрана fact.tb_id (exact same name),
+        а не fact.gosb_id (который был ошибочно выбран до исправления).
+        Ожидаемый ON: g.tb_id = f.tb_id AND g.old_gosb_id = f.gosb_id
+        """
+        df_dim = _make_dim_gosb_df()
+        df_fact = _make_fact_outflow_df()
+        candidates = rank_join_candidates(
+            "s", "uzp_dwh_fact_outflow", df_fact,
+            "s", "uzp_dim_gosb", df_dim,
+            pk_count1=1, pk_count2=2,
+        )
+        lines = suggest_composite_joins(
+            candidates, df_fact, df_dim,
+            pk_count1=1, pk_count2=2,
+            tbl1="s.uzp_dwh_fact_outflow",
+            tbl2="s.uzp_dim_gosb",
+        )
+        on_text = "\n".join(lines)
+        # tb_id должен сопоставляться с tb_id (не с gosb_id)
+        assert "tb_id = f.tb_id" in on_text or "tb_id = g.tb_id" in on_text, (
+            f"tb_id должен маппироваться на tb_id (same name), а не на gosb_id. ON: {on_text}"
+        )
+        # gosb_id должен сопоставляться с old_gosb_id
+        assert "gosb_id" in on_text
+
+
+# ---------------------------------------------------------------------------
+# user_hints.join_fields побеждает PK-normalized (column_selector._pick_join_candidate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synthetic_two_table_loader(tmp_path):
+    """Синтетические fact_a + dim_b:
+    - fact_a: event_id (PK), inn, client_id (нет PK, но 50% unique)
+    - dim_b:  client_pk (PK), inn, client_id
+
+    У обеих таблиц общие поля `inn` и `client_id`.
+    `client_id` — key-like по имени и по normalized_pk (client_pk),
+    `inn` — бизнес-ключ, не PK.
+    """
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["syn", "syn"],
+        "table_name": ["fact_a", "dim_b"],
+        "description": ["Синт. факт-таблица", "Синт. справочник клиентов"],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+
+    attrs_df = pd.DataFrame({
+        "schema_name": ["syn"] * 6,
+        "table_name": [
+            "fact_a", "fact_a", "fact_a",
+            "dim_b",  "dim_b",  "dim_b",
+        ],
+        "column_name": [
+            "event_id", "inn", "client_id",
+            "client_pk", "inn", "client_id",
+        ],
+        "dType": [
+            "bigint", "varchar", "bigint",
+            "bigint", "varchar", "bigint",
+        ],
+        "description": [
+            "PK события", "ИНН", "ID клиента",
+            "PK клиента", "ИНН", "ID клиента",
+        ],
+        "is_primary_key": [
+            True, False, False,
+            True, False, False,
+        ],
+        "unique_perc": [100.0, 80.0, 50.0, 100.0, 80.0, 100.0],
+        "not_null_perc": [100.0, 90.0, 80.0, 100.0, 90.0, 95.0],
+    })
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+
+    return SchemaLoader(data_dir=tmp_path)
+
+
+class TestUserHintJoinFieldsWins:
+    """`user_hints.join_fields` должен побеждать PK-normalized выбор join-колонки."""
+
+    def test_hint_inn_overrides_pk_default(self, synthetic_two_table_loader):
+        """Без подсказки алгоритм мог бы выбрать client_id/client_pk,
+        но с hint_join_fields=['inn'] должен взять `inn`."""
+        from core.column_selector_deterministic import _pick_join_candidate
+
+        pick = _pick_join_candidate(
+            text="",
+            t1="syn.fact_a",
+            t2="syn.dim_b",
+            schema_loader=synthetic_two_table_loader,
+            user_input="соедини по инн",
+            hint_join_fields=["inn"],
+        )
+        assert pick is not None
+        assert pick["col1"] == "inn"
+        assert pick["col2"] == "inn"
+
+    def test_hint_client_id_wins_even_non_pk(self, synthetic_two_table_loader):
+        """Даже если в fact_a client_id не PK и всего 50% unique, hint должен
+        заставить выбрать именно его, а не fallback на какой-то другой ключ."""
+        from core.column_selector_deterministic import _pick_join_candidate
+
+        pick = _pick_join_candidate(
+            text="",
+            t1="syn.fact_a",
+            t2="syn.dim_b",
+            schema_loader=synthetic_two_table_loader,
+            user_input="",
+            hint_join_fields=["client_id"],
+        )
+        assert pick is not None
+        assert pick["col1"] == "client_id"
+        assert pick["col2"] == "client_id"
+
+    def test_no_hint_falls_back_to_key_like(self, synthetic_two_table_loader):
+        """Без user_hints алгоритм опирается на упоминание в тексте + key-like.
+        Здесь текст явно упоминает client_id — он key-like и должен быть выбран."""
+        from core.column_selector_deterministic import _pick_join_candidate
+
+        pick = _pick_join_candidate(
+            text="",
+            t1="syn.fact_a",
+            t2="syn.dim_b",
+            schema_loader=synthetic_two_table_loader,
+            user_input="джойн через client_id",
+            hint_join_fields=None,
+        )
+        assert pick is not None
+        assert pick["col1"] == "client_id"
+
+    def test_hint_missing_column_graceful(self, synthetic_two_table_loader):
+        """Если hint_join_fields указывает на несуществующую в обеих таблицах
+        колонку — hint не применяется, используется обычный fallback."""
+        from core.column_selector_deterministic import _pick_join_candidate
+
+        pick = _pick_join_candidate(
+            text="",
+            t1="syn.fact_a",
+            t2="syn.dim_b",
+            schema_loader=synthetic_two_table_loader,
+            user_input="через client_id",
+            hint_join_fields=["nonexistent_col"],
+        )
+        # Не падает, fallback работает
+        assert pick is None or pick["col1"] in {"client_id", "inn"}
+
+
+class TestExplicitFK:
+    """Direction 2: foreign_key_target метаданные дают приоритетную пару."""
+
+    def test_explicit_fk_wins_over_heuristic(self):
+        """Колонка с foreign_key_target даёт explicit_fk с высшим base score."""
+        df_fact = _make_cols_df([
+            {"column_name": "client_ref", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 0.5, "description": "ссылка на клиента",
+             "foreign_key_target": "s.dim_client.inn"},
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 0.5, "description": ""},
+        ])
+        df_dim = _make_cols_df([
+            {"column_name": "inn", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        candidates = rank_join_candidates("s", "fact", df_fact, "s", "dim_client", df_dim, 1, 1)
+        # Первый (топ) — explicit_fk
+        assert candidates[0].match_type == "explicit_fk"
+        assert candidates[0].col1 == "client_ref"
+        assert candidates[0].col2 == "inn"
+
+    def test_explicit_fk_reverse_direction(self):
+        """foreign_key_target заполнен на стороне 2 → пара тоже находится."""
+        df_dim = _make_cols_df([
+            {"column_name": "inn", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        df_fact = _make_cols_df([
+            {"column_name": "customer", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 0.5, "description": "",
+             "foreign_key_target": "s.dim.inn"},
+        ])
+        candidates = rank_join_candidates("s", "dim", df_dim, "s", "fact", df_fact, 1, 1)
+        assert any(c.match_type == "explicit_fk" for c in candidates)
+
+    def test_explicit_fk_ignored_when_target_elsewhere(self):
+        """foreign_key_target указывает на другую таблицу — не используется."""
+        df1 = _make_cols_df([
+            {"column_name": "x_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 0.5, "description": "",
+             "foreign_key_target": "s.other.id"},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        candidates = rank_join_candidates("s", "a", df1, "s", "b", df2, 1, 1)
+        # Не должно быть explicit_fk — таргет указывает на other
+        assert not any(c.match_type == "explicit_fk" for c in candidates)
+
+
+class TestCardinalityRating:
+    def test_pk_to_pk_is_one_to_one(self):
+        df1 = _make_cols_df([
+            {"column_name": "id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        cands = rank_join_candidates("s", "a", df1, "s", "b", df2, 1, 1)
+        assert cands[0].cardinality_rating == "1:1"
+
+    def test_pk_to_non_unique_is_one_to_n(self):
+        df1 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": True,
+             "unique_perc": 100.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "client_id", "dType": "int8", "is_primary_key": False,
+             "unique_perc": 5.0, "description": ""},
+        ])
+        cands = rank_join_candidates("s", "dim", df1, "s", "fact", df2, 1, 1)
+        assert cands[0].cardinality_rating == "1:N"
+
+    def test_non_unique_both_is_n_to_m(self):
+        df1 = _make_cols_df([
+            {"column_name": "status", "dType": "int4", "is_primary_key": False,
+             "unique_perc": 5.0, "description": ""},
+        ])
+        df2 = _make_cols_df([
+            {"column_name": "status", "dType": "int4", "is_primary_key": False,
+             "unique_perc": 5.0, "description": ""},
+        ])
+        cands = rank_join_candidates("s", "a", df1, "s", "b", df2, 0, 0)
+        # Может быть отфильтрован по score, но если остался — N:N
+        if cands:
+            assert cands[0].cardinality_rating == "N:N"
+
+
+class TestForeignKeyInference:
+    """Direction 2: SchemaLoader.infer_foreign_keys — детерминированная инференция."""
+
+    def test_dry_run_finds_matching_pk_with_same_dtype(self, tmp_path):
+        import pandas as pd
+        from core.schema_loader import SchemaLoader
+
+        (tmp_path / "tables_list.csv").write_text(
+            "schema_name,table_name,description,grain\n"
+            "s,dim_c,dim,dictionary\n"
+            "s,fact_a,fact,event\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "attr_list.csv").write_text(
+            "schema_name,table_name,column_name,dType,is_not_null,description,is_primary_key,not_null_perc,unique_perc\n"
+            "s,dim_c,inn,int8,True,,True,100.0,100.0\n"
+            "s,fact_a,inn,int8,False,,False,100.0,0.5\n"
+            "s,fact_a,value,numeric,False,,False,100.0,0.5\n",
+            encoding="utf-8",
+        )
+        loader = SchemaLoader(data_dir=tmp_path)
+        result = loader.infer_foreign_keys(dry_run=True)
+        assert result == {"s.fact_a.inn": "s.dim_c.inn"}
+
+    def test_persist_writes_to_csv(self, tmp_path):
+        from core.schema_loader import SchemaLoader
+
+        (tmp_path / "tables_list.csv").write_text(
+            "schema_name,table_name,description,grain\n"
+            "s,dim_c,dim,dictionary\n"
+            "s,fact_a,fact,event\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "attr_list.csv").write_text(
+            "schema_name,table_name,column_name,dType,is_not_null,description,is_primary_key,not_null_perc,unique_perc\n"
+            "s,dim_c,inn,int8,True,,True,100.0,100.0\n"
+            "s,fact_a,inn,int8,False,,False,100.0,0.5\n",
+            encoding="utf-8",
+        )
+        loader = SchemaLoader(data_dir=tmp_path)
+        loader.infer_foreign_keys(dry_run=False)
+
+        # Reload and verify
+        loader2 = SchemaLoader(data_dir=tmp_path)
+        target = loader2.get_foreign_key_target("s", "fact_a", "inn")
+        assert target == ("s", "dim_c", "inn")
+
+    def test_dtype_mismatch_skipped(self, tmp_path):
+        from core.schema_loader import SchemaLoader
+
+        (tmp_path / "tables_list.csv").write_text(
+            "schema_name,table_name,description,grain\n"
+            "s,dim_c,dim,dictionary\n"
+            "s,fact_a,fact,event\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "attr_list.csv").write_text(
+            "schema_name,table_name,column_name,dType,is_not_null,description,is_primary_key,not_null_perc,unique_perc\n"
+            "s,dim_c,inn,int8,True,,True,100.0,100.0\n"
+            "s,fact_a,inn,text,False,,False,100.0,0.5\n",
+            encoding="utf-8",
+        )
+        loader = SchemaLoader(data_dir=tmp_path)
+        result = loader.infer_foreign_keys(dry_run=True)
+        assert result == {}

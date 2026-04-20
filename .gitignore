@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .env
+.venv/
+.pytest_cache/
+.codex
 
 # Memory — ignore DB files, keep directory
 memory/*
@@ -12,5 +15,5 @@ workspace/*
 !workspace/.gitkeep
 
 # Data — ignore CSV/JSON data files, keep directory
-data_for_agent/*
-!data_for_agent/.gitkeep
+# data_for_agent/*
+# !data_for_agent/.gitkeep

@@ -12,6 +12,19 @@ logger = logging.getLogger(__name__)
 class SummarizerNodes:
     """Mixin с узлом summarizer."""
 
+    def _extract_preview_markdown(self, tool_calls: list[dict[str, Any]]) -> str:
+        """Достать markdown-preview из последнего execute_query."""
+        for tc in reversed(tool_calls or []):
+            if tc.get("tool") != "execute_query":
+                continue
+            payload = self._parse_sql_tool_payload(tc.get("result", ""))
+            if not payload:
+                continue
+            preview = str(payload.get("preview_markdown", "") or "").strip()
+            if preview:
+                return preview
+        return ""
+
     def _get_summarizer_system_prompt(self) -> str:
         """Системный промпт для формирования финального ответа."""
         return (
@@ -28,6 +41,11 @@ class SummarizerNodes:
             "- Интерпретируй результат в бизнес-терминах, если это возможно\n"
             "- Если данные обрезаны — укажи это и покажи общее количество строк\n"
             "- Если результат большой — покажи топ-10 строк и общую статистику\n"
+            "- КРИТИЧНО: в блоке ```sql РАЗРЕШЁН ТОЛЬКО тот запрос, который дословно "
+            "находится в разделе «Результаты инструментов». Запрещено писать ЛЮБОЙ другой "
+            "SQL — даже если считаешь, что результат не отвечает на вопрос. "
+            "Если данных недостаточно — напиши ТОЛЬКО текст: "
+            "«Данных недостаточно, требуется дополнительный запрос» — без SQL-блока.\n"
         )
 
     def summarizer(self, state: AgentState) -> dict[str, Any]:
@@ -44,8 +62,10 @@ class SummarizerNodes:
             self.memory.add_message("assistant", state["final_answer"])
             return {}
 
+        # Используем только последние N tool_calls — предотвращаем раздувание промпта
+        capped_tool_calls = self._cap_tool_calls(state.get("tool_calls", []))
         tool_results_parts = []
-        for tc in state.get("tool_calls", []):
+        for tc in capped_tool_calls:
             sql = tc.get("args", {}).get("sql", "")
             sql_line = f"\n  SQL: {sql}" if sql else ""
             tool_results_parts.append(
@@ -94,6 +114,12 @@ class SummarizerNodes:
                   f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
 
         answer = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.2)
+        preview_markdown = self._extract_preview_markdown(capped_tool_calls)
+        if preview_markdown and preview_markdown not in answer:
+            answer = (
+                f"{answer.rstrip()}\n\n"
+                f"Предварительный результат:\n{preview_markdown}"
+            ).strip()
         self.memory.add_message("assistant", answer)
 
         logger.info("Summarizer: ответ сформирован")

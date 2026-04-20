@@ -1,0 +1,2178 @@
+{
+  "schema.uzp_dwh_fact_outflow.report_dt": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "report_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.tb_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "tb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.gosb_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.inn": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "inn",
+    "semantic_class": "identifier",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.segment_name": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "segment_name",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.is_force": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "is_force",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.mzp_fio": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "mzp_fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.saphr_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "saphr_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.calc_fl_qty": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "calc_fl_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.prev_m_overflow_qty": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "prev_m_overflow_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.plan_payee_qty": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "plan_payee_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.fact_payee_qty": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "fact_payee_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.outflow_qty": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "outflow_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.outflow_perc": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "outflow_perc",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.other_inn_emp_perc": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "other_inn_emp_perc",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.m_avg_salary_amt": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "m_avg_salary_amt",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.prev_m_avg_salary_amt": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "prev_m_avg_salary_amt",
+    "semantic_class": "join_key",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.next_m_avg_salary_amt": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "next_m_avg_salary_amt",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.prev_m_fl_val": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "prev_m_fl_val",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.next_m_fl_val": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "next_m_fl_val",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.is_task": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "is_task",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.client_communication_infopovod": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "client_communication_infopovod",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_dwh_fact_outflow.is_oktmo": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "is_oktmo",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.oktmo_subject_code": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "oktmo_subject_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_dwh_fact_outflow.oktmo_subject_district_code": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "oktmo_subject_district_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_dwh_fact_outflow.oktmo_subject_district_city_code": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "oktmo_subject_district_city_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_dwh_fact_outflow.oktmo": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "oktmo",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_dwh_fact_outflow.inserted_dttm": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "inserted_dttm",
+    "semantic_class": "system_timestamp",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_fact_outflow.author_login": {
+    "schema": "schema",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "author_login",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dim_gosb.tb_id": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "tb_id",
+    "semantic_class": "join_key",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.tb_short_name": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "tb_short_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.tb_full_name": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "tb_full_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.old_gosb_name": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "old_gosb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.old_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "old_gosb_id",
+    "semantic_class": "identifier",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.new_gosb_name": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "new_gosb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.new_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "new_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dim_gosb.isu_branch_id": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "isu_branch_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.isu_branch_name": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "isu_branch_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.web_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "web_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dim_gosb.pirs_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "pirs_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dim_gosb.pirs_gosb_name": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "pirs_gosb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.utc_timezone": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "utc_timezone",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dim_gosb.timezone_violation_msk": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "timezone_violation_msk",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dim_gosb.region_id": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "region_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.region_name": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "region_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dim_gosb.inserted_dttm": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "inserted_dttm",
+    "semantic_class": "system_timestamp",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dim_gosb.author_login": {
+    "schema": "schema",
+    "table": "uzp_dim_gosb",
+    "column": "author_login",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.report_dt": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "report_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.tb_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "tb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.tb_name": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "tb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.gosb_name": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "gosb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.department_manager_saphr_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "department_manager_saphr_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.department_manager_saphr_fio": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "department_manager_saphr_fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_manager_saphr_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_manager_saphr_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_manager_saphr_fio": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_manager_saphr_fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.manager_saphr_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "manager_saphr_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.manager_saphr_fio": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "manager_saphr_fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.saphr_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "saphr_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.fio": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.km_saphr_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "km_saphr_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.km_fio": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "km_fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.post_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "post_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.post_name": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "post_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_role_name": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_role_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_leader_saphr_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_leader_saphr_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_leader_fio": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_leader_fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_task_leader": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_task_leader",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.segment_name": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "segment_name",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.company_name": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "company_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.inn": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "inn",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.epk_id": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "epk_id",
+    "semantic_class": "join_key",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_code": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_code",
+    "semantic_class": "identifier",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.uzp_task_code": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "uzp_task_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_created_dt": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_created_dt",
+    "semantic_class": "system_timestamp",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_plan_closed_dt": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_plan_closed_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_fact_closed_dt": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_fact_closed_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.campaign_code": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "campaign_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.sale_scenario": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "sale_scenario",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_category": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_category",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_type": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_type",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_subtype": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_subtype",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.reason_comment": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "reason_comment",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.last_activity_type": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "last_activity_type",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.last_activity_dt": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "last_activity_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.last_activity_status": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "last_activity_status",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.np_motiv_qty": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "np_motiv_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.staff_qty": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "staff_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.task_source_code": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "task_source_code",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_closed": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_closed",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_success_closed": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_success_closed",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_worked": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_worked",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_np_task": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_np_task",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_overdue_task": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_overdue_task",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_required_task": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_required_task",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_deal_created": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_deal_created",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_interest_offer": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_interest_offer",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.is_outflow": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "is_outflow",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.employee_potential_qty": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "employee_potential_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.holding_name": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "holding_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.np_qty": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "np_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.new_fl_qty": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "new_fl_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.staff_deal_qty": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "staff_deal_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.deal_code": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "deal_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.deal_created_dt": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "deal_created_dt",
+    "semantic_class": "system_timestamp",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.deal_m_dt": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "deal_m_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_split_mzp_sale_funnel.modified_dttm": {
+    "schema": "schema",
+    "table": "uzp_data_split_mzp_sale_funnel",
+    "column": "modified_dttm",
+    "semantic_class": "system_timestamp",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_data_payroll_m.acc_num": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "acc_num",
+    "semantic_class": "identifier",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.acc_open_dt": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "acc_open_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_payroll_m.acc_subtype": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "acc_subtype",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.acc_type": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "acc_type",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.actual_client_tid": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "actual_client_tid",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.amt": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "amt",
+    "semantic_class": "join_key",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.client_category": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "client_category",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.company_name": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "company_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.document_info_sha1": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "document_info_sha1",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.agrmnt_dt": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "agrmnt_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_payroll_m.agrmnt_num": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "agrmnt_num",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_data_payroll_m.enrollment_transcription": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "enrollment_transcription",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_payroll_m.enrollment_type": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "enrollment_type",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.epk_id": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "epk_id",
+    "semantic_class": "identifier",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.sys_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "sys_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_payroll_m.inn": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "inn",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_data_payroll_m.inn_parsing": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "inn_parsing",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_payroll_m.ipt_name": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "ipt_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.sys_osb_id": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "sys_osb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_payroll_m.card_type": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "card_type",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.modified_dttm": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "modified_dttm",
+    "semantic_class": "system_timestamp",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_data_payroll_m.report_dt": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "report_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_payroll_m.tb_id": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "tb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.sys_tb_id": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "sys_tb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_payroll_m.transaction_qty": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "transaction_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_payroll_m.untb": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "untb",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.vsp_id": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "vsp_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.sys_vsp_id": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "sys_vsp_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_payroll_m.report_id": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "report_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.is_security_force": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "is_security_force",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.segment_name": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "segment_name",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.enrollment_kind_descr": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "enrollment_kind_descr",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_payroll_m.market_share_flag_name": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "market_share_flag_name",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_payroll_m.src_system_name": {
+    "schema": "schema",
+    "table": "uzp_data_payroll_m",
+    "column": "src_system_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.epk_id": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "epk_id",
+    "semantic_class": "identifier",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.saphr_id": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "saphr_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.post_id": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "post_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.pos_id": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "pos_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.role_id": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "role_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.start_dttm": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "start_dttm",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.end_dttm": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "end_dttm",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.balance_unit_code": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "balance_unit_code",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.tb_id": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "tb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_emp_epk_assignment.gosb_code": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "gosb_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_emp_epk_assignment.sap_gosb_code": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "sap_gosb_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_emp_epk_assignment.vsp_code": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "vsp_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_emp_epk_assignment.modified_dttm": {
+    "schema": "schema",
+    "table": "uzp_data_emp_epk_assignment",
+    "column": "modified_dttm",
+    "semantic_class": "system_timestamp",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.epk_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "epk_id",
+    "semantic_class": "identifier",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.epk_create_dttm": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "epk_create_dttm",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.client_type_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "client_type_id",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.client_type_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "client_type_name",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.industry_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "industry_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.industry_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "industry_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.inn": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "inn",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.kpp": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "kpp",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.ogrn": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "ogrn",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.okato": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "okato",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.oktmo": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "oktmo",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.old_epk_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "old_epk_id",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_data_epk_consolidation.segment_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "segment_id",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.segment_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "segment_name",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.priority_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "priority_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.priority_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "priority_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.company_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "company_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.holding_epk_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "holding_epk_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.holding_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "holding_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.reference_holding_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "reference_holding_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.head_holding_epk_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "head_holding_epk_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.head_holding_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "head_holding_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.reference_head_holding_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "reference_head_holding_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.is_parent": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "is_parent",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.is_key_client": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "is_key_client",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.importance_lvl_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "importance_lvl_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.tb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "tb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.oktmo_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "oktmo_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.okato_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "okato_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.epk_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "epk_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.payroll_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "payroll_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.km_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "km_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.last_mzp_activity_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "last_mzp_activity_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.last_deal_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "last_deal_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.kpp_gosb_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "kpp_gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.gosb_method_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "gosb_method_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.status_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "status_id",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.status_name": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "status_name",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.is_educational": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "is_educational",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.is_military": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "is_military",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.report_id": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "report_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_data_epk_consolidation.modified_dttm": {
+    "schema": "schema",
+    "table": "uzp_data_epk_consolidation",
+    "column": "modified_dttm",
+    "semantic_class": "system_timestamp",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.report_dt": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "report_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.saphr_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "saphr_id",
+    "semantic_class": "join_key",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.fio": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.post_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "post_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.post_name": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "post_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.pos_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "pos_id",
+    "semantic_class": "join_key",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.pos_name": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "pos_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.tb_code": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "tb_code",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.tb_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "tb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.gosb_code": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "gosb_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_dwh_sap_staff_emp.sap_gosb_code": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "sap_gosb_code",
+    "semantic_class": "free_text",
+    "semantic_tags": []
+  },
+  "schema.uzp_dwh_sap_staff_emp.gosb_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "gosb_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.city": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "city",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.post_total_experience_ym": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "post_total_experience_ym",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.post_continuous_experience_ym": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "post_continuous_experience_ym",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.sb_total_experience_ym": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "sb_total_experience_ym",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.sb_continuous_experience_ym": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "sb_continuous_experience_ym",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.pos_vacancy_dt": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "pos_vacancy_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.fact_qty": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "fact_qty",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.post_cnt_fill": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "post_cnt_fill",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.post_start_dt": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "post_start_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.org_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "org_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate",
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_saphr_id": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "manager_lvl_1_saphr_id",
+    "semantic_class": "metric",
+    "semantic_tags": [
+      "aggregate_candidate"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_name": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "manager_lvl_1_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_fio": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "manager_lvl_1_fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.vertical_name": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "vertical_name",
+    "semantic_class": "join_key",
+    "semantic_tags": [
+      "dense",
+      "join_candidate"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.modified_dttm": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "modified_dttm",
+    "semantic_class": "system_timestamp",
+    "semantic_tags": [
+      "dense"
+    ]
+  },
+  "schema.uzp_dwh_sap_staff_emp.role_code": {
+    "schema": "schema",
+    "table": "uzp_dwh_sap_staff_emp",
+    "column": "role_code",
+    "semantic_class": "free_text",
+    "semantic_tags": [
+      "dense"
+    ]
+  }
+}

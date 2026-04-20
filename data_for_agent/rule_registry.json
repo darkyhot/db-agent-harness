@@ -1,0 +1,1251 @@
+{
+  "rules": [
+    {
+      "rule_id": "text:schema.uzp_dwh_fact_outflow.segment_name",
+      "column_key": "schema.uzp_dwh_fact_outflow.segment_name",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "segment",
+        "сегмент",
+        "сегмента"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_dwh_fact_outflow.is_force",
+      "column_key": "schema.uzp_dwh_fact_outflow.is_force",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is force",
+        "силов организаци",
+        "силовой организации"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_fact_outflow.mzp_fio",
+      "column_key": "schema.uzp_dwh_fact_outflow.mzp_fio",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "mzp fio",
+        "фио закрепленн мзп",
+        "фио закрепленного мзп"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_dwh_fact_outflow.is_task",
+      "column_key": "schema.uzp_dwh_fact_outflow.is_task",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is task",
+        "выставленн задач",
+        "выставленной задачи"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_fact_outflow.client_communication_infopovod",
+      "column_key": "schema.uzp_dwh_fact_outflow.client_communication_infopovod",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "client communication infopovod",
+        "инфоповод общени клиентам",
+        "инфоповод общения клиентами"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_dwh_fact_outflow.is_oktmo",
+      "column_key": "schema.uzp_dwh_fact_outflow.is_oktmo",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is oktmo",
+        "октм организаци принадлежит госб эмисси карт",
+        "октмо организации принадлежит госб эмиссии карт"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_fact_outflow.oktmo_subject_code",
+      "column_key": "schema.uzp_dwh_fact_outflow.oktmo_subject_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "oktmo subject",
+        "субъект рф согласн справочник октм",
+        "субъекта рф согласно справочнику октмо"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_fact_outflow.oktmo_subject_district_code",
+      "column_key": "schema.uzp_dwh_fact_outflow.oktmo_subject_district_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "oktmo subject district",
+        "субъект рф муниципальн район округ согласн справочник октм",
+        "субъекта рф муниципального района округа согласно справочнику октмо"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_fact_outflow.oktmo_subject_district_city_code",
+      "column_key": "schema.uzp_dwh_fact_outflow.oktmo_subject_district_city_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "oktmo subject district city",
+        "октм субъект рф муниципальн район округ городск сельск поселени согласн справочник октм",
+        "октмо субъекта рф муниципального района округа городского сельского поселения согласно справочнику октмо"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_fact_outflow.oktmo",
+      "column_key": "schema.uzp_dwh_fact_outflow.oktmo",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "oktmo",
+        "октм",
+        "октмо"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_fact_outflow.author_login",
+      "column_key": "schema.uzp_dwh_fact_outflow.author_login",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "author login",
+        "логин автор запис",
+        "логин автора записи"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dim_gosb.tb_short_name",
+      "column_key": "schema.uzp_dim_gosb.tb_short_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "tb short",
+        "кратк тб",
+        "краткое тб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dim_gosb.tb_full_name",
+      "column_key": "schema.uzp_dim_gosb.tb_full_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "tb full",
+        "полн тб",
+        "полное тб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dim_gosb.old_gosb_name",
+      "column_key": "schema.uzp_dim_gosb.old_gosb_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "old gosb",
+        "стар госб",
+        "старое госб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dim_gosb.new_gosb_name",
+      "column_key": "schema.uzp_dim_gosb.new_gosb_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "new gosb",
+        "ново госб",
+        "новое госб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dim_gosb.isu_branch_name",
+      "column_key": "schema.uzp_dim_gosb.isu_branch_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "isu branch",
+        "филиал ису",
+        "филиала ису"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dim_gosb.pirs_gosb_name",
+      "column_key": "schema.uzp_dim_gosb.pirs_gosb_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "pirs gosb",
+        "госб ас пирс"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dim_gosb.region_name",
+      "column_key": "schema.uzp_dim_gosb.region_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "region",
+        "регион",
+        "региона"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dim_gosb.author_login",
+      "column_key": "schema.uzp_dim_gosb.author_login",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "author login",
+        "логин автор запис",
+        "логин автора записи"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.tb_name",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.tb_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "tb",
+        "тб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.gosb_name",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.gosb_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "gosb",
+        "госб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.department_manager_saphr_fio",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.department_manager_saphr_fio",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "department manager saphr fio",
+        "фио начальник отдел",
+        "фио начальника отдела"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.task_manager_saphr_fio",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.task_manager_saphr_fio",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "task manager saphr fio",
+        "фио руководител направлени",
+        "фио руководителя направления"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.manager_saphr_fio",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.manager_saphr_fio",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "manager saphr fio",
+        "фио начальник управлени",
+        "фио начальника управления"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.fio",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.fio",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "fio",
+        "фио сотрудник",
+        "фио сотрудника"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.km_fio",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.km_fio",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "km fio",
+        "фио клиентск менеджер",
+        "фио клиентского менеджера"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.post_name",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.post_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "post",
+        "должность сотрудник",
+        "должность сотрудника"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.task_role_name",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.task_role_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "task role",
+        "роли сотрудник задач",
+        "роли сотрудника задаче"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.task_leader_fio",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.task_leader_fio",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "task leader fio",
+        "фио лидер задач",
+        "фио лидера задаче"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_task_leader",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_task_leader",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is task leader",
+        "лидер задач",
+        "лидера задаче"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.segment_name",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.segment_name",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "segment",
+        "сегмент",
+        "сегмента"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.company_name",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.company_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "company",
+        "компани",
+        "компании"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.uzp_task_code",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.uzp_task_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "uzp task",
+        "задач узп",
+        "задачи узп"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.campaign_code",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.campaign_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "campaign",
+        "кампани продаж",
+        "кампании продаж"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.sale_scenario",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.sale_scenario",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "sale scenario",
+        "сценар продаж",
+        "сценарий продажи"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.task_category",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.task_category",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "task category",
+        "категори задач",
+        "категория задачи"
+      ],
+      "value_candidates": [
+        "Задача"
+      ]
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.task_type",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.task_type",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [],
+      "value_candidates": [
+        "сервисная задача по юр-лицу"
+      ]
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.task_subtype",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.task_subtype",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "task subtype",
+        "подтип задач",
+        "подтип задачи"
+      ],
+      "value_candidates": [
+        "фактический отток"
+      ]
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.reason_comment",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.reason_comment",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "reason comment",
+        "инфоповод"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.last_activity_type",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.last_activity_type",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "last activity",
+        "последн активност",
+        "последней активности"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.last_activity_status",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.last_activity_status",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "last activity status",
+        "статус последн активност",
+        "статус последней активности"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.task_source_code",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.task_source_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "task source",
+        "источник задач",
+        "источник задачи"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_closed",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_closed",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is closed",
+        "закрыти задач",
+        "закрытия задачи"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_success_closed",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_success_closed",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is success closed",
+        "успешн закрыти задач",
+        "успешного закрытия задачи"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_worked",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_worked",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is worked",
+        "задач выполняетс",
+        "задача выполняется"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_np_task",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_np_task",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is np task",
+        "наличи задач привлечен новых получател",
+        "наличия задачи привлечение новых получателей"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_overdue_task",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_overdue_task",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is overdue task",
+        "просроченн задач",
+        "просроченной задачи"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_required_task",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_required_task",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is required task",
+        "обязательн необязательн задач",
+        "обязательной необязательной задачи"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_deal_created",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_deal_created",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is deal created",
+        "оформлени сделк",
+        "оформления сделки"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_interest_offer",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_interest_offer",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is interest offer",
+        "проявлени интерес предложени",
+        "проявления интереса предложению"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_split_mzp_sale_funnel.is_outflow",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.is_outflow",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is outflow",
+        "подтверждени отток",
+        "подтверждения оттока"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.holding_name",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.holding_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "holding",
+        "холдинг",
+        "холдинга"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.deal_code",
+      "column_key": "schema.uzp_data_split_mzp_sale_funnel.deal_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "deal",
+        "сделк",
+        "сделки"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.acc_subtype",
+      "column_key": "schema.uzp_data_payroll_m.acc_subtype",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "acc subtype",
+        "подтип кода счет",
+        "подтип кода счета"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.acc_type",
+      "column_key": "schema.uzp_data_payroll_m.acc_type",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "acc",
+        "агрегировани период sum сумм avg средневзешенн last последн период",
+        "агрегирования периодам sum сумма avg средневзешенное last последний период"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.client_category",
+      "column_key": "schema.uzp_data_payroll_m.client_category",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "client category",
+        "категори клиент",
+        "категория клиента"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.company_name",
+      "column_key": "schema.uzp_data_payroll_m.company_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "company",
+        "компани заключивш зп договор",
+        "компании заключившей зп договор"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.agrmnt_num",
+      "column_key": "schema.uzp_data_payroll_m.agrmnt_num",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "agrmnt num",
+        "номер договор",
+        "номер договора"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.enrollment_transcription",
+      "column_key": "schema.uzp_data_payroll_m.enrollment_transcription",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "enrollment transcription",
+        "вид зачислени",
+        "вид зачисления"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.enrollment_type",
+      "column_key": "schema.uzp_data_payroll_m.enrollment_type",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "enrollment",
+        "зачислени",
+        "зачисления"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.inn",
+      "column_key": "schema.uzp_data_payroll_m.inn",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "inn",
+        "инн"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.inn_parsing",
+      "column_key": "schema.uzp_data_payroll_m.inn_parsing",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "inn parsing",
+        "инн"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.ipt_name",
+      "column_key": "schema.uzp_data_payroll_m.ipt_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "ipt",
+        "системн номер осб",
+        "системный номер осб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.card_type",
+      "column_key": "schema.uzp_data_payroll_m.card_type",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "card",
+        "карт",
+        "карты"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_payroll_m.is_security_force",
+      "column_key": "schema.uzp_data_payroll_m.is_security_force",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is security force",
+        "силов структур",
+        "силовой структуры"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.segment_name",
+      "column_key": "schema.uzp_data_payroll_m.segment_name",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "segment",
+        "сегмент клиент юл",
+        "сегмента клиента юл"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.enrollment_kind_descr",
+      "column_key": "schema.uzp_data_payroll_m.enrollment_kind_descr",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "enrollment kind descr",
+        "описан рода выплат основн проч",
+        "описание рода выплаты основные прочие"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_payroll_m.market_share_flag_name",
+      "column_key": "schema.uzp_data_payroll_m.market_share_flag_name",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "market share",
+        "признак участи доле рынк",
+        "признака участия доле рынка"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_payroll_m.src_system_name",
+      "column_key": "schema.uzp_data_payroll_m.src_system_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "src system",
+        "систем источник",
+        "системы источника"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_emp_epk_assignment.balance_unit_code",
+      "column_key": "schema.uzp_data_emp_epk_assignment.balance_unit_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "balance unit",
+        "балансов единиц",
+        "балансовой единицы"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_emp_epk_assignment.gosb_code",
+      "column_key": "schema.uzp_data_emp_epk_assignment.gosb_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "gosb",
+        "госб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_emp_epk_assignment.sap_gosb_code",
+      "column_key": "schema.uzp_data_emp_epk_assignment.sap_gosb_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "sap gosb",
+        "исходн госб sap",
+        "исходный госб sap"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_emp_epk_assignment.vsp_code",
+      "column_key": "schema.uzp_data_emp_epk_assignment.vsp_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "vsp",
+        "всп"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.client_type_id",
+      "column_key": "schema.uzp_data_epk_consolidation.client_type_id",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "client id",
+        "идентификатор типа клиент",
+        "идентификатор типа клиента"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.client_type_name",
+      "column_key": "schema.uzp_data_epk_consolidation.client_type_name",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "client",
+        "типа клиент",
+        "типа клиента"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.industry_name",
+      "column_key": "schema.uzp_data_epk_consolidation.industry_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "industry",
+        "отрасл",
+        "отрасли"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.old_epk_id",
+      "column_key": "schema.uzp_data_epk_consolidation.old_epk_id",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "old epk id",
+        "истори изменен епк",
+        "история изменений епк"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.segment_id",
+      "column_key": "schema.uzp_data_epk_consolidation.segment_id",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "segment id",
+        "идентификатор сегмент",
+        "идентификатор сегмента"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.segment_name",
+      "column_key": "schema.uzp_data_epk_consolidation.segment_name",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "segment",
+        "сегмент",
+        "сегмента"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.priority_name",
+      "column_key": "schema.uzp_data_epk_consolidation.priority_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "priority",
+        "приоритет",
+        "приоритета"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.company_name",
+      "column_key": "schema.uzp_data_epk_consolidation.company_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "company",
+        "компани",
+        "компании"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.holding_name",
+      "column_key": "schema.uzp_data_epk_consolidation.holding_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "holding",
+        "холдинг",
+        "холдинга"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.reference_holding_name",
+      "column_key": "schema.uzp_data_epk_consolidation.reference_holding_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "reference holding",
+        "эталонн холдинг",
+        "эталонного холдинга"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.head_holding_name",
+      "column_key": "schema.uzp_data_epk_consolidation.head_holding_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "head holding",
+        "головн холдинг",
+        "головного холдинга"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.reference_head_holding_name",
+      "column_key": "schema.uzp_data_epk_consolidation.reference_head_holding_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "reference head holding",
+        "эталонн головн холдинг",
+        "эталонного головного холдинга"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_epk_consolidation.is_parent",
+      "column_key": "schema.uzp_data_epk_consolidation.is_parent",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is parent",
+        "головн организаци",
+        "головной организации"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_epk_consolidation.is_key_client",
+      "column_key": "schema.uzp_data_epk_consolidation.is_key_client",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is key client",
+        "ключев клиент",
+        "ключевого клиента"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.status_id",
+      "column_key": "schema.uzp_data_epk_consolidation.status_id",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "status id",
+        "идентификатор статус организаци",
+        "идентификатор статуса организации"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_data_epk_consolidation.status_name",
+      "column_key": "schema.uzp_data_epk_consolidation.status_name",
+      "semantic_class": "enum_like",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "status",
+        "статус организаци",
+        "статуса организации"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_epk_consolidation.is_educational",
+      "column_key": "schema.uzp_data_epk_consolidation.is_educational",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is educational",
+        "вуз"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "flag:schema.uzp_data_epk_consolidation.is_military",
+      "column_key": "schema.uzp_data_epk_consolidation.is_military",
+      "semantic_class": "flag",
+      "match_kind": "boolean_true",
+      "match_phrases": [
+        "is military",
+        "силов организаци",
+        "силовой организации"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.fio",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.fio",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "fio",
+        "фио"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.post_name",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.post_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "post",
+        "эталонн должност",
+        "эталонной должности"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.pos_name",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.pos_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "pos",
+        "штатн должност",
+        "штатной должности"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.tb_code",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.tb_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "tb",
+        "тб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.gosb_code",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.gosb_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "gosb",
+        "госб"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.sap_gosb_code",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.sap_gosb_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "sap gosb",
+        "исходн госб sap",
+        "исходный госб sap"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.city",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.city",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "city",
+        "город"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.post_total_experience_ym",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.post_total_experience_ym",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "post total experience ym",
+        "стаж должност общий лет мес",
+        "стаж должности общий лет мес"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.post_continuous_experience_ym",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.post_continuous_experience_ym",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "post continuous experience ym",
+        "стаж должност непрерывн лет мес",
+        "стаж должности непрерывный лет мес"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.sb_total_experience_ym",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.sb_total_experience_ym",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "sb total experience ym",
+        "стаж сб общий лет мес"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.sb_continuous_experience_ym",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.sb_continuous_experience_ym",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "sb continuous experience ym",
+        "стаж сб непрерывн лет мес",
+        "стаж сб непрерывный лет мес"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.manager_lvl_1_name",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_name",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "manager lvl",
+        "должност руководител перв уровн",
+        "должности руководителя первого уровня"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.manager_lvl_1_fio",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_fio",
+      "semantic_class": "label",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "manager lvl fio",
+        "фио руководител перв уровн",
+        "фио руководителя первого уровня"
+      ],
+      "value_candidates": []
+    },
+    {
+      "rule_id": "text:schema.uzp_dwh_sap_staff_emp.role_code",
+      "column_key": "schema.uzp_dwh_sap_staff_emp.role_code",
+      "semantic_class": "free_text",
+      "match_kind": "text_search",
+      "match_phrases": [
+        "role",
+        "роли"
+      ],
+      "value_candidates": []
+    }
+  ]
+}

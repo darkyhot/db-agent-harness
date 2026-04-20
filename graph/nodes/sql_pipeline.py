@@ -3,8 +3,8 @@
 Содержит SqlPipelineNodes — миксин для GraphNodes с методами:
 - sql_planner: определение стратегии SQL-запроса
 - sql_writer: написание SQL по blueprint
+- sql_static_checker: детерминированная проверка SQL до БД (без LLM)
 - sql_validator_node: валидация, выполнение, проверка результата
-- _semantic_sql_check: лёгкая LLM-проверка семантики
 """
 
 import json
@@ -13,6 +13,18 @@ import re
 import time
 from typing import Any
 
+from core.confidence import (
+    build_fallback_policy,
+    build_planning_confidence,
+    evaluate_filter_confidence,
+    evaluate_join_confidence,
+)
+from core.log_safety import summarize_sql, summarize_text
+from core.sql_static_checker import check_sql
+from core.sql_planner_deterministic import build_blueprint as _deterministic_blueprint
+from core.sql_builder import SqlBuilder as _SqlBuilder
+from core.sql_formatter import format_sql_safe as _format_sql
+from core.where_resolver import candidate_label as _candidate_label
 from graph.nodes.common import (
     BaseNodeMixin,
     ToolResult,
@@ -70,16 +82,16 @@ _STRATEGY_EXAMPLES: dict[str, str] = {
         "SELECT s.client_id, s.total_sales, p.total_paid\n"
         "FROM sales_agg s JOIN payments_agg p ON p.client_id = s.client_id;\n\n"
         "Пример — ФАКТ + таблица с атрибутом (DISTINCT ON по ключу):\n"
-        "WITH epk_seg AS (\n"
-        "    SELECT DISTINCT ON (inn) inn, segment_name\n"
-        "    FROM schema.epk_consolidation ORDER BY inn\n"
-        "), outflow_agg AS (\n"
-        "    SELECT report_dt, inn, SUM(outflow_qty) AS total_outflow\n"
-        "    FROM schema.fact_outflow GROUP BY report_dt, inn\n"
+        "WITH customer_seg AS (\n"
+        "    SELECT DISTINCT ON (customer_id) customer_id, customer_segment\n"
+        "    FROM schema.customer_segments ORDER BY customer_id, updated_at DESC\n"
+        "), order_agg AS (\n"
+        "    SELECT order_dt, customer_id, SUM(order_amount) AS total_amount\n"
+        "    FROM schema.fact_orders GROUP BY order_dt, customer_id\n"
         ")\n"
-        "SELECT o.report_dt, e.segment_name, SUM(o.total_outflow) AS total_outflow\n"
-        "FROM outflow_agg o JOIN epk_seg e ON e.inn = o.inn\n"
-        "GROUP BY o.report_dt, e.segment_name;"
+        "SELECT o.order_dt, s.customer_segment, SUM(o.total_amount) AS total_amount\n"
+        "FROM order_agg o JOIN customer_seg s ON s.customer_id = o.customer_id\n"
+        "GROUP BY o.order_dt, s.customer_segment;"
     ),
     "dim_dim_join": (
         "Пример — СПРАВОЧНИК + СПРАВОЧНИК (уникальные выборки из обеих сторон):\n"
@@ -179,6 +191,101 @@ def _build_join_rule(strategy: str, join_spec: list[dict]) -> str:
     return "\nПРАВИЛА JOIN (на основе проверенных ключей):\n" + "\n".join(parts) + "\n"
 
 
+def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> str:
+    """Построить конкретный вопрос по фильтру из кандидатов where_resolution.
+
+    Пропускает request_id, уже закрытые через user_filter_choices, и
+    подхватывает примеры значений (matched_example/example_values) из кандидата
+    через candidate_label(), чтобы пользователю было видно, почему каждая
+    колонка попала в кандидаты.
+
+    Возвращает пустую строку, когда задавать нечего: либо все request_id
+    закрыты через user_filter_choices, либо filter_candidates пуст. Caller
+    должен интерпретировать это как «уточнение не требуется» и идти дальше.
+    """
+    where_resolution = where_resolution or {}
+    filter_candidates = where_resolution.get("filter_candidates", {}) or {}
+    user_choices = where_resolution.get("user_filter_choices", {}) or {}
+    spec = where_resolution.get("clarification_spec", {}) or {}
+    if spec.get("message"):
+        return str(spec.get("message") or "")
+    for request_id, candidates in filter_candidates.items():
+        if not candidates:
+            continue
+        if str(request_id) in user_choices:
+            continue
+        top = candidates[0]
+        second = candidates[1] if len(candidates) > 1 else None
+        if second:
+            left = _candidate_label(top)
+            right = _candidate_label(second)
+            return (
+                "Найдено несколько близких вариантов фильтра. "
+                f"Уточните, пожалуйста, по какому признаку фильтровать: {left} или {right}?"
+            )
+        if top.get("column"):
+            label = _candidate_label(top)
+            evidence = {str(ev) for ev in (top.get("evidence") or [])}
+            if top.get("matched_example") or any(
+                ev.startswith("known_term_phrase=") or ev.startswith("value_match=")
+                for ev in evidence
+            ):
+                continue
+            return (
+                "Уточните, пожалуйста, фильтр: "
+                f"нужно отфильтровать именно по полю {label}? Ответьте да/нет."
+            )
+    return ""
+
+
+def _build_specific_clarification_spec(where_resolution: dict[str, Any] | None) -> dict[str, Any]:
+    """Построить typed clarification spec для CLI."""
+    where_resolution = where_resolution or {}
+    existing = where_resolution.get("clarification_spec", {}) or {}
+    if existing.get("message"):
+        return dict(existing)
+    filter_candidates = where_resolution.get("filter_candidates", {}) or {}
+    user_choices = where_resolution.get("user_filter_choices", {}) or {}
+    for request_id, candidates in filter_candidates.items():
+        if not candidates or str(request_id) in user_choices:
+            continue
+        top = candidates[0]
+        second = candidates[1] if len(candidates) > 1 else None
+        if second:
+            left = _candidate_label(top)
+            right = _candidate_label(second)
+            return {
+                "type": "choice",
+                "request_id": str(request_id),
+                "message": (
+                    "Найдено несколько близких вариантов фильтра. "
+                    f"Уточните, пожалуйста, по какому признаку фильтровать: {left} или {right}?"
+                ),
+                "options": [
+                    {"column": str(top.get("column") or ""), "label": left},
+                    {"column": str(second.get("column") or ""), "label": right},
+                ],
+            }
+        if top.get("column"):
+            evidence = {str(ev) for ev in (top.get("evidence") or [])}
+            if top.get("matched_example") or any(
+                ev.startswith("known_term_phrase=") or ev.startswith("value_match=")
+                for ev in evidence
+            ):
+                continue
+            label = _candidate_label(top)
+            return {
+                "type": "confirm",
+                "request_id": str(request_id),
+                "message": (
+                    "Уточните, пожалуйста, фильтр: "
+                    f"нужно отфильтровать именно по полю {label}? Ответьте да/нет."
+                ),
+                "options": [{"column": str(top.get("column") or ""), "label": label}],
+            }
+    return {}
+
+
 class SqlPipelineNodes:
     """Миксин с узлами sql_planner, sql_writer и sql_validator_node для GraphNodes."""
 
@@ -189,138 +296,163 @@ class SqlPipelineNodes:
     def sql_planner(self, state: AgentState) -> dict[str, Any]:
         """Определение стратегии SQL-запроса: тип JOIN, агрегация, CTE, фильтры.
 
-        Получает extracted-данные из column_selector и решает КАК писать SQL.
+        Полностью детерминированный — LLM не вызывается.
+        Использует core.sql_planner_deterministic.build_blueprint.
 
         Returns:
             Обновления состояния с sql_blueprint.
         """
         iterations = state.get("graph_iterations", 0) + 1
-        user_input = state["user_input"]
         intent = state.get("intent", {})
         selected_columns = state.get("selected_columns", {})
         join_spec = state.get("join_spec", [])
         table_types = state.get("table_types", {})
         join_analysis_data = state.get("join_analysis_data", {})
 
-        logger.info("SqlPlanner: строю blueprint для запроса")
+        logger.info("SqlPlanner (deterministic): строю blueprint")
 
         # --- Проверка согласованности: join_analysis_data vs selected_columns ---
-        # Если join_analysis_data содержит таблицы, которых нет в selected_columns,
-        # значит column_selector пропустил одну из таблиц — предупреждаем планировщик.
         missing_from_columns: list[str] = []
         if join_analysis_data and selected_columns:
-            for pair_key, data in join_analysis_data.items():
+            for _pair_key, data in join_analysis_data.items():
                 for tbl_field in ("table1", "table2"):
                     tbl = data.get(tbl_field, "") if isinstance(data, dict) else ""
                     if tbl and tbl not in selected_columns:
                         missing_from_columns.append(tbl)
-        missing_from_columns = list(dict.fromkeys(missing_from_columns))  # deduplicate
+        missing_from_columns = list(dict.fromkeys(missing_from_columns))
 
         if missing_from_columns:
             logger.warning(
-                "SqlPlanner: таблицы из join_analysis_data отсутствуют в selected_columns: %s. "
-                "Возможно, column_selector пропустил их — укажем в notes для sql_writer.",
+                "SqlPlanner: таблицы из join_analysis_data отсутствуют в selected_columns: %s",
                 missing_from_columns,
             )
 
-        # --- System prompt (~2K) ---
-        system_prompt = (
-            "Ты — планировщик SQL-стратегии для Greenplum (PostgreSQL-совместимая).\n"
-            "Определи КАК написать SQL: тип JOIN, нужны ли CTE/подзапросы, агрегация.\n\n"
-            "Стратегии безопасного JOIN по типам таблиц:\n"
-            "1. ФАКТ + ФАКТ → CTE с агрегацией ОБЕИХ сторон по ключу\n"
-            "2. ФАКТ + СПРАВОЧНИК → подзапрос с DISTINCT ON из справочника\n"
-            "3. СПРАВОЧНИК + ФАКТ → подзапрос с агрегацией фактов\n"
-            "4. СПРАВОЧНИК + СПРАВОЧНИК → DISTINCT ON из обеих сторон в CTE\n"
-            "5. Прямой JOIN допустим ТОЛЬКО если ключ помечен как безопасный\n\n"
-            "Верни ТОЛЬКО JSON:\n"
-            "{\n"
-            '  "strategy": "<simple_select|fact_dim_join|dim_fact_join|fact_fact_join|dim_dim_join|subquery>",\n'
-            '  "main_table": "<schema.table>",\n'
-            '  "cte_needed": <true|false>,\n'
-            '  "subquery_for": ["<schema.table>"],\n'
-            '  "where_conditions": ["<condition1>", ...],\n'
-            '  "aggregation": {"function": "<SUM|COUNT|AVG|...>", "column": "<col>", "alias": "<alias>"} | null,\n'
-            '  "group_by": ["<col1>", ...],\n'
-            '  "order_by": "<expression>" | null,\n'
-            '  "limit": <number> | null,\n'
-            '  "notes": "<дополнительные указания для sql_writer>"\n'
-            "}"
+        # --- Детерминированное построение blueprint (без LLM) ---
+        blueprint = _deterministic_blueprint(
+            intent=intent,
+            selected_columns=selected_columns,
+            join_spec=join_spec,
+            table_types=table_types,
+            join_analysis_data=join_analysis_data,
+            user_input=state.get("user_input", ""),
+            user_hints=state.get("user_hints", {}) or {},
+            schema_loader=self.schema,
+            semantic_frame=state.get("semantic_frame", {}) or {},
+            user_filter_choices=state.get("user_filter_choices", {}) or {},
+            rejected_filter_choices=state.get("rejected_filter_choices", {}) or {},
         )
 
-        # --- User prompt (~5-10K) ---
-        user_parts = []
-        user_parts.append(f"Запрос пользователя: {user_input}")
+        logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
 
-        # Intent
-        if intent:
-            intent_str = json.dumps(intent, ensure_ascii=False, indent=None)
-            user_parts.append(f"Интент: {intent_str}")
+        where_resolution = blueprint.get("where_resolution", {}) or {}
+        filter_confidence = evaluate_filter_confidence(
+            where_resolution,
+            semantic_frame=state.get("semantic_frame", {}) or {},
+            intent=intent,
+        )
+        previous_planning = state.get("planning_confidence", {}) or {}
+        previous_components = previous_planning.get("components", {}) if isinstance(previous_planning, dict) else {}
+        planning_confidence = build_planning_confidence(
+            table_confidence=previous_components.get("table_confidence") or previous_planning,
+            filter_confidence=filter_confidence,
+            join_confidence=previous_components.get("join_confidence")
+            or evaluate_join_confidence(state.get("join_decision", {}) or {}),
+        )
+        evidence_trace = dict(state.get("evidence_trace") or {})
+        evidence_trace["where_resolution"] = {
+            "applied_rules": where_resolution.get("applied_rules", []),
+            "reasoning": where_resolution.get("reasoning", []),
+            "filter_candidates": {
+                k: [
+                    {
+                        "column": c.get("column"),
+                        "condition": c.get("condition"),
+                        "score": c.get("score"),
+                        "confidence": c.get("confidence"),
+                    }
+                    for c in (v or [])[:3]
+                ]
+                for k, v in (where_resolution.get("filter_candidates", {}) or {}).items()
+            },
+        }
+        evidence_trace["planning_confidence"] = planning_confidence
 
-        # Selected columns
-        if selected_columns:
-            cols_str = json.dumps(selected_columns, ensure_ascii=False, indent=2)
-            user_parts.append(f"Выбранные колонки:\n{cols_str}")
-
-        # Join spec
-        if join_spec:
-            join_str = json.dumps(join_spec, ensure_ascii=False, indent=2)
-            user_parts.append(f"JOIN-спецификация:\n{join_str}")
-
-        # Table types
-        if table_types:
-            types_str = ", ".join(f"{k}: {v}" for k, v in table_types.items())
-            user_parts.append(f"Типы таблиц: {types_str}")
-
-        # JOIN analysis (only relevant pairs)
-        if join_analysis_data:
-            ja_str = json.dumps(join_analysis_data, ensure_ascii=False, indent=2)
-            user_parts.append(f"JOIN-анализ:\n{ja_str}")
-
-        # Предупреждение о несогласованности: таблицы из join_analysis без колонок
-        if missing_from_columns:
-            warn_tables = ", ".join(missing_from_columns)
-            user_parts.append(
-                f"ВНИМАНИЕ: таблицы {warn_tables} присутствуют в JOIN-анализе, "
-                f"но column_selector не включил их в selected_columns. "
-                f"Если запрос требует данных из этих таблиц (название, наименование, "
-                f"атрибут из справочника) — выбери стратегию fact_dim_join и укажи "
-                f"в notes что требуется JOIN с {warn_tables}."
-            )
-
-        user_prompt = "\n\n".join(user_parts)
-
-        if self.debug_prompt:
-            print(f"\n{'='*80}\n[DEBUG PROMPT — sql_planner]\n{'='*80}\n"
-                  f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n")
-
-        response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.2)
-
-        # --- Парсинг blueprint ---
-        blueprint = self._parse_json_response(response)
-        if not blueprint or "strategy" not in blueprint:
-            logger.warning("SqlPlanner: не удалось распарсить blueprint, fallback")
-            blueprint = {
-                "strategy": "simple_select",
-                "main_table": list(selected_columns.keys())[0] if selected_columns else "",
-                "cte_needed": False,
-                "subquery_for": [],
-                "where_conditions": [],
-                "aggregation": None,
-                "group_by": [],
-                "order_by": None,
-                "limit": 100,
-                "notes": response[:500],
+        # --- Блок C: NEEDS_YEAR guard ---
+        # Если intent_classifier уже поставил month_without_year=True, pipeline должен
+        # был остановиться на clarification. Если дошли сюда — where_conditions может
+        # содержать маркер NEEDS_YEAR от _derive_date_filters_from_text. Прерываем.
+        if any("NEEDS_YEAR" in str(w) for w in blueprint.get("where_conditions", [])):
+            import re as _re
+            _q = (state.get("user_input") or "").lower()
+            _ru_stems = {
+                'январ': 'январь', 'феврал': 'февраль', 'март': 'март',
+                'апрел': 'апрель', 'май': 'май', 'мая': 'май',
+                'июн': 'июнь', 'июл': 'июль', 'август': 'август',
+                'сентябр': 'сентябрь', 'октябр': 'октябрь',
+                'ноябр': 'ноябрь', 'декабр': 'декабрь',
+            }
+            _month = next((v for k, v in _ru_stems.items() if k in _q), "указанный месяц")
+            _clarif = f"За какой год считать данные за {_month}?"
+            logger.warning("SqlPlanner: NEEDS_YEAR в where_conditions → clarification: %r", _clarif)
+            return {
+                "needs_clarification": True,
+                "clarification_message": _clarif,
+                "sql_blueprint": blueprint,
+                "where_resolution": where_resolution,
+                "planning_confidence": planning_confidence,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": _clarif}
+                ],
             }
 
-        logger.info("SqlPlanner: стратегия=%s", blueprint.get("strategy"))
+        if where_resolution.get("needs_clarification"):
+            _clarif = str(where_resolution.get("clarification_message") or "").strip()
+            return {
+                "needs_clarification": True,
+                "clarification_message": _clarif,
+                "sql_blueprint": blueprint,
+                "where_resolution": where_resolution,
+                "planning_confidence": planning_confidence,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": _clarif}
+                ],
+            }
 
-        # Если dim-таблица пропущена в selected_columns — формируем подсказку для
-        # повторного запуска column_selector, но только один раз (hint ещё не установлен).
+        if planning_confidence.get("action") != "execute":
+            clarification_spec = _build_specific_clarification_spec(where_resolution)
+            if clarification_spec:
+                where_resolution = dict(where_resolution)
+                where_resolution["clarification_spec"] = clarification_spec
+            _clarif = str(clarification_spec.get("message") or _build_specific_clarification(where_resolution))
+            # Пустая строка — задавать нечего: все request_id закрыты через
+            # user_filter_choices. Не блокируем пайплайн фейковым clarification.
+            if _clarif:
+                return {
+                    "needs_clarification": True,
+                    "clarification_message": _clarif,
+                    "sql_blueprint": blueprint,
+                    "where_resolution": where_resolution,
+                    "planning_confidence": planning_confidence,
+                    "evidence_trace": evidence_trace,
+                    "graph_iterations": iterations,
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": _clarif}
+                    ],
+                }
+            logger.info(
+                "SqlPlanner: planning_confidence=%s, но все filter request_id закрыты "
+                "через user_filter_choices — продолжаю выполнение",
+                planning_confidence.get("action"),
+            )
+
+        # Если dim-таблица пропущена — формируем подсказку для повторного column_selector
         new_hint = ""
         if missing_from_columns and not state.get("column_selector_hint", ""):
             miss_str = ", ".join(missing_from_columns)
-            # Собираем список name-колонок из пропущенных таблиц для подсказки
             name_col_examples: list[str] = []
             for tbl in missing_from_columns:
                 parts = tbl.split(".", 1)
@@ -349,7 +481,7 @@ class SqlPipelineNodes:
             ]
             if name_col_examples:
                 hint_lines.append(
-                    f"Name-колонки доступные в пропущенных таблицах: "
+                    "Name-колонки доступные в пропущенных таблицах: "
                     + "; ".join(name_col_examples)
                 )
             new_hint = " ".join(hint_lines)
@@ -360,11 +492,14 @@ class SqlPipelineNodes:
 
         return {
             "sql_blueprint": blueprint,
+            "where_resolution": where_resolution,
+            "planning_confidence": planning_confidence,
+            "evidence_trace": evidence_trace,
             "column_selector_hint": new_hint,
             "graph_iterations": iterations,
             "messages": state["messages"] + [
                 {"role": "assistant",
-                 "content": f"SQL стратегия: {blueprint.get('strategy', 'unknown')}"}
+                 "content": f"SQL стратегия: {blueprint.get('strategy', 'unknown')} [детерминировано]"}
             ],
         }
 
@@ -406,6 +541,112 @@ class SqlPipelineNodes:
                 ],
             }
 
+        # --- Попытка детерминированной генерации SQL через SqlBuilder ---
+        table_types = state.get("table_types", {})
+        allowed_tables: list[str] = state.get("allowed_tables") or []
+        planning_confidence = state.get("planning_confidence", {}) or {}
+        evidence_trace = dict(state.get("evidence_trace") or {})
+        _builder = _SqlBuilder()
+        template_sql = _builder.build(
+            strategy=strategy,
+            selected_columns=selected_columns,
+            join_spec=join_spec_check,
+            blueprint=blueprint,
+            table_types=table_types,
+        )
+        if template_sql:
+            template_sql = _format_sql(template_sql)
+            # Проверяем статическим чекером до принятия (включая белый список таблиц)
+            check_result = check_sql(
+                template_sql,
+                schema_loader=self.schema,
+                allowed_tables=allowed_tables if allowed_tables else None,
+            )
+            fallback_policy = build_fallback_policy(
+                planning_confidence=planning_confidence,
+                deterministic_sql_valid=check_result.is_valid,
+                has_template_sql=True,
+            )
+            if check_result.is_valid:
+                logger.info("SqlWriter: SQL сгенерирован детерминированно, минуем LLM")
+                step_idx = state["current_step"]
+                evidence_trace["sql_generation"] = {
+                    "mode": "deterministic",
+                    "strategy": strategy,
+                    "fallback_policy": fallback_policy,
+                }
+                return {
+                    "sql_to_validate": template_sql,
+                    "pending_sql_tool_call": {
+                        "tool": "execute_query",
+                        "args": {"sql": template_sql},
+                        "step_idx": step_idx,
+                    },
+                    "graph_iterations": iterations,
+                    "fallback_policy": fallback_policy,
+                    "evidence_trace": evidence_trace,
+                    "tool_calls": state.get("tool_calls", []) + [
+                        {"tool": "execute_query", "args": {"sql": template_sql},
+                         "result": "awaiting_validation"}
+                    ],
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": "SQL сгенерирован детерминированно"}
+                    ],
+                }
+            else:
+                logger.info(
+                    "SqlWriter: шаблонный SQL не прошёл статический чекер (%s) — передаём LLM",
+                    check_result.summary()[:200],
+                )
+                if not fallback_policy.get("allow_llm_fallback"):
+                    msg = str(fallback_policy.get("message") or "Генерация SQL остановлена по policy.")
+                    evidence_trace["sql_generation"] = {
+                        "mode": "blocked_before_llm",
+                        "strategy": strategy,
+                        "fallback_policy": fallback_policy,
+                    }
+                    result: dict[str, Any] = {
+                        "graph_iterations": iterations,
+                        "fallback_policy": fallback_policy,
+                        "evidence_trace": evidence_trace,
+                        "messages": state["messages"] + [
+                            {"role": "assistant", "content": msg}
+                        ],
+                    }
+                    if fallback_policy.get("action") == "clarify":
+                        result["needs_clarification"] = True
+                        result["clarification_message"] = msg
+                    else:
+                        result["last_error"] = msg
+                    return result
+        else:
+            fallback_policy = build_fallback_policy(
+                planning_confidence=planning_confidence,
+                deterministic_sql_valid=False,
+                has_template_sql=False,
+            )
+            if not fallback_policy.get("allow_llm_fallback"):
+                msg = str(fallback_policy.get("message") or "Генерация SQL через LLM остановлена по policy.")
+                evidence_trace["sql_generation"] = {
+                    "mode": "blocked_before_llm",
+                    "strategy": strategy,
+                    "fallback_policy": fallback_policy,
+                }
+                result = {
+                    "graph_iterations": iterations,
+                    "fallback_policy": fallback_policy,
+                    "evidence_trace": evidence_trace,
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": msg}
+                    ],
+                }
+                if fallback_policy.get("action") == "clarify":
+                    result["needs_clarification"] = True
+                    result["clarification_message"] = msg
+                else:
+                    result["last_error"] = msg
+                return result
+
         # --- System prompt (~3K) ---
         # Выбираем 1-2 релевантных примера по стратегии
         relevant_examples = _STRATEGY_EXAMPLES.get(strategy, "")
@@ -417,6 +658,27 @@ class SqlPipelineNodes:
         # - safe=False → DISTINCT ON / агрегация по реальному ключу из join_spec
         # - Composite JOIN: несколько записей для одной пары таблиц → AND в ON
         join_subquery_warning = _build_join_rule(strategy, join_spec_check)
+
+        # Формируем секцию разрешённых таблиц для LLM
+        _allowed_section = ""
+        if allowed_tables:
+            _allowed_section = (
+                "\n\n⚠ КРИТИЧНО — РАЗРЕШЁННЫЕ ТАБЛИЦЫ (только они):\n"
+                + "\n".join(f"  - {t}" for t in allowed_tables)
+                + "\nЛЮБАЯ другая таблица в FROM/JOIN — ЗАПРЕЩЕНА. "
+                "Если нужной метрики нет в этих таблицах — используй COUNT(*) или SUM "
+                "из доступных колонок, но НЕ выдумывай другие таблицы.\n"
+            )
+
+        # Формируем секцию обязательных колонок в SELECT
+        _required_section = ""
+        _required_output = blueprint.get("required_output") or []
+        if _required_output:
+            _required_section = (
+                "\n\n⚠ ОБЯЗАТЕЛЬНО в SELECT (пользователь явно запросил):\n"
+                + "\n".join(f"  - {r}" for r in _required_output)
+                + "\nЭти измерения ДОЛЖНЫ присутствовать в SELECT и GROUP BY финального запроса.\n"
+            )
 
         system_prompt = (
             "Ты — SQL-писатель для Greenplum (PostgreSQL-совместимая).\n"
@@ -431,15 +693,19 @@ class SqlPipelineNodes:
             "- DISTINCT на внешнем SELECT — ЗАПРЕЩЁН\n"
             "- Составной JOIN: если join_keys содержит несколько пар для одной пары таблиц — "
             "объединяй ВСЕ условия через AND в одном ON-клаузе\n"
+            f"{_allowed_section}"
+            f"{_required_section}"
             f"{join_subquery_warning}\n"
             f"{relevant_examples}\n\n"
             "Чеклист:\n"
-            "1. Формат дат соответствует данным?\n"
-            "2. NULL обработан для колонок с высоким % NULL?\n"
-            "3. JOIN НЕ множит данные (по стратегии из blueprint)?\n"
-            "4. GROUP BY содержит все не-агрегированные колонки?\n"
-            "5. Алиасы на английском?\n"
-            "6. Если join_keys составной (несколько пар) — все условия объединены через AND?\n\n"
+            "1. Использую ТОЛЬКО таблицы из разрешённого списка?\n"
+            "2. Все required_output-атрибуты есть в SELECT и GROUP BY?\n"
+            "3. Формат дат соответствует данным?\n"
+            "4. NULL обработан для колонок с высоким % NULL?\n"
+            "5. JOIN НЕ множит данные (по стратегии из blueprint)?\n"
+            "6. GROUP BY содержит все не-агрегированные колонки?\n"
+            "7. Алиасы на английском?\n"
+            "8. Если join_keys составной (несколько пар) — все условия объединены через AND?\n\n"
             "Верни ТОЛЬКО JSON:\n"
             '{"tool": "execute_query", "args": {"sql": "SELECT ..."}}'
         )
@@ -462,6 +728,48 @@ class SqlPipelineNodes:
             js_str = json.dumps(join_spec, ensure_ascii=False, indent=2)
             user_parts.append(f"JOIN ключи:\n{js_str}")
 
+        # Multi-turn: добавить предыдущий SQL как базу для модификации (followup)
+        prev_sql = state.get("prev_sql", "")
+        if prev_sql and state.get("intent", {}).get("intent") == "followup":
+            user_parts.append(
+                f"ПРЕДЫДУЩИЙ SQL (измени его под новый запрос, не переписывай с нуля):\n{prev_sql}"
+            )
+
+        # Few-shot примеры из audit log (похожие успешные запросы)
+        try:
+            semantic_frame = state.get("semantic_frame") or {}
+            fact_dim_pair: tuple[str, str] | None = None
+            selected_tables = state.get("selected_tables") or []
+            table_types = state.get("table_types") or {}
+            if selected_tables:
+                fact = next(
+                    (f"{s}.{t}" for (s, t) in selected_tables if table_types.get(f"{s}.{t}") == "fact"),
+                    "",
+                )
+                dim = next(
+                    (f"{s}.{t}" for (s, t) in selected_tables if table_types.get(f"{s}.{t}") == "dim"),
+                    "",
+                )
+                if fact or dim:
+                    fact_dim_pair = (fact, dim)
+            few_shot_examples = self.few_shot.get_similar(
+                state["user_input"],
+                strategy=strategy,
+                n=2,
+                semantic_frame=semantic_frame,
+                fact_dim_pair=fact_dim_pair,
+            )
+            if few_shot_examples:
+                user_parts.append(self.few_shot.format_for_prompt(few_shot_examples))
+                logger.debug("SqlWriter: добавлено %d few-shot примеров", len(few_shot_examples))
+            evidence_trace["few_shot"] = {
+                "count": len(few_shot_examples),
+                "similarities": self.few_shot.last_similarities,
+                "strategy": strategy,
+            }
+        except Exception as _exc:
+            evidence_trace.setdefault("few_shot", {"count": 0, "similarities": [], "error": str(_exc)})
+
         user_prompt = "\n\n".join(user_parts)
 
         if self.debug_prompt:
@@ -474,11 +782,20 @@ class SqlPipelineNodes:
         tool_call = self._parse_tool_call(response)
 
         sql = tool_call.get("args", {}).get("sql")
+        if sql:
+            sql = _format_sql(sql)
+            if isinstance(tool_call.get("args"), dict):
+                tool_call["args"]["sql"] = sql
         tool_name = tool_call.get("tool", "execute_query")
 
         if sql and tool_name in self.SQL_TOOL_NAMES:
             logger.info("SqlWriter: SQL готов, отправляю на валидацию")
             step_idx = state["current_step"]
+            evidence_trace["sql_generation"] = {
+                "mode": "llm_fallback",
+                "strategy": strategy,
+                "fallback_policy": fallback_policy,
+            }
             return {
                 "sql_to_validate": sql,
                 "pending_sql_tool_call": {
@@ -487,6 +804,8 @@ class SqlPipelineNodes:
                     "step_idx": step_idx,
                 },
                 "graph_iterations": iterations,
+                "fallback_policy": fallback_policy,
+                "evidence_trace": evidence_trace,
                 "tool_calls": state.get("tool_calls", []) + [
                     {"tool": tool_name, "args": tool_call.get("args", {}),
                      "result": "awaiting_validation"}
@@ -546,6 +865,58 @@ class SqlPipelineNodes:
         }
 
     # --------------------------------------------------------------------------
+    # sql_static_checker
+    # --------------------------------------------------------------------------
+
+    def sql_static_checker(self, state: AgentState) -> dict[str, Any]:
+        """Детерминированная проверка SQL до отправки в БД (без LLM).
+
+        Проверяет:
+        - кириллические алиасы
+        - SELECT *
+        - галлюцинированные колонки (не существуют в каталоге)
+
+        При ошибке → error_diagnoser. При успехе → sql_validator.
+        """
+        sql = state.get("sql_to_validate")
+        pending_call = state.get("pending_sql_tool_call")
+        if not sql and pending_call:
+            sql = pending_call.get("args", {}).get("sql")
+        if not sql:
+            return {}
+
+        iterations = state.get("graph_iterations", 0) + 1
+        logger.info("StaticChecker: проверка SQL (%d символов)", len(sql))
+
+        _allowed = state.get("allowed_tables") or None
+        check_result = check_sql(sql, schema_loader=self.schema, allowed_tables=_allowed)
+
+        if not check_result.is_valid:
+            error_msg = (
+                "SQL не выполнен: ошибка статической проверки.\n"
+                f"[sql_static_checker] {check_result.summary()}\n"
+                "Исправь SQL перед отправкой в БД."
+            )
+            logger.warning("StaticChecker: найдены ошибки: %s", error_msg[:300])
+            return {
+                "last_error": error_msg,
+                "sql_to_validate": None,
+                "pending_sql_tool_call": None,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": error_msg}
+                ],
+            }
+
+        if check_result.warnings:
+            logger.info(
+                "StaticChecker: предупреждения: %s",
+                "; ".join(check_result.warnings),
+            )
+
+        return {"graph_iterations": iterations}
+
+    # --------------------------------------------------------------------------
     # sql_validator_node
     # --------------------------------------------------------------------------
 
@@ -564,7 +935,7 @@ class SqlPipelineNodes:
         if not sql:
             return {"sql_to_validate": None, "pending_sql_tool_call": None}
 
-        logger.info("Validator: проверка SQL: %s", sql[:200])
+        logger.info("Validator: проверка SQL: %s", summarize_sql(sql))
         result = self.validator.validate(sql)
 
         # Требуется подтверждение пользователя
@@ -592,8 +963,11 @@ class SqlPipelineNodes:
 
         # Невалидный SQL
         if not result.is_valid:
-            error_msg = result.summary()
-            logger.warning("Validator: SQL невалиден: %s", error_msg[:200])
+            error_msg = (
+                "SQL не выполнен: ошибка валидации.\n"
+                f"{result.summary()}"
+            )
+            logger.warning("Validator: SQL невалиден: %s", summarize_text(error_msg, label="validation_error"))
             return {
                 "last_error": error_msg,
                 "sql_to_validate": None,
@@ -662,18 +1036,9 @@ class SqlPipelineNodes:
                 "слишком строгие или данные отсутствуют."
             )
 
-        # Семантическая проверка (лёгкий LLM-вызов — только SQL + запрос + blueprint)
-        semantic_warnings = self._semantic_sql_check(
-            state["user_input"], sql, state.get("sql_blueprint", {}),
-        )
-        if semantic_warnings:
-            warnings_text += "\n" + "\n".join(
-                f"⚠ Семантика: {w}" for w in semantic_warnings
-            )
-
         # Подсчёт строк
         if structured_payload is not None:
-            row_count = max(0, int(structured_payload.get("total_rows", 0)))
+            row_count = max(0, int(structured_payload.get("rows_returned", 0)))
         else:
             data_lines = [
                 ln for ln in rendered_result.split("\n") if ln.strip().startswith("|")
@@ -690,6 +1055,50 @@ class SqlPipelineNodes:
             sanity_warnings = self._check_result_sanity(state["user_input"], sanity_source)
             for sw in sanity_warnings:
                 warnings_text += f"\n⚠ {sw}"
+
+        # Row-count sanity по истории (Direction 3.3):
+        # Сверяем row_count с p95 * 10 по (subject, metric) из semantic_frame.
+        # Запускается только для успешных запросов с непустым результатом.
+        frame = state.get("semantic_frame") or {}
+        subject = str(frame.get("subject") or "")
+        metric_intent = str(frame.get("metric_intent") or "")
+        if (
+            not empty_result
+            and tool_name == "execute_query"
+            and (subject or metric_intent)
+        ):
+            suspicion = self.memory.check_row_count_suspicion(
+                subject, metric_intent, row_count,
+            )
+            if suspicion.get("is_suspect"):
+                p95 = suspicion.get("p95", 0.0)
+                n_hist = suspicion.get("n", 0)
+                ratio = suspicion.get("ratio", 0.0)
+                suspect_msg = (
+                    f"ROW-COUNT SUSPECT: {row_count} строк для (subject={subject or '_'}, "
+                    f"metric={metric_intent or '_'}). "
+                    f"Исторический p95={p95:.0f} по {n_hist} наблюдениям, "
+                    f"текущий результат в {ratio:.1f}× больше p95 (порог: 10×). "
+                    "Вероятно, JOIN множит строки или фильтр слишком широкий."
+                )
+                self.memory.log_sql_execution(
+                    state["user_input"], sql, row_count, "row_explosion_suspect",
+                    duration_ms, retry_count=state.get("retry_count", 0),
+                    error_type="row_count_suspect",
+                )
+                return {
+                    "sql_to_validate": None,
+                    "pending_sql_tool_call": None,
+                    "last_error": suspect_msg,
+                    "retry_count": state.get("retry_count", 0),
+                    "join_risk_info": join_risk_info,
+                    "tool_calls": tool_calls[:-1] + [
+                        {**last_tool, "result": rendered_result}
+                    ],
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": f"⚠ {suspect_msg}"}
+                    ],
+                }
 
         # Row explosion detection
         if not empty_result and join_risk_info and tool_name == "execute_query":
@@ -729,6 +1138,16 @@ class SqlPipelineNodes:
             retry_count=state.get("retry_count", 0),
         )
         self.memory.add_message("tool", f"[{tool_name}] {rendered_result[:500]}")
+        # Сбрасываем few-shot кэш: новый успешный запрос попадёт в следующую сессию
+        if audit_status == "success":
+            self.few_shot.invalidate_cache()
+            # Накопление row_count_stats для будущей row-count sanity (Direction 3.3)
+            try:
+                self.memory.record_row_count_sample(
+                    subject, metric_intent, row_count,
+                )
+            except Exception as e:
+                logger.debug("record_row_count_sample failed: %s", e)
 
         # Пустой результат → коррекция
         if empty_result:
@@ -765,46 +1184,6 @@ class SqlPipelineNodes:
                  "content": f"SQL выполнен.{warnings_text}\n{rendered_result[:1000]}"}
             ],
         }
-
-    # --------------------------------------------------------------------------
-    # _semantic_sql_check (лёгкий LLM-вызов)
-    # --------------------------------------------------------------------------
-
-    def _semantic_sql_check(
-        self, user_input: str, sql: str, blueprint: dict | None = None,
-    ) -> list[str]:
-        """Лёгкая LLM-проверка семантического соответствия SQL запросу.
-
-        Получает только SQL + запрос + blueprint (~5K), не full table context.
-        """
-        system = (
-            "Ты — валидатор SQL-запросов. Проверь соответствие SQL запросу.\n"
-            "Проверяй ТОЛЬКО:\n"
-            "1. Фильтры дат: есть ли ОБЕ границы (>= и <)?\n"
-            "2. Агрегация: COUNT(DISTINCT) при 'сколько уникальных'?\n"
-            "3. GROUP BY: все не-агрегированные колонки?\n\n"
-            "Верни JSON-массив: [] если всё ок, [\"предупреждение\"] если нет.\n"
-            "Верни ТОЛЬКО JSON-массив."
-        )
-
-        user_parts = [f"Запрос: {user_input}", f"SQL:\n{sql}"]
-        if blueprint:
-            bp_str = json.dumps(blueprint, ensure_ascii=False, indent=None)
-            user_parts.append(f"Blueprint: {bp_str[:1000]}")
-        user = "\n\n".join(user_parts)
-
-        try:
-            response = self.llm.invoke_with_system(system, user, temperature=0.0)
-            cleaned = self._clean_llm_json(response)
-            match = re.search(r'\[.*\]', cleaned, re.DOTALL)
-            if match:
-                warnings = json.loads(match.group())
-                if isinstance(warnings, list):
-                    return [str(w) for w in warnings if w]
-        except Exception as e:
-            logger.warning("Semantic SQL check failed: %s", e)
-
-        return []
 
     # --------------------------------------------------------------------------
     # _parse_json_response — общий парсер JSON из ответа LLM

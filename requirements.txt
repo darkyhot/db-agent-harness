@@ -8,3 +8,4 @@ pandas==2.2.3
 sqlparse==0.5.3
 json-repair==0.30.3
 ipython==8.31.0
+scikit-learn>=1.4.0

@@ -12,6 +12,8 @@ from IPython.display import clear_output, display, Markdown
 from core.database import DatabaseManager
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
+from core.query_cache import QueryCache
+from core.enrichment_pipeline import EnrichmentPipeline
 from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
 from graph.graph import build_graph, create_initial_state
@@ -42,10 +44,6 @@ _NODE_STATUS = {
     "sql_fixer": "Исправляю SQL...",
     "tool_dispatcher": "Выполняю поиск...",
     "summarizer": "Формирую ответ...",
-    # Обратная совместимость (старые узлы)
-    "planner": "Анализирую запрос и составляю план...",
-    "executor": "Выполняю шаг плана...",
-    "corrector": "Исправляю ошибку...",
 }
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -62,6 +60,94 @@ def _status_print(msg: str, done: bool = False) -> None:
     else:
         sys.stdout.write(f"\r{padded}")
     sys.stdout.flush()
+
+
+def _match_clarification_to_choice(
+    clarification: str,
+    filter_candidates: dict,
+    already_resolved: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Сопоставить ответ пользователя с конкретным кандидатом из clarification.
+
+    Ищем первый request_id (не закрытый ранее), у которого в топ-2 кандидатах
+    имя колонки или описание совпадает (подстрочно, регистронезависимо) с
+    ответом пользователя. Возвращаем {request_id: column_name} или пустой
+    словарь, если однозначного соответствия не нашлось.
+    """
+    normalized = (clarification or "").strip().lower().replace("ё", "е")
+    if not normalized:
+        return {}
+    already_resolved = already_resolved or {}
+    for request_id, candidates in (filter_candidates or {}).items():
+        if str(request_id) in already_resolved:
+            continue
+        if not candidates:
+            continue
+        for cand in candidates[:2]:
+            column = str(cand.get("column") or "").strip().lower().replace("ё", "е")
+            description = str(cand.get("description") or "").strip().lower().replace("ё", "е")
+            if column and (column in normalized or normalized in column):
+                return {str(request_id): str(cand.get("column") or "")}
+            if description and description in normalized:
+                return {str(request_id): str(cand.get("column") or "")}
+    return {}
+
+
+def _is_yes_reply(text: str) -> bool:
+    normalized = (text or "").strip().lower().replace("ё", "е")
+    return normalized in {"да", "ага", "угу", "yes", "y", "ok", "ок", "верно", "подтверждаю"}
+
+
+def _is_no_reply(text: str) -> bool:
+    normalized = (text or "").strip().lower().replace("ё", "е")
+    return normalized in {"нет", "no", "n", "неа", "не", "неверно"}
+
+
+def _interpret_filter_clarification(
+    clarification: str,
+    where_resolution: dict,
+    *,
+    already_resolved: dict[str, str] | None = None,
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Понять ответ пользователя на typed clarification по фильтрам."""
+    already_resolved = already_resolved or {}
+    spec = (where_resolution or {}).get("clarification_spec", {}) or {}
+    request_id = str(spec.get("request_id") or "").strip()
+    options = list(spec.get("options") or [])
+
+    if request_id and request_id not in already_resolved:
+        if spec.get("type") == "confirm" and options:
+            candidate_column = str(options[0].get("column") or "").strip()
+            if candidate_column:
+                if _is_yes_reply(clarification):
+                    return ({request_id: candidate_column}, {})
+                if _is_no_reply(clarification):
+                    return ({}, {request_id: [candidate_column]})
+
+        if spec.get("type") == "choice":
+            choice_candidates = {
+                request_id: [
+                    {
+                        "column": opt.get("column"),
+                        "description": opt.get("label"),
+                    }
+                    for opt in options
+                ]
+            }
+            matched = _match_clarification_to_choice(
+                clarification,
+                choice_candidates,
+                already_resolved=already_resolved,
+            )
+            if matched:
+                return (matched, {})
+
+    matched = _match_clarification_to_choice(
+        clarification,
+        (where_resolution or {}).get("filter_candidates", {}) or {},
+        already_resolved=already_resolved,
+    )
+    return (matched, {})
 
 
 def setup_logging() -> None:
@@ -84,12 +170,13 @@ def setup_logging() -> None:
 
 HELP_TEXT = """
 Доступные команды:
-  help   — показать этот список
-  config — настроить подключение к БД (user, host, port)
-  memory — просмотр и управление долгосрочной памятью
-  reset  — сбросить контекст текущей сессии
-  clear  — очистить вывод ячейки
-  exit   — завершить работу (сохранить резюме сессии)
+  help    — показать этот список
+  config  — настроить подключение к БД (user, host, port)
+  memory  — просмотр и управление долгосрочной памятью
+  metrics — метрики качества генерации SQL (последние 30 дней)
+  reset   — сбросить контекст текущей сессии
+  clear   — очистить вывод ячейки
+  exit    — завершить работу (сохранить резюме сессии)
 
 Любой другой ввод обрабатывается как запрос к агенту.
 """.strip()
@@ -106,12 +193,19 @@ class CLIInterface:
         self.llm = RateLimitedLLM()
         self.memory = MemoryManager()
         self.schema = SchemaLoader()
+        EnrichmentPipeline(self.schema, llm=self.llm, db_manager=self.db).run()
         self.validator = SQLValidator(self.db, schema_loader=self.schema)
 
         # Создание tools через DI (замыкания)
         db_tools = create_db_tools(self.db, self.validator, self.schema)
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
+
+        # Кэш повторных запросов
+        self.query_cache = QueryCache(self.memory)
+        # Multi-turn контекст: последний успешный SQL и краткое резюме
+        self._prev_sql: str = ""
+        self._prev_result_summary: str = ""
 
         # Флаг отладки промптов из конфига
         self.debug_prompt = self.db.runtime_config.get("debug_prompt", False)
@@ -350,6 +444,45 @@ class CLIInterface:
             else:
                 print(f"✗ Ключ '{key_to_delete}' не найден.")
 
+    def _handle_metrics(self) -> None:
+        """Показать метрики качества генерации SQL."""
+        metrics = self.memory.get_sql_quality_metrics(days=30)
+        total = metrics.get("total_queries", 0)
+
+        if total == 0:
+            print("\nНет данных за последние 30 дней.\nВыполните несколько запросов для накопления статистики.")
+            return
+
+        success_rate = metrics.get("success_rate", 0)
+        first_try = metrics.get("first_try_success_rate", 0)
+        avg_retry = metrics.get("avg_retries", 0)
+        max_retry = metrics.get("max_retries", 0)
+        avg_ms = metrics.get("avg_duration_ms", 0)
+        errors = metrics.get("error_distribution", {})
+        statuses = metrics.get("status_distribution", {})
+
+        print(f"""
+╔══════════════════════════════════════════╗
+║       Метрики качества SQL (30 дней)     ║
+╚══════════════════════════════════════════╝
+
+  Всего запросов:       {total}
+  Успешность:           {success_rate:.1f}%
+  С первой попытки:     {first_try:.1f}%
+  Среднее retry:        {avg_retry:.2f}  (макс: {max_retry})
+  Среднее время:        {avg_ms:.0f} мс
+
+  Распределение статусов:""")
+        for status, cnt in sorted(statuses.items(), key=lambda x: -x[1]):
+            bar = "█" * min(int(cnt / max(statuses.values()) * 20), 20)
+            print(f"    {status:<15} {cnt:>4}  {bar}")
+
+        if errors:
+            print("\n  Топ ошибок:")
+            for err_type, cnt in sorted(errors.items(), key=lambda x: -x[1])[:5]:
+                print(f"    {err_type:<25} {cnt}")
+        print()
+
     def _handle_exit(self) -> None:
         """Завершение работы с сохранением резюме."""
         _status_print("Сохранение резюме сессии...")
@@ -395,13 +528,45 @@ class CLIInterface:
         self._save_memory_from_llm_response(response)
         logger.info("Долгосрочная память (слои) обновлена")
 
-    def _process_query(self, user_input: str) -> None:
+    def _process_query(
+        self,
+        user_input: str,
+        user_filter_choices: dict[str, str] | None = None,
+        rejected_filter_choices: dict[str, list[str]] | None = None,
+    ) -> None:
         """Обработать запрос пользователя через граф агента.
 
         Args:
             user_input: Запрос пользователя.
+            user_filter_choices: Явные выборы колонок от пользователя, собранные
+                при предыдущих уточнениях. Передаются в state нетронутыми —
+                где_resolver использует их, чтобы не задавать тот же вопрос снова.
         """
-        state = create_initial_state(user_input)
+        # --- Проверка кэша (только для read-запросов без явных write-ключевых слов) ---
+        _write_keywords = ("insert", "update", "delete", "drop", "create", "truncate", "alter")
+        _is_write = any(kw in user_input.lower() for kw in _write_keywords)
+        # Не отдаём из кэша, если пользователь уточнил фильтр — ответ может поменяться.
+        if not _is_write and not user_filter_choices:
+            cached = self.query_cache.get(user_input)
+            if cached:
+                from datetime import datetime, timezone
+                try:
+                    ts = datetime.fromisoformat(cached["created_at"])
+                    age_min = int((datetime.now(timezone.utc) - ts).total_seconds() / 60)
+                    age_str = f"{age_min} мин. назад" if age_min < 60 else f"{age_min // 60} ч. назад"
+                except Exception:
+                    age_str = "ранее"
+                print(f"\n💾 Найден кэшированный ответ ({age_str}). Используется без запроса к БД.\n")
+                print(cached["final_answer"])
+                return
+
+        state = create_initial_state(
+            user_input,
+            prev_sql=self._prev_sql,
+            prev_result_summary=self._prev_result_summary,
+            user_filter_choices=dict(user_filter_choices or {}),
+            rejected_filter_choices={k: list(v) for k, v in dict(rejected_filter_choices or {}).items()},
+        )
         result = {}
         spinner_idx = 0
         start_time = time.time()
@@ -427,6 +592,63 @@ class CLIInterface:
 
             # Очищаем статусную строку
             _status_print("")
+
+            # Проверяем нужна ли disambiguation (несколько таблиц)
+            if result.get("needs_clarification"):
+                msg = result.get(
+                    "clarification_message",
+                    "Не хватает деталей для выполнения запроса.",
+                )
+                print(f"\n{msg}")
+                clarification = input("\nУточнение: ").strip()
+                if clarification:
+                    self.memory.add_message("user", f"Уточнение пользователя: {clarification}")
+                    where_resolution = result.get("where_resolution", {}) or {}
+                    filter_candidates = where_resolution.get("filter_candidates", {}) or {}
+                    prev_choices = dict(
+                        (user_filter_choices or {})
+                        | (where_resolution.get("user_filter_choices", {}) or {})
+                    )
+                    prev_rejections = dict(
+                        (rejected_filter_choices or {})
+                        | (where_resolution.get("rejected_filter_choices", {}) or {})
+                    )
+                    new_choices, new_rejections = _interpret_filter_clarification(
+                        clarification,
+                        where_resolution,
+                        already_resolved=prev_choices,
+                    )
+                    if new_choices:
+                        merged_choices = {**prev_choices, **new_choices}
+                        self._process_query(
+                            user_input,
+                            user_filter_choices=merged_choices,
+                            rejected_filter_choices=prev_rejections or None,
+                        )
+                    elif new_rejections:
+                        merged_rejections = dict(prev_rejections)
+                        for request_id, columns in new_rejections.items():
+                            merged_rejections[request_id] = list(
+                                dict.fromkeys((merged_rejections.get(request_id, []) or []) + list(columns))
+                            )
+                        self._process_query(
+                            user_input,
+                            user_filter_choices=prev_choices or None,
+                            rejected_filter_choices=merged_rejections,
+                        )
+                    else:
+                        # Фолбэк: не смогли сопоставить ответ с кандидатами — как раньше,
+                        # дописываем в сам текст запроса, чтобы explicit-choice в
+                        # where_resolver мог поймать имя колонки напрямую.
+                        augmented_input = f"{user_input}\nУточнение пользователя: {clarification}"
+                        self._process_query(
+                            augmented_input,
+                            user_filter_choices=prev_choices or None,
+                            rejected_filter_choices=prev_rejections or None,
+                        )
+                else:
+                    print("Уточнение не получено. Операция отменена.")
+                return
 
             # Проверяем нужна ли disambiguation (несколько таблиц)
             if result.get("needs_disambiguation"):
@@ -493,6 +715,21 @@ class CLIInterface:
             answer = result.get("final_answer", "Нет ответа.")
             print(f"\n{answer}")
 
+            # Сохраняем успешные read-запросы в кэш + multi-turn контекст
+            if not _is_write and answer and answer != "Нет ответа.":
+                executed_sql = None
+                for tc in reversed(result.get("tool_calls", [])):
+                    if tc.get("tool") == "execute_query":
+                        executed_sql = tc.get("args", {}).get("sql")
+                        break
+                self.query_cache.put(user_input, answer, sql=executed_sql)
+                # Обновляем multi-turn контекст для следующего запроса
+                if executed_sql:
+                    self._prev_sql = executed_sql
+                    # Краткое резюме: первые 200 символов ответа без markdown
+                    summary = re.sub(r'```[^`]*```', '', answer, flags=re.DOTALL).strip()
+                    self._prev_result_summary = summary[:200]
+
         except Exception as e:
             _status_print("")
             logger.error("Ошибка обработки запроса: %s", e, exc_info=True)
@@ -523,6 +760,8 @@ class CLIInterface:
                 self._handle_config()
             elif command == "memory":
                 self._handle_memory()
+            elif command == "metrics":
+                self._handle_metrics()
             elif command == "reset":
                 self._handle_reset()
             elif command == "clear":

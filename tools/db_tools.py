@@ -19,8 +19,10 @@ def _build_sql_tool_payload(
     *,
     message: str,
     preview_markdown: str = "",
-    total_rows: int = 0,
+    rows_returned: int = 0,
+    rows_saved: int = 0,
     is_empty: bool = False,
+    is_truncated: bool = False,
     saved_file: str | None = None,
     mode: str = "preview",
 ) -> str:
@@ -28,8 +30,10 @@ def _build_sql_tool_payload(
     payload = {
         "message": message,
         "preview_markdown": preview_markdown,
-        "total_rows": int(total_rows),
+        "rows_returned": int(rows_returned),
+        "rows_saved": int(rows_saved),
         "is_empty": bool(is_empty),
+        "is_truncated": bool(is_truncated),
         "saved_file": saved_file,
         "mode": mode,
     }
@@ -47,41 +51,51 @@ def create_db_tools(
 
     @tool
     def execute_query(sql: str, limit: int = 1000) -> str:
-        """Run SELECT query and return a structured preview/full-result metadata payload."""
+        """Run SELECT query in preview mode and return a structured payload."""
         try:
             df = db_manager.preview_query(sql, limit=limit)
             if df.empty:
                 return _build_sql_tool_payload(
                     message="Запрос выполнен. Результат пуст.",
                     preview_markdown="",
-                    total_rows=0,
+                    rows_returned=0,
+                    rows_saved=0,
                     is_empty=True,
+                    is_truncated=False,
                     saved_file=None,
                     mode="preview",
                 )
 
-            total = len(df)
-            if total <= PREVIEW_ROWS:
+            returned = len(df)
+            # Сохраняем именно preview-результат, чтобы диск и сообщение отражали правду.
+            auto_file = resolve_workspace_path(WORKSPACE_DIR, "last_query_result.csv")
+            df.to_csv(auto_file, index=False, encoding="utf-8")
+            is_truncated = returned >= limit
+
+            if returned <= PREVIEW_ROWS:
                 return _build_sql_tool_payload(
-                    message=f"Показаны все {total} строк.",
+                    message=f"Preview выполнен. Показаны все {returned} строк из полученного preview.",
                     preview_markdown=df.to_markdown(index=False),
-                    total_rows=total,
+                    rows_returned=returned,
+                    rows_saved=returned,
                     is_empty=False,
-                    saved_file=None,
+                    is_truncated=is_truncated,
+                    saved_file="last_query_result.csv",
                     mode="preview",
                 )
 
             preview = df.head(PREVIEW_ROWS).to_markdown(index=False)
-            auto_file = resolve_workspace_path(WORKSPACE_DIR, "last_query_result.csv")
-            df.to_csv(auto_file, index=False, encoding="utf-8")
             return _build_sql_tool_payload(
                 message=(
-                    f"Показано {PREVIEW_ROWS} из {total} строк. "
-                    "Полный результат сохранен в last_query_result.csv"
+                    f"Preview выполнен. Показано {PREVIEW_ROWS} из {returned} строк preview-результата. "
+                    "В файл last_query_result.csv сохранён только preview-результат. "
+                    "Для полной выгрузки используй export_query."
                 ),
                 preview_markdown=preview,
-                total_rows=total,
+                rows_returned=returned,
+                rows_saved=returned,
                 is_empty=False,
+                is_truncated=True,
                 saved_file="last_query_result.csv",
                 mode="preview",
             )
@@ -101,12 +115,42 @@ def create_db_tools(
 
     @tool
     def check_key_uniqueness(schema: str, table: str, columns: str) -> str:
-        """Check key uniqueness in CSV metadata (fallback to DB)."""
+        """Check key uniqueness in CSV metadata (mandatory DB-probe for composite non-PK keys)."""
         cols = [c.strip() for c in columns.split(",")]
         if schema_loader is not None:
             result = schema_loader.check_key_uniqueness(schema, table, cols)
             if result.get("error"):
                 raise ValueError(result["error"])
+
+            # Для составных ключей без PK-гарантии CSV-статистика ненадёжна:
+            # fanout/row explosion может возникнуть даже при high unique_perc.
+            # DB-верификация обязательна — она единственный авторитетный источник.
+            if result.get("needs_db_probe"):
+                try:
+                    db_result = db_manager.check_key_uniqueness(schema, table, cols)
+                    is_uniq = db_result["is_unique"]
+                    db_suffix = (
+                        f"\n  DB-верификация: "
+                        f"{db_result['unique_keys']:,}/{db_result['total_rows']:,} уник., "
+                        f"дублей {db_result['duplicate_pct']}%"
+                    )
+                    prefix = "уникален" if is_uniq else "НЕ уникален"
+                    col_lines = "\n".join(
+                        f"  {c}: unique_perc={d.get('unique_perc', '?')}%, "
+                        f"is_pk={d.get('is_primary_key', False)}"
+                        for c, d in result["columns"].items()
+                        if d.get("found")
+                    )
+                    return (
+                        f"Ключ ({columns}) в {schema}.{table} {prefix} "
+                        f"(подтверждено БД).{db_suffix}\n{col_lines}"
+                    )
+                except Exception as db_e:
+                    logger.warning(
+                        "check_key_uniqueness: DB-проверка не удалась (%s), "
+                        "используем CSV-оценку (ненадёжно для составного ключа)", db_e
+                    )
+
             if result["is_unique"]:
                 reason = (
                     "все колонки являются PK"
@@ -220,8 +264,10 @@ def create_db_tools(
             return _build_sql_tool_payload(
                 message=f"Запрос выполнен. Затронуто строк: {affected}",
                 preview_markdown="",
-                total_rows=affected,
+                rows_returned=affected,
+                rows_saved=0,
                 is_empty=affected == 0,
+                is_truncated=False,
                 saved_file=None,
                 mode="write",
             )
@@ -254,8 +300,10 @@ def create_db_tools(
             return _build_sql_tool_payload(
                 message=ddl_message,
                 preview_markdown="",
-                total_rows=0,
+                rows_returned=0,
+                rows_saved=0,
                 is_empty=True,
+                is_truncated=False,
                 saved_file=None,
                 mode="ddl",
             )
@@ -278,8 +326,10 @@ def create_db_tools(
             return _build_sql_tool_payload(
                 message=f"Сохранено в {rel_path} ({row_count} строк)",
                 preview_markdown="",
-                total_rows=row_count,
+                rows_returned=row_count,
+                rows_saved=row_count,
                 is_empty=row_count == 0,
+                is_truncated=False,
                 saved_file=rel_path,
                 mode="export",
             )

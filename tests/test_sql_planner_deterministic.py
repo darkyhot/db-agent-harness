@@ -86,7 +86,7 @@ class TestComputeAggregation:
     def test_count_no_agg_col_fallback(self):
         intent = {"aggregation_hint": "count"}
         agg = _compute_aggregation(intent, self._cols([]))
-        assert agg == {"function": "COUNT", "column": "*", "alias": "cnt"}
+        assert agg == {"function": "COUNT", "column": "*", "alias": "count_all"}
 
     def test_avg(self):
         intent = {"aggregation_hint": "avg"}
@@ -107,6 +107,38 @@ class TestComputeAggregation:
         intent = {"aggregation_hint": "max"}
         agg = _compute_aggregation(intent, self._cols(["score"]))
         assert agg == {"function": "MAX", "column": "score", "alias": "max_score"}
+
+    def test_count_on_primary_identifier_becomes_distinct(self, tmp_path):
+        from core.schema_loader import SchemaLoader
+
+        tables_df = pd.DataFrame({
+            "schema_name": ["dm"],
+            "table_name": ["sales"],
+            "description": ["Продажи по задачам"],
+        })
+        attrs_df = pd.DataFrame({
+            "schema_name": ["dm"] * 2,
+            "table_name": ["sales"] * 2,
+            "column_name": ["task_code", "report_dt"],
+            "dType": ["text", "date"],
+            "description": ["Код задачи", "Отчетная дата"],
+            "is_primary_key": [True, False],
+            "unique_perc": [100.0, 0.2],
+            "not_null_perc": [100.0, 100.0],
+        })
+        tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+        attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+
+        loader = SchemaLoader(data_dir=tmp_path)
+        agg = _compute_aggregation(
+            {"aggregation_hint": "count"},
+            self._cols(["task_code"]),
+            schema_loader=loader,
+            semantic_frame={"requires_single_entity_count": True},
+        )
+        assert agg["function"] == "COUNT"
+        assert agg["column"] == "task_code"
+        assert agg["distinct"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -410,13 +442,8 @@ class TestBuildBlueprint:
         assert bp["strategy"] == "dim_dim_join"
         assert bp["cte_needed"] is True
 
-    def test_filter_col_promoted_to_group_by_when_no_where(self):
-        """Лог 1: report_dt в filter без WHERE-условия → должен попасть в group_by.
-
-        Пользователь просит 'по дате и названию ГОСБ' — column_selector кладёт
-        report_dt в filter, но явных date_filters нет. Планировщик должен
-        автоматически перенести report_dt в group_by.
-        """
+    def test_filter_col_promoted_to_group_by_only_when_dimension_requested(self):
+        """Filter-only дата попадает в GROUP BY только если пользователь просил измерение."""
         intent = {
             "aggregation_hint": "sum",
             "date_filters": {"from": None, "to": None},
@@ -440,10 +467,9 @@ class TestBuildBlueprint:
             intent, cols, [],
             {"dm.fact_outflow": "fact", "dm.dim_gosb": "dim"},
             {},
+            semantic_frame={"output_dimensions": ["date"]},
         )
-        assert "report_dt" in bp["group_by"], (
-            "report_dt в filter без WHERE-условия должен быть продвинут в group_by"
-        )
+        assert "report_dt" in bp["group_by"]
 
     def test_filter_col_not_promoted_when_where_exists(self):
         """Если для filter-колонки есть WHERE-условие, в group_by она НЕ добавляется."""
@@ -494,16 +520,16 @@ class TestNoDefaultLimit:
         assert bp.get("limit") == 50
 
 
-class TestCountDistinctAggregation:
-    """_compute_aggregation должен выставлять distinct=True для COUNT по pk-колонке."""
+class TestCountAggregation:
+    """COUNT не должен становиться DISTINCT без явного сигнала."""
 
-    def test_count_with_pk_col_gets_distinct(self):
+    def test_count_with_pk_col_has_no_distinct_by_default(self):
         intent = {"aggregation_hint": "count"}
         cols = {"dm.gosb": {"select": ["gosb_id"], "aggregate": ["gosb_id"], "group_by": []}}
         agg = _compute_aggregation(intent, cols)
         assert agg is not None
         assert agg["function"] == "COUNT"
-        assert agg.get("distinct") is True, "Ожидали distinct=True для COUNT по pk-колонке"
+        assert not agg.get("distinct"), "COUNT по колонке не должен становиться DISTINCT по умолчанию"
 
     def test_count_star_fallback_no_distinct(self):
         intent = {"aggregation_hint": "count"}
@@ -576,3 +602,159 @@ class TestApplyTimeGranularity:
         bp = build_blueprint(intent, cols, [], {"dm.fact": "fact"}, {}, user_hints=user_hints, schema_loader=loader)
         group_by_str = " ".join(bp.get("group_by", []))
         assert "DATE_TRUNC('month'" in group_by_str
+
+
+def test_build_blueprint_does_not_leak_filter_only_keys_into_group_by():
+    intent = {"aggregation_hint": "count", "required_output": []}
+    cols = {
+        "dm.sales": {
+            "select": ["task_code"],
+            "filter": ["inn", "report_dt"],
+            "aggregate": ["task_code"],
+            "group_by": [],
+        }
+    }
+    bp = build_blueprint(
+        intent,
+        cols,
+        [],
+        {"dm.sales": "fact"},
+        {},
+        semantic_frame={"output_dimensions": []},
+    )
+    assert "inn" not in bp["group_by"]
+    assert "report_dt" not in bp["group_by"]
+
+
+def test_build_blueprint_single_entity_count_clears_spurious_group_by():
+    intent = {"aggregation_hint": "count", "required_output": []}
+    cols = {
+        "dm.sales": {
+            "select": ["uzp_task_code", "task_code"],
+            "filter": ["report_dt"],
+            "aggregate": ["task_code"],
+            "group_by": ["uzp_task_code"],
+        }
+    }
+    bp = build_blueprint(
+        intent,
+        cols,
+        [],
+        {"dm.sales": "fact"},
+        {},
+        semantic_frame={
+            "requires_single_entity_count": True,
+            "output_dimensions": [],
+        },
+    )
+    assert bp["aggregation"]["column"] == "task_code"
+    assert bp["aggregation"]["distinct"] is True
+    assert bp["group_by"] == []
+
+
+def test_build_blueprint_for_outflow_tasks_uses_distinct_task_code(tmp_path):
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["uzp_data_split_mzp_sale_funnel"],
+        "description": ["Воронка продаж по задачам"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": ["uzp_data_split_mzp_sale_funnel"] * 5,
+        "column_name": ["report_dt", "task_code", "uzp_task_code", "task_subtype", "task_category"],
+        "dType": ["date", "text", "text", "text", "text"],
+        "description": [
+            "Отчетная дата",
+            "Код задачи",
+            "Код задачи УЗП",
+            "Подтип задачи",
+            "Категория задачи",
+        ],
+        "is_primary_key": [False, True, False, False, False],
+        "unique_perc": [0.5, 100.0, 36.68, 2.62, 0.02],
+        "not_null_perc": [99.0, 100.0, 36.68, 37.06, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    bp = build_blueprint(
+        intent={
+            "aggregation_hint": "count",
+            "date_filters": {"from": "2026-02-01", "to": "2026-03-01"},
+            "required_output": [],
+        },
+        selected_columns={
+            "dm.uzp_data_split_mzp_sale_funnel": {
+                "select": ["task_code"],
+                "filter": ["report_dt", "task_subtype", "task_category"],
+                "aggregate": ["task_code"],
+                "group_by": [],
+            }
+        },
+        join_spec=[],
+        table_types={"dm.uzp_data_split_mzp_sale_funnel": "fact"},
+        join_analysis_data={},
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 26",
+        schema_loader=loader,
+        semantic_frame={
+            "subject": "task",
+            "requires_single_entity_count": True,
+            "output_dimensions": [],
+        },
+    )
+    assert bp["aggregation"]["column"] == "task_code"
+    assert bp["aggregation"]["distinct"] is True
+    assert bp["group_by"] == []
+
+
+def test_build_blueprint_single_entity_safety_net_rewrites_count_star(tmp_path):
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["sales"],
+        "description": ["Продажи по задачам"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["sales"] * 3,
+        "column_name": ["task_code", "uzp_task_code", "report_dt"],
+        "dType": ["text", "text", "date"],
+        "description": ["Код задачи", "Код задачи УЗП", "Отчетная дата"],
+        "is_primary_key": [True, False, False],
+        "unique_perc": [100.0, 36.68, 0.5],
+        "not_null_perc": [100.0, 36.68, 99.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    bp = build_blueprint(
+        intent={"aggregation_hint": "count", "required_output": []},
+        selected_columns={
+            "dm.sales": {
+                "select": ["uzp_task_code"],
+                "filter": ["report_dt"],
+                "aggregate": ["*"],
+                "group_by": ["uzp_task_code"],
+            }
+        },
+        join_spec=[],
+        table_types={"dm.sales": "fact"},
+        join_analysis_data={},
+        user_input="Сколько задач по фактическому оттоку",
+        schema_loader=loader,
+        semantic_frame={
+            "subject": "task",
+            "requires_single_entity_count": True,
+            "output_dimensions": [],
+        },
+    )
+    assert bp["aggregation"]["column"] == "task_code"
+    assert bp["aggregation"]["distinct"] is True
+    assert bp["group_by"] == []

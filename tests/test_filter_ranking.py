@@ -137,9 +137,9 @@ def test_filter_ranking_matches_known_terms_semantically(tmp_path):
 
 
 def test_filter_ranking_phrase_bonus_breaks_tie_between_similar_columns(tmp_path):
-    """Полная фраза «фактический отток» должна склонить выбор к task_subtype
-    даже рядом с очень похожим task_type, у которого в known_terms только
-    «отток» (одно слово)."""
+    """Полная фраза «фактический отток» должна детерминированно выбрать
+    task_subtype. Общий task_type=«отток» больше не должен оставаться
+    равноправным кандидатом и провоцировать clarification."""
     loader = _loader(tmp_path)
     loader._value_profiles = {
         "dm.sale_funnel.task_subtype": {
@@ -164,16 +164,13 @@ def test_filter_ranking_phrase_bonus_breaks_tie_between_similar_columns(tmp_path
         schema_loader=loader,
         semantic_frame=frame,
     )
+    assert list(ranked.keys()) == ["text:dm.sale_funnel.task_subtype"]
     candidates = next(iter(ranked.values()))
-    columns = [c["column"] for c in candidates]
-    assert columns.index("task_subtype") < columns.index("task_type"), columns
     top = candidates[0]
     assert top["column"] == "task_subtype"
     assert top["matched_example"] == "фактический отток"
-    # score gap достаточно большой, чтобы where_resolver не ушёл в ambiguity.
-    subtype_score = next(c["score"] for c in candidates if c["column"] == "task_subtype")
-    type_score = next(c["score"] for c in candidates if c["column"] == "task_type")
-    assert subtype_score - type_score >= 40.0
+    assert all(c["column"] != "task_type" for c in candidates)
+    assert top["score"] >= 100.0
 
 
 def test_filter_ranking_phrase_bonus_tolerates_single_letter_typo(tmp_path):
@@ -207,6 +204,7 @@ def test_filter_ranking_phrase_bonus_tolerates_single_letter_typo(tmp_path):
         schema_loader=loader,
         semantic_frame=frame,
     )
+    assert "phrase:0" in ranked
     phrase_candidates = next(
         (cands for rid, cands in ranked.items() if rid.startswith("phrase:") and cands),
         None,

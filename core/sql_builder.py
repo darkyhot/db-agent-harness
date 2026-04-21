@@ -30,6 +30,25 @@ _GENERIC_COL_TOKENS = {"id", "name", "dt", "date", "dttm", "amt", "qty", "num", 
 _TOKEN_ABBREVIATIONS = {"segment": "seg", "region": "reg"}
 
 
+def _normalize_aggregation(aggregation: dict | None) -> tuple[str | None, str | None, str | None, bool]:
+    """Нормализовать aggregation для обратной совместимости."""
+    if not aggregation:
+        return None, None, None, False
+    raw_func = str(aggregation.get("function") or "").strip()
+    raw_col = aggregation.get("column")
+    raw_alias = aggregation.get("alias")
+    distinct = bool(aggregation.get("distinct", False))
+
+    if raw_func.lower() == "count_distinct":
+        raw_func = "COUNT"
+        distinct = True
+
+    func = raw_func.upper() if raw_func else None
+    col = str(raw_col) if raw_col is not None else None
+    alias = str(raw_alias) if raw_alias not in (None, "") else None
+    return func, col, alias, distinct
+
+
 def _short_alias(full_name: str, used: set[str]) -> str:
     """Сгенерировать короткий, уникальный алиас для таблицы.
 
@@ -103,11 +122,7 @@ def _build_select_items(
     items: list[str] = []
     seen_cols: set[str] = set()
 
-    agg_col = aggregation.get("column") if aggregation else None
-    agg_func = aggregation.get("function") if aggregation else None
-    agg_alias = aggregation.get("alias") if aggregation else None
-
-    agg_distinct = aggregation.get("distinct", False) if aggregation else False
+    agg_func, agg_col, agg_alias, agg_distinct = _normalize_aggregation(aggregation)
 
     for table, roles in selected_columns.items():
         alias = table_alias_map.get(table, "t")
@@ -351,10 +366,7 @@ def _build_fact_dim_join(
     seen: set[str] = set()
 
     # Колонки факт-таблицы
-    agg_col = aggregation.get("column") if aggregation else None
-    agg_func = aggregation.get("function") if aggregation else None
-    agg_alias = aggregation.get("alias") if aggregation else None
-    agg_distinct = aggregation.get("distinct", False) if aggregation else False
+    agg_func, agg_col, agg_alias, agg_distinct = _normalize_aggregation(aggregation)
     fact_agg_set = set(fact_roles.get("aggregate", []))
 
     for col in (fact_roles.get("select", []) + fact_roles.get("group_by", [])):
@@ -569,9 +581,10 @@ def _build_dim_fact_join(
     d_alias = _short_alias(dim_table, used)
 
     aggregation = blueprint.get("aggregation")
-    agg_func = aggregation.get("function") if aggregation else "COUNT"
-    agg_col = aggregation.get("column") if aggregation else "*"
-    agg_alias = aggregation.get("alias") if aggregation else "agg_val"
+    agg_func, agg_col, agg_alias, agg_distinct = _normalize_aggregation(aggregation)
+    agg_func = agg_func or "COUNT"
+    agg_col = agg_col or "*"
+    agg_alias = agg_alias or "agg_val"
 
     fact_roles = selected_columns.get(fact_table, {})
     dim_roles = selected_columns.get(dim_table, {})
@@ -588,8 +601,9 @@ def _build_dim_fact_join(
     fact_group_by_str = ", ".join(fact_join_cols)
     fact_select_keys_str = ", ".join(fact_join_cols)
     fact_agg_col = "*" if agg_col == "*" else agg_col
+    distinct_sql = "DISTINCT " if agg_distinct and fact_agg_col != "*" else ""
     fact_subquery = (
-        f"SELECT {fact_select_keys_str}, {agg_func}({fact_agg_col}) AS {agg_alias}\n"
+        f"SELECT {fact_select_keys_str}, {agg_func}({distinct_sql}{fact_agg_col}) AS {agg_alias}\n"
         f"    FROM {fact_table}\n"
         f"    GROUP BY {fact_group_by_str}"
     )
@@ -655,22 +669,25 @@ def _build_fact_fact_join(
     cte2 = f"{a2}_agg"
 
     aggregation = blueprint.get("aggregation")
-    agg_func = aggregation.get("function") if aggregation else "COUNT"
+    agg_func, _, _, agg_distinct = _normalize_aggregation(aggregation)
+    agg_func = agg_func or "COUNT"
 
     roles1 = selected_columns[t1]
     roles2 = selected_columns[t2]
 
     # Агрегации для каждой таблицы: ищем aggregate-роль, fallback COUNT(*)
     def _agg_for(roles: dict, suffix: str, key_col: str) -> str:
-        agg_cols = [c for c in roles.get("aggregate", []) if c != key_col]
+        agg_cols = [c for c in roles.get("aggregate", []) if c and c not in {key_col, "*"}]
         if agg_cols:
             col = agg_cols[0]
-            return f"{agg_func}({col}) AS {agg_func.lower()}_{col}"
+            distinct_sql = "DISTINCT " if agg_distinct else ""
+            return f"{agg_func}({distinct_sql}{col}) AS {agg_func.lower()}_{col}"
         # Попробуем найти числовую метрику в select
         for col in roles.get("select", []):
-            if col == key_col:
+            if not col or col in {key_col, "*"}:
                 continue
-            return f"{agg_func}({col}) AS {agg_func.lower()}_{col}"
+            distinct_sql = "DISTINCT " if agg_distinct else ""
+            return f"{agg_func}({distinct_sql}{col}) AS {agg_func.lower()}_{col}"
         return f"COUNT(*) AS cnt_{suffix}"
 
     agg1_expr = _agg_for(roles1, a1, join_key_1)

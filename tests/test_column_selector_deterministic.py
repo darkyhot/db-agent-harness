@@ -119,3 +119,126 @@ def test_explorer_uses_llm_path_when_group_by_hints_present(tmp_path):
     hints = state.get("user_hints", {}) or {}
     has_explicit_group = bool(hints.get("group_by_hints"))
     assert has_explicit_group is True
+
+
+def test_select_columns_single_entity_count_prefers_pk_over_aux_code(tmp_path):
+    from core.column_selector_deterministic import select_columns
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["uzp_data_split_mzp_sale_funnel"],
+        "description": ["Воронка продаж по задачам"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": ["uzp_data_split_mzp_sale_funnel"] * 5,
+        "column_name": ["report_dt", "task_code", "uzp_task_code", "task_subtype", "task_category"],
+        "dType": ["date", "text", "text", "text", "text"],
+        "description": [
+            "Отчетная дата",
+            "Код задачи",
+            "Код задачи УЗП",
+            "Подтип задачи",
+            "Категория задачи",
+        ],
+        "is_primary_key": [False, True, False, False, False],
+        "unique_perc": [0.5, 100.0, 36.68, 2.62, 0.02],
+        "not_null_perc": [99.0, 100.0, 36.68, 37.06, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+
+    loader = SchemaLoader(data_dir=tmp_path)
+    result = select_columns(
+        intent={
+            "aggregation_hint": "count",
+            "entities": ["задачи", "отток"],
+            "date_filters": {"from": "2026-02-01", "to": "2026-03-01"},
+        },
+        table_structures={"dm.uzp_data_split_mzp_sale_funnel": "Воронка продаж по задачам"},
+        table_types={"dm.uzp_data_split_mzp_sale_funnel": "fact"},
+        join_analysis_data={},
+        schema_loader=loader,
+        user_input="Сколько задач по фактическому оттоку за февраль 2026",
+        semantic_frame={
+            "subject": "task",
+            "requires_single_entity_count": True,
+            "output_dimensions": [],
+        },
+    )
+
+    roles = result["selected_columns"]["dm.uzp_data_split_mzp_sale_funnel"]
+    assert roles["aggregate"] == ["task_code"]
+    assert roles["select"] == ["task_code"]
+    assert "group_by" not in roles or not roles["group_by"]
+    assert "uzp_task_code" not in roles.get("select", [])
+
+
+def test_select_columns_scalar_count_without_semantic_flag_still_avoids_group_by(tmp_path):
+    from core.column_selector_deterministic import select_columns
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["uzp_data_split_mzp_sale_funnel"],
+        "description": ["Воронка продаж по задачам"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": ["uzp_data_split_mzp_sale_funnel"] * 5,
+        "column_name": ["report_dt", "task_code", "uzp_task_code", "task_subtype", "task_category"],
+        "dType": ["date", "text", "text", "text", "text"],
+        "description": [
+            "Отчетная дата",
+            "Код задачи",
+            "Код задачи УЗП",
+            "Подтип задачи",
+            "Категория задачи",
+        ],
+        "is_primary_key": [False, True, False, False, False],
+        "unique_perc": [0.5, 100.0, 36.68, 2.62, 0.02],
+        "not_null_perc": [99.0, 100.0, 36.68, 37.06, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+
+    loader = SchemaLoader(data_dir=tmp_path)
+    result = select_columns(
+        intent={
+            "aggregation_hint": "count",
+            "entities": ["задачи", "отток"],
+            "date_filters": {"from": "2026-02-01", "to": "2026-03-01"},
+        },
+        table_structures={"dm.uzp_data_split_mzp_sale_funnel": "Воронка продаж по задачам"},
+        table_types={"dm.uzp_data_split_mzp_sale_funnel": "fact"},
+        join_analysis_data={},
+        schema_loader=loader,
+        user_input="Сколько задач по фактическому оттоку за февраль 2026",
+        semantic_frame={"subject": "task", "output_dimensions": []},
+    )
+
+    roles = result["selected_columns"]["dm.uzp_data_split_mzp_sale_funnel"]
+    assert roles["aggregate"] == ["task_code"]
+    assert roles["select"] == ["task_code"]
+    assert "group_by" not in roles or not roles["group_by"]
+
+
+def test_requested_slots_ignore_table_choice_suffix_and_filter_value(tmp_path):
+    from core.column_selector_deterministic import _derive_requested_slots
+
+    requested = _derive_requested_slots(
+        "Сколько задач по фактическому оттоку поставили в феврале 26 "
+        "(использовать таблицу dm.uzp_data_split_mzp_sale_funnel)",
+        {
+            "aggregation_hint": "count",
+            "entities": ["задачи", "отток"],
+            "required_output": [],
+        },
+    )
+
+    assert "uzp_data_split_mzp_sale_funnel" not in requested["dimensions"]
+    assert not any("фактическому" in dim for dim in requested["dimensions"])
+    assert requested["metric"] is not None

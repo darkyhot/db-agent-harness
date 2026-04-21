@@ -416,6 +416,7 @@ def create_initial_state(
     prev_result_summary: str = "",
     user_filter_choices: dict[str, str] | None = None,
     plan_preview_approved: bool = False,
+    rejected_filter_choices: dict[str, list[str]] | None = None,
 ) -> AgentState:
     """Создать начальное состояние для запуска графа."""
     return AgentState(
@@ -436,6 +437,7 @@ def create_initial_state(
         needs_disambiguation=False,
         disambiguation_options=[],
         user_filter_choices=dict(user_filter_choices or {}),
+        rejected_filter_choices={k: list(v) for k, v in dict(rejected_filter_choices or {}).items()},
         tables_context="",
         graph_iterations=0,
         correction_examples=[],

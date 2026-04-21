@@ -206,6 +206,9 @@ def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> st
     where_resolution = where_resolution or {}
     filter_candidates = where_resolution.get("filter_candidates", {}) or {}
     user_choices = where_resolution.get("user_filter_choices", {}) or {}
+    spec = where_resolution.get("clarification_spec", {}) or {}
+    if spec.get("message"):
+        return str(spec.get("message") or "")
     for request_id, candidates in filter_candidates.items():
         if not candidates:
             continue
@@ -222,11 +225,65 @@ def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> st
             )
         if top.get("column"):
             label = _candidate_label(top)
+            evidence = {str(ev) for ev in (top.get("evidence") or [])}
+            if top.get("matched_example") or any(
+                ev.startswith("known_term_phrase=") or ev.startswith("value_match=")
+                for ev in evidence
+            ):
+                continue
             return (
                 "Уточните, пожалуйста, фильтр: "
-                f"нужно отфильтровать именно по полю {label}?"
+                f"нужно отфильтровать именно по полю {label}? Ответьте да/нет."
             )
     return ""
+
+
+def _build_specific_clarification_spec(where_resolution: dict[str, Any] | None) -> dict[str, Any]:
+    """Построить typed clarification spec для CLI."""
+    where_resolution = where_resolution or {}
+    existing = where_resolution.get("clarification_spec", {}) or {}
+    if existing.get("message"):
+        return dict(existing)
+    filter_candidates = where_resolution.get("filter_candidates", {}) or {}
+    user_choices = where_resolution.get("user_filter_choices", {}) or {}
+    for request_id, candidates in filter_candidates.items():
+        if not candidates or str(request_id) in user_choices:
+            continue
+        top = candidates[0]
+        second = candidates[1] if len(candidates) > 1 else None
+        if second:
+            left = _candidate_label(top)
+            right = _candidate_label(second)
+            return {
+                "type": "choice",
+                "request_id": str(request_id),
+                "message": (
+                    "Найдено несколько близких вариантов фильтра. "
+                    f"Уточните, пожалуйста, по какому признаку фильтровать: {left} или {right}?"
+                ),
+                "options": [
+                    {"column": str(top.get("column") or ""), "label": left},
+                    {"column": str(second.get("column") or ""), "label": right},
+                ],
+            }
+        if top.get("column"):
+            evidence = {str(ev) for ev in (top.get("evidence") or [])}
+            if top.get("matched_example") or any(
+                ev.startswith("known_term_phrase=") or ev.startswith("value_match=")
+                for ev in evidence
+            ):
+                continue
+            label = _candidate_label(top)
+            return {
+                "type": "confirm",
+                "request_id": str(request_id),
+                "message": (
+                    "Уточните, пожалуйста, фильтр: "
+                    f"нужно отфильтровать именно по полю {label}? Ответьте да/нет."
+                ),
+                "options": [{"column": str(top.get("column") or ""), "label": label}],
+            }
+    return {}
 
 
 class SqlPipelineNodes:
@@ -282,6 +339,7 @@ class SqlPipelineNodes:
             schema_loader=self.schema,
             semantic_frame=state.get("semantic_frame", {}) or {},
             user_filter_choices=state.get("user_filter_choices", {}) or {},
+            rejected_filter_choices=state.get("rejected_filter_choices", {}) or {},
         )
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
@@ -366,7 +424,11 @@ class SqlPipelineNodes:
             }
 
         if planning_confidence.get("action") != "execute":
-            _clarif = _build_specific_clarification(where_resolution)
+            clarification_spec = _build_specific_clarification_spec(where_resolution)
+            if clarification_spec:
+                where_resolution = dict(where_resolution)
+                where_resolution["clarification_spec"] = clarification_spec
+            _clarif = str(clarification_spec.get("message") or _build_specific_clarification(where_resolution))
             # Пустая строка — задавать нечего: все request_id закрыты через
             # user_filter_choices. Не блокируем пайплайн фейковым clarification.
             if _clarif:
@@ -832,6 +894,7 @@ class SqlPipelineNodes:
 
         if not check_result.is_valid:
             error_msg = (
+                "SQL не выполнен: ошибка статической проверки.\n"
                 f"[sql_static_checker] {check_result.summary()}\n"
                 "Исправь SQL перед отправкой в БД."
             )
@@ -901,7 +964,10 @@ class SqlPipelineNodes:
 
         # Невалидный SQL
         if not result.is_valid:
-            error_msg = result.summary()
+            error_msg = (
+                "SQL не выполнен: ошибка валидации.\n"
+                f"{result.summary()}"
+            )
             logger.warning("Validator: SQL невалиден: %s", summarize_text(error_msg, label="validation_error"))
             return {
                 "last_error": error_msg,

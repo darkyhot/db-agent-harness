@@ -427,19 +427,19 @@
         "категори задач",
         "категория задачи"
       ],
-      "value_candidates": []
+      "value_candidates": [
+        "Задача"
+      ]
     },
     {
       "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.task_type",
       "column_key": "schema.uzp_data_split_mzp_sale_funnel.task_type",
       "semantic_class": "enum_like",
       "match_kind": "text_search",
-      "match_phrases": [
-        "task",
-        "задач",
-        "задачи"
-      ],
-      "value_candidates": []
+      "match_phrases": [],
+      "value_candidates": [
+        "сервисная задача по юр-лицу"
+      ]
     },
     {
       "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.task_subtype",
@@ -451,7 +451,9 @@
         "подтип задач",
         "подтип задачи"
       ],
-      "value_candidates": []
+      "value_candidates": [
+        "фактический отток"
+      ]
     },
     {
       "rule_id": "text:schema.uzp_data_split_mzp_sale_funnel.reason_comment",

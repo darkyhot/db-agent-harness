@@ -30,6 +30,11 @@ def _tokenize(text: str) -> list[str]:
     return [tok for tok in normalized.split() if len(tok) >= 2 and tok not in _STOPWORDS]
 
 
+def _raw_tokenize(text: str) -> list[str]:
+    normalized = _normalize_phrase(text)
+    return [tok for tok in normalized.split() if len(tok) >= 2]
+
+
 def _token_stem(token: str) -> str:
     token = _normalize_phrase(token)
     for suffix in (
@@ -66,8 +71,14 @@ def _tokens_overlap(query_tokens: set[str], candidate_tokens: set[str]) -> int:
 
 
 def _phrase_variants(text: str) -> list[str]:
+    raw_tokens = _raw_tokenize(text)
     tokens = _tokenize(text)
     if not tokens:
+        return []
+    # Если исходная фраза была многословной, но после выкидывания stopwords
+    # схлопнулась в одно слишком общее слово ("Тип задачи" -> "задачи"),
+    # такой alias только засоряет registry и даёт ложные text-match'и.
+    if len(raw_tokens) > 1 and len(tokens) < 2:
         return []
     variants = {
         " ".join(tokens),
@@ -92,6 +103,23 @@ def _collect_aliases(*parts: str) -> list[str]:
             seen.add(alias)
             result.append(alias)
     return result
+
+
+def _is_overly_generic_match_phrase(column: str, phrase: str) -> bool:
+    """Отсечь слишком общие match_phrases для type/category-полей.
+
+    Пример нежелательного поведения: `task_type` начинает матчиться по словам
+    "task"/"задача", из-за чего любой запрос про задачи провоцирует лишний
+    фильтр по типу. Для таких полей оставляем только более специфичные фразы.
+    """
+    column_norm = _normalize_phrase(column)
+    phrase_tokens = _tokenize(phrase)
+    if not phrase_tokens:
+        return True
+
+    if column_norm.endswith("_type") or column_norm.endswith("_category"):
+        return len(phrase_tokens) < 2
+    return False
 
 
 def build_semantic_lexicon(
@@ -200,7 +228,13 @@ def build_rule_registry(
 
         description = str(row.get("description", "") or "")
         aliases = _collect_aliases(column.replace("_", " "), description)
-        match_phrases = [alias for alias in aliases if alias and alias not in _FLAG_WORDS]
+        match_phrases = [
+            alias
+            for alias in aliases
+            if alias
+            and alias not in _FLAG_WORDS
+            and not _is_overly_generic_match_phrase(column, alias)
+        ]
         values = [str(v) for v in list(profile.get("top_values", []) or []) + list(profile.get("known_terms", []) or []) if str(v).strip()]
 
         if sem_class == "flag":
@@ -250,10 +284,17 @@ def find_best_subject(query: str, lexicon: dict[str, Any]) -> str | None:
 def find_matching_dimensions(query: str, lexicon: dict[str, Any]) -> list[str]:
     query_tokens = set(_stem_tokens(_tokenize(query)))
     results: list[str] = []
+    low_signal = {"тип", "задач", "задача", "дат", "фактическ", "фактическая", "фактическому"}
     for dim_key, meta in (lexicon.get("dimensions") or {}).items():
         for alias in meta.get("aliases", []) or []:
             alias_tokens = set(_stem_tokens(_tokenize(alias)))
-            if alias_tokens and len(query_tokens & alias_tokens) >= max(1, min(2, len(alias_tokens))):
+            if not alias_tokens:
+                continue
+            if alias_tokens <= low_signal:
+                continue
+            threshold = 1 if len(alias_tokens) == 1 else 2
+            overlap = len(query_tokens & alias_tokens)
+            if overlap >= threshold:
                 results.append(dim_key)
                 break
     return list(dict.fromkeys(results))
@@ -265,24 +306,63 @@ def find_matching_rules(query: str, registry: dict[str, Any]) -> list[dict[str, 
     for rule in (registry.get("rules") or []):
         best = 0
         matched_phrase = ""
+        match_source = ""
         for phrase in rule.get("match_phrases", []) or []:
             phrase_tokens = set(_stem_tokens(_tokenize(phrase)))
             overlap = _tokens_overlap(query_tokens, phrase_tokens)
-            threshold = 1 if len(phrase_tokens) <= 1 else min(2, len(phrase_tokens))
+            raw_phrase_tokens = _raw_tokenize(phrase)
+            threshold = 1 if len(raw_phrase_tokens) <= 1 else min(2, len(raw_phrase_tokens))
             if overlap >= threshold and overlap > best:
                 best = overlap
                 matched_phrase = phrase
+                match_source = "match_phrase"
         for value in rule.get("value_candidates", []) or []:
             value_tokens = set(_stem_tokens(_tokenize(value)))
             overlap = _tokens_overlap(query_tokens, value_tokens)
-            threshold = 1 if len(value_tokens) <= 1 else min(2, len(value_tokens))
+            raw_value_tokens = _raw_tokenize(value)
+            threshold = 1 if len(raw_value_tokens) <= 1 else min(2, len(raw_value_tokens))
             if overlap >= threshold and overlap > best:
                 best = overlap
                 matched_phrase = value
+                match_source = "value_candidate"
         if best > 0:
             enriched = dict(rule)
             enriched["match_score"] = float(best)
             enriched["matched_phrase"] = matched_phrase
+            enriched["match_source"] = match_source
             matched.append(enriched)
-    matched.sort(key=lambda item: item.get("match_score", 0.0), reverse=True)
-    return matched
+
+    # Если запрос уже содержит более специфичную фразу, не оставляем рядом
+    # общий «вложенный» матч по её подмножеству. Пример:
+    # - "фактический отток" -> task_subtype
+    # - "отток" -> task_type
+    # Для запроса "по фактическому оттоку" второй матч не должен провоцировать
+    # clarification: пользователь уже задал более точный признак.
+    pruned: list[dict[str, Any]] = []
+    matched_token_sets: list[set[str]] = [
+        set(_stem_tokens(_tokenize(str(item.get("matched_phrase") or ""))))
+        for item in matched
+    ]
+    for idx, item in enumerate(matched):
+        current_tokens = matched_token_sets[idx]
+        dominated = False
+        if current_tokens:
+            for other_idx, other in enumerate(matched):
+                if other_idx == idx:
+                    continue
+                other_tokens = matched_token_sets[other_idx]
+                if not other_tokens or current_tokens == other_tokens:
+                    continue
+                if current_tokens < other_tokens:
+                    dominated = True
+                    break
+        if not dominated:
+            pruned.append(item)
+    pruned.sort(
+        key=lambda item: (
+            item.get("match_score", 0.0),
+            len(_stem_tokens(_tokenize(str(item.get("matched_phrase") or "")))),
+        ),
+        reverse=True,
+    )
+    return pruned

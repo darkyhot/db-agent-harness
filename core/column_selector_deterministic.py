@@ -30,6 +30,7 @@ from typing import Any
 
 import pandas as pd
 
+from core.semantic_frame import sanitize_user_input_for_semantics
 from core.synonym_map import expand_with_synonyms
 
 logger = logging.getLogger(__name__)
@@ -183,8 +184,12 @@ _METRIC_PARTS = frozenset({
 _STATUS_PARTS = frozenset({'status', 'state', 'flag', 'type', 'code', 'category', 'kind'})
 _METRIC_SUFFIXES = ('_qty', '_amt', '_sum', '_cnt', '_perc', '_pct', '_amount', '_value')
 _LABEL_SUFFIXES = ('_name', '_label', '_title')
-_DATE_HINTS = frozenset({'date', 'dt', 'dttm', 'timestamp', 'data'})
+_DATE_HINTS = frozenset({'date', 'dt', 'dttm', 'timestamp'})
 _COUNT_HINTS = frozenset({'count', 'kolichestvo', 'qty', 'cnt'})
+_TABLE_ARTIFACT_TOKENS = frozenset({
+    'schema', 'data', 'dwh', 'fact', 'dim', 'split', 'funnel', 'mart', 'table', 'tbl',
+})
+_DIMENSION_QUERY_STEMS = ('сегмент', 'регион', 'госб', 'тб', 'филиал')
 _TRANSLIT_TABLE = str.maketrans({
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
     'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
@@ -252,6 +257,44 @@ def _looks_like_explicit_column(token: str) -> bool:
     return "_" in lower or lower.endswith(_METRIC_SUFFIXES + _LABEL_SUFFIXES + ('_id', '_code'))
 
 
+def _looks_like_table_artifact(token: str) -> bool:
+    lower = str(token or '').lower().strip()
+    if not lower or '.' in lower:
+        return True if '.' in lower else False
+    parts = [p for p in lower.split('_') if p]
+    if len(parts) < 3:
+        return False
+    hits = sum(1 for part in parts if part in _TABLE_ARTIFACT_TOKENS)
+    return hits >= 2
+
+
+def _is_probable_grouping_token(raw_token: str) -> bool:
+    token = str(raw_token or '').strip().lower()
+    if not token:
+        return False
+    if _looks_like_table_artifact(token):
+        return False
+    if token in {'дата', 'дате', 'date', 'report_dt'}:
+        return True
+    if _looks_like_explicit_column(token):
+        return True
+    return any(token.startswith(stem) for stem in _DIMENSION_QUERY_STEMS)
+
+
+def _is_trustworthy_dimension(slot: str) -> bool:
+    lower = str(slot or '').lower().strip()
+    if not lower:
+        return False
+    if _looks_like_table_artifact(lower):
+        return False
+    parts = [p for p in lower.split('_') if p]
+    if not parts:
+        return False
+    if len(parts) == 1 and not any(parts[0].startswith(stem) for stem in _DIMENSION_QUERY_STEMS) and parts[0] != 'date':
+        return False
+    return True
+
+
 def _is_label_slot(slot: str) -> bool:
     return slot.endswith(_LABEL_SUFFIXES) or slot in {'name', 'label'}
 
@@ -284,14 +327,14 @@ def _fuzzy_overlap_score(slot_tokens: set[str], source_tokens: set[str]) -> floa
 
 def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str, Any]:
     """Вытащить из user_input явные аналитические слоты без LLM."""
-    query = _normalize_query_text(user_input)
+    query = _normalize_query_text(sanitize_user_input_for_semantics(user_input))
     agg_hint = str(intent.get('aggregation_hint') or '').lower().strip()
     query_tokens = _tokenize(query)
     dimensions: list[str] = []
 
     explicit_cols = [
         t for t in re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', query)
-        if _looks_like_explicit_column(t)
+        if _looks_like_explicit_column(t) and not _looks_like_table_artifact(t)
     ]
     for col in explicit_cols:
         lower = col.lower()
@@ -299,19 +342,20 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
             dimensions.append(lower)
 
     for m in re.finditer(r'(?:по|в разбивке по)\s+([a-zA-Zа-яА-ЯёЁ_]+)', query):
-        concept = _normalize_concept(m.group(1))
+        raw_token = str(m.group(1) or "").strip()
+        concept = _normalize_concept(raw_token)
         if not concept:
             continue
         if any(tok in _DATE_HINTS for tok in concept.split('_')):
             dimensions.append('date')
-        elif _looks_like_explicit_column(m.group(1)):
-            dimensions.append(m.group(1).lower())
-        else:
-            dimensions.append(f'{concept}_name')
+        elif _looks_like_explicit_column(raw_token) and not _looks_like_table_artifact(raw_token):
+            dimensions.append(raw_token.lower())
+        elif _is_probable_grouping_token(raw_token):
+            dimensions.append(concept)
 
     for m in re.finditer(r'(?:названи[еяю]|наименовани[еяю])\s+([a-zA-Zа-яА-ЯёЁ_]+)', query):
         concept = _normalize_concept(m.group(1))
-        if concept:
+        if concept and not _looks_like_table_artifact(concept):
             dimensions.append(f'{concept}_name')
 
     metric: str | None = None
@@ -350,7 +394,7 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
         if any(tok in _DATE_HINTS for tok in concept.split('_')):
             if 'date' not in dimensions:
                 dimensions.append('date')
-        elif concept not in dimensions and f'{concept}_name' not in dimensions:
+        elif concept not in dimensions and f'{concept}_name' not in dimensions and not _looks_like_table_artifact(concept):
             dimensions.append(concept)
 
     return {
@@ -569,6 +613,88 @@ def _metric_score(col_name: str, entities: list[str]) -> float:
     return min(base + entity_hit * 0.4, 1.0)
 
 
+def _choose_single_entity_count_column(
+    table_key: str,
+    schema_loader: Any,
+    entities: list[str],
+    subject: str = "",
+) -> str | None:
+    """Подобрать PK/identifier-колонку для single-entity COUNT на факте."""
+    parts = table_key.split(".", 1)
+    if len(parts) != 2:
+        return None
+    schema_name, table_name = parts
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return None
+
+    best: tuple[float, str] | None = None
+    subject = str(subject or "").strip().lower()
+    subject_tokens = [subject] if subject else []
+    query_entities = [str(e).strip() for e in entities if str(e).strip()]
+
+    for _, row in cols_df.iterrows():
+        col_name = str(row.get("column_name", "") or "").strip()
+        if not col_name:
+            continue
+        desc = str(row.get("description", "") or "")
+        is_pk = bool(row.get("is_primary_key", False))
+        dtype = str(row.get("dType", "") or "").lower().strip()
+        unique_perc = float(row.get("unique_perc", 0) or 0)
+        semantics = schema_loader.get_column_semantics(schema_name, table_name, col_name)
+        sem_class = str(semantics.get("semantic_class", "") or "")
+
+        score = 0.0
+        if is_pk:
+            score += 140.0
+        if sem_class == "identifier":
+            score += 80.0
+        if sem_class == "join_key":
+            score += 20.0
+        if unique_perc >= 95.0:
+            score += 45.0
+        elif unique_perc >= 80.0:
+            score += 20.0
+        if _is_numeric(dtype):
+            score -= 40.0
+
+        entity_match = _entity_score(col_name, desc, query_entities + subject_tokens)
+        score += entity_match * 90.0
+
+        lower_name = col_name.lower()
+        if lower_name.endswith("_code"):
+            score += 35.0
+        if lower_name.endswith("_id"):
+            score += 15.0
+        if subject == "task" and "task" in lower_name:
+            score += 25.0
+        if subject == "client" and any(tok in lower_name for tok in ("client", "cust", "inn")):
+            score += 25.0
+        if subject == "employee" and any(tok in lower_name for tok in ("employee", "staff", "emp")):
+            score += 25.0
+
+        candidate = (score, col_name)
+        if best is None or candidate > best:
+            best = candidate
+
+    if best is None or best[0] < 60.0:
+        return None
+    return best[1]
+
+
+def _is_scalar_count_request(
+    agg_hint: str,
+    semantic_output_dimensions: list[str],
+    explicit_count_metric: bool,
+) -> bool:
+    """True для запросов вида «сколько задач ...» без разбивки."""
+    if agg_hint != "count":
+        return False
+    if explicit_count_metric:
+        return False
+    return not semantic_output_dimensions
+
+
 # ---------------------------------------------------------------------------
 # Основная функция
 # ---------------------------------------------------------------------------
@@ -581,6 +707,7 @@ def select_columns(
     schema_loader: Any,
     user_input: str = "",
     user_hints: dict[str, Any] | None = None,
+    semantic_frame: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Детерминированно выбрать колонки и JOIN-спецификацию.
 
@@ -590,7 +717,8 @@ def select_columns(
         table_types:       dict schema.table → "fact"/"dim"/"ref"/"unknown"
         join_analysis_data: dict из table_explorer (pre-computed join candidates)
         schema_loader:     SchemaLoader для доступа к колонкам и check_key_uniqueness
-        user_hints:        dict из hint_extractor (dim_sources, join_fields, having_hints)
+    user_hints:        dict из hint_extractor (dim_sources, join_fields, having_hints)
+    semantic_frame:    Семантический фрейм запроса; нужен для requires_single_entity_count
 
     Returns:
         dict с ключами: selected_columns, join_spec, confidence, reason
@@ -600,6 +728,25 @@ def select_columns(
     date_filters: dict = intent.get('date_filters') or {}
     filter_conditions: list[dict] = intent.get('filter_conditions') or []
     requested = _derive_requested_slots(user_input, intent)
+    frame = dict(semantic_frame or {})
+    requires_single_entity_count = bool(frame.get("requires_single_entity_count"))
+    semantic_output_dimensions = [
+        dim for dim in list(frame.get("output_dimensions") or [])
+        if _is_trustworthy_dimension(dim)
+    ]
+    if semantic_output_dimensions:
+        requires_single_entity_count = False
+    scalar_count_request = _is_scalar_count_request(
+        agg_hint=agg_hint,
+        semantic_output_dimensions=semantic_output_dimensions,
+        explicit_count_metric=bool(requested.get("explicit_count_metric")),
+    )
+    logger.info(
+        "ColumnSelectorDet: requested=%s, requires_single_entity_count=%s, scalar_count_request=%s",
+        requested,
+        requires_single_entity_count,
+        scalar_count_request,
+    )
 
     # Подсказки пользователя: связки «слот → таблица», JOIN-поля, HAVING-хинты.
     user_hints = user_hints or {}
@@ -673,35 +820,38 @@ def select_columns(
             # Не кладём PK и числовые метрики в group_by если они не упомянуты в entities
             gb_s = 0.0
             if not is_pk:
-                entity_hit = _entity_score(col_name, desc, entities)
-                slot_hit = max(
-                    [_semantic_match_score(col_name, desc, slot) for slot in requested['dimensions']],
-                    default=0.0,
-                )
-                if _is_categorical(dtype):
-                    gb_s += 0.25
-                if (entity_hit > 0 or slot_hit > 0) and unique_perc > 0 and unique_perc < 30:
-                    gb_s += 0.20
-                gb_s += max(entity_hit, slot_hit) * 0.75
-                # Числовые — только если явно упомянуты в entities
-                if _is_numeric(dtype) and max(entity_hit, slot_hit) < 0.3:
+                if scalar_count_request:
                     gb_s = 0.0
-                if _is_date(dtype):
-                    if slot_hit >= 0.8:
-                        gb_s = max(gb_s, 0.95)
-                    else:
-                        gb_s = min(gb_s, 0.2)
-                    # Подавляем дата-колонки в таблицах, которые выступают dim-источником
-                    # для нечасовых слотов. Дата берётся из фактовой таблицы; справочник
-                    # нужен только ради своего атрибута (сегмент, регион и т.п.).
-                    if gb_s > 0.05 and hint_dim_sources:
-                        _is_nondated_dim_src = any(
-                            b.get('table') == table_key and sk != 'date'
-                            for sk, b in hint_dim_sources.items()
-                            if isinstance(b, dict)
-                        )
-                        if _is_nondated_dim_src:
-                            gb_s = 0.05
+                else:
+                    entity_hit = _entity_score(col_name, desc, entities)
+                    slot_hit = max(
+                        [_semantic_match_score(col_name, desc, slot) for slot in requested['dimensions']],
+                        default=0.0,
+                    )
+                    if _is_categorical(dtype):
+                        gb_s += 0.25
+                    if (entity_hit > 0 or slot_hit > 0) and unique_perc > 0 and unique_perc < 30:
+                        gb_s += 0.20
+                    gb_s += max(entity_hit, slot_hit) * 0.75
+                    # Числовые — только если явно упомянуты в entities
+                    if _is_numeric(dtype) and max(entity_hit, slot_hit) < 0.3:
+                        gb_s = 0.0
+                    if _is_date(dtype):
+                        if slot_hit >= 0.8:
+                            gb_s = max(gb_s, 0.95)
+                        else:
+                            gb_s = min(gb_s, 0.2)
+                        # Подавляем дата-колонки в таблицах, которые выступают dim-источником
+                        # для нечасовых слотов. Дата берётся из фактовой таблицы; справочник
+                        # нужен только ради своего атрибута (сегмент, регион и т.п.).
+                        if gb_s > 0.05 and hint_dim_sources:
+                            _is_nondated_dim_src = any(
+                                b.get('table') == table_key and sk != 'date'
+                                for sk, b in hint_dim_sources.items()
+                                if isinstance(b, dict)
+                            )
+                            if _is_nondated_dim_src:
+                                gb_s = 0.05
             if gb_s > 0:
                 gb_candidates.append((col_name, round(gb_s, 3)))
 
@@ -751,7 +901,7 @@ def select_columns(
         group_by_cols = [c for c, s in gb_sorted if s > 0.30 and c not in agg_set][:3]
 
         # COUNT DISTINCT на dim-таблице: group_by не нужен (считаем сами PK-сущности)
-        if _use_count_distinct:
+        if _use_count_distinct or scalar_count_request:
             group_by_cols = []
 
         # select = group_by ∪ aggregate (без дублей, порядок: group_by первым)
@@ -962,9 +1112,60 @@ def select_columns(
             main_table = next(iter(table_structures), None)
         if main_table:
             roles = selected_columns.setdefault(main_table, {})
-            roles.setdefault('aggregate', [])
-            if '*' not in roles['aggregate']:
-                roles['aggregate'].append('*')
+            if requires_single_entity_count or scalar_count_request:
+                count_col = _choose_single_entity_count_column(
+                    main_table,
+                    schema_loader,
+                    entities=entities,
+                    subject=str(frame.get("subject") or requested.get("metric") or ""),
+                )
+                if count_col:
+                    roles['aggregate'] = [count_col]
+                    roles['select'] = [count_col]
+                    roles.pop('group_by', None)
+                    logger.info(
+                        "ColumnSelectorDet: single-entity count → %s.%s",
+                        main_table, count_col,
+                    )
+                else:
+                    roles.setdefault('aggregate', [])
+                    if '*' not in roles['aggregate']:
+                        roles['aggregate'].append('*')
+            else:
+                roles.setdefault('aggregate', [])
+                if '*' not in roles['aggregate']:
+                    roles['aggregate'].append('*')
+            if roles.get('aggregate') == ['*']:
+                count_col = _choose_single_entity_count_column(
+                    main_table,
+                    schema_loader,
+                    entities=entities,
+                    subject=str(frame.get("subject") or requested.get("metric") or ""),
+                )
+                if count_col:
+                    roles['aggregate'] = [count_col]
+                    roles['select'] = [count_col]
+                    roles.pop('group_by', None)
+                    logger.info(
+                        "ColumnSelectorDet: count fallback → %s.%s",
+                        main_table, count_col,
+                    )
+
+    if requires_single_entity_count or scalar_count_request:
+        main_fact = next((t for t, tp in table_types.items() if tp == 'fact'), None)
+        for table_key, roles in list(selected_columns.items()):
+            if table_key != main_fact:
+                roles.pop('group_by', None)
+                non_agg_select = [
+                    c for c in roles.get('select', [])
+                    if c in roles.get('aggregate', [])
+                ]
+                if non_agg_select:
+                    roles['select'] = non_agg_select
+                elif not roles.get('filter'):
+                    selected_columns.pop(table_key, None)
+            else:
+                roles.pop('group_by', None)
 
     if requested['dimensions']:
         allowed_refs: set[tuple[str, str]] = set()
@@ -1065,6 +1266,7 @@ def select_columns(
         overall = min(overall, 0.99)
 
     logger.info('ColumnSelectorDet: %s', reason)
+    logger.info('ColumnSelectorDet: selected_columns=%s', selected_columns)
 
     return {
         'selected_columns': selected_columns,

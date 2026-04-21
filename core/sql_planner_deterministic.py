@@ -304,9 +304,88 @@ def _compute_having(
 # 3. Агрегация
 # ---------------------------------------------------------------------------
 
+def _count_column_should_be_distinct(
+    selected_columns: dict[str, dict],
+    column: str,
+    schema_loader=None,
+    semantic_frame: dict | None = None,
+) -> bool:
+    """Определить, нужно ли считать COUNT по колонке как DISTINCT."""
+    if not column or column == "*":
+        return False
+    if (semantic_frame or {}).get("requires_single_entity_count"):
+        return True
+    if schema_loader is None:
+        return False
+
+    for table_key, roles in selected_columns.items():
+        if column not in roles.get("aggregate", []):
+            continue
+        parts = table_key.split(".", 1)
+        if len(parts) != 2:
+            continue
+        schema_name, table_name = parts
+        cols_df = schema_loader.get_table_columns(schema_name, table_name)
+        if cols_df.empty:
+            continue
+        matched = cols_df[cols_df["column_name"].astype(str).str.lower() == column.lower()]
+        if matched.empty:
+            continue
+        row = matched.iloc[0]
+        if bool(row.get("is_primary_key", False)):
+            return True
+        semantics = schema_loader.get_column_semantics(schema_name, table_name, column)
+        if str(semantics.get("semantic_class", "") or "").lower() == "identifier":
+            return True
+    return False
+
+
+def _choose_count_identifier_column(
+    main_table: str,
+    schema_loader,
+) -> str | None:
+    """Подобрать identifier/PK-колонку для COUNT(DISTINCT ...) safety net."""
+    if not main_table or schema_loader is None or "." not in main_table:
+        return None
+    schema_name, table_name = main_table.split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return None
+
+    best: tuple[float, str] | None = None
+    for _, row in cols_df.iterrows():
+        col_name = str(row.get("column_name", "") or "").strip()
+        if not col_name:
+            continue
+        score = 0.0
+        if bool(row.get("is_primary_key", False)):
+            score += 100.0
+        unique_perc = float(row.get("unique_perc", 0) or 0)
+        if unique_perc >= 95.0:
+            score += 40.0
+        semantics = schema_loader.get_column_semantics(schema_name, table_name, col_name)
+        sem_class = str(semantics.get("semantic_class", "") or "").lower()
+        if sem_class == "identifier":
+            score += 60.0
+        lower_name = col_name.lower()
+        if lower_name.endswith("_code"):
+            score += 20.0
+        if lower_name.endswith("_id"):
+            score += 10.0
+        candidate = (score, col_name)
+        if best is None or candidate > best:
+            best = candidate
+    if best is None or best[0] < 50.0:
+        return None
+    return best[1]
+
+
 def _compute_aggregation(
     intent: dict,
     selected_columns: dict[str, dict],
+    *,
+    schema_loader=None,
+    semantic_frame: dict | None = None,
 ) -> dict | None:
     """Вычислить агрегацию из intent.aggregation_hint + aggregate-роли колонок."""
     hint = (intent.get("aggregation_hint") or "").lower().strip()
@@ -321,11 +400,17 @@ def _compute_aggregation(
         agg_cols = roles.get("aggregate", [])
         if agg_cols:
             col = agg_cols[0]
-            alias = f"{func.lower()}_{col}"
-            # COUNT DISTINCT: если агрегируемая колонка явно помечена (_count_distinct)
-            # или если hint=count и колонка выглядит как PK (имя оканчивается на _id/_num)
+            alias = "count_all" if hint == "count" and col == "*" else f"{func.lower()}_{col}"
             distinct = False
-            if hint == "count" and col != "*":
+            if hint == "count" and (
+                col.lower().endswith("_count_distinct")
+                or _count_column_should_be_distinct(
+                    selected_columns,
+                    col,
+                    schema_loader=schema_loader,
+                    semantic_frame=semantic_frame,
+                )
+            ):
                 distinct = True
             result: dict = {"function": func, "column": col, "alias": alias}
             if distinct:
@@ -334,7 +419,7 @@ def _compute_aggregation(
 
     # Нет явной aggregate-роли — COUNT(*) как fallback для count
     if hint == "count":
-        return {"function": "COUNT", "column": "*", "alias": "cnt"}
+        return {"function": "COUNT", "column": "*", "alias": "count_all"}
 
     return None
 
@@ -578,6 +663,7 @@ def build_blueprint(
     schema_loader=None,
     semantic_frame: dict | None = None,
     user_filter_choices: dict[str, str] | None = None,
+    rejected_filter_choices: dict[str, list[str]] | None = None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -594,7 +680,12 @@ def build_blueprint(
     Returns:
         dict совместимый с форматом sql_blueprint из AgentState.
     """
-    aggregation = _compute_aggregation(intent, selected_columns)
+    aggregation = _compute_aggregation(
+        intent,
+        selected_columns,
+        schema_loader=schema_loader,
+        semantic_frame=semantic_frame,
+    )
     strategy, main_table = _determine_strategy(table_types, join_spec)
 
     # --- Блок C: date-aligned JOIN (axis-join по дате) ---
@@ -616,6 +707,32 @@ def build_blueprint(
             "DeterministicPlanner: date-aligned JOIN по оси '%s' → fact_fact_join",
             axis_column,
         )
+
+    if (
+        str((intent or {}).get("aggregation_hint") or "").lower().strip() == "count"
+        and (semantic_frame or {}).get("requires_single_entity_count")
+        and schema_loader is not None
+        and main_table
+    ):
+        main_roles = selected_columns.setdefault(main_table, {})
+        suspicious_group_by = list(main_roles.get("group_by", []) or [])
+        fallback_col = None
+        if main_roles.get("aggregate") == ["*"] or suspicious_group_by:
+            fallback_col = _choose_count_identifier_column(main_table, schema_loader)
+        if fallback_col:
+            main_roles["aggregate"] = [fallback_col]
+            main_roles["select"] = [fallback_col]
+            main_roles.pop("group_by", None)
+            aggregation = _compute_aggregation(
+                intent,
+                selected_columns,
+                schema_loader=schema_loader,
+                semantic_frame=semantic_frame,
+            )
+            logger.info(
+                "DeterministicPlanner: single-entity safety net → %s.%s",
+                main_table, fallback_col,
+            )
 
     # Если одна таблица даёт метрику, а вторая только атрибуты для группировки/селекта,
     # рассматриваем вторую как dimension-like источник атрибута, даже если её тип unknown/fact.
@@ -649,6 +766,7 @@ def build_blueprint(
         semantic_frame=semantic_frame,
         base_conditions=base_where_conditions,
         user_filter_choices=user_filter_choices,
+        rejected_filter_choices=rejected_filter_choices,
     )
     where_conditions = where_resolution.get("conditions", base_where_conditions)
 
@@ -678,17 +796,45 @@ def build_blueprint(
                             )
                         break
 
-    # Если есть агрегация — filter-колонки без WHERE-условия нужны в GROUP BY.
-    # Типичный случай: column_selector кладёт report_dt в filter, но пользователь
-    # хочет группировку «по дате» — и явного фильтра по дате нет.
+    # Filter-only колонки не должны автоматически утекать в GROUP BY.
+    # Добавляем их только если пользователь действительно просил измерение
+    # в required_output/output_dimensions.
     if aggregation:
         where_str = " ".join(where_conditions).lower()
         seen_gb: set[str] = set(group_by)
+        requested_dimensions = {
+            str(v).strip().lower()
+            for v in list((semantic_frame or {}).get("output_dimensions") or [])
+            + list(required_output)
+            if str(v).strip()
+        }
         for _table, roles in selected_columns.items():
             for col in roles.get("filter", []):
-                if col not in seen_gb and col.lower() not in where_str:
+                col_lower = col.lower()
+                should_group = any(
+                    dim in col_lower or col_lower in dim
+                    for dim in requested_dimensions
+                )
+                if not should_group and "date" in requested_dimensions:
+                    should_group = any(
+                        col_lower.endswith(suf)
+                        for suf in ("_dt", "_date", "_dttm", "_timestamp", "_ts")
+                    ) or "date" in col_lower or "dttm" in col_lower or "timestamp" in col_lower
+                if should_group and col not in seen_gb and col_lower not in where_str:
                     group_by.append(col)
                     seen_gb.add(col)
+
+    if (
+        aggregation
+        and (semantic_frame or {}).get("requires_single_entity_count")
+        and not list((semantic_frame or {}).get("output_dimensions") or [])
+    ):
+        if group_by:
+            logger.info(
+                "DeterministicPlanner: single-entity count → очищаю group_by=%s",
+                group_by,
+            )
+        group_by = []
 
     # CTE нужен при: fact+fact, dim+dim, или при небезопасном JOIN
     cte_needed = (

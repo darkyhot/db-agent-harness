@@ -198,12 +198,6 @@ def _build_condition(column: str, operator: str, value: Any, profile: dict[str, 
         return f"{column} = '{_escape_sql_literal(str(value))}'"
 
     if op == "ILIKE":
-        tokens = [tok for tok in _tokenize(str(value)) if len(tok) >= 4]
-        if len(tokens) >= 2:
-            unique_tokens = list(dict.fromkeys(tokens))
-            return " AND ".join(
-                f"{column} ILIKE '%{_escape_sql_literal(token)}%'" for token in unique_tokens
-            )
         return f"{column} ILIKE '%{_escape_sql_literal(str(value))}%'"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return f"{column} {op} {value}"
@@ -275,6 +269,9 @@ def rank_filter_candidates(
                 unique_perc = 0.0
 
             for request in requests:
+                request_column_key = str(request.get("column_key") or "").strip().lower()
+                if request_column_key and key != request_column_key:
+                    continue
                 query_text = str(request.get("query_text") or request.get("value") or "")
                 if not query_text:
                     continue

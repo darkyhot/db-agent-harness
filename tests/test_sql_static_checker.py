@@ -77,6 +77,14 @@ class TestSelectStar:
         assert result.errors
 
 
+class TestSyntaxSanity:
+    def test_unbalanced_parenthesis_is_error(self):
+        sql = "SELECT COUNT(*) AS cnt FROM dm.sales WHERE (region = 'Msk'"
+        result = check_sql(sql, check_columns=False)
+        assert not result.is_valid
+        assert any("скоб" in err.lower() for err in result.errors)
+
+
 # ---------------------------------------------------------------------------
 # check_columns=False режим (без каталога)
 # ---------------------------------------------------------------------------

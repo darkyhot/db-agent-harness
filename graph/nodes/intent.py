@@ -25,12 +25,41 @@ from core.column_selector_deterministic import (
 from core.join_analysis import detect_table_type
 from core.sql_planner_deterministic import _derive_date_filters_from_text
 from core.semantic_frame import derive_semantic_frame
+from core.semantic_frame import sanitize_user_input_for_semantics
 from core.domain_rules import table_bonus_for_frame, table_can_satisfy_frame
 from core.join_governor import decide_join_plan
 from core.confidence import evaluate_join_confidence, evaluate_table_confidence, build_planning_confidence
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_forced_single_source(
+    query_norm: str,
+    tables_df,
+) -> tuple[str, str] | None:
+    """Вытащить таблицу из служебной фразы `использовать таблицу schema.table`.
+
+    CLI уже дописывает такую фразу после выбора витрины. Для planner это должен
+    быть жёсткий single-source сигнал, а не просто ещё одно явное упоминание.
+    """
+    match = re.search(
+        r"использовать\s+таблицу\s+([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)",
+        query_norm,
+    )
+    if not match or tables_df is None or tables_df.empty:
+        return None
+    schema_name = match.group(1).lower()
+    table_name = match.group(2).lower()
+    mask = (
+        tables_df["schema_name"].astype(str).str.lower() == schema_name
+    ) & (
+        tables_df["table_name"].astype(str).str.lower() == table_name
+    )
+    if tables_df[mask].empty:
+        return None
+    row = tables_df[mask].iloc[0]
+    return (str(row["schema_name"]), str(row["table_name"]))
 
 
 class IntentNodes:
@@ -330,10 +359,15 @@ class IntentNodes:
                 "Не хватает деталей, чтобы корректно продолжить. Уточните, пожалуйста, запрос."
             )
 
-        semantic_frame = derive_semantic_frame(user_input, intent, schema_loader=self.schema)
+        semantic_input = sanitize_user_input_for_semantics(user_input)
+        semantic_frame = derive_semantic_frame(semantic_input, intent, schema_loader=self.schema)
         logger.info(
             "IntentClassifier: semantic_frame=%s",
             summarize_dict_keys(semantic_frame, label="semantic_frame"),
+        )
+        logger.info(
+            "IntentClassifier: semantic_frame_full=%s",
+            semantic_frame,
         )
 
         self.memory.add_message(
@@ -512,9 +546,13 @@ class IntentNodes:
 
         # --- Детерминированная коррекция по семантике запроса и каталогу ---
         query_norm = _normalize_query_text(user_input)
-        requested = _derive_requested_slots(user_input, intent)
-        semantic_frame = state.get("semantic_frame", {}) or derive_semantic_frame(user_input, intent, schema_loader=self.schema)
+        semantic_input = sanitize_user_input_for_semantics(user_input)
+        requested = _derive_requested_slots(semantic_input, intent)
+        semantic_frame = state.get("semantic_frame", {}) or derive_semantic_frame(semantic_input, intent, schema_loader=self.schema)
+        logger.info("TableResolver: user_input_full=%r", user_input)
+        logger.info("TableResolver: semantic_frame_full=%s", semantic_frame)
         tables_df = self.schema.tables_df
+        forced_single_source = _extract_forced_single_source(query_norm, tables_df)
 
         # === Подсказки пользователя (hint_extractor) ===
         user_hints = state.get("user_hints", {}) or {}
@@ -739,6 +777,16 @@ class IntentNodes:
             full = f"{schema_name}.{table_name}".lower()
             if table_name.lower() in query_norm or full in query_norm:
                 explicit_tables.append((schema_name, table_name))
+        if forced_single_source is not None:
+            explicit_tables = [forced_single_source]
+            validated_tables = [forced_single_source]
+            table_confidences = {
+                f"{forced_single_source[0]}.{forced_single_source[1]}": 100
+            }
+            logger.info(
+                "TableResolver: жёстко фиксирую single-source таблицу %s.%s",
+                forced_single_source[0], forced_single_source[1],
+            )
 
         # Hard-lock: must_keep = explicit_tables ∪ user_hints.must_keep_tables.
         # Эти таблицы НЕ могут быть исключены детерминированной коррекцией.
@@ -772,7 +820,9 @@ class IntentNodes:
         # Для больших каталогов (>100 таблиц) без явных упоминаний: предварительная фильтрация
         # через TF-IDF/keyword поиск сокращает O(N*cols) scoring до O(top_k*cols).
         _LARGE_CATALOG = 100
-        if len(explicit_tables) >= 2:
+        if forced_single_source is not None:
+            candidate_tables = [forced_single_source]
+        elif len(explicit_tables) >= 2:
             candidate_tables = explicit_tables
         elif len(tables_df) > _LARGE_CATALOG and not explicit_tables:
             search_parts = [user_input]
@@ -1048,6 +1098,8 @@ class IntentNodes:
         if (
             not explicit_tables
             and not hint_must_keep
+            and forced_single_source is None
+            and not join_requested
             and len(ranked_main_candidates) >= 2
         ):
             top_1 = ranked_main_candidates[0]

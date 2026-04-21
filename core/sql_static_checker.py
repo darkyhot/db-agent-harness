@@ -197,6 +197,34 @@ def _check_select_star(sql: str, result: StaticCheckResult) -> None:
         )
 
 
+def _check_balanced_delimiters(sql: str, result: StaticCheckResult) -> None:
+    """Проверить баланс круглых скобок и кавычек в простом виде.
+
+    Это не полноценный SQL parser, но хорошо ловит самые частые артефакты
+    генерации: лишнюю `)` или незакрытую `(`, которые иначе всплывают только
+    на этапе EXPLAIN.
+    """
+    paren_depth = 0
+    in_single = False
+    for idx, ch in enumerate(sql):
+        if ch == "'" and (idx == 0 or sql[idx - 1] != "\\"):
+            in_single = not in_single
+            continue
+        if in_single:
+            continue
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+            if paren_depth < 0:
+                result.add_error("SQL содержит лишнюю закрывающую скобку.")
+                return
+    if in_single:
+        result.add_error("SQL содержит незакрытую строковую кавычку.")
+    if paren_depth > 0:
+        result.add_error("SQL содержит незакрытую круглую скобку.")
+
+
 def _build_alias_to_table_map(sql: str, real_tables: dict[tuple[str, str], set[str]]) -> dict[str, tuple[str, str]]:
     """Построить маппинг алиас/имя_таблицы → (schema, table).
 
@@ -237,6 +265,105 @@ def _build_alias_to_table_map(sql: str, real_tables: dict[tuple[str, str], set[s
     return alias_map
 
 
+def _extract_projection_names(select_sql: str) -> set[str]:
+    """Извлечь имена колонок/алиасов из SELECT-части запроса."""
+    select_match = re.search(r"(?is)\bSELECT\b(.+?)\bFROM\b", select_sql, re.DOTALL)
+    if not select_match:
+        return set()
+
+    body = select_match.group(1)
+    items: list[str] = []
+    current = ""
+    depth = 0
+    for ch in body:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            if current.strip():
+                items.append(current.strip())
+            current = ""
+            continue
+        current += ch
+    if current.strip():
+        items.append(current.strip())
+
+    names: set[str] = set()
+    for item in items:
+        alias_match = re.search(r"(?i)\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*$", item)
+        if alias_match:
+            names.add(alias_match.group(1).lower())
+            continue
+        token = item.strip()
+        if "." in token:
+            token = token.rsplit(".", 1)[-1]
+        token = token.strip('"').strip()
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", token):
+            names.add(token.lower())
+    return names
+
+
+def _extract_cte_columns(sql: str) -> dict[str, set[str]]:
+    """Извлечь имена колонок, объявленных в top-level CTE."""
+    stripped = sql.strip()
+    if not re.match(r"(?is)^WITH\b", stripped):
+        return {}
+
+    pos = re.match(r"(?is)^WITH\b", stripped).end()
+    cte_columns: dict[str, set[str]] = {}
+
+    while pos < len(stripped):
+        while pos < len(stripped) and stripped[pos].isspace():
+            pos += 1
+        name_match = re.match(r"([a-zA-Z_][a-zA-Z0-9_]*)", stripped[pos:])
+        if not name_match:
+            break
+        cte_name = name_match.group(1).lower()
+        pos += name_match.end()
+
+        while pos < len(stripped) and stripped[pos].isspace():
+            pos += 1
+        if not re.match(r"(?is)AS\s*\(", stripped[pos:]):
+            break
+        as_match = re.match(r"(?is)AS\s*\(", stripped[pos:])
+        pos += as_match.end()
+
+        depth = 1
+        body_start = pos
+        while pos < len(stripped) and depth > 0:
+            if stripped[pos] == "(":
+                depth += 1
+            elif stripped[pos] == ")":
+                depth -= 1
+            pos += 1
+        cte_body = stripped[body_start:pos - 1]
+        cte_columns[cte_name] = _extract_projection_names(cte_body)
+
+        while pos < len(stripped) and stripped[pos].isspace():
+            pos += 1
+        if pos >= len(stripped) or stripped[pos] != ",":
+            break
+        pos += 1
+
+    return cte_columns
+
+
+def _build_source_alias_map(sql: str) -> dict[str, str]:
+    """Построить alias -> source_name для FROM/JOIN, включая CTE."""
+    alias_map: dict[str, str] = {}
+    source_pat = re.compile(
+        r'(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_\.]*)'
+        r'(?:\s+AS)?\s+([a-zA-Z_][a-zA-Z0-9_]*)',
+        re.IGNORECASE,
+    )
+    for match in source_pat.finditer(sql):
+        source = match.group(1).lower()
+        alias = match.group(2).lower()
+        alias_map[alias] = source
+    return alias_map
+
+
 def _check_columns_against_catalog(
     sql: str,
     schema_loader,
@@ -270,6 +397,8 @@ def _check_columns_against_catalog(
 
     # Строим alias → (schema, table) маппинг с учётом явных алиасов из SQL
     alias_to_table = _build_alias_to_table_map(sql, real_tables)
+    cte_columns = _extract_cte_columns(sql)
+    source_alias_map = _build_source_alias_map(sql)
 
     # Объединённый список всех реальных колонок (для fallback)
     all_real_columns: set[str] = set()
@@ -312,6 +441,9 @@ def _check_columns_against_catalog(
             if right not in table_cols:
                 suspicious_cols.append(f"{left}.{right}")
         else:
+            source_name = source_alias_map.get(left, left)
+            if source_name in cte_columns and right in cte_columns[source_name]:
+                continue
             # Алиас не распознан → fallback: проверяем против всех колонок
             if right not in all_real_columns:
                 suspicious_cols.append(f"{left}.{right}")
@@ -771,6 +903,9 @@ def check_sql(
 
     # 1. Кириллические алиасы — жёсткая ошибка, если остались
     _check_cyrillic_aliases(sql, result)
+
+    # 1a. Грубая синтаксическая sanity-проверка скобок/кавычек
+    _check_balanced_delimiters(sql, result)
 
     # 2. SELECT * — жёсткая ошибка (запрещено правилами агента)
     _check_select_star(sql, result)

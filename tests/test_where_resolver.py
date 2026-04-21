@@ -13,14 +13,21 @@ def _loader(tmp_path):
         "grain": ["task"],
     })
     attrs_df = pd.DataFrame({
-        "schema_name": ["dm"] * 4,
-        "table_name": ["uzp_data_split_mzp_sale_funnel"] * 4,
-        "column_name": ["report_dt", "task_code", "task_subtype", "is_outflow"],
-        "dType": ["date", "text", "text", "int4"],
-        "description": ["Отчетная дата", "Код задачи", "Подтип задачи", "Признак подтверждения оттока"],
-        "is_primary_key": [False, False, False, False],
-        "unique_perc": [0.5, 90.0, 10.0, 2.0],
-        "not_null_perc": [99.0, 100.0, 100.0, 100.0],
+        "schema_name": ["dm"] * 6,
+        "table_name": ["uzp_data_split_mzp_sale_funnel"] * 6,
+        "column_name": ["report_dt", "task_code", "task_subtype", "task_category", "task_type", "is_outflow"],
+        "dType": ["date", "text", "text", "text", "text", "int4"],
+        "description": [
+            "Отчетная дата",
+            "Код задачи",
+            "Подтип задачи",
+            "Категория задачи",
+            "Тип задачи",
+            "Признак подтверждения оттока",
+        ],
+        "is_primary_key": [False, False, False, False, False, False],
+        "unique_perc": [0.5, 90.0, 10.0, 0.02, 0.11, 2.0],
+        "not_null_perc": [99.0, 100.0, 100.0, 100.0, 100.0, 100.0],
     })
     tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
     attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
@@ -51,7 +58,23 @@ def test_where_resolver_adds_confirmed_outflow_flag(tmp_path):
 
 def test_where_resolver_adds_factual_outflow_task_subtype(tmp_path):
     loader = _loader(tmp_path)
-    loader.ensure_value_profiles()
+    loader._value_profiles = {
+        "dm.uzp_data_split_mzp_sale_funnel.task_subtype": {
+            "known_terms": ["фактический отток"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        },
+        "dm.uzp_data_split_mzp_sale_funnel.task_category": {
+            "known_terms": ["Задача"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        },
+        "dm.uzp_data_split_mzp_sale_funnel.task_type": {
+            "known_terms": ["сервисная задача по юр-лицу"],
+            "top_values": [],
+            "value_mode": "enum_like",
+        },
+    }
     frame = derive_semantic_frame(
         "Посчитай количество задач по фактическому оттоку",
         schema_loader=loader,
@@ -65,8 +88,9 @@ def test_where_resolver_adds_factual_outflow_task_subtype(tmp_path):
         semantic_frame=frame,
         base_conditions=[],
     )
-    assert any("task_subtype ILIKE '%фактическому%'" in cond for cond in result["conditions"])
-    assert any("task_subtype ILIKE '%оттоку%'" in cond for cond in result["conditions"])
+    assert any("task_subtype ILIKE '%фактический отток%'" in cond for cond in result["conditions"])
+    assert any("task_category ILIKE '%Задача%'" in cond for cond in result["conditions"])
+    assert not any("task_type" in cond for cond in result["conditions"])
     assert result["applied_rules"]
     assert any(cands[0]["column"] == "task_subtype" for cands in result["filter_candidates"].values() if cands)
 
@@ -126,6 +150,34 @@ def test_where_resolver_honors_user_filter_choices_without_text_augmentation(tmp
     assert result["needs_clarification"] is False
     assert any("task_subtype" in cond for cond in result["conditions"])
     assert any(r.startswith("user_choice:") for r in result["reasoning"])
+
+
+def test_where_resolver_skips_rejected_candidate_without_reasking(tmp_path):
+    loader = _loader(tmp_path)
+    loader.ensure_value_profiles()
+    frame = {
+        "filter_intents": [
+            {
+                "request_id": "text:dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+                "kind": "text_search",
+                "query_text": "фактический отток",
+                "column_key": "dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+            }
+        ]
+    }
+    result = resolve_where(
+        user_input="Посчитай количество задач по фактическому оттоку",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.uzp_data_split_mzp_sale_funnel": {"select": ["task_code"], "aggregate": ["task_code"]}},
+        selected_tables=["dm.uzp_data_split_mzp_sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+        rejected_filter_choices={"text:dm.uzp_data_split_mzp_sale_funnel.task_subtype": ["task_subtype"]},
+    )
+    assert result["needs_clarification"] is False
+    assert not any("task_subtype" in cond for cond in result["conditions"])
+    assert any(r.startswith("rejected_all:") for r in result["reasoning"])
 
 
 def test_where_resolver_clarification_message_shows_example_values(tmp_path):

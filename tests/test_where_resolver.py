@@ -169,3 +169,65 @@ def test_candidate_label_falls_back_to_example_values():
     assert "segment_name" in label
     assert "Сегмент клиента" in label
     assert "retail" in label and "corp" in label
+
+
+# ---------------------------------------------------------------------------
+# Task 1.2: _user_explicitly_named и user_filter_choices
+# ---------------------------------------------------------------------------
+
+def test_user_explicitly_named_prevents_clarification(tmp_path):
+    """Если пользователь явно назвал имя колонки — clarification не запрашивается."""
+    from core.where_resolver import _user_explicitly_named
+
+    best = {"column": "task_subtype", "confidence": "medium", "condition": "task_subtype='X'", "score": 50.0}
+    second = {"column": "task_type", "confidence": "medium", "condition": "task_type='X'", "score": 40.0}
+
+    is_explicit, chosen = _user_explicitly_named("посчитай по task_subtype", best, second)
+    assert is_explicit is True
+    assert chosen == best
+
+
+def test_user_explicitly_named_chooses_second(tmp_path):
+    """Если пользователь явно назвал второй вариант — выбирается он."""
+    from core.where_resolver import _user_explicitly_named
+
+    best = {"column": "task_subtype", "confidence": "medium", "condition": "task_subtype='X'", "score": 50.0}
+    second = {"column": "task_type", "confidence": "medium", "condition": "task_type='X'", "score": 40.0}
+
+    is_explicit, chosen = _user_explicitly_named("посчитай по task_type", best, second)
+    assert is_explicit is True
+    assert chosen == second
+
+
+def test_user_explicitly_named_both_mentioned_no_choice(tmp_path):
+    """Если оба варианта упомянуты — однозначного выбора нет."""
+    from core.where_resolver import _user_explicitly_named
+
+    best = {"column": "task_subtype", "confidence": "medium", "condition": "task_subtype='X'", "score": 50.0}
+    second = {"column": "task_type", "confidence": "medium", "condition": "task_type='X'", "score": 40.0}
+
+    is_explicit, chosen = _user_explicitly_named("task_subtype и task_type вместе", best, second)
+    assert is_explicit is False
+    assert chosen is None
+
+
+def test_user_filter_choices_bypasses_clarification(tmp_path):
+    """user_filter_choices с уже выбранной колонкой — clarification_message должен быть пустым."""
+    loader = _loader(tmp_path)
+    loader.ensure_value_profiles()
+    frame = derive_semantic_frame(
+        "Посчитай по task_subtype",
+        schema_loader=loader,
+    )
+    result = resolve_where(
+        user_input="Посчитай по task_subtype",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.uzp_data_split_mzp_sale_funnel": {"select": ["task_code", "task_subtype"]}},
+        selected_tables=["dm.uzp_data_split_mzp_sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+        user_filter_choices={"task_subtype": "task_subtype"},
+    )
+    # clarification_message должен быть пустым
+    assert result.get("clarification_message", "") == ""

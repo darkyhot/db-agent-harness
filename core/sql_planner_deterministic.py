@@ -159,6 +159,72 @@ def _compute_group_by(
 
 
 # ---------------------------------------------------------------------------
+# 2a-ext. TIME GRANULARITY — DATE_TRUNC wrap для group_by
+# ---------------------------------------------------------------------------
+
+_DATE_LIKE_DTYPES: frozenset[str] = frozenset({
+    "date", "timestamp", "timestamptz",
+    "timestamp with time zone", "timestamp without time zone",
+})
+
+
+def _apply_time_granularity(
+    group_by: list[str],
+    selected_columns: dict[str, dict],
+    time_granularity: str | None,
+    schema_loader,
+) -> list[str]:
+    """Обернуть date/timestamp-колонки в DATE_TRUNC если задана гранулярность.
+
+    Если колонка уже в group_by — заменяет её на DATE_TRUNC(gran, col).
+    Если date-колонка есть в select/filter, но не в group_by — добавляет DATE_TRUNC в группировку.
+    Если date-колонок нет — возвращает group_by без изменений.
+    """
+    if not time_granularity or schema_loader is None:
+        return group_by
+
+    date_cols: set[str] = set()
+    for table_key, roles in selected_columns.items():
+        parts = table_key.split(".", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            cols_df = schema_loader.get_table_columns(parts[0], parts[1])
+        except Exception:
+            continue
+        for _, row in cols_df.iterrows():
+            dtype_raw = str(row.get("dType") or row.get("dtype") or "").lower().strip()
+            if any(d in dtype_raw for d in _DATE_LIKE_DTYPES):
+                col_name = str(row.get("column_name", "")).strip()
+                if col_name:
+                    date_cols.add(col_name.lower())
+
+    if not date_cols:
+        return group_by
+
+    result: list[str] = []
+    wrapped: set[str] = set()
+    for col in group_by:
+        if col.lower() in date_cols:
+            expr = f"DATE_TRUNC('{time_granularity}', {col})"
+            result.append(expr)
+            wrapped.add(col.lower())
+        else:
+            result.append(col)
+
+    # Добавляем date-колонки из select/filter, которых нет в group_by
+    all_in_gb = {c.lower() for c in group_by}
+    for table_key, roles in selected_columns.items():
+        for role in ("select", "filter"):
+            for col in roles.get(role, []):
+                if col.lower() in date_cols and col.lower() not in all_in_gb:
+                    result.append(f"DATE_TRUNC('{time_granularity}', {col})")
+                    all_in_gb.add(col.lower())
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 2b. HAVING (постагрегатные фильтры из user_hints)
 # ---------------------------------------------------------------------------
 
@@ -566,6 +632,13 @@ def build_blueprint(
                 strategy = "fact_dim_join"
 
     group_by    = _compute_group_by(selected_columns, aggregation)
+
+    # Применяем DATE_TRUNC из time_granularity (если задана)
+    _time_gran = (user_hints or {}).get("time_granularity")
+    if _time_gran:
+        group_by = _apply_time_granularity(group_by, selected_columns, _time_gran, schema_loader)
+        logger.info("DeterministicPlanner: time_granularity='%s' → group_by=%s", _time_gran, group_by)
+
     base_where_conditions = _compute_where_from_intent(intent, selected_columns, user_input=user_input)
     where_resolution = resolve_where(
         user_input=user_input,

@@ -299,6 +299,7 @@ class SqlPipelineNodes:
             filter_confidence=filter_confidence,
             join_confidence=previous_components.get("join_confidence")
             or evaluate_join_confidence(state.get("join_decision", {}) or {}),
+            user_hints=state.get("user_hints"),
         )
         evidence_trace = dict(state.get("evidence_trace") or {})
         evidence_trace["where_resolution"] = {

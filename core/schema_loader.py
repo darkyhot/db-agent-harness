@@ -119,6 +119,8 @@ class SchemaLoader:
         self._table_semantics: dict[str, dict[str, Any]] | None = None
         self._semantic_lexicon: dict[str, Any] | None = None
         self._rule_registry: dict[str, Any] | None = None
+        # Семантический индекс (GigaChat Embeddings) — опциональный, инжектируется извне
+        self.semantic_index: Any | None = None
 
     @staticmethod
     def _load_json_artifact(path: Path) -> dict[str, Any] | None:
@@ -344,6 +346,52 @@ class SchemaLoader:
             query, len(result), len(keyword_result), len(tfidf_hits),
         )
         return result.reset_index(drop=True)
+
+    def semantic_search_tables(
+        self, query: str, top_k: int = 10
+    ) -> list[tuple[str, str, float]]:
+        """Семантический поиск таблиц через GigaChat Embeddings.
+
+        Дополнительный сигнал рядом с keyword-поиском (search_tables).
+        Если semantic_index недоступен — возвращает пустой список без ошибок.
+
+        Args:
+            query: Текстовый запрос пользователя.
+            top_k: Максимальное количество результатов.
+
+        Returns:
+            Список (schema, table, score) отсортированный по убыванию score.
+            Дедуплицированный по (schema, table).
+        """
+        if self.semantic_index is None:
+            return []
+        try:
+            hits = self.semantic_index.semantic_search(query, top_k=top_k * 3)
+        except Exception as e:
+            logger.warning("semantic_search_tables: ошибка поиска: %s", e)
+            return []
+        if not hits:
+            return []
+
+        seen: set[tuple[str, str]] = set()
+        result: list[tuple[str, str, float]] = []
+        for key, score in hits:
+            parts = key.split(".")
+            if len(parts) < 2:
+                continue
+            schema, table = parts[0], parts[1]
+            pair = (schema, table)
+            if pair not in seen:
+                seen.add(pair)
+                result.append((schema, table, score))
+            if len(result) >= top_k:
+                break
+
+        logger.debug(
+            "semantic_search_tables('%s'): найдено %d уникальных таблиц",
+            query, len(result),
+        )
+        return result
 
     def _persist_tables_df(self, df: pd.DataFrame) -> None:
         """Сохранить tables_list.csv и обновить кеш/индексы."""

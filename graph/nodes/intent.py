@@ -1082,6 +1082,8 @@ class IntentNodes:
             table_confidence=table_confidence_summary,
             filter_confidence=None,
             join_confidence=join_confidence_summary,
+            user_hints=state.get("user_hints"),
+            explicit_mode=bool(state.get("explicit_mode")),
         )
         evidence_trace = dict(state.get("evidence_trace") or {})
         evidence_trace.update({

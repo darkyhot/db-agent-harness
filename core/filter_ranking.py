@@ -141,14 +141,37 @@ def _phrase_in_known_terms(profile: dict[str, Any], query_text: str) -> tuple[st
     return best_value, best_len
 
 
-def _column_reference_score(user_input: str, column: str, description: str) -> float:
-    """Высокий бонус, если пользователь явно назвал колонку или её описание."""
+def _column_reference_score(
+    user_input: str,
+    column: str,
+    description: str,
+    *,
+    semantic_index: Any = None,
+    column_key: str = "",
+) -> float:
+    """Высокий бонус, если пользователь явно назвал колонку или её описание.
+
+    Опциональный semantic_index добавляет бонус (до +20) на основе косинусного
+    сходства между запросом и эмбеддингом колонки.
+    """
     normalized = _normalize_text(user_input)
     column_norm = _normalize_text(column)
     if column_norm and column_norm in normalized:
-        return 120.0
-    desc_score = _text_score(user_input, "", description)
-    return 35.0 if desc_score >= 14.0 else 0.0
+        base = 120.0
+    else:
+        desc_score = _text_score(user_input, "", description)
+        base = 35.0 if desc_score >= 14.0 else 0.0
+
+    if semantic_index is not None and column_key:
+        try:
+            sem_scores = semantic_index.similarity(user_input, [column_key])
+            sem_score = sem_scores.get(column_key, 0.0)
+        except Exception:
+            sem_score = 0.0
+        bonus = 20.0 if sem_score >= 0.8 else (10.0 if sem_score >= 0.6 else 0.0)
+        return base + bonus
+
+    return base
 
 
 def _escape_sql_literal(value: str) -> str:
@@ -267,7 +290,12 @@ def rank_filter_candidates(
                         score += 16.0
                     if request.get("column_hint"):
                         score += _text_score(str(request.get("column_hint") or ""), column, description)
-                    score += _column_reference_score(user_input, column, description)
+                    _sem_idx = getattr(schema_loader, "semantic_index", None)
+                    score += _column_reference_score(
+                        user_input, column, description,
+                        semantic_index=_sem_idx,
+                        column_key=key,
+                    )
                     matched_value, value_score = _profile_value_match(profile, query_text)
                     score += value_score
                     if matched_value and _stem(request.get("query_text") or "") in _stem(matched_value):

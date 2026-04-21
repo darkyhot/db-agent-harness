@@ -182,7 +182,7 @@ def _route_after_sql_planner(state: AgentState) -> str:
     """Маршрутизация после sql_planner.
 
     Если column_selector пропустил dim-таблицу, возвращаемся в column_selector
-    с корректирующей подсказкой. Иначе — стандартный путь к sql_writer.
+    с корректирующей подсказкой. Иначе — через plan_preview к sql_writer.
     """
     limit = _check_limits(state)
     if limit:
@@ -192,6 +192,22 @@ def _route_after_sql_planner(state: AgentState) -> str:
         return "column_selector"
 
     if state.get("needs_clarification"):
+        return END
+
+    return "plan_preview"
+
+
+def _route_after_plan_preview(state: AgentState) -> str:
+    """Маршрутизация после plan_preview.
+
+    Если plan_preview_pending=True — ждём подтверждения пользователя (END).
+    Иначе — транзит к sql_writer.
+    """
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("plan_preview_pending"):
         return END
 
     return "sql_writer"
@@ -257,6 +273,7 @@ def build_graph(
     sql_validator: SQLValidator,
     tools: list,
     debug_prompt: bool = False,
+    show_plan: bool = False,
 ) -> StateGraph:
     """Собрать граф агента.
 
@@ -275,17 +292,20 @@ def build_graph(
     nodes = GraphNodes(
         llm, db_manager, schema_loader, memory, sql_validator, tools,
         debug_prompt=debug_prompt,
+        show_plan=show_plan,
     )
 
     graph = StateGraph(AgentState)
 
-    # Добавляем все 13 узлов
+    # Добавляем все 15 узлов
     graph.add_node("intent_classifier", nodes.intent_classifier)
     graph.add_node("hint_extractor", nodes.hint_extractor)
+    graph.add_node("explicit_mode_dispatcher", nodes.explicit_mode_dispatcher)
     graph.add_node("table_resolver", nodes.table_resolver)
     graph.add_node("table_explorer", nodes.table_explorer)
     graph.add_node("column_selector", nodes.column_selector)
     graph.add_node("sql_planner", nodes.sql_planner)
+    graph.add_node("plan_preview", nodes.plan_preview)
     graph.add_node("sql_writer", nodes.sql_writer)
     graph.add_node("sql_static_checker", nodes.sql_static_checker)
     graph.add_node("sql_validator", nodes.sql_validator_node)
@@ -306,8 +326,9 @@ def build_graph(
         "hint_extractor": "hint_extractor",
     })
 
-    # hint_extractor (детерминированный) → table_resolver
-    graph.add_edge("hint_extractor", "table_resolver")
+    # hint_extractor → explicit_mode_dispatcher (детерминированный) → table_resolver
+    graph.add_edge("hint_extractor", "explicit_mode_dispatcher")
+    graph.add_edge("explicit_mode_dispatcher", "table_resolver")
 
     # tool_dispatcher → conditional routing (back to resolver or diagnoser)
     graph.add_conditional_edges("tool_dispatcher", _route_after_tool_dispatcher, {
@@ -326,12 +347,18 @@ def build_graph(
     graph.add_edge("column_selector", "sql_planner")
 
     # sql_planner → conditional routing:
-    # если dim-таблица пропущена → column_selector (повтор с hint), иначе → sql_writer
+    # если dim-таблица пропущена → column_selector, иначе → plan_preview
     graph.add_conditional_edges("sql_planner", _route_after_sql_planner, {
         END: END,
         "column_selector": "column_selector",
-        "sql_writer": "sql_writer",
+        "plan_preview": "plan_preview",
         "summarizer": "summarizer",
+    })
+
+    # plan_preview → sql_writer (транзит) или END (ожидание подтверждения)
+    graph.add_conditional_edges("plan_preview", _route_after_plan_preview, {
+        END: END,
+        "sql_writer": "sql_writer",
     })
 
     # sql_writer → sql_static_checker → sql_validator (или error_diagnoser)
@@ -388,6 +415,7 @@ def create_initial_state(
     prev_sql: str = "",
     prev_result_summary: str = "",
     user_filter_choices: dict[str, str] | None = None,
+    plan_preview_approved: bool = False,
 ) -> AgentState:
     """Создать начальное состояние для запуска графа."""
     return AgentState(
@@ -438,6 +466,10 @@ def create_initial_state(
             "join_fields": [],
             "dim_sources": {},
             "having_hints": [],
+            "group_by_hints": [],
+            "aggregate_hints": [],
+            "time_granularity": None,
+            "negative_filters": [],
         },
         semantic_frame={},
         where_resolution={},
@@ -447,4 +479,10 @@ def create_initial_state(
         fallback_policy={},
         # Белый список таблиц (заполняется в table_resolver)
         allowed_tables=[],
+        # Explicit mode (задача 2.2)
+        explicit_mode=False,
+        # Plan-preview (задача 2.1)
+        plan_preview_pending=False,
+        plan_preview_approved=plan_preview_approved,
+        plan_preview_iteration=0,
     )

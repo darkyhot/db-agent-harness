@@ -22,13 +22,15 @@ def test_filter_confidence_low_when_clarification_needed():
 
 
 def test_planning_confidence_uses_worst_component():
+    # Weighted formula: 0.4*0.9 + 0.3*0.52 + 0.3*0.86 = 0.36 + 0.156 + 0.258 = 0.774 → high
+    # Поведение изменилось: взвешенная сумма, а не min — medium filter больше не блокирует
     planning = build_planning_confidence(
         table_confidence={"score": 0.9, "level": "high", "evidence": []},
         filter_confidence={"score": 0.52, "level": "medium", "evidence": []},
         join_confidence={"score": 0.86, "level": "high", "evidence": []},
     )
-    assert planning["level"] == "medium"
-    assert planning["action"] == "clarify"
+    assert planning["level"] == "high"
+    assert planning["action"] == "execute"
 
 
 def test_fallback_policy_allows_llm_only_for_high_confidence():
@@ -91,3 +93,53 @@ def test_filter_confidence_treats_user_choices_as_resolved():
     assert result["level"] == "high"
     assert result["score"] >= 0.95
     assert all("user_choice" in ev for ev in result["evidence"])
+
+
+# ---------------------------------------------------------------------------
+# Task 1.3: Weighted confidence with hint-boost
+# ---------------------------------------------------------------------------
+
+def test_hint_boost_must_keep_tables_elevates_low_table_score():
+    """must_keep_tables → table_score boosted to 0.9 → overall high."""
+    planning = build_planning_confidence(
+        table_confidence={"score": 0.5, "level": "medium", "evidence": []},
+        filter_confidence={"score": 0.9, "level": "high", "evidence": []},
+        join_confidence={"score": 0.9, "level": "high", "evidence": []},
+        user_hints={"must_keep_tables": [("dm", "fact_churn")]},
+    )
+    # 0.4*0.9 + 0.3*0.9 + 0.3*0.9 = 0.9 → high
+    assert planning["level"] == "high"
+
+
+def test_hint_boost_group_by_hints_elevates_filter_score():
+    """group_by_hints → filter_score boosted to 0.8."""
+    planning = build_planning_confidence(
+        table_confidence={"score": 0.9, "level": "high", "evidence": []},
+        filter_confidence={"score": 0.3, "level": "low", "evidence": []},
+        join_confidence={"score": 0.9, "level": "high", "evidence": []},
+        user_hints={"group_by_hints": ["task_code"]},
+    )
+    # filter_score = max(0.3, 0.8) = 0.8
+    # 0.4*0.9 + 0.3*0.8 + 0.3*0.9 = 0.36 + 0.24 + 0.27 = 0.87 → high
+    assert planning["level"] == "high"
+
+
+def test_no_hints_low_table_score_remains_low():
+    """Без hints, table=0.3 и все компоненты низкие → level == 'low'."""
+    planning = build_planning_confidence(
+        table_confidence={"score": 0.3, "level": "low", "evidence": []},
+        filter_confidence={"score": 0.3, "level": "low", "evidence": []},
+        join_confidence={"score": 0.3, "level": "low", "evidence": []},
+    )
+    assert planning["level"] == "low"
+    assert planning["action"] == "stop"
+
+
+def test_all_high_scores_remain_high():
+    """Все компоненты высокие → high."""
+    planning = build_planning_confidence(
+        table_confidence={"score": 0.9, "level": "high", "evidence": []},
+        filter_confidence={"score": 0.9, "level": "high", "evidence": []},
+        join_confidence={"score": 0.9, "level": "high", "evidence": []},
+    )
+    assert planning["level"] == "high"

@@ -1,6 +1,8 @@
 """Тесты для core/sql_planner_deterministic.py."""
 
+import pandas as pd
 import pytest
+from unittest.mock import MagicMock
 from core.sql_planner_deterministic import (
     build_blueprint,
     _determine_strategy,
@@ -8,6 +10,7 @@ from core.sql_planner_deterministic import (
     _compute_aggregation,
     _compute_where_from_intent,
     _find_date_column,
+    _apply_time_granularity,
 )
 
 
@@ -509,3 +512,67 @@ class TestCountDistinctAggregation:
         assert agg is not None
         assert agg["column"] == "*"
         assert not agg.get("distinct"), "COUNT(*) не должен иметь distinct"
+
+
+# ---------------------------------------------------------------------------
+# Task 1.2: _apply_time_granularity
+# ---------------------------------------------------------------------------
+
+class TestApplyTimeGranularity:
+    def _make_loader(self, date_cols: list[str]):
+        """Сделать мок schema_loader с date-колонками."""
+        loader = MagicMock()
+        rows = [{"column_name": c, "dType": "timestamp"} for c in date_cols]
+        loader.get_table_columns.return_value = pd.DataFrame(rows)
+        return loader
+
+    def test_wraps_date_col_in_group_by(self):
+        """Если date-колонка уже в group_by — оборачивает в DATE_TRUNC."""
+        loader = self._make_loader(["report_dt"])
+        selected = {"dm.fact": {"select": ["report_dt", "amount"], "filter": [], "group_by": ["report_dt"]}}
+        result = _apply_time_granularity(["report_dt", "amount"], selected, "month", loader)
+        assert "DATE_TRUNC('month', report_dt)" in result
+        assert "amount" in result
+
+    def test_adds_date_col_not_in_group_by(self):
+        """Если date-колонка только в filter — добавляет DATE_TRUNC в group_by."""
+        loader = self._make_loader(["event_date"])
+        selected = {"dm.fact": {"select": ["amount"], "filter": ["event_date"], "group_by": []}}
+        result = _apply_time_granularity(["amount"], selected, "quarter", loader)
+        assert any("DATE_TRUNC('quarter'" in r for r in result)
+
+    def test_no_granularity_returns_unchanged(self):
+        """Без gранулярности group_by не меняется."""
+        loader = self._make_loader(["report_dt"])
+        selected = {"dm.fact": {"select": ["report_dt"], "filter": [], "group_by": []}}
+        original = ["report_dt"]
+        result = _apply_time_granularity(original, selected, None, loader)
+        assert result == original
+
+    def test_no_date_cols_returns_unchanged(self):
+        """Если нет date-колонок — group_by не меняется."""
+        loader = self._make_loader([])
+        selected = {"dm.fact": {"select": ["name"], "filter": [], "group_by": []}}
+        result = _apply_time_granularity(["name"], selected, "month", loader)
+        assert result == ["name"]
+
+    def test_build_blueprint_applies_date_trunc(self):
+        """build_blueprint с time_granularity='month' и date-колонкой → DATE_TRUNC в group_by."""
+        loader = self._make_loader(["report_dt"])
+        intent = {
+            "aggregation_hint": "count",
+            "date_filters": {"from": None, "to": None},
+            "complexity": "single_table",
+        }
+        cols = {
+            "dm.fact": {
+                "select": ["report_dt", "client_id"],
+                "aggregate": ["client_id"],
+                "group_by": ["report_dt"],
+                "filter": [],
+            }
+        }
+        user_hints = {"time_granularity": "month"}
+        bp = build_blueprint(intent, cols, [], {"dm.fact": "fact"}, {}, user_hints=user_hints, schema_loader=loader)
+        group_by_str = " ".join(bp.get("group_by", []))
+        assert "DATE_TRUNC('month'" in group_by_str

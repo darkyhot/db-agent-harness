@@ -684,6 +684,83 @@ class MemoryManager:
     # Свойства и совместимость
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Feedback loop (задача 3.2)
+    # ------------------------------------------------------------------
+
+    @property
+    def _feedback_path(self) -> Path:
+        return self._memory_dir / "feedback.jsonl"
+
+    def log_user_feedback(
+        self,
+        query: str,
+        sql: str,
+        verdict: str,
+        corrected_sql: str | None = None,
+        comment: str | None = None,
+    ) -> None:
+        """Записать оценку пользователя в feedback.jsonl (append-only).
+
+        Args:
+            query: Запрос пользователя.
+            sql: SQL, который был выполнен.
+            verdict: "up" (хорошо) или "down" (плохо).
+            corrected_sql: Правильный SQL, если пользователь указал.
+            comment: Произвольный комментарий.
+        """
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "query": query,
+            "sql": sql,
+            "verdict": verdict,
+            "corrected_sql": corrected_sql or None,
+            "comment": comment or None,
+        }
+        try:
+            with self._feedback_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            logger.info(
+                "feedback: записан %s для запроса '%s...'",
+                verdict, query[:50],
+            )
+        except OSError as e:
+            logger.warning("feedback: ошибка записи в %s: %s", self._feedback_path, e)
+
+    def load_feedback(
+        self, verdict: str | None = None, limit: int = 500
+    ) -> list[dict]:
+        """Загрузить записи из feedback.jsonl.
+
+        Args:
+            verdict: Фильтр по оценке ("up"/"down"). None — все записи.
+            limit: Максимальное количество записей (последние N).
+
+        Returns:
+            Список записей (dict) в хронологическом порядке.
+        """
+        path = self._feedback_path
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            logger.warning("feedback: ошибка чтения %s: %s", path, e)
+            return []
+
+        entries = []
+        for line in lines[-limit:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if verdict is None or entry.get("verdict") == verdict:
+                    entries.append(entry)
+            except json.JSONDecodeError:
+                pass
+        return entries
+
     @property
     def session_count(self) -> int:
         """Количество сессий с резюме."""

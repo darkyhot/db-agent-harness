@@ -126,13 +126,35 @@ def build_planning_confidence(
     table_confidence: dict[str, Any] | None,
     filter_confidence: dict[str, Any] | None,
     join_confidence: dict[str, Any] | None,
+    user_hints: dict[str, Any] | None = None,
+    explicit_mode: bool = False,
 ) -> dict[str, Any]:
     components = {
         "table_confidence": table_confidence or {"score": 0.25, "level": "low", "evidence": ["missing"]},
         "filter_confidence": filter_confidence or {"score": 0.95, "level": "high", "evidence": ["default"]},
         "join_confidence": join_confidence or {"score": 0.95, "level": "high", "evidence": ["default"]},
     }
-    score = min(float(components["table_confidence"]["score"]), float(components["filter_confidence"]["score"]), float(components["join_confidence"]["score"]))
+    table_score = float(components["table_confidence"]["score"])
+    filter_score = float(components["filter_confidence"]["score"])
+    join_score = float(components["join_confidence"]["score"])
+
+    # Hint-boost: явные хинты пользователя повышают соответствующие компоненты.
+    # В explicit_mode (≥2 явных хинта) применяется строже: max(score, 0.95) вместо 0.9/0.8.
+    hints = user_hints or {}
+    _boost_table = 0.95 if explicit_mode else 0.9
+    _boost_filter = 0.95 if explicit_mode else 0.8
+    _boost_join = 0.95 if explicit_mode else 0.9
+
+    if hints.get("must_keep_tables"):
+        table_score = max(table_score, _boost_table)
+    if hints.get("group_by_hints") or hints.get("aggregate_hints"):
+        filter_score = max(filter_score, _boost_filter)
+    if hints.get("join_fields"):
+        join_score = max(join_score, _boost_join)
+
+    # Взвешенная сумма (table доминирует, т.к. выбор таблиц — критический шаг)
+    score = 0.4 * table_score + 0.3 * filter_score + 0.3 * join_score
+
     level = _level(score)
     action = "execute" if level == "high" else ("clarify" if level == "medium" else "stop")
     return {

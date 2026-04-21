@@ -435,8 +435,16 @@ class ExplorerNodes:
             _det_result.get("reason", ""),
         )
 
-        if _det_conf >= _DET_CONFIDENCE_THRESHOLD and not state.get("column_selector_hint", ""):
-            # Достаточная уверенность — пропускаем LLM
+        _hints = state.get("user_hints", {}) or {}
+        # Только group_by_hints (явная ось группировки) требует пересмотра колонок через LLM.
+        # aggregate_hints не меняет набор колонок — только способ агрегации.
+        _has_explicit_group = bool(_hints.get("group_by_hints"))
+        if (
+            _det_conf >= _DET_CONFIDENCE_THRESHOLD
+            and not state.get("column_selector_hint", "")
+            and not _has_explicit_group
+        ):
+            # Достаточная уверенность и нет явных group_by-хинтов → пропускаем LLM
             logger.info(
                 "ColumnSelector: confidence=%.2f >= %.2f → используем детерминированный результат",
                 _det_conf,

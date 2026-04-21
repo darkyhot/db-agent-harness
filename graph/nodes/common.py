@@ -228,6 +228,7 @@ class BaseNodeMixin:
         sql_validator: SQLValidator,
         tools: list,
         debug_prompt: bool = False,
+        show_plan: bool = False,
     ) -> None:
         self.llm = llm
         self.db = db_manager
@@ -236,6 +237,7 @@ class BaseNodeMixin:
         self.validator = sql_validator
         self.tools = tools
         self.debug_prompt = debug_prompt
+        self.show_plan = show_plan
         self.tool_map: dict[str, Any] = {t.name: t for t in tools}
         self.few_shot = FewShotRetriever(memory)
         self._sample_cache: dict[tuple[str, str], tuple[float, str]] = {}

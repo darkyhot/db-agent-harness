@@ -198,7 +198,6 @@ class FewShotRetriever:
         for i, ex in enumerate(examples, 1):
             user_q = ex["user_input"][:150]
             sql = ex["sql"].strip()
-            # Обрезаем очень длинные SQL
             if len(sql) > 800:
                 sql = sql[:800] + "\n-- ... (обрезано)"
             lines.append(f"\nПример {i}:")
@@ -206,3 +205,86 @@ class FewShotRetriever:
             lines.append(f"  SQL:\n{sql}")
 
         return "\n".join(lines)
+
+    def _load_negative_examples(self, limit: int = 20) -> list[dict]:
+        """Загрузить негативные примеры из feedback.jsonl через memory API."""
+        try:
+            entries = self._memory.load_feedback(verdict="down", limit=limit)
+        except AttributeError:
+            # Старый MemoryManager без load_feedback — graceful fallback
+            return []
+        return [
+            e for e in entries
+            if e.get("corrected_sql") and e.get("query")
+        ]
+
+    def format_negatives_for_prompt(self, negatives: list[dict]) -> str:
+        """Форматировать негативные примеры для вставки в промпт."""
+        if not negatives:
+            return ""
+
+        lines = [
+            "=== НЕ ДЕЛАЙ ТАК (пользователь исправил) ===",
+        ]
+        for entry in negatives[:3]:
+            query = str(entry.get("query") or "")[:150]
+            bad_sql = str(entry.get("sql") or "").strip()
+            good_sql = str(entry.get("corrected_sql") or "").strip()
+            if not (bad_sql and good_sql):
+                continue
+            if len(bad_sql) > 600:
+                bad_sql = bad_sql[:600] + "\n-- ... (обрезано)"
+            if len(good_sql) > 600:
+                good_sql = good_sql[:600] + "\n-- ... (обрезано)"
+            lines.append(f'\nЗапрос: "{query}"')
+            lines.append(f"Плохой SQL:\n{bad_sql}")
+            lines.append(f"Правильный SQL:\n{good_sql}")
+
+        return "\n".join(lines)
+
+    def retrieve_examples(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        include_negatives: bool = False,
+        strategy: str = "",
+        semantic_frame: dict | None = None,
+        fact_dim_pair: tuple[str, str] | None = None,
+    ) -> str:
+        """Единый метод получения few-shot контекста для промпта.
+
+        Объединяет позитивные примеры (get_similar) и опционально
+        негативные примеры (feedback.jsonl с verdict="down").
+
+        Args:
+            query: Текстовый запрос пользователя.
+            top_k: Количество позитивных примеров.
+            include_negatives: Включить антипримеры из feedback.jsonl.
+            strategy: SQL-стратегия для бонусов.
+            semantic_frame: Семантический фрейм для бонусов.
+            fact_dim_pair: Пара таблиц для бонусов.
+
+        Returns:
+            Строка для вставки в промпт (может быть пустой).
+        """
+        positives = self.get_similar(
+            query,
+            strategy=strategy,
+            n=top_k,
+            semantic_frame=semantic_frame,
+            fact_dim_pair=fact_dim_pair,
+        )
+        parts: list[str] = []
+
+        pos_text = self.format_for_prompt(positives)
+        if pos_text:
+            parts.append(pos_text)
+
+        if include_negatives:
+            negatives = self._load_negative_examples()
+            neg_text = self.format_negatives_for_prompt(negatives)
+            if neg_text:
+                parts.append(neg_text)
+
+        return "\n\n".join(parts)

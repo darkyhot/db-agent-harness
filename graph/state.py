@@ -118,9 +118,14 @@ class AgentState(TypedDict):
     #     "join_fields": ["inn", "customer_id", ...],
     #     "dim_sources": {"segment": {"table": "schema.t", "join_col": "inn"}},
     #     "having_hints": [{"op": ">=", "value": 3, "unit_hint": "человек"}],
+    #     "group_by_hints": ["task_code", "region", ...],
+    #     "aggregate_hints": [("count", "task"), ("sum", "revenue"), ...],
+    #     "time_granularity": "month" | "quarter" | "year" | "day" | "week" | None,
+    #     "negative_filters": ["канцелярия", ...],
     #   }
     # Используется в table_resolver (hard-lock must_keep_tables),
-    # column_selector (dim_sources/join_fields), sql_planner (HAVING).
+    # column_selector (dim_sources/join_fields/group_by_hints),
+    # sql_planner (HAVING, GROUP BY, DATE_TRUNC).
     user_hints: dict[str, Any]
 
     # semantic frame запроса и результат where_resolver
@@ -130,3 +135,17 @@ class AgentState(TypedDict):
     planning_confidence: dict[str, Any]
     evidence_trace: dict[str, Any]
     fallback_policy: dict[str, Any]
+
+    # === Explicit mode (Задача 2.2) ===
+    # Устанавливается explicit_mode_dispatcher если пользователь явно задал ≥2 параметра
+    # (таблица + JOIN-поле, таблица + гранулярность, etc.). При True — план показывается
+    # принудительно и хинты применяются строже.
+    explicit_mode: bool
+
+    # === Plan-preview (Задача 2.1) ===
+    # plan_preview_pending: plan_preview выставил True — ждём подтверждения пользователя.
+    # plan_preview_approved: CLI выставляет True при повторном запуске после "ок".
+    # plan_preview_iteration: счётчик правок (максимум 3 итерации).
+    plan_preview_pending: bool
+    plan_preview_approved: bool
+    plan_preview_iteration: int

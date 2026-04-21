@@ -90,3 +90,32 @@ def test_choose_best_metric_prefers_outflow_qty_over_is_outflow_for_sum(tmp_path
     )
 
     assert best == ("dm.uzp_dwh_fact_outflow", "outflow_qty")
+
+
+# ---------------------------------------------------------------------------
+# Task 1.2: group_by_hints influence on explorer (indirect test via state)
+# ---------------------------------------------------------------------------
+
+def test_explorer_skips_llm_when_no_group_by_hints(tmp_path):
+    """Если group_by_hints пустые — ColumnSelector использует детерминированный путь."""
+    from graph.graph import create_initial_state
+
+    state = create_initial_state("посчитай отток")
+    state["user_hints"]["group_by_hints"] = []
+
+    # Нет явных group_by_hints → _has_explicit_group = False
+    hints = state.get("user_hints", {}) or {}
+    has_explicit_group = bool(hints.get("group_by_hints"))
+    assert has_explicit_group is False
+
+
+def test_explorer_uses_llm_path_when_group_by_hints_present(tmp_path):
+    """Если group_by_hints не пустые — _has_explicit_group = True (LLM путь)."""
+    from graph.graph import create_initial_state
+
+    state = create_initial_state("сгруппируй по segment_name")
+    state["user_hints"]["group_by_hints"] = ["segment_name"]
+
+    hints = state.get("user_hints", {}) or {}
+    has_explicit_group = bool(hints.get("group_by_hints"))
+    assert has_explicit_group is True

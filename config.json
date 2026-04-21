@@ -3,5 +3,6 @@
     "host": "",
     "port": 5432,
     "database": "prom",
-    "debug_prompt": false
+    "debug_prompt": false,
+    "show_plan": false
 }

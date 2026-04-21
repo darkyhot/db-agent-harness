@@ -27,6 +27,30 @@ def _explicit_column_choice(user_input: str, candidates: list[dict[str, Any]]) -
     return None
 
 
+def _user_explicitly_named(
+    user_input: str,
+    best: dict[str, Any],
+    second: dict[str, Any] | None,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Проверить, упоминает ли пользователь явно best.column или second.column.
+
+    Если ровно одна из двух колонок встречается в тексте — пользователь явно указал
+    выбор, clarification не нужен. Возвращает (is_explicit, chosen_candidate).
+    """
+    if second is None:
+        return False, None
+    normalized = str(user_input or "").lower().replace("ё", "е")
+    best_col = str(best.get("column") or "").lower().replace("ё", "е")
+    second_col = str(second.get("column") or "").lower().replace("ё", "е")
+    best_mentioned = bool(best_col and best_col in normalized)
+    second_mentioned = bool(second_col and second_col in normalized)
+    if best_mentioned and not second_mentioned:
+        return True, best
+    if second_mentioned and not best_mentioned:
+        return True, second
+    return False, None
+
+
 def candidate_label(candidate: dict[str, Any]) -> str:
     """Построить подпись кандидата для clarification-сообщения.
 
@@ -137,15 +161,24 @@ def resolve_where(
         if best.get("confidence") == "low":
             continue
         if second and best.get("confidence") == "medium" and score_gap < 15.0:
-            best_label = candidate_label(best)
-            second_label = candidate_label(second)
-            clarification_message = (
-                "Найдено несколько близких вариантов фильтра. "
-                f"Уточните, пожалуйста, по какому признаку фильтровать: "
-                f"{best_label} или {second_label}?"
-            )
-            reasoning.append(f"ambiguity:{request_id}:gap={score_gap:.1f}")
-            break
+            _is_explicit, _chosen = _user_explicitly_named(user_input, best, second)
+            if _is_explicit and _chosen is not None:
+                # Пользователь явно назвал одну из колонок — берём её без уточнения
+                best = _chosen
+                second = None
+            elif str(request_id) in user_filter_choices:
+                # Уже выбрано через user_filter_choices (handled above)
+                pass
+            else:
+                best_label = candidate_label(best)
+                second_label = candidate_label(second)
+                clarification_message = (
+                    "Найдено несколько близких вариантов фильтра. "
+                    f"Уточните, пожалуйста, по какому признаку фильтровать: "
+                    f"{best_label} или {second_label}?"
+                )
+                reasoning.append(f"ambiguity:{request_id}:gap={score_gap:.1f}")
+                break
 
         _add_unique(conditions, str(best.get("condition") or ""))
         applied_rules.append(str(request_id))

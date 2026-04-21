@@ -38,6 +38,8 @@ _NODE_STATUS = {
     "table_explorer": "Подгружаю структуру и образцы данных таблиц...",
     "column_selector": "Выбираю колонки для запроса...",
     "sql_planner": "Планирую стратегию SQL...",
+    "plan_preview": "Готовлю план запроса...",
+    "explicit_mode_dispatcher": "Определяю режим запроса...",
     "sql_writer": "Пишу SQL-запрос...",
     "sql_validator": "Проверяю и выполняю SQL...",
     "error_diagnoser": "Анализирую ошибку...",
@@ -150,13 +152,15 @@ class CLIInterface:
         self._prev_sql: str = ""
         self._prev_result_summary: str = ""
 
-        # Флаг отладки промптов из конфига
+        # Флаги из конфига
         self.debug_prompt = self.db.runtime_config.get("debug_prompt", False)
+        self.show_plan = self.db.runtime_config.get("show_plan", False)
 
         # Сборка графа
         self.graph = build_graph(
             self.llm, self.db, self.schema, self.memory, self.validator, all_tools,
             debug_prompt=self.debug_prompt,
+            show_plan=self.show_plan,
         )
 
         # Периодическая очистка старых сессий (старше 90 дней)
@@ -325,18 +329,31 @@ class CLIInterface:
         else:
             debug_prompt = current_debug
 
+        current_show_plan = self.db.runtime_config.get("show_plan", False)
+        show_plan_str = input(f"show_plan (true/false) [{current_show_plan}]: ").strip().lower()
+        if show_plan_str in ("true", "1", "yes", "да"):
+            show_plan = True
+        elif show_plan_str in ("false", "0", "no", "нет"):
+            show_plan = False
+        else:
+            show_plan = current_show_plan
+
         self.db.set_debug_prompt(debug_prompt)
         self.db.save_config(user_id, host, port, database)
+        self.db.runtime_config["show_plan"] = show_plan
         self.debug_prompt = debug_prompt
+        self.show_plan = show_plan
         db_tools = create_db_tools(self.db, self.validator, self.schema)
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
         self.graph = build_graph(
             self.llm, self.db, self.schema, self.memory, self.validator, all_tools,
             debug_prompt=self.debug_prompt,
+            show_plan=self.show_plan,
         )
         print(f"\n✓ Конфигурация сохранена: {self.db.config_summary}")
         print(f"  debug_prompt: {debug_prompt}")
+        print(f"  show_plan: {show_plan}")
 
     def _handle_reset(self) -> None:
         """Сброс контекста текущей сессии."""
@@ -426,6 +443,38 @@ class CLIInterface:
                 print(f"    {err_type:<25} {cnt}")
         print()
 
+    def _ask_feedback(self, user_input: str, sql: str) -> None:
+        """Запросить у пользователя оценку ответа (y/n/skip).
+
+        При отрицательной оценке предлагает ввести правильный SQL.
+        Результат записывается в memory/feedback.jsonl.
+        """
+        try:
+            verdict_raw = input("\nКак ответ? [y=хороший, n=плохой, skip=пропустить]: ").strip().lower()
+        except EOFError:
+            return
+
+        if verdict_raw in ("skip", "s", ""):
+            return
+
+        if verdict_raw in ("y", "yes", "д", "да", "1", "+"):
+            self.memory.log_user_feedback(user_input, sql, verdict="up")
+            return
+
+        if verdict_raw in ("n", "no", "н", "нет", "0", "-"):
+            try:
+                corrected = input(
+                    "Введите правильный SQL (или оставьте пустым): "
+                ).strip()
+            except EOFError:
+                corrected = ""
+            self.memory.log_user_feedback(
+                user_input, sql, verdict="down",
+                corrected_sql=corrected or None,
+            )
+            print("✓ Отзыв записан. Спасибо — это улучшает качество ответов.")
+            return
+
     def _handle_exit(self) -> None:
         """Завершение работы с сохранением резюме."""
         _status_print("Сохранение резюме сессии...")
@@ -471,10 +520,19 @@ class CLIInterface:
         self._save_memory_from_llm_response(response)
         logger.info("Долгосрочная память (слои) обновлена")
 
+    # Константы для plan-preview подтверждения
+    _PLAN_APPROVE_TOKENS = frozenset({
+        "ок", "ok", "да", "yes", "подтверждаю", "ага", "ладно", "давай",
+        "подтвердить", "выполнить", "запустить",
+    })
+    _PLAN_MAX_ITERATIONS = 3
+
     def _process_query(
         self,
         user_input: str,
         user_filter_choices: dict[str, str] | None = None,
+        plan_preview_approved: bool = False,
+        _plan_iteration: int = 0,
     ) -> None:
         """Обработать запрос пользователя через граф агента.
 
@@ -507,6 +565,7 @@ class CLIInterface:
             prev_sql=self._prev_sql,
             prev_result_summary=self._prev_result_summary,
             user_filter_choices=dict(user_filter_choices or {}),
+            plan_preview_approved=plan_preview_approved,
         )
         result = {}
         spinner_idx = 0
@@ -533,6 +592,59 @@ class CLIInterface:
 
             # Очищаем статусную строку
             _status_print("")
+
+            # Plan-preview: показываем план и ждём подтверждения пользователя
+            if result.get("plan_preview_pending"):
+                plan_msg = result.get("confirmation_message", "")
+                if plan_msg:
+                    print(f"\n{plan_msg}\n")
+                else:
+                    print("\n[Plan preview: план недоступен]\n")
+
+                if _plan_iteration >= self._PLAN_MAX_ITERATIONS:
+                    print(
+                        f"⚠️  Достигнут лимит правок плана ({self._PLAN_MAX_ITERATIONS}). "
+                        "Продолжаем с текущим планом."
+                    )
+                    self._process_query(
+                        user_input,
+                        user_filter_choices=user_filter_choices,
+                        plan_preview_approved=True,
+                        _plan_iteration=_plan_iteration,
+                    )
+                    return
+
+                try:
+                    plan_input = input("Ваш ответ (ок/правка): ").strip()
+                except EOFError:
+                    plan_input = "ok"
+
+                normalized = plan_input.lower().strip()
+                if normalized in self._PLAN_APPROVE_TOKENS or not normalized:
+                    # Подтверждено — перезапускаем с флагом approved
+                    self.memory.add_message(
+                        "user", f"[plan_preview] подтверждено: {plan_input}"
+                    )
+                    self._process_query(
+                        user_input,
+                        user_filter_choices=user_filter_choices,
+                        plan_preview_approved=True,
+                        _plan_iteration=_plan_iteration,
+                    )
+                else:
+                    # Пользователь хочет изменить план — мёржим новые хинты в запрос
+                    self.memory.add_message(
+                        "user", f"[plan_preview] правка #{_plan_iteration + 1}: {plan_input}"
+                    )
+                    # Добавляем уточнение к запросу, чтобы hint_extractor перечитал хинты
+                    augmented = f"{user_input}\nУточнение пользователя: {plan_input}"
+                    self._process_query(
+                        augmented,
+                        user_filter_choices=user_filter_choices,
+                        plan_preview_approved=False,
+                        _plan_iteration=_plan_iteration + 1,
+                    )
+                return
 
             # Проверяем нужна ли disambiguation (несколько таблиц)
             if result.get("needs_clarification"):
@@ -634,8 +746,8 @@ class CLIInterface:
             print(f"\n{answer}")
 
             # Сохраняем успешные read-запросы в кэш + multi-turn контекст
+            executed_sql: str | None = None
             if not _is_write and answer and answer != "Нет ответа.":
-                executed_sql = None
                 for tc in reversed(result.get("tool_calls", [])):
                     if tc.get("tool") == "execute_query":
                         executed_sql = tc.get("args", {}).get("sql")
@@ -644,9 +756,12 @@ class CLIInterface:
                 # Обновляем multi-turn контекст для следующего запроса
                 if executed_sql:
                     self._prev_sql = executed_sql
-                    # Краткое резюме: первые 200 символов ответа без markdown
                     summary = re.sub(r'```[^`]*```', '', answer, flags=re.DOTALL).strip()
                     self._prev_result_summary = summary[:200]
+
+            # Feedback loop: запрашиваем оценку ответа
+            if answer and answer != "Нет ответа.":
+                self._ask_feedback(user_input, executed_sql or "")
 
         except Exception as e:
             _status_print("")

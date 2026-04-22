@@ -6,6 +6,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from IPython.display import clear_output, display, Markdown
 
@@ -39,6 +40,12 @@ _NODE_STATUS = {
     "column_selector": "Выбираю колонки для запроса...",
     "sql_planner": "Планирую стратегию SQL...",
     "plan_preview": "Готовлю план запроса...",
+    "plan_edit_router": "Разбираю правку плана...",
+    "plan_patcher": "Применяю локальные изменения...",
+    "source_rebinder": "Пересобираю источники данных...",
+    "intent_rewriter": "Пересобираю смысл запроса...",
+    "plan_edit_validator": "Проверяю обновлённый план...",
+    "plan_diff_renderer": "Показываю изменения плана...",
     "explicit_mode_dispatcher": "Определяю режим запроса...",
     "sql_writer": "Пишу SQL-запрос...",
     "sql_validator": "Проверяю и выполняю SQL...",
@@ -748,6 +755,8 @@ class CLIInterface:
         user_filter_choices: dict[str, str] | None = None,
         plan_preview_approved: bool = False,
         _plan_iteration: int = 0,
+        plan_edit_text: str = "",
+        plan_context: dict[str, Any] | None = None,
         rejected_filter_choices: dict[str, list[str]] | None = None,
     ) -> None:
         """Обработать запрос пользователя через граф агента.
@@ -762,7 +771,7 @@ class CLIInterface:
         _write_keywords = ("insert", "update", "delete", "drop", "create", "truncate", "alter")
         _is_write = any(kw in user_input.lower() for kw in _write_keywords)
         # Не отдаём из кэша, если пользователь уточнил фильтр — ответ может поменяться.
-        if not _is_write and not user_filter_choices:
+        if not _is_write and not user_filter_choices and not plan_edit_text and not plan_context:
             cached = self.query_cache.get(user_input)
             if cached:
                 from datetime import datetime, timezone
@@ -782,6 +791,9 @@ class CLIInterface:
             prev_result_summary=self._prev_result_summary,
             user_filter_choices=dict(user_filter_choices or {}),
             plan_preview_approved=plan_preview_approved,
+            plan_preview_iteration=_plan_iteration,
+            plan_edit_text=plan_edit_text,
+            plan_context=plan_context,
             rejected_filter_choices={k: list(v) for k, v in dict(rejected_filter_choices or {}).items()},
         )
         result = {}
@@ -830,6 +842,7 @@ class CLIInterface:
                         user_filter_choices=user_filter_choices,
                         plan_preview_approved=True,
                         _plan_iteration=_plan_iteration,
+                        plan_context=result,
                         rejected_filter_choices=rejected_filter_choices,
                     )
                     return
@@ -850,20 +863,21 @@ class CLIInterface:
                         user_filter_choices=user_filter_choices,
                         plan_preview_approved=True,
                         _plan_iteration=_plan_iteration,
+                        plan_context=result,
                         rejected_filter_choices=rejected_filter_choices,
                     )
                 else:
-                    # Пользователь хочет изменить план — мёржим новые хинты в запрос
+                    # Пользователь хочет изменить текущий план — запускаем plan-edit цикл
                     self.memory.add_message(
                         "user", f"[plan_preview] правка #{_plan_iteration + 1}: {plan_input}"
                     )
-                    # Добавляем уточнение к запросу, чтобы hint_extractor перечитал хинты
-                    augmented = f"{user_input}\nУточнение пользователя: {plan_input}"
                     self._process_query(
-                        augmented,
+                        user_input,
                         user_filter_choices=user_filter_choices,
                         plan_preview_approved=False,
                         _plan_iteration=_plan_iteration + 1,
+                        plan_edit_text=plan_input,
+                        plan_context=result,
                         rejected_filter_choices=rejected_filter_choices,
                     )
                 return

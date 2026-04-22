@@ -196,6 +196,7 @@ class TestExtractUserHintsContract:
         assert hints["having_hints"] == []
         assert hints["group_by_hints"] == []
         assert hints["aggregate_hints"] == []
+        assert hints["aggregation_preferences"] == {}
         assert hints["time_granularity"] is None
         assert hints["negative_filters"] == []
 
@@ -276,6 +277,17 @@ class TestAggregateHints:
         agg_funcs = [a[0] for a in hints["aggregate_hints"]]
         assert "count" in agg_funcs
         assert "segment_name" in hints["group_by_hints"]
+
+    def test_count_distinct_preference(self, synthetic_loader):
+        """count(distinct event_id) → aggregation_preferences.distinct=True."""
+        hints = extract_user_hints(
+            "возьми count(distinct event_id)", synthetic_loader,
+        )
+        assert hints["aggregation_preferences"] == {
+            "function": "count",
+            "column": "event_id",
+            "distinct": True,
+        }
 
 
 class TestTimeGranularity:

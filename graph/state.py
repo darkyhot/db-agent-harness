@@ -124,6 +124,7 @@ class AgentState(TypedDict):
     #     "having_hints": [{"op": ">=", "value": 3, "unit_hint": "человек"}],
     #     "group_by_hints": ["task_code", "region", ...],
     #     "aggregate_hints": [("count", "task"), ("sum", "revenue"), ...],
+    #     "aggregation_preferences": {"function": "count", "column": "task_code", "distinct": True},
     #     "time_granularity": "month" | "quarter" | "year" | "day" | "week" | None,
     #     "negative_filters": ["канцелярия", ...],
     #   }
@@ -153,3 +154,16 @@ class AgentState(TypedDict):
     plan_preview_pending: bool
     plan_preview_approved: bool
     plan_preview_iteration: int
+
+    # === Plan-edit cycle ===
+    plan_edit_text: str
+    plan_edit_kind: str
+    plan_edit_confidence: float
+    plan_edit_payload: dict[str, Any]
+    plan_edit_explanation: str
+    plan_edit_needs_clarification: bool
+    plan_edit_applied: bool
+    plan_edit_history: list[dict[str, Any]]
+    previous_sql_blueprint: dict[str, Any]
+    plan_diff: dict[str, Any]
+    plan_diff_summary: str

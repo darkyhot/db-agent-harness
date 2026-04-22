@@ -141,6 +141,17 @@ _AGGREGATE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ), "avg"),
 ]
 
+_COUNT_DISTINCT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\bcount\s*\(\s*distinct\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bcount\s+distinct\s+([a-zA-Z_][a-zA-Z0-9_]*)\b",
+        re.IGNORECASE,
+    ),
+]
+
 # Нормализация гранулярности времени.
 # Ключ — каноническое значение; список — паттерны (подстроки/regex).
 _TIME_GRANULARITY_MAP: dict[str, list[str]] = {
@@ -402,6 +413,7 @@ def extract_user_hints(
             "having_hints": [{"op": ">=", "value": 3, "unit_hint": "человек"}],
             "group_by_hints": ["task_code", "region", ...],
             "aggregate_hints": [("count", "task"), ("sum", "revenue"), ...],
+            "aggregation_preferences": {"function": "count", "column": "task_code", "distinct": True},
             "time_granularity": "month" | "quarter" | "year" | "day" | "week" | None,
             "negative_filters": ["канцелярия", ...],
         }
@@ -413,6 +425,7 @@ def extract_user_hints(
         "having_hints": [],
         "group_by_hints": [],
         "aggregate_hints": [],
+        "aggregation_preferences": {},
         "time_granularity": None,
         "negative_filters": [],
     }
@@ -531,6 +544,22 @@ def extract_user_hints(
             if pair not in aggregate_hints:
                 aggregate_hints.append(pair)
     result["aggregate_hints"] = aggregate_hints
+
+    aggregation_preferences: dict[str, Any] = {}
+    for pattern in _COUNT_DISTINCT_PATTERNS:
+        match = pattern.search(user_input)
+        if not match:
+            continue
+        column = match.group(1).strip().lower()
+        if not column:
+            continue
+        aggregation_preferences = {
+            "function": "count",
+            "column": column,
+            "distinct": True,
+        }
+        break
+    result["aggregation_preferences"] = aggregation_preferences
 
     # 8. Time granularity: "помесячно" → "month", "по кварталам" → "quarter"
     time_granularity: str | None = None

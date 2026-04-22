@@ -44,6 +44,7 @@ class HintExtractorNodes:
                 "join_fields": [],
                 "dim_sources": {},
                 "having_hints": [],
+                "aggregation_preferences": {},
             }
 
         if (
@@ -51,14 +52,16 @@ class HintExtractorNodes:
             or hints.get("join_fields")
             or hints.get("dim_sources")
             or hints.get("having_hints")
+            or hints.get("aggregation_preferences")
         ):
             logger.info(
                 "hint_extractor: must_keep=%s, join_fields=%s, "
-                "dim_sources=%s, having_hints=%s",
+                "dim_sources=%s, having_hints=%s, aggregation_preferences=%s",
                 hints.get("must_keep_tables"),
                 hints.get("join_fields"),
                 list(hints.get("dim_sources", {}).keys()),
                 hints.get("having_hints"),
+                hints.get("aggregation_preferences"),
             )
         else:
             logger.debug("hint_extractor: подсказок не найдено")

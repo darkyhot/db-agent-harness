@@ -83,6 +83,23 @@ class TestComputeAggregation:
         assert agg["function"] == "COUNT"
         assert agg["column"] == "client_id"
 
+    def test_count_distinct_override_from_user_hints(self):
+        intent = {"aggregation_hint": "count"}
+        agg = _compute_aggregation(
+            intent,
+            self._cols(["task_code"]),
+            user_hints={
+                "aggregation_preferences": {
+                    "function": "count",
+                    "column": "task_code",
+                    "distinct": True,
+                }
+            },
+        )
+        assert agg["function"] == "COUNT"
+        assert agg["column"] == "task_code"
+        assert agg["distinct"] is True
+
     def test_count_no_agg_col_fallback(self):
         intent = {"aggregation_hint": "count"}
         agg = _compute_aggregation(intent, self._cols([]))

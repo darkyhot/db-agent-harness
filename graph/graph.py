@@ -9,6 +9,7 @@ intent_classifier → table_resolver → table_explorer → column_selector
 
 import logging
 import time
+import copy
 from typing import Any
 
 from langgraph.graph import END, StateGraph
@@ -23,6 +24,14 @@ from core.sql_validator import SQLValidator
 from graph.nodes import GraphNodes
 import graph.nodes.intent as intent_module
 from graph.state import AgentState
+
+
+def _full_table_name(item: tuple[str, str] | list[str] | str) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, (list, tuple)) and len(item) == 2:
+        return f"{item[0]}.{item[1]}"
+    return ""
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +70,12 @@ def _route_after_intent_classifier(state: AgentState) -> str:
     limit = _check_limits(state)
     if limit:
         return limit
+
+    if state.get("plan_preview_approved") and state.get("sql_blueprint"):
+        return "plan_preview"
+
+    if state.get("plan_edit_text") and state.get("sql_blueprint"):
+        return "plan_edit_router"
 
     if state.get("needs_clarification"):
         return END
@@ -213,6 +228,37 @@ def _route_after_plan_preview(state: AgentState) -> str:
     return "sql_writer"
 
 
+def _route_after_plan_edit_router(state: AgentState) -> str:
+    """Маршрутизация после plan_edit_router."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("plan_edit_needs_clarification") or state.get("needs_clarification"):
+        return END
+
+    kind = str(state.get("plan_edit_kind") or "")
+    if kind == "patch":
+        return "plan_patcher"
+    if kind == "rebind":
+        return "source_rebinder"
+    if kind == "rewrite":
+        return "intent_rewriter"
+    return END
+
+
+def _route_after_plan_edit_validator(state: AgentState) -> str:
+    """После validator либо просим уточнение, либо рендерим diff и новый preview."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("plan_edit_needs_clarification") or state.get("needs_clarification"):
+        return END
+
+    return "plan_diff_renderer"
+
+
 def _route_after_error_diagnoser(state: AgentState) -> str:
     """Маршрутизация после error_diagnoser."""
     limit = _check_limits(state)
@@ -306,6 +352,12 @@ def build_graph(
     graph.add_node("column_selector", nodes.column_selector)
     graph.add_node("sql_planner", nodes.sql_planner)
     graph.add_node("plan_preview", nodes.plan_preview)
+    graph.add_node("plan_edit_router", nodes.plan_edit_router)
+    graph.add_node("plan_patcher", nodes.plan_patcher)
+    graph.add_node("source_rebinder", nodes.source_rebinder)
+    graph.add_node("intent_rewriter", nodes.intent_rewriter)
+    graph.add_node("plan_edit_validator", nodes.plan_edit_validator)
+    graph.add_node("plan_diff_renderer", nodes.plan_diff_renderer)
     graph.add_node("sql_writer", nodes.sql_writer)
     graph.add_node("sql_static_checker", nodes.sql_static_checker)
     graph.add_node("sql_validator", nodes.sql_validator_node)
@@ -324,6 +376,8 @@ def build_graph(
         "summarizer": "summarizer",
         "tool_dispatcher": "tool_dispatcher",
         "hint_extractor": "hint_extractor",
+        "plan_edit_router": "plan_edit_router",
+        "plan_preview": "plan_preview",
     })
 
     # hint_extractor → explicit_mode_dispatcher (детерминированный) → table_resolver
@@ -360,6 +414,23 @@ def build_graph(
         END: END,
         "sql_writer": "sql_writer",
     })
+
+    graph.add_conditional_edges("plan_edit_router", _route_after_plan_edit_router, {
+        END: END,
+        "plan_patcher": "plan_patcher",
+        "source_rebinder": "source_rebinder",
+        "intent_rewriter": "intent_rewriter",
+        "summarizer": "summarizer",
+    })
+    graph.add_edge("plan_patcher", "plan_edit_validator")
+    graph.add_edge("source_rebinder", "plan_edit_validator")
+    graph.add_edge("intent_rewriter", "plan_edit_validator")
+    graph.add_conditional_edges("plan_edit_validator", _route_after_plan_edit_validator, {
+        END: END,
+        "plan_diff_renderer": "plan_diff_renderer",
+        "summarizer": "summarizer",
+    })
+    graph.add_edge("plan_diff_renderer", "plan_preview")
 
     # sql_writer → sql_static_checker → sql_validator (или error_diagnoser)
     graph.add_conditional_edges("sql_writer", _route_after_sql_writer, {
@@ -416,9 +487,15 @@ def create_initial_state(
     prev_result_summary: str = "",
     user_filter_choices: dict[str, str] | None = None,
     plan_preview_approved: bool = False,
+    plan_preview_iteration: int = 0,
+    plan_edit_text: str = "",
+    plan_context: dict[str, Any] | None = None,
     rejected_filter_choices: dict[str, list[str]] | None = None,
 ) -> AgentState:
     """Создать начальное состояние для запуска графа."""
+    ctx = dict(plan_context or {})
+    selected_tables = list(ctx.get("selected_tables") or [])
+    seeded_user_hints = copy.deepcopy(ctx.get("user_hints") or {})
     return AgentState(
         messages=[],
         plan=[],
@@ -447,15 +524,15 @@ def create_initial_state(
         needs_replan=False,
         replan_context="",
         # Новые структурированные поля
-        intent={},
-        selected_tables=[],
-        table_structures={},
-        table_samples={},
-        table_types={},
-        join_analysis_data={},
-        selected_columns={},
-        join_spec=[],
-        sql_blueprint={},
+        intent=dict(ctx.get("intent") or {}),
+        selected_tables=selected_tables,
+        table_structures=dict(ctx.get("table_structures") or {}),
+        table_samples=dict(ctx.get("table_samples") or {}),
+        table_types=dict(ctx.get("table_types") or {}),
+        join_analysis_data=dict(ctx.get("join_analysis_data") or {}),
+        selected_columns=dict(ctx.get("selected_columns") or {}),
+        join_spec=list(ctx.get("join_spec") or []),
+        sql_blueprint=dict(ctx.get("sql_blueprint") or {}),
         error_diagnosis={},
         pending_sql_tool_call=None,
         column_selector_hint="",
@@ -463,28 +540,41 @@ def create_initial_state(
         prev_sql=prev_sql,
         prev_result_summary=prev_result_summary,
         # Подсказки пользователя (детерминированный экстрактор)
-        user_hints={
+        user_hints=seeded_user_hints or {
             "must_keep_tables": [],
             "join_fields": [],
             "dim_sources": {},
             "having_hints": [],
             "group_by_hints": [],
             "aggregate_hints": [],
+            "aggregation_preferences": {},
             "time_granularity": None,
             "negative_filters": [],
         },
-        semantic_frame={},
-        where_resolution={},
-        join_decision={},
-        planning_confidence={},
-        evidence_trace={},
-        fallback_policy={},
+        semantic_frame=dict(ctx.get("semantic_frame") or {}),
+        where_resolution=dict(ctx.get("where_resolution") or {}),
+        join_decision=dict(ctx.get("join_decision") or {}),
+        planning_confidence=dict(ctx.get("planning_confidence") or {}),
+        evidence_trace=dict(ctx.get("evidence_trace") or {}),
+        fallback_policy=dict(ctx.get("fallback_policy") or {}),
         # Белый список таблиц (заполняется в table_resolver)
-        allowed_tables=[],
+        allowed_tables=list(ctx.get("allowed_tables") or [_full_table_name(t) for t in selected_tables if _full_table_name(t)]),
         # Explicit mode (задача 2.2)
-        explicit_mode=False,
+        explicit_mode=bool(ctx.get("explicit_mode", False)),
         # Plan-preview (задача 2.1)
         plan_preview_pending=False,
         plan_preview_approved=plan_preview_approved,
-        plan_preview_iteration=0,
+        plan_preview_iteration=plan_preview_iteration,
+        # Plan-edit cycle
+        plan_edit_text=plan_edit_text,
+        plan_edit_kind="",
+        plan_edit_confidence=0.0,
+        plan_edit_payload={},
+        plan_edit_explanation="",
+        plan_edit_needs_clarification=False,
+        plan_edit_applied=False,
+        plan_edit_history=list(ctx.get("plan_edit_history") or []),
+        previous_sql_blueprint=dict(ctx.get("previous_sql_blueprint") or {}),
+        plan_diff=dict(ctx.get("plan_diff") or {}),
+        plan_diff_summary=str(ctx.get("plan_diff_summary") or ""),
     )

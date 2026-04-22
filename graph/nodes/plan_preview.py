@@ -25,9 +25,15 @@ def _render_plan(
     join_spec: list[dict[str, Any]],
     where_resolution: dict[str, Any],
     user_hints: dict[str, Any],
+    plan_diff_summary: str = "",
 ) -> str:
     """Собрать человекочитаемый Markdown-план запроса."""
     lines: list[str] = ["**План запроса:**", ""]
+
+    if plan_diff_summary:
+        lines.append("**Изменения после правки:**")
+        lines.extend(plan_diff_summary.splitlines())
+        lines.append("")
 
     # Главная таблица
     main_table = sql_blueprint.get("main_table") or ""
@@ -57,7 +63,8 @@ def _render_plan(
         col = aggregation.get("column") or ""
         alias = aggregation.get("alias") or ""
         if func and col:
-            agg_str = f"{func.upper()}({col})"
+            distinct_sql = "DISTINCT " if aggregation.get("distinct") else ""
+            agg_str = f"{func.upper()}({distinct_sql}{col})"
             if alias:
                 agg_str += f" AS {alias}"
             lines.append(f"- **Агрегация:** `{agg_str}`")
@@ -150,6 +157,7 @@ class PlanPreviewNodes:
             join_spec=join_spec,
             where_resolution=where_resolution,
             user_hints=user_hints,
+            plan_diff_summary=str(state.get("plan_diff_summary") or ""),
         )
 
         iteration = state.get("plan_preview_iteration", 0)

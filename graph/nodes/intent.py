@@ -92,6 +92,14 @@ class IntentNodes:
         Returns:
             Обновления состояния с распознанным интентом.
         """
+        if (state.get("plan_edit_text") and state.get("sql_blueprint")) or (
+            state.get("plan_preview_approved") and state.get("sql_blueprint")
+        ):
+            logger.info("IntentClassifier: plan-edit/approved fast-path — пропускаю реклассификацию")
+            return {
+                "graph_iterations": state.get("graph_iterations", 0) + 1,
+            }
+
         user_input = state["user_input"]
         logger.info("IntentClassifier: обработка запроса: %s", summarize_text(user_input, label="user_input"))
 

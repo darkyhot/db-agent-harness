@@ -686,11 +686,14 @@ def _is_scalar_count_request(
     agg_hint: str,
     semantic_output_dimensions: list[str],
     explicit_count_metric: bool,
+    requested_dimensions: list[str] | None = None,
 ) -> bool:
     """True для запросов вида «сколько задач ...» без разбивки."""
     if agg_hint != "count":
         return False
     if explicit_count_metric:
+        return False
+    if requested_dimensions:
         return False
     return not semantic_output_dimensions
 
@@ -740,6 +743,7 @@ def select_columns(
         agg_hint=agg_hint,
         semantic_output_dimensions=semantic_output_dimensions,
         explicit_count_metric=bool(requested.get("explicit_count_metric")),
+        requested_dimensions=list(requested.get("dimensions") or []),
     )
     logger.info(
         "ColumnSelectorDet: requested=%s, requires_single_entity_count=%s, scalar_count_request=%s",
@@ -1225,6 +1229,63 @@ def select_columns(
                     roles.pop(role, None)
             if not roles:
                 selected_columns.pop(table_key, None)
+
+    # ---- Fallback для COUNT c разбивкой ----
+    # Если пользователь явно просит "по X", но эвристики не смогли удержать
+    # ни одной таблицы (или осталась только dim-таблица без факта), собираем
+    # минимально корректный набор ролей вручную.
+    if agg_hint == 'count' and requested['dimensions']:
+        query_norm = _normalize_query_text(user_input)
+        explicit_positions: list[tuple[int, str]] = []
+        for t in table_structures:
+            table_name = t.split('.', 1)[-1].lower()
+            pos = query_norm.find(table_name)
+            if pos >= 0:
+                explicit_positions.append((pos, t))
+        explicit_positions.sort()
+        main_table = explicit_positions[0][1] if explicit_positions else None
+        if main_table is None:
+            main_table = next((t for t, tp in table_types.items() if tp == 'fact'), None)
+        if main_table is None:
+            main_table = next(iter(table_structures), None)
+
+        has_fact_agg = any(roles.get('aggregate') for roles in selected_columns.values())
+        if main_table and not has_fact_agg:
+            roles = selected_columns.setdefault(main_table, {})
+            roles.setdefault('aggregate', [])
+            if '*' not in roles['aggregate']:
+                roles['aggregate'].append('*')
+
+        if not selected_columns or all(not roles.get('group_by') for roles in selected_columns.values()):
+            for slot in requested['dimensions']:
+                choice = _choose_best_column(
+                    table_structures,
+                    table_types,
+                    schema_loader,
+                    slot,
+                    dim_source_table=_slot_dim_source(slot),
+                )
+                if not choice:
+                    continue
+                table_key, col_name = choice
+                roles = selected_columns.setdefault(table_key, {})
+                roles.setdefault('select', [])
+                roles.setdefault('group_by', [])
+                if col_name not in roles['select']:
+                    roles['select'].append(col_name)
+                if col_name not in roles['group_by']:
+                    roles['group_by'].append(col_name)
+
+        if has_date_filter and main_table:
+            date_choice = _choose_best_column(
+                table_structures, table_types, schema_loader, 'date'
+            )
+            if date_choice:
+                table_key, col_name = date_choice
+                roles = selected_columns.setdefault(table_key, {})
+                roles.setdefault('filter', [])
+                if col_name not in roles['filter']:
+                    roles['filter'].append(col_name)
 
     join_spec = _build_join_spec(
         join_analysis_data,

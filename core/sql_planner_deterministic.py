@@ -384,6 +384,7 @@ def _compute_aggregation(
     intent: dict,
     selected_columns: dict[str, dict],
     *,
+    user_hints: dict | None = None,
     schema_loader=None,
     semantic_frame: dict | None = None,
 ) -> dict | None:
@@ -415,11 +416,43 @@ def _compute_aggregation(
             result: dict = {"function": func, "column": col, "alias": alias}
             if distinct:
                 result["distinct"] = True
+            override = (user_hints or {}).get("aggregation_preferences", {}) or {}
+            override_func = str(override.get("function") or "").strip().lower()
+            override_col = str(override.get("column") or "").strip()
+            if override_func == "count" and result["function"] == "COUNT":
+                if override_col:
+                    selected_cols = {
+                        c
+                        for roles in selected_columns.values()
+                        for role_name in ("aggregate", "select", "group_by", "filter")
+                        for c in (roles.get(role_name, []) or [])
+                    }
+                    if override_col in selected_cols:
+                        result["column"] = override_col
+                        result["alias"] = f"count_{override_col}"
+                if override.get("distinct"):
+                    result["distinct"] = True
             return result
 
     # Нет явной aggregate-роли — COUNT(*) как fallback для count
     if hint == "count":
-        return {"function": "COUNT", "column": "*", "alias": "count_all"}
+        result = {"function": "COUNT", "column": "*", "alias": "count_all"}
+        override = (user_hints or {}).get("aggregation_preferences", {}) or {}
+        override_func = str(override.get("function") or "").strip().lower()
+        override_col = str(override.get("column") or "").strip()
+        if override_func == "count":
+            selected_cols = {
+                c
+                for roles in selected_columns.values()
+                for role_name in ("aggregate", "select", "group_by", "filter")
+                for c in (roles.get(role_name, []) or [])
+            }
+            if override_col and override_col in selected_cols:
+                result["column"] = override_col
+                result["alias"] = f"count_{override_col}"
+            if override.get("distinct") and result["column"] != "*":
+                result["distinct"] = True
+        return result
 
     return None
 
@@ -683,6 +716,7 @@ def build_blueprint(
     aggregation = _compute_aggregation(
         intent,
         selected_columns,
+        user_hints=user_hints,
         schema_loader=schema_loader,
         semantic_frame=semantic_frame,
     )
@@ -726,6 +760,7 @@ def build_blueprint(
             aggregation = _compute_aggregation(
                 intent,
                 selected_columns,
+                user_hints=user_hints,
                 schema_loader=schema_loader,
                 semantic_frame=semantic_frame,
             )

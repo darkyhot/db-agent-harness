@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from core.domain_rules import table_can_satisfy_frame
@@ -10,6 +11,86 @@ from core.filter_ranking import rank_filter_candidates
 from core.log_safety import summarize_dict_keys
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_text(text: str) -> str:
+    text = str(text or "").lower().replace("ё", "е")
+    text = re.sub(r"[^0-9a-zа-я_ ]+", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _tokenize(text: str) -> list[str]:
+    return [tok for tok in _normalize_text(text).split() if len(tok) >= 2]
+
+
+def _stem(token: str) -> str:
+    token = _normalize_text(token)
+    for suffix in (
+        "ыми", "ими", "ого", "его", "ому", "ему", "ая", "яя", "ое", "ее",
+        "ые", "ие", "ый", "ий", "ой", "ом", "ем", "ым", "им", "ах", "ях",
+        "ов", "ев", "ей", "ам", "ям", "у", "ю", "а", "я", "ы", "и", "е", "о",
+    ):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+            return token[: -len(suffix)]
+    return token
+
+
+def _business_event_is_already_encoded_in_table(
+    *,
+    schema_loader,
+    selected_tables: list[str],
+    semantic_frame: dict[str, Any] | None,
+) -> bool:
+    """Определить, что бизнес-смысл запроса уже покрыт выбранной таблицей.
+
+    Сценарий: пользователь или table_resolver выбрал одну витрину по событию
+    ("фактический отток"), а filter_intents всё ещё указывают на колонки другой
+    таблицы. В таком случае отдельный WHERE по этому событию не нужен.
+    """
+    if len(selected_tables) != 1:
+        return False
+
+    business_event = str((semantic_frame or {}).get("business_event") or "").strip()
+    filter_intents = list((semantic_frame or {}).get("filter_intents") or [])
+    if not business_event or not filter_intents:
+        return False
+
+    selected_table = str(selected_tables[0]).strip().lower()
+    if "." not in selected_table:
+        return False
+    schema, table = selected_table.split(".", 1)
+
+    bound_to_other_tables = []
+    for item in filter_intents:
+        column_key = str(item.get("column_key") or "").strip().lower()
+        if not column_key:
+            return False
+        table_key = ".".join(column_key.split(".")[:2])
+        if table_key == selected_table:
+            return False
+        bound_to_other_tables.append(table_key)
+
+    if not bound_to_other_tables:
+        return False
+
+    table_info = schema_loader.get_table_info(schema, table)
+    haystack_stems = {_stem(tok) for tok in _tokenize(table_info)}
+    business_stems = {_stem(tok) for tok in _tokenize(business_event) if len(tok) >= 4}
+    if not business_stems:
+        return False
+
+    # Смысл считается покрытым таблицей, если каждый существенный токен события
+    # читается в имени/описании таблицы хотя бы по общему стему.
+    return all(
+        any(
+            cand == token_stem
+            or cand.startswith(token_stem)
+            or token_stem.startswith(cand)
+            for cand in haystack_stems
+        )
+        for token_stem in business_stems
+    )
 
 
 def _add_unique(conditions: list[str], condition: str) -> None:
@@ -228,6 +309,22 @@ def resolve_where(
             "но уверенности недостаточно. Уточните, пожалуйста, желаемый признак или значение."
         )
         logger.info("WhereResolver: не удалось привязать filter_intents автоматически")
+
+    if (
+        clarification_message
+        and not applied_rules
+        and _business_event_is_already_encoded_in_table(
+            schema_loader=schema_loader,
+            selected_tables=selected_tables,
+            semantic_frame=semantic_frame,
+        )
+    ):
+        clarification_message = ""
+        reasoning.append("table_context_covers_business_event")
+        logger.info(
+            "WhereResolver: suppress clarification — business_event уже покрыт выбранной таблицей %s",
+            selected_tables[0] if selected_tables else "",
+        )
 
     logger.info(
         "WhereResolver: filter_intents=%d, applied_rules=%s, conditions=%d, candidates=%s",

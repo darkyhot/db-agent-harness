@@ -443,6 +443,30 @@ class DatabaseManager:
             df = pd.read_sql(sql, conn, params={"n": n})
         return df
 
+    def get_random_sample(
+        self,
+        schema: str,
+        table: str,
+        n: int = 100_000,
+        columns: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """Получить random sample строк из таблицы."""
+        schema = _validate_identifier(schema, "schema")
+        table = _validate_identifier(table, "table")
+        if not isinstance(n, int) or n < 1:
+            raise ValueError(f"Недопустимое значение n: {n}")
+        projection = "*"
+        if columns:
+            safe_columns = [_validate_identifier(col, "column") for col in columns]
+            projection = ", ".join(f'"{col}"' for col in safe_columns)
+        sql = text(
+            f'SELECT {projection} FROM "{schema}"."{table}" ORDER BY random() LIMIT :n'
+        )
+        engine = self.get_engine()
+        with engine.connect() as conn:
+            df = pd.read_sql(sql, conn, params={"n": n})
+        return df
+
     def table_exists(self, schema: str, table: str) -> bool:
         """Проверить существование таблицы.
 

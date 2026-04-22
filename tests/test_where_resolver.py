@@ -209,6 +209,71 @@ def test_where_resolver_clarification_message_shows_example_values(tmp_path):
     assert "Тип задачи" in label_b
 
 
+def test_where_resolver_treats_business_event_as_table_context_for_single_selected_table(tmp_path):
+    loader = _loader(tmp_path)
+    tables_df = pd.read_csv(tmp_path / "tables_list.csv")
+    tables_df = pd.concat([
+        tables_df,
+        pd.DataFrame({
+            "schema_name": ["dm"],
+            "table_name": ["uzp_dwh_fact_outflow"],
+            "description": ["Информация по фактическим оттокам для УЗП"],
+            "grain": ["snapshot"],
+        }),
+    ], ignore_index=True)
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+    frame = {
+        "business_event": "фактический отток",
+        "filter_intents": [
+            {
+                "request_id": "text:dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+                "kind": "text_search",
+                "query_text": "фактический отток",
+                "column_key": "dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+            }
+        ],
+    }
+    result = resolve_where(
+        user_input="Сколько фактических оттоков",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.uzp_dwh_fact_outflow": {"select": ["inn"], "aggregate": ["inn"]}},
+        selected_tables=["dm.uzp_dwh_fact_outflow"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+    )
+    assert result["needs_clarification"] is False
+    assert "table_context_covers_business_event" in result["reasoning"]
+
+
+def test_where_resolver_keeps_clarification_when_single_table_does_not_cover_business_event(tmp_path):
+    loader = _loader(tmp_path)
+    frame = {
+        "business_event": "фактический отток",
+        "filter_intents": [
+            {
+                "request_id": "text:dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+                "kind": "text_search",
+                "query_text": "фактический отток",
+                "column_key": "dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+            }
+        ],
+    }
+    result = resolve_where(
+        user_input="Сколько фактических оттоков",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.uzp_data_split_mzp_sale_funnel": {"select": ["task_code"], "aggregate": ["task_code"]}},
+        selected_tables=["dm.uzp_data_split_mzp_sale_funnel"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+    )
+    assert result["needs_clarification"] is True
+    assert "table_context_covers_business_event" not in result["reasoning"]
+
+
 def test_candidate_label_falls_back_to_example_values():
     from core.where_resolver import candidate_label
     cand = {

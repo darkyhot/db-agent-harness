@@ -13,7 +13,7 @@ class EnrichmentPipeline:
         self.llm = llm
         self.db = db_manager
 
-    def run(self) -> None:
+    def run(self, *, sample_cache: dict[tuple[str, str], Any] | None = None) -> None:
         """Запустить полный enrichment pipeline.
 
         Порядок: сначала детерминированное заполнение grain (без LLM) — это
@@ -23,5 +23,5 @@ class EnrichmentPipeline:
         self.schema.ensure_table_grains(self.llm)
         self.schema.ensure_column_semantics()
         self.schema.ensure_table_semantics()
-        self.schema.ensure_value_profiles(self.db)
+        self.schema.ensure_value_profiles(self.db, sample_cache=sample_cache)
         self.schema.ensure_semantic_registry()

@@ -15,6 +15,7 @@ from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.query_cache import QueryCache
 from core.enrichment_pipeline import EnrichmentPipeline
+from core.metadata_refresh import MetadataRefreshService, parse_table_refs
 from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
 from graph.graph import build_graph, create_initial_state
@@ -159,6 +160,31 @@ def _interpret_filter_clarification(
     return (matched, {})
 
 
+def _log_clarification_prompt(memory: MemoryManager, question: str) -> None:
+    """Записать уточняющий вопрос в session memory и файл лога."""
+    normalized = str(question or "").strip()
+    if not normalized:
+        return
+    logger.info("CLI clarification prompt: %s", normalized)
+    memory.add_message("assistant", f"Уточняющий вопрос: {normalized}")
+
+
+def _build_augmented_clarification_input(
+    original_user_input: str,
+    clarification_question: str,
+    clarification_answer: str,
+) -> str:
+    """Собрать следующий user_input так, чтобы агент видел и вопрос, и ответ."""
+    parts = [str(original_user_input or "").rstrip()]
+    question = str(clarification_question or "").strip()
+    answer = str(clarification_answer or "").strip()
+    if question:
+        parts.append(f"Вопрос уточнения: {question}")
+    if answer:
+        parts.append(f"Уточнение пользователя: {answer}")
+    return "\n".join(part for part in parts if part)
+
+
 def setup_logging() -> None:
     """Настройка логирования: только файл, консоль отключена."""
     root = logging.getLogger()
@@ -183,6 +209,10 @@ HELP_TEXT = """
   /config              — показать доступные разделы настройки
   /config connection   — настроить подключение к БД
   /config params       — настроить runtime-параметры агента
+  /metadata list       — показать список таблиц в metadata manifest
+  /metadata add ...    — добавить schema.table или список через запятую
+  /metadata remove ... — удалить schema.table или список через запятую
+  /refresh metadata    — пересобрать metadata для всех таблиц из manifest
   /memory              — просмотр и управление долгосрочной памятью
   /metrics             — метрики качества генерации SQL (последние 30 дней)
   /reset               — сбросить контекст текущей сессии
@@ -216,6 +246,7 @@ class CLIInterface:
         self.memory = MemoryManager()
         self.schema = SchemaLoader()
         EnrichmentPipeline(self.schema, llm=self.llm, db_manager=self.db).run()
+        self.metadata = MetadataRefreshService(self.schema, self.db, self.llm)
         self.validator = SQLValidator(self.db, schema_loader=self.schema)
 
         # Создание tools через DI (замыкания)
@@ -393,7 +424,7 @@ class CLIInterface:
         command = tokens[0].lower()
         if command.startswith("/"):
             command = command[1:]
-        elif command not in {"help", "config", "memory", "metrics", "reset", "clear", "exit"}:
+        elif command not in {"help", "config", "metadata", "refresh", "memory", "metrics", "reset", "clear", "exit"}:
             return (None, [])
 
         return (command, [token.lower() for token in tokens[1:]])
@@ -407,6 +438,7 @@ class CLIInterface:
     def _rebuild_graph(self) -> None:
         """Пересобрать graph и tool bindings после смены конфига."""
         self._refresh_runtime_flags()
+        self.metadata = MetadataRefreshService(self.schema, self.db, self.llm)
         db_tools = create_db_tools(self.db, self.validator, self.schema)
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
@@ -665,6 +697,128 @@ class CLIInterface:
                 print(f"    {err_type:<25} {cnt}")
         print()
 
+    def _handle_metadata(self, args: list[str] | None = None) -> None:
+        """Управление manifest таблиц и синхронизацией metadata."""
+        args = args or []
+        if not args:
+            print("Использование: /metadata list | /metadata add schema.table[,schema.table] | /metadata remove ...")
+            return
+
+        action = args[0]
+        if action == "list":
+            targets = self.metadata.list_targets()
+            if not targets:
+                print("Manifest таблиц пуст. Каталог metadata будет пересоздан автоматически при следующем add/refresh.")
+                return
+            print("\n=== Metadata Targets ===")
+            for item in targets:
+                print(f"  {item}")
+            return
+
+        raw_refs = " ".join(args[1:]).strip()
+        if not raw_refs:
+            print("Нужен список таблиц в формате schema.table через запятую или пробел.")
+            return
+
+        try:
+            parsed_refs = [f"{schema}.{table}" for schema, table in parse_table_refs(raw_refs)]
+        except ValueError as exc:
+            print(str(exc))
+            return
+
+        def _metadata_progress(message: str) -> None:
+            _status_print(message)
+
+        if action == "add":
+            print("Обновляю manifest и собираю metadata для новых таблиц...")
+            try:
+                result = self.metadata.add_targets(
+                    parsed_refs,
+                    progress_callback=_metadata_progress,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _status_print("")
+                logger.error("Metadata add error: %s", exc, exc_info=True)
+                print(f"Ошибка добавления таблиц: {exc}")
+                return
+            _status_print("")
+            if result["added"]:
+                print("Добавлены:")
+                for item in result["added"]:
+                    print(f"  {item}")
+            if result["already_present"]:
+                print("Уже были в manifest:")
+                for item in result["already_present"]:
+                    print(f"  {item}")
+            if result.get("invalid_schemas"):
+                print("Отклонены из-за недопустимой схемы:")
+                for item in result["invalid_schemas"]:
+                    print(f"  {item}")
+            if result.get("missing_tables"):
+                print("Не найдены в БД:")
+                for item in result["missing_tables"]:
+                    print(f"  {item}")
+            refresh = result.get("refresh", {}) or {}
+            if refresh.get("refreshed"):
+                print("Metadata обновлены:")
+                for item in refresh["refreshed"]:
+                    print(f"  {item}")
+            if refresh.get("failed"):
+                print("Не удалось обновить:")
+                for item in refresh["failed"]:
+                    print(f"  {item}")
+            self._rebuild_graph()
+            return
+
+        if action == "remove":
+            print("Обновляю manifest и удаляю metadata для таблиц...")
+            try:
+                result = self.metadata.remove_targets(parsed_refs)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Metadata remove error: %s", exc, exc_info=True)
+                print(f"Ошибка удаления таблиц: {exc}")
+                return
+            if result["removed"]:
+                print("Удалены:")
+                for item in result["removed"]:
+                    print(f"  {item}")
+            if result["missing"]:
+                print("Не найдены в manifest:")
+                for item in result["missing"]:
+                    print(f"  {item}")
+            self._rebuild_graph()
+            return
+
+        print("Неизвестная подкоманда metadata. Используйте list, add или remove.")
+
+    def _handle_refresh(self, args: list[str] | None = None) -> None:
+        """Ручной refresh служебных артефактов."""
+        args = args or []
+        if args != ["metadata"]:
+            print("Использование: /refresh metadata")
+            return
+        print("Пересобираю metadata по всем таблицам из manifest...")
+
+        def _metadata_progress(message: str) -> None:
+            _status_print(message)
+
+        try:
+            result = self.metadata.refresh_all(progress_callback=_metadata_progress)
+        except Exception as exc:  # noqa: BLE001
+            _status_print("")
+            logger.error("Metadata refresh error: %s", exc, exc_info=True)
+            print(f"Ошибка refresh metadata: {exc}")
+            return
+        _status_print("")
+        refreshed = result.get("refreshed", [])
+        failed = result.get("failed", [])
+        print(f"Обновлено таблиц: {len(refreshed)}")
+        if failed:
+            print("Не удалось обновить:")
+            for item in failed:
+                print(f"  {item}")
+        self._rebuild_graph()
+
     def _ask_feedback(self, user_input: str, sql: str) -> None:
         """Запросить у пользователя оценку ответа (y/n/skip).
 
@@ -888,6 +1042,7 @@ class CLIInterface:
                     "clarification_message",
                     "Не хватает деталей для выполнения запроса.",
                 )
+                _log_clarification_prompt(self.memory, msg)
                 print(f"\n{msg}")
                 clarification = input("\nУточнение: ").strip()
                 if clarification:
@@ -927,9 +1082,13 @@ class CLIInterface:
                         )
                     else:
                         # Фолбэк: не смогли сопоставить ответ с кандидатами — как раньше,
-                        # дописываем в сам текст запроса, чтобы explicit-choice в
-                        # where_resolver мог поймать имя колонки напрямую.
-                        augmented_input = f"{user_input}\nУточнение пользователя: {clarification}"
+                        # дописываем в текст и сам вопрос, и ответ пользователя, чтобы
+                        # следующий прогон графа видел полный контекст уточнения.
+                        augmented_input = _build_augmented_clarification_input(
+                            user_input,
+                            msg,
+                            clarification,
+                        )
                         self._process_query(
                             augmented_input,
                             user_filter_choices=prev_choices or None,
@@ -1050,6 +1209,10 @@ class CLIInterface:
                 print(HELP_TEXT)
             elif command == "config":
                 self._handle_config(args)
+            elif command == "metadata":
+                self._handle_metadata(args)
+            elif command == "refresh":
+                self._handle_refresh(args)
             elif command == "memory":
                 self._handle_memory()
             elif command == "metrics":

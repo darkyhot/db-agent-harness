@@ -11,6 +11,8 @@ from typing import Any
 # длины 5+, но не срабатывает на разных словах («факт»/«акт»).
 _FUZZY_STEM_RATIO = 0.85
 _FUZZY_STEM_MIN_LEN = 5
+_FLAG_PREFIXES = {"is", "has", "flag", "flg", "bool", "boolean", "priznak", "признак"}
+_FLAG_SUFFIXES = {"flag", "flg", "ind", "indicator", "bool", "boolean", "priznak", "признак"}
 
 
 def _normalize_text(text: str) -> str:
@@ -62,6 +64,44 @@ def _fuzzy_stem_match(stem: str, candidates: set[str]) -> bool:
 def _fuzzy_overlap_count(value_stems: set[str], query_stems: set[str]) -> int:
     """Сколько value_stems имеют exact- или fuzzy-матч в query_stems."""
     return sum(1 for vs in value_stems if _fuzzy_stem_match(vs, query_stems))
+
+
+def _subject_alias_stems(subject: str, schema_loader) -> set[str]:
+    subject = _normalize_text(subject)
+    if not subject:
+        return set()
+    aliases = [subject]
+    try:
+        lexicon = schema_loader.get_semantic_lexicon()
+    except Exception:  # noqa: BLE001
+        lexicon = {}
+    meta = ((lexicon or {}).get("subjects") or {}).get(subject) or {}
+    aliases.extend(str(v) for v in (meta.get("aliases") or []) if str(v).strip())
+    stems: set[str] = set()
+    for alias in aliases:
+        stems.update(_stem_set(alias))
+    return stems
+
+
+def _column_looks_like_subject_flag(column: str, subject_stems: set[str]) -> bool:
+    """Определить, что flag-колонка кодирует принадлежность строки к subject.
+
+    Правило умышленно строгое: после снятия типичных boolean-prefix/suffix имя
+    должно схлопываться к одному subject-токену. Это даёт универсальный механизм
+    для is_task / client_flag / has_employee и не задевает более узкие признаки
+    вроде is_task_leader.
+    """
+    tokens = _tokenize(str(column or "").replace("_", " "))
+    if not tokens:
+        return False
+    while tokens and tokens[0] in _FLAG_PREFIXES:
+        tokens = tokens[1:]
+    while tokens and tokens[-1] in _FLAG_SUFFIXES:
+        tokens = tokens[:-1]
+    if len(tokens) != 1:
+        return False
+    token_stem = _stem(tokens[0])
+    return _fuzzy_stem_match(token_stem, subject_stems)
 
 
 def _text_score(query_text: str, column: str, description: str) -> float:
@@ -229,6 +269,69 @@ def _collect_requests(intent: dict[str, Any], semantic_frame: dict[str, Any] | N
     return requests
 
 
+def _collect_implicit_subject_flag_requests(
+    *,
+    selected_tables: list[str],
+    schema_loader,
+    semantic_frame: dict[str, Any] | None,
+    existing_requests: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    subject = str((semantic_frame or {}).get("subject") or "").strip().lower()
+    subject_stems = _subject_alias_stems(subject, schema_loader)
+    if not subject_stems:
+        return []
+
+    existing_keys = {
+        str(req.get("column_key") or "").strip().lower()
+        for req in existing_requests
+        if str(req.get("column_key") or "").strip()
+    }
+    implicit_requests: list[dict[str, Any]] = []
+
+    for table_key in selected_tables:
+        if "." not in table_key:
+            continue
+        schema, table = table_key.split(".", 1)
+        cols_df = schema_loader.get_table_columns(schema, table)
+        if cols_df.empty:
+            continue
+
+        best_match: tuple[float, str] | None = None
+        for _, row in cols_df.iterrows():
+            column = str(row.get("column_name", "") or "").strip()
+            if not column:
+                continue
+            column_key = f"{schema}.{table}.{column}".lower()
+            if column_key in existing_keys:
+                continue
+
+            semantics = schema_loader.get_column_semantics(schema, table, column)
+            semantic_class = str(semantics.get("semantic_class", "") or "")
+            profile = schema_loader.get_value_profile(schema, table, column)
+            value_mode = str(profile.get("value_mode", "") or "")
+            if semantic_class != "flag" and value_mode != "boolean_like":
+                continue
+            if not _column_looks_like_subject_flag(column, subject_stems):
+                continue
+
+            score = 100.0 + _text_score(subject, column, str(row.get("description", "") or ""))
+            candidate = (score, column_key)
+            if best_match is None or candidate > best_match:
+                best_match = candidate
+
+        if best_match is None:
+            continue
+        implicit_requests.append({
+            "request_id": f"implicit_subject_flag:{best_match[1]}",
+            "kind": "boolean_true",
+            "query_text": subject,
+            "column_key": best_match[1],
+            "match_source": "implicit_subject_flag",
+        })
+
+    return implicit_requests
+
+
 def rank_filter_candidates(
     *,
     user_input: str,
@@ -239,6 +342,14 @@ def rank_filter_candidates(
 ) -> dict[str, list[dict[str, Any]]]:
     """Rank filter candidates for metadata-driven filter intents."""
     requests = _collect_requests(intent, semantic_frame)
+    requests.extend(
+        _collect_implicit_subject_flag_requests(
+            selected_tables=selected_tables,
+            schema_loader=schema_loader,
+            semantic_frame=semantic_frame,
+            existing_requests=requests,
+        )
+    )
     ranked: dict[str, list[dict[str, Any]]] = {str(req.get("request_id")): [] for req in requests}
     if not requests:
         return ranked

@@ -266,3 +266,40 @@ def test_filter_ranking_records_example_values_for_fallback_label(tmp_path):
     )
     top = next(c for c in next(iter(ranked.values())) if c["column"] == "task_subtype")
     assert top["example_values"][:2] == ["фактический отток", "новый"]
+
+
+def test_filter_ranking_adds_implicit_subject_flag_for_task_rows(tmp_path):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["outflow_snapshot"],
+        "description": ["Снимок событий оттока"],
+        "grain": ["snapshot"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["outflow_snapshot"] * 3,
+        "column_name": ["report_dt", "inn", "is_task"],
+        "dType": ["date", "text", "boolean"],
+        "description": ["Отчетная дата", "ИНН клиента", "Признак выставленной задачи"],
+        "is_primary_key": [False, False, False],
+        "unique_perc": [0.5, 90.0, 0.02],
+        "not_null_perc": [100.0, 100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+
+    frame = derive_semantic_frame("Сколько задач", schema_loader=loader)
+    ranked = rank_filter_candidates(
+        user_input="Сколько задач",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.outflow_snapshot"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+
+    assert "implicit_subject_flag:dm.outflow_snapshot.is_task" in ranked
+    top = ranked["implicit_subject_flag:dm.outflow_snapshot.is_task"][0]
+    assert top["column"] == "is_task"
+    assert top["condition"] == "is_task = true"

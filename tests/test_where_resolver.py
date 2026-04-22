@@ -248,6 +248,42 @@ def test_where_resolver_treats_business_event_as_table_context_for_single_select
     assert "table_context_covers_business_event" in result["reasoning"]
 
 
+def test_where_resolver_adds_implicit_subject_flag_for_task_subject(tmp_path):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["outflow_snapshot"],
+        "description": ["Снимок событий оттока"],
+        "grain": ["snapshot"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["outflow_snapshot"] * 3,
+        "column_name": ["report_dt", "inn", "is_task"],
+        "dType": ["date", "text", "boolean"],
+        "description": ["Отчетная дата", "ИНН клиента", "Признак выставленной задачи"],
+        "is_primary_key": [False, False, False],
+        "unique_perc": [0.5, 90.0, 0.02],
+        "not_null_perc": [100.0, 100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+
+    frame = derive_semantic_frame("Сколько задач", schema_loader=loader)
+    result = resolve_where(
+        user_input="Сколько задач",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.outflow_snapshot": {"select": ["inn"], "aggregate": ["inn"]}},
+        selected_tables=["dm.outflow_snapshot"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+    )
+    assert result["needs_clarification"] is False
+    assert any("is_task = true" == cond for cond in result["conditions"])
+
+
 def test_where_resolver_keeps_clarification_when_single_table_does_not_cover_business_event(tmp_path):
     loader = _loader(tmp_path)
     frame = {

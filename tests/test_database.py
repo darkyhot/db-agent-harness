@@ -1,5 +1,7 @@
 """Тесты helper-функций DatabaseManager."""
 
+import json
+
 from core.database import DatabaseManager, _has_top_level_limit
 
 
@@ -50,3 +52,33 @@ def test_estimate_affected_rows_aliases_count_readonly():
 
     assert result == 42
     assert calls == [("id = 1", "hr", "emp")]
+
+
+def test_missing_fields_detect_incomplete_config(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"user_id": "alice"}), encoding="utf-8")
+
+    db = DatabaseManager(config_path=config_path)
+
+    assert db.missing_connection_fields() == ["host", "port", "database"]
+    assert db.missing_runtime_fields() == ["debug_prompt", "show_plan"]
+    assert db.has_complete_config is False
+
+
+def test_save_connection_and_runtime_params_preserve_full_config(tmp_path):
+    config_path = tmp_path / "config.json"
+    db = DatabaseManager(config_path=config_path)
+
+    db.save_connection_config("alice", "db.local", 5433, "analytics")
+    db.save_runtime_params(debug_prompt=True, show_plan=False)
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved == {
+        "user_id": "alice",
+        "host": "db.local",
+        "port": 5433,
+        "database": "analytics",
+        "debug_prompt": True,
+        "show_plan": False,
+    }
+    assert db.has_complete_config is True

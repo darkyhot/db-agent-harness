@@ -499,7 +499,9 @@ class GraphRunner:
                 for event in graph.stream(state):
                     node_name = list(event.keys())[0]
                     visited.append(node_name)
-                    result.update(event[node_name])
+                    node_payload = event.get(node_name)
+                    if isinstance(node_payload, dict):
+                        result.update(node_payload)
 
                 self._final_state = result
                 self._tool_calls = result.get("tool_calls", [])

@@ -172,15 +172,27 @@ def setup_logging() -> None:
 
 HELP_TEXT = """
 Доступные команды:
-  help    — показать этот список
-  config  — настроить подключение к БД (user, host, port)
-  memory  — просмотр и управление долгосрочной памятью
-  metrics — метрики качества генерации SQL (последние 30 дней)
-  reset   — сбросить контекст текущей сессии
-  clear   — очистить вывод ячейки
-  exit    — завершить работу (сохранить резюме сессии)
+  /help                — показать этот список
+  /config              — показать доступные разделы настройки
+  /config connection   — настроить подключение к БД
+  /config params       — настроить runtime-параметры агента
+  /memory              — просмотр и управление долгосрочной памятью
+  /metrics             — метрики качества генерации SQL (последние 30 дней)
+  /reset               — сбросить контекст текущей сессии
+  /clear               — очистить вывод ячейки
+  /exit                — завершить работу (сохранить резюме сессии)
 
-Любой другой ввод обрабатывается как запрос к агенту.
+Любой ввод, не начинающийся с `/`, обрабатывается как запрос к агенту.
+""".strip()
+
+CONFIG_HELP_TEXT = """
+Доступные варианты `/config`:
+  /config connection   — изменить подключение к БД: user_id, host, port, database
+  /config params       — изменить параметры агента: debug_prompt, show_plan
+
+Когда что использовать:
+  /config connection   — если меняется база, хост, порт или пользователь
+  /config params       — если меняется режим работы агента без переподключения к БД
 """.strip()
 
 
@@ -192,6 +204,7 @@ class CLIInterface:
         setup_logging()
 
         self.db = DatabaseManager()
+        self._ensure_startup_config()
         self.llm = RateLimitedLLM()
         self.memory = MemoryManager()
         self.schema = SchemaLoader()
@@ -357,49 +370,36 @@ class CLIInterface:
 Загружено таблиц: {tables_count} | Загружено атрибутов: {attrs_count}
 Память: загружено {sessions} предыдущих сессий
 Отладка промптов: {"ВКЛ" if self.debug_prompt else "ВЫКЛ"} (debug_prompt в config.json)
+Показ плана: {"ВКЛ" if self.show_plan else "ВЫКЛ"} (show_plan в config.json)
 
-Введите запрос или команду. help — список команд.
+Введите запрос или slash-команду. /help — список команд.
 """
         print(banner)
 
-    def _handle_config(self) -> None:
-        """Интерактивная настройка подключения к БД."""
-        print("\n--- Настройка подключения ---")
-        user_id = input("user_id: ").strip()
-        if not user_id:
-            print("Отменено.")
-            return
-        host = input("host: ").strip()
-        if not host:
-            print("Отменено.")
-            return
-        port_str = input("port [5432]: ").strip()
-        port = int(port_str) if port_str else 5432
-        database = input("database [prom]: ").strip() or "prom"
+    @staticmethod
+    def _parse_command(user_input: str) -> tuple[str | None, list[str]]:
+        """Разобрать slash-команду или legacy-алиас."""
+        tokens = user_input.strip().split()
+        if not tokens:
+            return (None, [])
 
-        current_debug = self.db.runtime_config.get("debug_prompt", False)
-        debug_str = input(f"debug_prompt (true/false) [{current_debug}]: ").strip().lower()
-        if debug_str in ("true", "1", "yes", "да"):
-            debug_prompt = True
-        elif debug_str in ("false", "0", "no", "нет"):
-            debug_prompt = False
-        else:
-            debug_prompt = current_debug
+        command = tokens[0].lower()
+        if command.startswith("/"):
+            command = command[1:]
+        elif command not in {"help", "config", "memory", "metrics", "reset", "clear", "exit"}:
+            return (None, [])
 
-        current_show_plan = self.db.runtime_config.get("show_plan", False)
-        show_plan_str = input(f"show_plan (true/false) [{current_show_plan}]: ").strip().lower()
-        if show_plan_str in ("true", "1", "yes", "да"):
-            show_plan = True
-        elif show_plan_str in ("false", "0", "no", "нет"):
-            show_plan = False
-        else:
-            show_plan = current_show_plan
+        return (command, [token.lower() for token in tokens[1:]])
 
-        self.db.set_debug_prompt(debug_prompt)
-        self.db.save_config(user_id, host, port, database)
-        self.db.runtime_config["show_plan"] = show_plan
-        self.debug_prompt = debug_prompt
-        self.show_plan = show_plan
+    def _refresh_runtime_flags(self) -> None:
+        """Подтянуть runtime-флаги из config.json в CLI."""
+        runtime = self.db.runtime_config
+        self.debug_prompt = runtime.get("debug_prompt", False)
+        self.show_plan = runtime.get("show_plan", False)
+
+    def _rebuild_graph(self) -> None:
+        """Пересобрать graph и tool bindings после смены конфига."""
+        self._refresh_runtime_flags()
         db_tools = create_db_tools(self.db, self.validator, self.schema)
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
@@ -408,9 +408,167 @@ class CLIInterface:
             debug_prompt=self.debug_prompt,
             show_plan=self.show_plan,
         )
-        print(f"\n✓ Конфигурация сохранена: {self.db.config_summary}")
+
+    def _prompt_text(
+        self,
+        label: str,
+        *,
+        current: str | None = None,
+        default: str | None = None,
+        required: bool = False,
+    ) -> str:
+        """Запросить строковое значение с поддержкой текущего значения/дефолта."""
+        while True:
+            prompt_default = current if current not in (None, "") else default
+            if prompt_default not in (None, ""):
+                raw = input(f"{label} [{prompt_default}]: ").strip()
+            else:
+                raw = input(f"{label}: ").strip()
+
+            if raw:
+                return raw
+            if current not in (None, ""):
+                return current
+            if default not in (None, ""):
+                return default
+            if not required:
+                return ""
+            print("Это поле обязательно. Нужна непустая строка.")
+
+    def _prompt_int(
+        self,
+        label: str,
+        *,
+        current: int | None = None,
+        default: int | None = None,
+        required: bool = False,
+    ) -> int:
+        """Запросить целое число."""
+        while True:
+            prompt_default = current if current is not None else default
+            if prompt_default is not None:
+                raw = input(f"{label} [{prompt_default}]: ").strip()
+            else:
+                raw = input(f"{label}: ").strip()
+
+            if not raw:
+                if current is not None:
+                    return current
+                if default is not None:
+                    return default
+                if not required:
+                    return 0
+                print("Это поле обязательно. Нужен целый номер.")
+                continue
+
+            try:
+                return int(raw)
+            except ValueError:
+                print("Нужно ввести целое число, например 5432.")
+
+    def _prompt_bool(self, label: str, *, current: bool = False) -> bool:
+        """Запросить булево значение в формате true/false."""
+        while True:
+            raw = input(f"{label} (true/false) [{current}]: ").strip().lower()
+            if not raw:
+                return current
+            if raw in ("true", "1", "yes", "y", "да"):
+                return True
+            if raw in ("false", "0", "no", "n", "нет"):
+                return False
+            print("Введите `true` или `false`.")
+
+    def _print_config_help(self) -> None:
+        """Показать подсказку по разделам /config."""
+        print(f"\n{CONFIG_HELP_TEXT}\n")
+
+    def _configure_connection(self) -> None:
+        """Интерактивно настроить только подключение к БД."""
+        runtime = self.db.runtime_config
+        print("\n--- Настройка подключения к БД ---")
+        user_id = self._prompt_text(
+            "user_id",
+            current=runtime.get("user_id") or None,
+            required=True,
+        )
+        host = self._prompt_text(
+            "host",
+            current=runtime.get("host") or None,
+            required=True,
+        )
+        port = self._prompt_int(
+            "port",
+            current=runtime.get("port"),
+            default=5432,
+            required=True,
+        )
+        database = self._prompt_text(
+            "database",
+            current=runtime.get("database") or None,
+            default="prom",
+            required=True,
+        )
+        self.db.save_connection_config(user_id, host, port, database)
+        print(f"\n✓ Подключение сохранено: {self.db.config_summary}")
+
+    def _configure_params(self) -> None:
+        """Интерактивно настроить только runtime-параметры агента."""
+        runtime = self.db.runtime_config
+        print("\n--- Настройка параметров агента ---")
+        print("Подсказка: `debug_prompt` включает печать внутренних промптов, "
+              "`show_plan` показывает план запроса перед выполнением.")
+        debug_prompt = self._prompt_bool(
+            "debug_prompt",
+            current=runtime.get("debug_prompt", False),
+        )
+        show_plan = self._prompt_bool(
+            "show_plan",
+            current=runtime.get("show_plan", False),
+        )
+        self.db.save_runtime_params(debug_prompt=debug_prompt, show_plan=show_plan)
+        print("\n✓ Параметры сохранены:")
         print(f"  debug_prompt: {debug_prompt}")
         print(f"  show_plan: {show_plan}")
+
+    def _run_full_config_setup(self) -> None:
+        """Полная первичная настройка config: connection + params."""
+        print("\nЗапускаю полную настройку конфигурации.")
+        self._configure_connection()
+        self._configure_params()
+
+    def _ensure_startup_config(self) -> None:
+        """При старте проверить config.json и, если нужно, запустить onboarding."""
+        missing_connection = self.db.missing_connection_fields()
+        missing_runtime = self.db.missing_runtime_fields()
+        if not missing_connection and not missing_runtime:
+            return
+
+        print("\nКонфигурация не найдена или заполнена не полностью.")
+        if missing_connection:
+            print(f"Не хватает параметров подключения: {', '.join(missing_connection)}")
+        if missing_runtime:
+            print(f"Не хватает параметров агента: {', '.join(missing_runtime)}")
+        self._run_full_config_setup()
+
+    def _handle_config(self, args: list[str] | None = None) -> None:
+        """Обработать `/config` и его подкоманды."""
+        args = args or []
+        if not args:
+            self._print_config_help()
+            return
+
+        section = args[0]
+        if section == "connection":
+            self._configure_connection()
+        elif section == "params":
+            self._configure_params()
+        else:
+            print(f"\nНеизвестная подкоманда `/config {' '.join(args)}`.")
+            self._print_config_help()
+            return
+
+        if hasattr(self, "llm") and hasattr(self, "validator") and hasattr(self, "schema"):
+            self._rebuild_graph()
 
     def _handle_reset(self) -> None:
         """Сброс контекста текущей сессии."""
@@ -633,7 +791,9 @@ class CLIInterface:
         try:
             for event in self.graph.stream(state):
                 node_name = list(event.keys())[0]
-                result.update(event[node_name])
+                node_payload = event.get(node_name)
+                if isinstance(node_payload, dict):
+                    result.update(node_payload)
 
                 elapsed = time.time() - start_time
                 status_text = _NODE_STATUS.get(node_name, node_name)
@@ -867,7 +1027,7 @@ class CLIInterface:
             if not user_input:
                 continue
 
-            command = user_input.lower()
+            command, args = self._parse_command(user_input)
 
             if command == "exit":
                 self._handle_exit()
@@ -875,7 +1035,7 @@ class CLIInterface:
             elif command == "help":
                 print(HELP_TEXT)
             elif command == "config":
-                self._handle_config()
+                self._handle_config(args)
             elif command == "memory":
                 self._handle_memory()
             elif command == "metrics":
@@ -885,5 +1045,8 @@ class CLIInterface:
             elif command == "clear":
                 clear_output(wait=True)
                 self._print_banner()
+            elif user_input.startswith("/"):
+                print(f"Неизвестная команда: {user_input}")
+                print("Используйте /help для списка команд.")
             else:
                 self._process_query(user_input)

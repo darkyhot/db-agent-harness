@@ -251,6 +251,76 @@ def test_metadata_service_add_targets_rejects_missing_table(tmp_path):
     assert result["missing_tables"] == ["s_grnplm_ld_salesntwrk_pcap_sn_uzp.missing_table"]
 
 
+def test_metadata_service_add_targets_rolls_back_manifest_for_failed_refresh(tmp_path):
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.replace_catalog(
+        pd.DataFrame(columns=["schema_name", "table_name", "description", "grain"]),
+        pd.DataFrame(columns=[
+            "schema_name", "table_name", "column_name", "dType",
+            "is_not_null", "description", "is_primary_key",
+            "not_null_perc", "unique_perc",
+            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+        ]),
+    )
+
+    service = MetadataRefreshService(
+        loader,
+        StubDB(),
+        StubLLM(),
+        targets_path=tmp_path / "metadata_targets.yaml",
+    )
+
+    original_refresh_tables = service.refresh_tables
+
+    def failing_refresh_tables(*args, **kwargs):
+        result = original_refresh_tables(*args, **kwargs)
+        result["failed"] = ["s_grnplm_ld_salesntwrk_pcap_sn_uzp.orders"]
+        result["refreshed"] = []
+        return result
+
+    service.refresh_tables = failing_refresh_tables  # type: ignore[method-assign]
+
+    result = service.add_targets(["s_grnplm_ld_salesntwrk_pcap_sn_uzp.orders"])
+
+    assert result["added"] == []
+    assert result["refresh"]["failed"] == ["s_grnplm_ld_salesntwrk_pcap_sn_uzp.orders"]
+    assert service.list_targets() == []
+
+
+def test_metadata_service_add_targets_rolls_back_manifest_when_refresh_raises(tmp_path):
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.replace_catalog(
+        pd.DataFrame(columns=["schema_name", "table_name", "description", "grain"]),
+        pd.DataFrame(columns=[
+            "schema_name", "table_name", "column_name", "dType",
+            "is_not_null", "description", "is_primary_key",
+            "not_null_perc", "unique_perc",
+            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+        ]),
+    )
+
+    service = MetadataRefreshService(
+        loader,
+        StubDB(),
+        StubLLM(),
+        targets_path=tmp_path / "metadata_targets.yaml",
+    )
+
+    def crashing_refresh_tables(*args, **kwargs):
+        raise RuntimeError("db is down")
+
+    service.refresh_tables = crashing_refresh_tables  # type: ignore[method-assign]
+
+    try:
+        service.add_targets(["s_grnplm_ld_salesntwrk_pcap_sn_uzp.orders"])
+    except RuntimeError as exc:
+        assert str(exc) == "db is down"
+    else:
+        raise AssertionError("Ожидалось исключение refresh_tables")
+
+    assert service.list_targets() == []
+
+
 def test_metadata_service_recreates_storage_when_data_dir_is_missing(tmp_path, monkeypatch):
     data_dir = tmp_path / "data_for_agent"
     loader = SchemaLoader(data_dir=data_dir)
@@ -389,6 +459,67 @@ def test_metadata_service_builds_few_shots_before_generating_missing_description
     assert llm.calls, "Ожидался хотя бы один LLM вызов для генерации описаний"
     prompt_text = "\n".join(user_prompt for _, user_prompt in llm.calls)
     assert "Клиентская таблица" in prompt_text or "Идентификатор клиента" in prompt_text
+
+
+def test_metadata_service_add_targets_rebuilds_few_shots_without_scanning_manifest(tmp_path, monkeypatch):
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.replace_catalog(
+        pd.DataFrame([
+            {
+                "schema_name": "dm",
+                "table_name": "clients",
+                "description": "Клиенты",
+                "grain": "",
+            }
+        ]),
+        pd.DataFrame([
+            {
+                "schema_name": "dm",
+                "table_name": "clients",
+                "column_name": "client_id",
+                "dType": "bigint",
+                "is_not_null": True,
+                "description": "Идентификатор клиента",
+                "is_primary_key": True,
+                "not_null_perc": 100.0,
+                "unique_perc": 100.0,
+                "foreign_key_target": "",
+                "sample_values": "",
+                "partition_key": False,
+                "synonyms": "",
+            }
+        ]),
+    )
+    (tmp_path / "metadata_targets.yaml").write_text(
+        "tables:\n"
+        "  - schema_name: dm\n"
+        "    table_name: clients\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("core.metadata_refresh.inspect", lambda engine: StubInspector())
+
+    service = MetadataRefreshService(
+        loader,
+        StubDB(),
+        StubLLM(),
+        targets_path=tmp_path / "metadata_targets.yaml",
+    )
+    progress_messages: list[str] = []
+
+    result = service.add_targets(
+        ["s_grnplm_ld_salesntwrk_pcap_sn_uzp.orders"],
+        progress_callback=progress_messages.append,
+    )
+
+    assert result["added"] == ["s_grnplm_ld_salesntwrk_pcap_sn_uzp.orders"]
+    assert all("few-shots" not in message.lower() for message in progress_messages)
+    table_few_shots = yaml.safe_load((tmp_path / "table_description_few_shots.yaml").read_text(encoding="utf-8"))
+    column_few_shots = yaml.safe_load((tmp_path / "column_description_few_shots.yaml").read_text(encoding="utf-8"))
+    assert any(item["table_name"] == "clients" and item["description"] == "Клиенты" for item in table_few_shots["tables"])
+    assert any(item["table_name"] == "orders" and item["description"] == "Описание из view" for item in table_few_shots["tables"])
+    assert any(item["column_name"] == "client_id" and item["description"] == "Идентификатор клиента" for item in column_few_shots["columns"])
+    assert any(item["column_name"] == "id" and item["description"] == "ID из view" for item in column_few_shots["columns"])
 
 
 def test_build_column_prompt_supports_batch_with_yaml_few_shots(tmp_path):

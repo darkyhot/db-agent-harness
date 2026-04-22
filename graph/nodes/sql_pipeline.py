@@ -204,6 +204,9 @@ def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> st
     должен интерпретировать это как «уточнение не требуется» и идти дальше.
     """
     where_resolution = where_resolution or {}
+    reasoning = {str(item) for item in (where_resolution.get("reasoning", []) or [])}
+    if "table_context_covers_business_event" in reasoning:
+        return ""
     filter_candidates = where_resolution.get("filter_candidates", {}) or {}
     user_choices = where_resolution.get("user_filter_choices", {}) or {}
     spec = where_resolution.get("clarification_spec", {}) or {}
@@ -241,6 +244,9 @@ def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> st
 def _build_specific_clarification_spec(where_resolution: dict[str, Any] | None) -> dict[str, Any]:
     """Построить typed clarification spec для CLI."""
     where_resolution = where_resolution or {}
+    reasoning = {str(item) for item in (where_resolution.get("reasoning", []) or [])}
+    if "table_context_covers_business_event" in reasoning:
+        return {}
     existing = where_resolution.get("clarification_spec", {}) or {}
     if existing.get("message"):
         return dict(existing)

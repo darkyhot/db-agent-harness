@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -59,16 +60,21 @@ _NODE_STATUS = {
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 # Ширина строки для полной перезаписи (Jupyter не поддерживает ANSI \033[K)
-_LINE_WIDTH = 80
+_LAST_STATUS_LEN = 0
 
 
 def _status_print(msg: str, done: bool = False) -> None:
     """Вывести статус с перезаписью текущей строки."""
-    padded = msg.ljust(_LINE_WIDTH)[:_LINE_WIDTH]
+    global _LAST_STATUS_LEN
+    terminal_width = shutil.get_terminal_size(fallback=(120, 20)).columns
+    target_width = max(_LAST_STATUS_LEN, len(msg), terminal_width)
+    padded = msg.ljust(target_width)
     if done:
         sys.stdout.write(f"\r{padded}\n")
+        _LAST_STATUS_LEN = 0
     else:
         sys.stdout.write(f"\r{padded}")
+        _LAST_STATUS_LEN = len(msg)
     sys.stdout.flush()
 
 

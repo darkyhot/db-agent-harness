@@ -95,3 +95,31 @@ def test_build_specific_clarification_spec_skips_semantic_exact_confirm():
     }
     spec = _build_specific_clarification_spec(where_resolution)
     assert spec == {}
+
+
+def test_build_specific_clarification_skips_when_table_context_covers_business_event():
+    where_resolution = {
+        "reasoning": ["table_context_covers_business_event"],
+        "filter_candidates": {
+            "text:dm.sale_funnel.task_subtype": [
+                {"column": "task_subtype", "description": "Подтип задачи"},
+                {"column": "task_type", "description": "Тип задачи"},
+            ]
+        },
+    }
+    msg = _build_specific_clarification(where_resolution)
+    assert msg == ""
+
+
+def test_build_specific_clarification_spec_skips_when_table_context_covers_business_event():
+    where_resolution = {
+        "reasoning": ["table_context_covers_business_event"],
+        "filter_candidates": {
+            "text:dm.sale_funnel.task_subtype": [
+                {"column": "task_subtype", "description": "Подтип задачи"},
+                {"column": "task_type", "description": "Тип задачи"},
+            ]
+        },
+    }
+    spec = _build_specific_clarification_spec(where_resolution)
+    assert spec == {}

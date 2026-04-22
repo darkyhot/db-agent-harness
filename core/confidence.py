@@ -47,6 +47,7 @@ def evaluate_filter_confidence(
     intent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     where_resolution = where_resolution or {}
+    reasoning = [str(item) for item in (where_resolution.get("reasoning", []) or [])]
     qualifier = str((semantic_frame or {}).get("qualifier") or "")
     explicit_filters = list((intent or {}).get("filter_conditions") or [])
     filter_candidates = where_resolution.get("filter_candidates", {}) or {}
@@ -65,6 +66,13 @@ def evaluate_filter_confidence(
             "score": 0.95,
             "level": "high",
             "evidence": ["no_extra_filters_requested"],
+        }
+
+    if "table_context_covers_business_event" in reasoning:
+        return {
+            "score": 0.95,
+            "level": "high",
+            "evidence": ["table_context_covers_business_event"],
         }
 
     candidate_scores: list[float] = []

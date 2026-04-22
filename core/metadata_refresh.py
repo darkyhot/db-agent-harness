@@ -647,44 +647,45 @@ class MetadataRefreshService:
 
     def _rebuild_few_shot_files(
         self,
-        inspector: Any | None = None,
-        progress_callback: Any | None = None,
+        tables_df: pd.DataFrame | None = None,
+        attrs_df: pd.DataFrame | None = None,
     ) -> None:
-        if inspector is None:
-            try:
-                inspector = inspect(self.db.get_engine())
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Не удалось пересобрать few-shot файлы: %s", exc)
-                return
+        if tables_df is None:
+            tables_df = self.schema_loader.tables_df.copy()
+        if attrs_df is None:
+            attrs_df = self.schema_loader.attrs_df.copy()
+        if tables_df.empty:
+            tables_df = pd.DataFrame(columns=TABLE_COLUMNS)
+        if attrs_df.empty:
+            attrs_df = pd.DataFrame(columns=ATTR_COLUMNS)
 
-        targets = list(self.load_targets_df().itertuples(index=False, name=None))
+        tables_df, attrs_df = self._sort_catalog(tables_df, attrs_df)
         table_examples: list[tuple[str, str, str]] = []
         column_examples: list[tuple[str, str, str]] = []
         seen_columns: set[str] = set()
 
-        for schema, table in targets:
-            if progress_callback is not None:
-                try:
-                    progress_callback(
-                        f"Обновляю few-shots для таблицы {schema}.{table}"
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.debug("Few-shot progress callback failed for %s.%s", schema, table)
-            if not self._table_exists(schema, table):
+        for row in tables_df.itertuples(index=False):
+            schema = str(row.schema_name or "").strip()
+            table = str(row.table_name or "").strip()
+            description = str(row.description or "").strip()
+            if not schema or not table or not description:
                 continue
-            table_comment, comment_map = self._get_comment_bundle(inspector, schema, table)
-            table_comment = str(table_comment or "").strip()
-            if table_comment:
-                table_examples.append((schema, table, table_comment))
-            for column_name, description in comment_map.items():
-                normalized_column = str(column_name or "").strip().lower()
-                normalized_description = str(description or "").strip()
-                if not normalized_column or not normalized_description:
-                    continue
-                if normalized_column in seen_columns:
-                    continue
-                seen_columns.add(normalized_column)
-                column_examples.append((table, normalized_column, normalized_description))
+            if description == _humanize_name(table):
+                continue
+            table_examples.append((schema, table, description))
+
+        for row in attrs_df.itertuples(index=False):
+            table = str(row.table_name or "").strip()
+            column_name = str(row.column_name or "").strip().lower()
+            description = str(row.description or "").strip()
+            if not table or not column_name or not description:
+                continue
+            if description == _humanize_name(column_name):
+                continue
+            if column_name in seen_columns:
+                continue
+            seen_columns.add(column_name)
+            column_examples.append((table, column_name, description))
 
         self._persist_few_shot_files(table_examples, column_examples)
 
@@ -785,7 +786,7 @@ class MetadataRefreshService:
                 _apply_result(schema, table, table_row, attr_rows, sample_df)
 
         _process_pass(tables_with_comments, allow_generation=False)
-        self._rebuild_few_shot_files(inspector=inspector, progress_callback=progress_callback)
+        self._rebuild_few_shot_files(current_tables, current_attrs)
         _process_pass(tables_without_comments, allow_generation=True)
 
         for schema, table in tables:
@@ -804,7 +805,7 @@ class MetadataRefreshService:
 
         current_tables, current_attrs = self._sort_catalog(current_tables, current_attrs)
         self.schema_loader.replace_catalog(current_tables, current_attrs)
-        self._rebuild_few_shot_files(inspector=inspector, progress_callback=progress_callback)
+        self._rebuild_few_shot_files(current_tables, current_attrs)
         EnrichmentPipeline(self.schema_loader, llm=self.llm, db_manager=self.db).run(sample_cache=sample_cache)
         return {"refreshed": refreshed, "failed": failed}
 
@@ -851,10 +852,31 @@ class MetadataRefreshService:
                 pd.DataFrame(added, columns=TARGET_COLUMNS),
             ], ignore_index=True)
             self.save_targets_df(updated)
-            refresh_result = self.refresh_tables(
-                added,
-                progress_callback=progress_callback,
-            )
+            try:
+                refresh_result = self.refresh_tables(
+                    added,
+                    progress_callback=progress_callback,
+                )
+            except Exception:
+                failed_set = set(added)
+                rolled_back = current[
+                    ~current.apply(lambda row: (row["schema_name"], row["table_name"]) in failed_set, axis=1)
+                ].reset_index(drop=True)
+                self.save_targets_df(rolled_back)
+                raise
+
+            failed_set = {
+                tuple(item.split(".", 1))
+                for item in (refresh_result.get("failed") or [])
+                if "." in item
+            }
+            if failed_set:
+                persisted = self.load_targets_df()
+                rolled_back = persisted[
+                    ~persisted.apply(lambda row: (row["schema_name"], row["table_name"]) in failed_set, axis=1)
+                ].reset_index(drop=True)
+                self.save_targets_df(rolled_back)
+            added = [item for item in added if item not in failed_set]
         else:
             refresh_result = {"refreshed": [], "failed": []}
 

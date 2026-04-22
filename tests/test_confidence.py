@@ -169,3 +169,33 @@ def test_filter_confidence_treats_semantic_exact_match_as_high():
     assert result["level"] == "high"
     assert result["score"] >= 0.95
     assert any("semantic_exact" in ev for ev in result["evidence"])
+
+
+def test_filter_confidence_treats_table_context_business_event_as_high():
+    where_resolution = {
+        "needs_clarification": False,
+        "applied_rules": [],
+        "reasoning": ["table_context_covers_business_event"],
+        "filter_candidates": {
+            "text:dm.sale_funnel.task_subtype": [
+                {
+                    "column": "task_subtype",
+                    "score": 61.0,
+                    "confidence": "medium",
+                },
+                {
+                    "column": "task_category",
+                    "score": 60.0,
+                    "confidence": "medium",
+                },
+            ],
+        },
+    }
+    result = evaluate_filter_confidence(
+        where_resolution,
+        semantic_frame={"qualifier": "factual_outflow"},
+        intent={"filter_conditions": []},
+    )
+    assert result["level"] == "high"
+    assert result["score"] >= 0.95
+    assert result["evidence"] == ["table_context_covers_business_event"]

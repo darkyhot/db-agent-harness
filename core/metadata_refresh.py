@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TARGETS_PATH = DATA_DIR / "metadata_targets.yaml"
-EXAMPLES_PATH = PROJECT_ROOT / "examples.txt"
+TABLE_FEW_SHOTS_PATH = DATA_DIR / "table_description_few_shots.yaml"
+COLUMN_FEW_SHOTS_PATH = DATA_DIR / "column_description_few_shots.yaml"
 
 SN_UZP_SCHEMA = "s_grnplm_ld_salesntwrk_pcap_sn_uzp"
 SN_UZP_VIEW_SCHEMA = "s_grnplm_as_salesntwrk_pcap_sn_view"
@@ -82,11 +83,50 @@ def _humanize_name(name: str) -> str:
     return " ".join(words)
 
 
-def _read_examples(examples_path: Path) -> str:
+def _read_yaml_examples(path: Path, key: str) -> list[dict[str, str]]:
     try:
-        return examples_path.read_text(encoding="utf-8").strip()
-    except OSError:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(loaded, dict):
+        return []
+    items = loaded.get(key) or []
+    if not isinstance(items, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        result.append({str(k): str(v) for k, v in item.items() if v is not None})
+    return result
+
+
+def _format_column_examples_for_prompt(examples: list[dict[str, str]]) -> str:
+    if not examples:
         return ""
+    lines: list[str] = []
+    for idx, item in enumerate(examples, 1):
+        lines.append(f"Пример {idx}:")
+        lines.append(f"Атрибут: {item.get('column_name', '')}")
+        lines.append(f"Описание: {item.get('description', '')}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _format_table_examples_for_prompt(examples: list[dict[str, str]]) -> str:
+    if not examples:
+        return ""
+    lines: list[str] = []
+    for idx, item in enumerate(examples, 1):
+        lines.append(f"Пример {idx}:")
+        lines.append(f"Таблица: {item.get('table_name', '')}")
+        lines.append(f"Описание: {item.get('description', '')}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _normalize_name(value: str) -> str:
+    return str(value or "").strip().lower()
 
 
 _METRIC_NAME_PATTERNS = (
@@ -172,16 +212,21 @@ class MetadataRefreshService:
         llm: Any | None = None,
         *,
         targets_path: Path | None = None,
-        examples_path: Path | None = None,
+        table_few_shots_path: Path | None = None,
+        column_few_shots_path: Path | None = None,
         sample_limit: int = 100_000,
     ) -> None:
         self.schema_loader = schema_loader
         self.db = db_manager
         self.llm = llm
+        default_data_dir = getattr(self.schema_loader, "_data_dir", DATA_DIR)
         self.targets_path = targets_path or TARGETS_PATH
-        self.examples_path = examples_path or EXAMPLES_PATH
+        self.table_few_shots_path = table_few_shots_path or (default_data_dir / TABLE_FEW_SHOTS_PATH.name)
+        self.column_few_shots_path = column_few_shots_path or (default_data_dir / COLUMN_FEW_SHOTS_PATH.name)
         self.sample_limit = int(sample_limit)
         self.targets_path.parent.mkdir(parents=True, exist_ok=True)
+        self.table_few_shots_path.parent.mkdir(parents=True, exist_ok=True)
+        self.column_few_shots_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _bootstrap_targets_from_catalog(self) -> pd.DataFrame:
         tables_df = self.schema_loader.tables_df
@@ -312,7 +357,9 @@ class MetadataRefreshService:
         table: str,
         columns: list[str],
     ) -> tuple[str, str]:
-        examples = _read_examples(self.examples_path)
+        examples = _format_column_examples_for_prompt(
+            _read_yaml_examples(self.column_few_shots_path, "columns")
+        )
         system_prompt = (
             "Ты senior аналитик DWH. Кратко расшифруй имена атрибутов БД.\n"
             "Не добавляй нумерацию, пояснения и знаки препинания.\n"
@@ -336,7 +383,9 @@ class MetadataRefreshService:
         columns_df: pd.DataFrame,
         sample_df: pd.DataFrame,
     ) -> tuple[str, str]:
-        examples = _read_examples(self.examples_path)
+        examples = _format_table_examples_for_prompt(
+            _read_yaml_examples(self.table_few_shots_path, "tables")
+        )
         attrs = "\n".join(
             f"- {row.column_name}: {row.description or row.column_name}"
             for row in columns_df.itertuples()
@@ -380,21 +429,42 @@ class MetadataRefreshService:
     ) -> dict[str, str]:
         if not missing_columns:
             return {}
-        if self.llm is None:
-            return {column: _humanize_name(column) for column in missing_columns}
 
-        system_prompt, user_prompt = self._build_column_prompt(schema, table, missing_columns)
+        examples = _read_yaml_examples(self.column_few_shots_path, "columns")
+        example_map = {
+            _normalize_name(item.get("column_name", "")): str(item.get("description", "")).strip()
+            for item in examples
+            if str(item.get("column_name", "")).strip() and str(item.get("description", "")).strip()
+        }
+
+        resolved: dict[str, str] = {}
+        unresolved: list[str] = []
+        for column in missing_columns:
+            matched = example_map.get(_normalize_name(column))
+            if matched:
+                resolved[column] = matched
+            else:
+                unresolved.append(column)
+
+        if not unresolved:
+            return resolved
+        if self.llm is None:
+            fallback = {column: _humanize_name(column) for column in unresolved}
+            return {**resolved, **fallback}
+
+        system_prompt, user_prompt = self._build_column_prompt(schema, table, unresolved)
         try:
             response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.2)
         except Exception:  # noqa: BLE001
             logger.warning("LLM не смог сгенерировать описания колонок для %s.%s", schema, table)
-            return {column: _humanize_name(column) for column in missing_columns}
+            fallback = {column: _humanize_name(column) for column in unresolved}
+            return {**resolved, **fallback}
 
         lines = [line.strip("- ").strip() for line in str(response).splitlines() if line.strip()]
-        result: dict[str, str] = {}
-        for idx, column in enumerate(missing_columns):
-            result[column] = lines[idx] if idx < len(lines) and lines[idx] else _humanize_name(column)
-        return result
+        generated: dict[str, str] = {}
+        for idx, column in enumerate(unresolved):
+            generated[column] = lines[idx] if idx < len(lines) and lines[idx] else _humanize_name(column)
+        return {**resolved, **generated}
 
     def _generate_table_description(
         self,
@@ -403,6 +473,15 @@ class MetadataRefreshService:
         columns_df: pd.DataFrame,
         sample_df: pd.DataFrame,
     ) -> str:
+        table_examples = _read_yaml_examples(self.table_few_shots_path, "tables")
+        table_example_map = {
+            _normalize_name(item.get("table_name", "")): str(item.get("description", "")).strip()
+            for item in table_examples
+            if str(item.get("table_name", "")).strip() and str(item.get("description", "")).strip()
+        }
+        matched = table_example_map.get(_normalize_name(table))
+        if matched:
+            return matched
         if self.llm is None:
             return _humanize_name(table)
         system_prompt, user_prompt = self._build_table_prompt(schema, table, columns_df, sample_df)
@@ -432,6 +511,7 @@ class MetadataRefreshService:
         schema: str,
         table: str,
         progress_callback: Any | None = None,
+        allow_generation: bool = True,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], pd.DataFrame]:
         columns = inspector.get_columns(table, schema=schema)
         pk = inspector.get_pk_constraint(table, schema=schema) or {}
@@ -465,7 +545,7 @@ class MetadataRefreshService:
             if not str(comment_map.get(str(col.get("name") or ""), "") or "").strip()
         ]
         generated_comments = {}
-        if schema == SN_T_UZP_SCHEMA:
+        if schema == SN_T_UZP_SCHEMA and allow_generation:
             generated_comments = self._generate_column_descriptions(schema, table, missing_comments)
 
         rows: list[dict[str, Any]] = []
@@ -501,7 +581,7 @@ class MetadataRefreshService:
             })
 
         table_description = str(table_comment or "").strip()
-        if schema == SN_T_UZP_SCHEMA and not table_description:
+        if schema == SN_T_UZP_SCHEMA and not table_description and allow_generation:
             columns_df = pd.DataFrame(rows)
             table_description = self._generate_table_description(schema, table, columns_df, sample_df)
         elif not table_description:
@@ -531,6 +611,83 @@ class MetadataRefreshService:
         )
         return (tables_df, attrs_df)
 
+    def _persist_few_shot_files(
+        self,
+        table_examples: list[tuple[str, str, str]],
+        column_examples: list[tuple[str, str, str]],
+    ) -> None:
+        self.table_few_shots_path.parent.mkdir(parents=True, exist_ok=True)
+        self.column_few_shots_path.parent.mkdir(parents=True, exist_ok=True)
+        table_payload = {
+            "tables": [
+                {
+                    "table_name": table,
+                    "description": description,
+                }
+                for _, table, description in table_examples
+            ]
+        }
+        column_payload = {
+            "columns": [
+                {
+                    "column_name": column_name,
+                    "description": description,
+                }
+                for _, column_name, description in column_examples
+            ]
+        }
+        self.table_few_shots_path.write_text(
+            yaml.safe_dump(table_payload, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        self.column_few_shots_path.write_text(
+            yaml.safe_dump(column_payload, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+
+    def _rebuild_few_shot_files(
+        self,
+        inspector: Any | None = None,
+        progress_callback: Any | None = None,
+    ) -> None:
+        if inspector is None:
+            try:
+                inspector = inspect(self.db.get_engine())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Не удалось пересобрать few-shot файлы: %s", exc)
+                return
+
+        targets = list(self.load_targets_df().itertuples(index=False, name=None))
+        table_examples: list[tuple[str, str, str]] = []
+        column_examples: list[tuple[str, str, str]] = []
+        seen_columns: set[str] = set()
+
+        for schema, table in targets:
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        f"Обновляю few-shots для таблицы {schema}.{table}"
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Few-shot progress callback failed for %s.%s", schema, table)
+            if not self._table_exists(schema, table):
+                continue
+            table_comment, comment_map = self._get_comment_bundle(inspector, schema, table)
+            table_comment = str(table_comment or "").strip()
+            if table_comment:
+                table_examples.append((schema, table, table_comment))
+            for column_name, description in comment_map.items():
+                normalized_column = str(column_name or "").strip().lower()
+                normalized_description = str(description or "").strip()
+                if not normalized_column or not normalized_description:
+                    continue
+                if normalized_column in seen_columns:
+                    continue
+                seen_columns.add(normalized_column)
+                column_examples.append((table, normalized_column, normalized_description))
+
+        self._persist_few_shot_files(table_examples, column_examples)
+
     def refresh_tables(
         self,
         tables: list[tuple[str, str]],
@@ -553,28 +710,30 @@ class MetadataRefreshService:
         refreshed: list[str] = []
         failed: list[str] = []
         sample_cache: dict[tuple[str, str], pd.DataFrame] = {}
+        tables_with_comments: list[tuple[str, str]] = []
+        tables_without_comments: list[tuple[str, str]] = []
 
         for schema, table in tables:
-            full_name = f"{schema}.{table}"
-            if progress_callback is not None:
-                try:
-                    progress_callback(f"Обновляю метаданные для таблицы {full_name}")
-                except Exception:  # noqa: BLE001
-                    logger.debug("Metadata progress callback failed for %s", full_name)
-            try:
-                if not self._table_exists(schema, table):
-                    raise ValueError(f"Таблица {full_name} не найдена в БД")
-                table_row, attr_rows, sample_df = self._collect_table_metadata(
-                    inspector,
-                    schema,
-                    table,
-                    progress_callback=progress_callback,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Metadata refresh skipped for %s: %s", full_name, exc)
-                failed.append(full_name)
+            if not self._table_exists(schema, table):
+                tables_without_comments.append((schema, table))
                 continue
+            table_comment, comment_map = self._get_comment_bundle(inspector, schema, table)
+            has_comments = bool(str(table_comment or "").strip()) or any(
+                str(value or "").strip() for value in comment_map.values()
+            )
+            if has_comments:
+                tables_with_comments.append((schema, table))
+            else:
+                tables_without_comments.append((schema, table))
 
+        def _apply_result(
+            schema: str,
+            table: str,
+            table_row: dict[str, Any],
+            attr_rows: list[dict[str, Any]],
+            sample_df: pd.DataFrame,
+        ) -> tuple[pd.DataFrame, pd.DataFrame]:
+            nonlocal current_tables, current_attrs
             current_tables = current_tables[
                 ~(
                     (current_tables["schema_name"] == schema)
@@ -598,7 +757,41 @@ class MetadataRefreshService:
             else:
                 current_attrs = pd.concat([current_attrs, attrs_df], ignore_index=True)
             sample_cache[(schema, table)] = sample_df
-            refreshed.append(full_name)
+            refreshed.append(f"{schema}.{table}")
+            return current_tables, current_attrs
+
+        def _process_pass(pass_tables: list[tuple[str, str]], *, allow_generation: bool) -> None:
+            for schema, table in pass_tables:
+                full_name = f"{schema}.{table}"
+                if progress_callback is not None:
+                    try:
+                        progress_callback(f"Обновляю метаданные для таблицы {full_name}")
+                    except Exception:  # noqa: BLE001
+                        logger.debug("Metadata progress callback failed for %s", full_name)
+                try:
+                    if not self._table_exists(schema, table):
+                        raise ValueError(f"Таблица {full_name} не найдена в БД")
+                    table_row, attr_rows, sample_df = self._collect_table_metadata(
+                        inspector,
+                        schema,
+                        table,
+                        progress_callback=progress_callback,
+                        allow_generation=allow_generation,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Metadata refresh skipped for %s: %s", full_name, exc)
+                    failed.append(full_name)
+                    continue
+                _apply_result(schema, table, table_row, attr_rows, sample_df)
+
+        _process_pass(tables_with_comments, allow_generation=False)
+        self._rebuild_few_shot_files(inspector=inspector, progress_callback=progress_callback)
+        _process_pass(tables_without_comments, allow_generation=True)
+
+        for schema, table in tables:
+            full_name = f"{schema}.{table}"
+            if full_name not in refreshed and full_name not in failed and not self._table_exists(schema, table):
+                failed.append(full_name)
 
         if prune_to_manifest:
             manifest = set(tuple(row) for row in self.load_targets_df()[TARGET_COLUMNS].itertuples(index=False, name=None))
@@ -611,6 +804,7 @@ class MetadataRefreshService:
 
         current_tables, current_attrs = self._sort_catalog(current_tables, current_attrs)
         self.schema_loader.replace_catalog(current_tables, current_attrs)
+        self._rebuild_few_shot_files(inspector=inspector, progress_callback=progress_callback)
         EnrichmentPipeline(self.schema_loader, llm=self.llm, db_manager=self.db).run(sample_cache=sample_cache)
         return {"refreshed": refreshed, "failed": failed}
 
@@ -703,6 +897,7 @@ class MetadataRefreshService:
                 attrs_df if not attrs_df.empty else pd.DataFrame(columns=ATTR_COLUMNS),
             )
             self.schema_loader.replace_catalog(tables_df, attrs_df)
+            self._rebuild_few_shot_files()
             EnrichmentPipeline(self.schema_loader, llm=self.llm, db_manager=self.db).run()
 
         return {"removed": removed, "missing": missing}

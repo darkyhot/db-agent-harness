@@ -1,4 +1,5 @@
 import pandas as pd
+import yaml
 
 from core.metadata_refresh import (
     MetadataRefreshService,
@@ -9,7 +10,11 @@ from core.schema_loader import SchemaLoader
 
 
 class StubLLM:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
     def invoke_with_system(self, system_prompt: str, user_prompt: str, temperature=None) -> str:
+        self.calls.append((system_prompt, user_prompt))
         if "один на строку" in user_prompt:
             return "идентификатор\nпризнак"
         return "1. Назначение\n2. Применение\n3. Ограничения\n4. Ключевые атрибуты"
@@ -125,7 +130,6 @@ def test_metadata_service_add_targets_refreshes_catalog(tmp_path, monkeypatch):
         StubDB(),
         StubLLM(),
         targets_path=tmp_path / "metadata_targets.yaml",
-        examples_path=tmp_path / "examples.txt",
     )
 
     result = service.add_targets(["s_grnplm_ld_salesntwrk_pcap_sn_uzp.orders"])
@@ -135,6 +139,12 @@ def test_metadata_service_add_targets_refreshes_catalog(tmp_path, monkeypatch):
     attrs_df = pd.read_csv(tmp_path / "attr_list.csv")
     assert tables_df.loc[0, "description"] == "Описание из view"
     assert set(attrs_df["description"]) == {"ID из view", "Флаг из view"}
+    table_few_shots = yaml.safe_load((tmp_path / "table_description_few_shots.yaml").read_text(encoding="utf-8"))
+    column_few_shots = yaml.safe_load((tmp_path / "column_description_few_shots.yaml").read_text(encoding="utf-8"))
+    assert table_few_shots["tables"][0]["description"] == "Описание из view"
+    assert "schema_name" not in table_few_shots["tables"][0]
+    assert any(item["column_name"] == "id" and item["description"] == "ID из view" for item in column_few_shots["columns"])
+    assert "table_name" not in column_few_shots["columns"][0]
 
 
 def test_metadata_service_remove_targets_prunes_catalog(tmp_path):
@@ -253,7 +263,6 @@ def test_metadata_service_recreates_storage_when_data_dir_is_missing(tmp_path, m
         db,
         StubLLM(),
         targets_path=data_dir / "metadata_targets.yaml",
-        examples_path=tmp_path / "examples.txt",
     )
 
     # Имитируем ручную очистку каталога пользователем после инициализации.
@@ -267,3 +276,232 @@ def test_metadata_service_recreates_storage_when_data_dir_is_missing(tmp_path, m
     assert (data_dir / "metadata_targets.yaml").exists()
     assert (data_dir / "tables_list.csv").exists()
     assert (data_dir / "attr_list.csv").exists()
+    assert (data_dir / "table_description_few_shots.yaml").exists()
+    assert (data_dir / "column_description_few_shots.yaml").exists()
+
+
+def test_metadata_service_deduplicates_column_few_shots(tmp_path, monkeypatch):
+    class DuplicateColumnInspector(StubInspector):
+        def get_columns(self, table, schema=None):
+            if table == "orders":
+                return [
+                    {"name": "id", "type": "bigint", "nullable": False, "comment": "ID заказа"},
+                    {"name": "status", "type": "text", "nullable": True, "comment": "Статус заказа"},
+                ]
+            if table == "payments":
+                return [
+                    {"name": "id", "type": "bigint", "nullable": False, "comment": "ID платежа"},
+                    {"name": "status", "type": "text", "nullable": True, "comment": "Статус платежа"},
+                ]
+            return super().get_columns(table, schema=schema)
+
+        def get_table_comment(self, table, schema=None):
+            if table == "orders":
+                return {"text": "Заказы"}
+            if table == "payments":
+                return {"text": "Платежи"}
+            return super().get_table_comment(table, schema=schema)
+
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.replace_catalog(
+        pd.DataFrame(columns=["schema_name", "table_name", "description", "grain"]),
+        pd.DataFrame(columns=[
+            "schema_name", "table_name", "column_name", "dType",
+            "is_not_null", "description", "is_primary_key",
+            "not_null_perc", "unique_perc",
+            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+        ]),
+    )
+
+    monkeypatch.setattr("core.metadata_refresh.inspect", lambda engine: DuplicateColumnInspector())
+
+    service = MetadataRefreshService(
+        loader,
+        StubDB(),
+        StubLLM(),
+        targets_path=tmp_path / "metadata_targets.yaml",
+    )
+
+    service.add_targets([
+        "s_grnplm_ld_salesntwrk_pcap_sn_uzp.orders",
+        "s_grnplm_ld_salesntwrk_pcap_sn_uzp.payments",
+    ])
+
+    column_few_shots = yaml.safe_load((tmp_path / "column_description_few_shots.yaml").read_text(encoding="utf-8"))
+    assert sum(1 for item in column_few_shots["columns"] if item["column_name"] == "status") == 1
+    assert "table_name" not in column_few_shots["columns"][0]
+
+
+def test_metadata_service_builds_few_shots_before_generating_missing_descriptions(tmp_path, monkeypatch):
+    class OrderedInspector(StubInspector):
+        def get_columns(self, table, schema=None):
+            if table == "commented":
+                return [
+                    {"name": "client_id", "type": "bigint", "nullable": False, "comment": "Идентификатор клиента"},
+                ]
+            if table == "generated":
+                return [
+                    {"name": "mystery_col", "type": "text", "nullable": True, "comment": ""},
+                ]
+            return super().get_columns(table, schema=schema)
+
+        def get_table_comment(self, table, schema=None):
+            if table == "commented":
+                return {"text": "Клиентская таблица"}
+            if table == "generated":
+                return {"text": ""}
+            return super().get_table_comment(table, schema=schema)
+
+        def get_pk_constraint(self, table, schema=None):
+            return {"constrained_columns": []}
+
+    class OrderedDB(StubDB):
+        def get_random_sample(self, schema, table, n=100000, columns=None):
+            if table == "commented":
+                return pd.DataFrame({"client_id": [1, 2, 3]})
+            return pd.DataFrame({"mystery_col": ["a", "b", "c"]})
+
+    llm = StubLLM()
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.replace_catalog(
+        pd.DataFrame(columns=["schema_name", "table_name", "description", "grain"]),
+        pd.DataFrame(columns=[
+            "schema_name", "table_name", "column_name", "dType",
+            "is_not_null", "description", "is_primary_key",
+            "not_null_perc", "unique_perc",
+            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+        ]),
+    )
+    monkeypatch.setattr("core.metadata_refresh.inspect", lambda engine: OrderedInspector())
+
+    service = MetadataRefreshService(
+        loader,
+        OrderedDB(),
+        llm,
+        targets_path=tmp_path / "metadata_targets.yaml",
+    )
+
+    service.add_targets([
+        "s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.commented",
+        "s_grnplm_ld_salesntwrk_pcap_sn_t_uzp.generated",
+    ])
+
+    assert llm.calls, "Ожидался хотя бы один LLM вызов для генерации описаний"
+    prompt_text = "\n".join(user_prompt for _, user_prompt in llm.calls)
+    assert "Клиентская таблица" in prompt_text or "Идентификатор клиента" in prompt_text
+
+
+def test_build_column_prompt_supports_batch_with_yaml_few_shots(tmp_path):
+    loader = SchemaLoader(data_dir=tmp_path)
+    service = MetadataRefreshService(
+        loader,
+        StubDB(),
+        StubLLM(),
+        targets_path=tmp_path / "metadata_targets.yaml",
+    )
+    (tmp_path / "column_description_few_shots.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "columns": [
+                    {
+                        "column_name": "client_id",
+                        "description": "Идентификатор клиента",
+                    }
+                ]
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    _, user_prompt = service._build_column_prompt(
+        "schema_x",
+        "target_table",
+        ["first_col", "second_col", "third_col"],
+    )
+
+    assert "Пример 1:" in user_prompt
+    assert "- first_col" in user_prompt
+    assert "- second_col" in user_prompt
+    assert "- third_col" in user_prompt
+    examples_block = user_prompt.split("Примеры:\n", 1)[1].split("Расшифруй список атрибутов", 1)[0]
+    assert "Таблица:" not in examples_block
+
+
+def test_generate_column_descriptions_uses_exact_few_shot_without_llm(tmp_path):
+    loader = SchemaLoader(data_dir=tmp_path)
+    llm = StubLLM()
+    service = MetadataRefreshService(
+        loader,
+        StubDB(),
+        llm,
+        targets_path=tmp_path / "metadata_targets.yaml",
+    )
+    (tmp_path / "column_description_few_shots.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "columns": [
+                    {
+                        "column_name": "client_id",
+                        "description": "Идентификатор клиента",
+                    },
+                    {
+                        "column_name": "status_cd",
+                        "description": "Код статуса",
+                    },
+                ]
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = service._generate_column_descriptions(
+        "schema_x",
+        "target_table",
+        ["client_id", "status_cd"],
+    )
+
+    assert result == {
+        "client_id": "Идентификатор клиента",
+        "status_cd": "Код статуса",
+    }
+    assert llm.calls == []
+
+
+def test_generate_table_description_uses_exact_few_shot_without_llm(tmp_path):
+    loader = SchemaLoader(data_dir=tmp_path)
+    llm = StubLLM()
+    service = MetadataRefreshService(
+        loader,
+        StubDB(),
+        llm,
+        targets_path=tmp_path / "metadata_targets.yaml",
+    )
+    (tmp_path / "table_description_few_shots.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "tables": [
+                    {
+                        "table_name": "known_table",
+                        "description": "Известное описание таблицы",
+                    }
+                ]
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = service._generate_table_description(
+        "schema_x",
+        "known_table",
+        pd.DataFrame([{"column_name": "id", "description": "Идентификатор"}]),
+        pd.DataFrame({"id": [1, 2]}),
+    )
+
+    assert result == "Известное описание таблицы"
+    assert llm.calls == []

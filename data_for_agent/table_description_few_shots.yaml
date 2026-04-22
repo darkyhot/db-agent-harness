@@ -1,0 +1,15 @@
+tables:
+- table_name: uzp_dwh_fact_outflow
+  description: Информация по фактическим оттокам
+- table_name: uzp_dim_gosb
+  description: Справочник ТБ и ГОСБ
+- table_name: uzp_data_split_mzp_sale_funnel
+  description: Сплит МЗП Воронка продаж
+- table_name: uzp_data_payroll_m
+  description: ЗП ведомости (месяц)
+- table_name: uzp_data_emp_epk_assignment
+  description: Данные по закреплению сотрудников за организациями
+- table_name: uzp_data_epk_consolidation
+  description: Данные по атрибутам ЕПК организаций
+- table_name: uzp_dwh_sap_staff_emp
+  description: Данные штатной численности сотрудников

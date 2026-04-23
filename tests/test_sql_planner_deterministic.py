@@ -965,3 +965,90 @@ def test_build_blueprint_simple_select_keeps_count_star_without_safety_net(tmp_p
     assert bp["aggregation"]["column"] == "*"
     assert "distinct" not in bp["aggregation"]
     assert bp["group_by"] == []
+
+
+def _build_outflow_event_loader_for_count(tmp_path):
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["uzp_dwh_fact_outflow"],
+        "description": ["Информация по фактическим оттокам"],
+        "grain": ["event"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": ["uzp_dwh_fact_outflow"] * 5,
+        "column_name": ["report_dt", "inn", "gosb_id", "is_task", "inserted_dttm"],
+        "dType": ["date", "int8", "int4", "boolean", "timestamp"],
+        "description": [
+            "Отчетная дата",
+            "ИНН",
+            "Идентификатор ГОСБ",
+            "Признак выставленной задачи",
+            "Дата и время загрузки",
+        ],
+        "is_primary_key": [False, True, False, False, False],
+        "unique_perc": [0.5, 98.75, 0.93, 0.02, 0.02],
+        "not_null_perc": [100.0, 100.0, 100.0, 100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_build_blueprint_rewrites_report_dt_count_to_count_star_for_simple_select(tmp_path):
+    loader = _build_outflow_event_loader_for_count(tmp_path)
+
+    bp = build_blueprint(
+        intent={
+            "aggregation_hint": "count",
+            "date_filters": {"from": "2026-02-01", "to": "2026-03-01"},
+            "required_output": [],
+        },
+        selected_columns={
+            "dm.uzp_dwh_fact_outflow": {
+                "select": ["report_dt"],
+                "filter": ["report_dt", "is_task"],
+                "aggregate": ["report_dt"],
+                "group_by": [],
+            }
+        },
+        join_spec=[],
+        table_types={"dm.uzp_dwh_fact_outflow": "fact"},
+        join_analysis_data={},
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 26",
+        schema_loader=loader,
+        semantic_frame={"subject": "task", "requires_single_entity_count": True, "output_dimensions": []},
+    )
+
+    assert bp["aggregation"] == {"function": "COUNT", "column": "*", "alias": "count_all"}
+    assert bp["group_by"] == []
+
+
+def test_build_blueprint_employee_subject_still_rewrites_report_dt_count(tmp_path):
+    loader = _build_outflow_event_loader_for_count(tmp_path)
+
+    bp = build_blueprint(
+        intent={
+            "aggregation_hint": "count",
+            "date_filters": {"from": "2026-02-01", "to": "2026-03-01"},
+            "required_output": [],
+        },
+        selected_columns={
+            "dm.uzp_dwh_fact_outflow": {
+                "select": ["report_dt"],
+                "filter": ["report_dt", "is_task"],
+                "aggregate": ["report_dt"],
+                "group_by": [],
+            }
+        },
+        join_spec=[],
+        table_types={"dm.uzp_dwh_fact_outflow": "fact"},
+        join_analysis_data={},
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 26",
+        schema_loader=loader,
+        semantic_frame={"subject": "employee", "requires_single_entity_count": True, "output_dimensions": []},
+    )
+
+    assert bp["aggregation"] == {"function": "COUNT", "column": "*", "alias": "count_all"}

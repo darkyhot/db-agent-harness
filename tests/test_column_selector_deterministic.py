@@ -242,3 +242,78 @@ def test_requested_slots_ignore_table_choice_suffix_and_filter_value(tmp_path):
     assert "uzp_data_split_mzp_sale_funnel" not in requested["dimensions"]
     assert not any("фактическому" in dim for dim in requested["dimensions"])
     assert requested["metric"] is not None
+
+
+def _build_outflow_event_loader(tmp_path):
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["uzp_dwh_fact_outflow"],
+        "description": ["Информация по фактическим оттокам"],
+        "grain": ["event"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": ["uzp_dwh_fact_outflow"] * 5,
+        "column_name": ["report_dt", "inn", "gosb_id", "is_task", "inserted_dttm"],
+        "dType": ["date", "int8", "int4", "boolean", "timestamp"],
+        "description": [
+            "Отчетная дата",
+            "ИНН",
+            "Идентификатор ГОСБ",
+            "Признак выставленной задачи",
+            "Дата и время загрузки",
+        ],
+        "is_primary_key": [False, True, False, False, False],
+        "unique_perc": [0.5, 98.75, 0.93, 0.02, 0.02],
+        "not_null_perc": [100.0, 100.0, 100.0, 100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_select_columns_task_count_on_event_table_falls_back_to_count_star(tmp_path):
+    from core.column_selector_deterministic import select_columns
+
+    loader = _build_outflow_event_loader(tmp_path)
+    result = select_columns(
+        intent={
+            "aggregation_hint": "count",
+            "entities": ["задачи", "отток"],
+            "date_filters": {"from": "2026-02-01", "to": "2026-03-01"},
+        },
+        table_structures={"dm.uzp_dwh_fact_outflow": "Информация по фактическим оттокам"},
+        table_types={"dm.uzp_dwh_fact_outflow": "fact"},
+        join_analysis_data={},
+        schema_loader=loader,
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 26",
+        semantic_frame={"subject": "task", "requires_single_entity_count": True, "output_dimensions": []},
+    )
+
+    roles = result["selected_columns"]["dm.uzp_dwh_fact_outflow"]
+    assert roles["aggregate"] == ["*"]
+    assert "report_dt" not in roles.get("aggregate", [])
+
+
+def test_select_columns_employee_subject_still_avoids_report_dt(tmp_path):
+    from core.column_selector_deterministic import select_columns
+
+    loader = _build_outflow_event_loader(tmp_path)
+    result = select_columns(
+        intent={
+            "aggregation_hint": "count",
+            "entities": ["задачи", "отток"],
+            "date_filters": {"from": "2026-02-01", "to": "2026-03-01"},
+        },
+        table_structures={"dm.uzp_dwh_fact_outflow": "Информация по фактическим оттокам"},
+        table_types={"dm.uzp_dwh_fact_outflow": "fact"},
+        join_analysis_data={},
+        schema_loader=loader,
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 26",
+        semantic_frame={"subject": "employee", "requires_single_entity_count": True, "output_dimensions": []},
+    )
+
+    roles = result["selected_columns"]["dm.uzp_dwh_fact_outflow"]
+    assert "report_dt" not in roles.get("aggregate", [])

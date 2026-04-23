@@ -59,34 +59,34 @@ def synthetic_loader(tmp_path):
     tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
 
     attrs_df = pd.DataFrame({
-        "schema_name": ["schema_a"] * 10,
+        "schema_name": ["schema_a"] * 11,
         "table_name": [
-            "fact_x", "fact_x", "fact_x", "fact_x",
+            "fact_x", "fact_x", "fact_x", "fact_x", "fact_x",
             "dim_y", "dim_y", "dim_y",
             "alt_fact", "alt_fact", "alt_fact",
         ],
         "column_name": [
-            "task_code", "report_dt", "task_subtype", "task_category",
+            "task_code", "report_dt", "task_subtype", "task_category", "inn",
             "task_code", "segment_name", "tb_id",
             "task_code", "report_dt", "task_category",
         ],
         "dType": [
-            "varchar", "date", "varchar", "varchar",
+            "varchar", "date", "varchar", "varchar", "varchar",
             "varchar", "varchar", "varchar",
             "varchar", "date", "varchar",
         ],
         "description": [
-            "Код задачи", "Дата отчёта", "Тип задачи", "Категория задачи",
+            "Код задачи", "Дата отчёта", "Тип задачи", "Категория задачи", "ИНН",
             "Код задачи", "Сегмент", "ТБ",
             "Код задачи", "Дата отчёта", "Категория задачи",
         ],
         "is_primary_key": [
-            True, False, False, False,
+            True, False, False, False, False,
             True, False, False,
             True, False, False,
         ],
-        "unique_perc": [100.0, 30.0, 5.0, 5.0, 100.0, 10.0, 20.0, 100.0, 30.0, 5.0],
-        "not_null_perc": [100.0] * 10,
+        "unique_perc": [100.0, 30.0, 5.0, 5.0, 80.0, 100.0, 10.0, 20.0, 100.0, 30.0, 5.0],
+        "not_null_perc": [100.0] * 11,
     })
     attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
     return SchemaLoader(data_dir=tmp_path)
@@ -201,6 +201,20 @@ def test_router_count_by_field(node):
     assert {"op": "replace", "path": "aggregation.column", "value": "task_code"} in ops
 
 
+def test_router_count_by_field_supports_count_po_inn(node):
+    result = node.plan_edit_router(_state(plan_edit_text="Давай count по инн"))
+    assert result["plan_edit_kind"] == "patch"
+    ops = result["plan_edit_payload"]["operations"]
+    assert {"op": "replace", "path": "aggregation.function", "value": "COUNT"} in ops
+    assert {"op": "replace", "path": "aggregation.column", "value": "inn"} in ops
+
+
+def test_router_count_by_unknown_field_clarifies(node):
+    result = node.plan_edit_router(_state(plan_edit_text="Давай count по mystery_field"))
+    assert result["plan_edit_kind"] == "clarify"
+    assert result["plan_edit_needs_clarification"] is True
+
+
 def test_router_patch_date_shift(node):
     result = node.plan_edit_router(_state(plan_edit_text="поменяй фильтр на дате с 1 числа на 2"))
     assert result["plan_edit_kind"] == "patch"
@@ -231,6 +245,45 @@ def test_patcher_applies_count_distinct(node):
     result = node.plan_patcher(state)
     assert result["sql_blueprint"]["aggregation"]["distinct"] is True
     assert result["sql_blueprint"]["aggregation"]["column"] == "task_code"
+
+
+def test_patcher_allows_main_table_column_not_in_selected_columns(node):
+    state = _state(
+        sql_blueprint={
+            "strategy": "simple_select",
+            "main_table": "schema_a.fact_x",
+            "where_conditions": [
+                "report_dt >= '2026-02-01'::date",
+                "report_dt < '2026-03-01'::date",
+                "is_task = true",
+            ],
+            "aggregation": {"function": "COUNT", "column": "report_dt", "alias": "count_report_dt"},
+            "group_by": [],
+            "order_by": "count_report_dt DESC",
+            "limit": None,
+        },
+        selected_columns={
+            "schema_a.fact_x": {
+                "select": ["report_dt"],
+                "filter": ["report_dt"],
+                "aggregate": ["report_dt"],
+                "group_by": [],
+            }
+        },
+        plan_edit_payload={
+            "operations": [
+                {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
+                {"op": "replace", "path": "aggregation.column", "value": "inn"},
+            ]
+        },
+    )
+    result = node.plan_patcher(state)
+    assert result["sql_blueprint"]["aggregation"]["column"] == "inn"
+    assert result["sql_blueprint"]["aggregation"]["alias"] == "count_inn"
+    assert result["sql_blueprint"]["order_by"] == "count_inn DESC"
+    assert result["user_hints"]["aggregation_preferences"]["column"] == "inn"
+    assert result["user_hints"]["aggregation_preferences"]["function"] == "count"
+    assert result["user_hints"]["aggregation_preferences"]["distinct"] is False
 
 
 def test_patcher_count_star_strips_distinct_and_updates_order_by(node):
@@ -295,6 +348,29 @@ def test_validator_rejects_invalid_distinct_star(node):
     })
     result = node.plan_edit_validator(state)
     assert result["needs_clarification"] is True
+
+
+def test_validator_accepts_catalog_column_not_in_selected_columns(node):
+    state = _state(
+        sql_blueprint={
+            "main_table": "schema_a.fact_x",
+            "aggregation": {"function": "COUNT", "column": "inn", "alias": "count_inn"},
+            "where_conditions": [],
+            "group_by": [],
+            "order_by": "count_inn DESC",
+            "limit": None,
+        },
+        selected_columns={
+            "schema_a.fact_x": {
+                "select": ["report_dt"],
+                "filter": ["report_dt"],
+                "aggregate": ["report_dt"],
+                "group_by": [],
+            }
+        },
+    )
+    result = node.plan_edit_validator(state)
+    assert result["needs_clarification"] is False
 
 
 def test_diff_renderer_reports_change(node):

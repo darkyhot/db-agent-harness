@@ -406,6 +406,38 @@ def _choose_count_identifier_column(
     return best[1]
 
 
+def _is_time_axis_count_column(
+    main_table: str,
+    column: str,
+    schema_loader=None,
+) -> bool:
+    """True если count-колонка похожа на дату/ось времени и опасна для COUNT."""
+    lower_col = str(column or "").strip().lower()
+    if not lower_col or lower_col == "*":
+        return False
+    if lower_col.endswith(_DATE_AXIS_SUFFIXES):
+        return True
+    if schema_loader is None or "." not in str(main_table or ""):
+        return "date" in lower_col or "dttm" in lower_col or "timestamp" in lower_col
+
+    schema_name, table_name = str(main_table).split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return "date" in lower_col or "dttm" in lower_col or "timestamp" in lower_col
+    matched = cols_df[cols_df["column_name"].astype(str).str.lower() == lower_col]
+    if matched.empty:
+        return "date" in lower_col or "dttm" in lower_col or "timestamp" in lower_col
+    row = matched.iloc[0]
+    dtype = str(row.get("dType", "") or "").lower().strip()
+    semantics = schema_loader.get_column_semantics(schema_name, table_name, lower_col)
+    sem_class = str(semantics.get("semantic_class", "") or "").lower().strip()
+    return (
+        dtype.startswith("date")
+        or dtype.startswith("timestamp")
+        or sem_class in {"date", "datetime", "timestamp", "system_timestamp"}
+    )
+
+
 def _compute_aggregation(
     intent: dict,
     selected_columns: dict[str, dict],
@@ -802,15 +834,41 @@ def build_blueprint(
     ):
         main_roles = selected_columns.setdefault(main_table, {})
         suspicious_group_by = list(main_roles.get("group_by", []) or [])
+        current_agg_cols = list(main_roles.get("aggregate", []) or [])
+        suspicious_agg_col = next(
+            (
+                col for col in current_agg_cols
+                if _is_time_axis_count_column(main_table, col, schema_loader=schema_loader)
+            ),
+            None,
+        )
         fallback_col = None
-        if main_roles.get("aggregate") == ["*"] or suspicious_group_by:
+        force_count_star = strategy == "simple_select" and (
+            main_roles.get("aggregate") == ["*"] or suspicious_agg_col is not None
+        )
+        if (main_roles.get("aggregate") == ["*"] or suspicious_group_by or suspicious_agg_col) and not force_count_star:
             fallback_col = _choose_count_identifier_column(
                 main_table,
                 schema_loader,
                 semantic_frame=semantic_frame,
                 user_input=user_input,
             )
-        if fallback_col:
+        if force_count_star:
+            main_roles["aggregate"] = ["*"]
+            main_roles.pop("group_by", None)
+            aggregation = _compute_aggregation(
+                intent,
+                selected_columns,
+                user_hints=user_hints,
+                schema_loader=schema_loader,
+                semantic_frame=semantic_frame,
+                strategy=strategy,
+            )
+            logger.info(
+                "DeterministicPlanner: single-entity safety net → %s.COUNT(*)",
+                main_table,
+            )
+        elif fallback_col:
             main_roles["aggregate"] = [fallback_col]
             main_roles["select"] = [fallback_col]
             main_roles.pop("group_by", None)

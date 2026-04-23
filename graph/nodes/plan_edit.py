@@ -48,6 +48,73 @@ def _collect_known_columns(selected_columns: dict[str, Any]) -> set[str]:
     return result
 
 
+def _table_columns_map(schema_loader: Any, main_table: str) -> dict[str, dict[str, Any]]:
+    split = _split_table_name(main_table)
+    if split is None:
+        return {}
+    cols_df = schema_loader.get_table_columns(*split)
+    if cols_df is None or cols_df.empty:
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for _, row in cols_df.iterrows():
+        col_name = str(row.get("column_name", "") or "").strip()
+        if not col_name:
+            continue
+        result[col_name.lower()] = {
+            "column_name": col_name,
+            "description": str(row.get("description", "") or "").strip(),
+        }
+    return result
+
+
+def _resolve_column_token(
+    schema_loader: Any,
+    main_table: str,
+    token: str,
+    selected_columns: dict[str, Any],
+) -> str | None:
+    raw = str(token or "").strip()
+    if not raw:
+        return None
+    if raw == "*":
+        return "*"
+
+    known_columns = _collect_known_columns(selected_columns)
+    raw_lower = raw.lower()
+    for col in known_columns:
+        if col.lower() == raw_lower:
+            return col
+
+    cols_map = _table_columns_map(schema_loader, main_table)
+    if raw_lower in cols_map:
+        return cols_map[raw_lower]["column_name"]
+
+    for lower_name, meta in cols_map.items():
+        if str(meta.get("description") or "").strip().lower() == raw_lower:
+            return meta["column_name"]
+
+    desc_matches = [
+        meta["column_name"]
+        for meta in cols_map.values()
+        if raw_lower and raw_lower in str(meta.get("description") or "").strip().lower()
+    ]
+    if len(desc_matches) == 1:
+        return desc_matches[0]
+
+    split = _split_table_name(main_table)
+    if split is not None:
+        schema_name, table_name = split
+        syn_matches: list[str] = []
+        for meta in cols_map.values():
+            synonyms = schema_loader.get_column_synonyms(schema_name, table_name, meta["column_name"])
+            if any(raw_lower == str(syn).strip().lower() for syn in synonyms):
+                syn_matches.append(meta["column_name"])
+        if len(syn_matches) == 1:
+            return syn_matches[0]
+
+    return None
+
+
 def _render_compact_plan(blueprint: dict[str, Any]) -> str:
     agg = blueprint.get("aggregation") or {}
     distinct_sql = "DISTINCT " if agg.get("distinct") else ""
@@ -144,7 +211,7 @@ class PlanEditNodes:
         re.IGNORECASE,
     )
     _PATCH_COUNT_BY_FIELD = re.compile(
-        r"(?:посчита[йи]\w*\s+по|count\s+by)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+        r"(?:давай\s+)?(?:посчита[йи]\w*|подсчита[йи]\w*|счита[йи]\w*|count)\s+(?:by|по|на)\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
         re.IGNORECASE,
     )
     _PATCH_DATE_SHIFT = re.compile(
@@ -156,6 +223,7 @@ class PlanEditNodes:
         self,
         operations: list[dict[str, Any]],
         selected_columns: dict[str, Any],
+        main_table: str = "",
     ) -> list[dict[str, Any]]:
         allowed_paths = {
             "aggregation.function",
@@ -188,8 +256,10 @@ class PlanEditNodes:
             if path in {"aggregation.column", "group_by"}:
                 value = cleaned.get("value")
                 if action == "replace" and path == "aggregation.column":
-                    if value not in known_columns and value != "*":
+                    resolved = _resolve_column_token(self.schema, main_table, str(value), selected_columns)
+                    if resolved is None:
                         continue
+                    cleaned["value"] = resolved
                 if path == "group_by":
                     if action == "add" and value not in known_columns:
                         continue
@@ -222,7 +292,12 @@ class PlanEditNodes:
         operations = parsed.get("operations") if isinstance(parsed, dict) else []
         if not isinstance(operations, list):
             return []
-        return self._sanitize_patch_operations(operations, state.get("selected_columns") or {})
+        blueprint = state.get("sql_blueprint") or {}
+        return self._sanitize_patch_operations(
+            operations,
+            state.get("selected_columns") or {},
+            str(blueprint.get("main_table") or ""),
+        )
 
     def _resolve_table_name(self, table_token: str) -> str | None:
         token = str(table_token or "").strip()
@@ -387,11 +462,25 @@ class PlanEditNodes:
         count_by_match = self._PATCH_COUNT_BY_FIELD.search(edit_text)
         if count_by_match:
             column = count_by_match.group(1).strip()
-            if column:
+            resolved_column = _resolve_column_token(
+                self.schema,
+                str(blueprint.get("main_table") or ""),
+                column,
+                state.get("selected_columns") or {},
+            )
+            if resolved_column:
                 operations.extend([
                     {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
-                    {"op": "replace", "path": "aggregation.column", "value": column},
+                    {"op": "replace", "path": "aggregation.column", "value": resolved_column},
                 ])
+            else:
+                return {
+                    "edit_kind": "clarify",
+                    "confidence": 0.75,
+                    "explanation": "Пользователь указал колонку для COUNT, но она не распознана",
+                    "needs_clarification": True,
+                    "payload": {"question": f"Не удалось распознать колонку '{column}'. По какой колонке нужно считать?"},
+                }
         if self._PATCH_NO_DISTINCT.search(edit_text):
             operations.append({"op": "replace", "path": "aggregation.distinct", "value": False})
 
@@ -461,7 +550,11 @@ class PlanEditNodes:
             }
 
         if operations:
-            operations = self._sanitize_patch_operations(operations, state.get("selected_columns") or {})
+            operations = self._sanitize_patch_operations(
+                operations,
+                state.get("selected_columns") or {},
+                str(blueprint.get("main_table") or ""),
+            )
             return {
                 "edit_kind": "patch",
                 "confidence": 0.95,
@@ -504,12 +597,13 @@ class PlanEditNodes:
         blueprint: dict[str, Any],
         operations: list[dict[str, Any]],
         selected_columns: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         bp = copy.deepcopy(blueprint)
         known_columns = _collect_known_columns(selected_columns)
         agg = dict(bp.get("aggregation") or {})
         where_conditions = list(bp.get("where_conditions") or [])
         old_alias = str(agg.get("alias") or "").strip()
+        patch_meta: dict[str, Any] = {}
         for op in operations:
             if not isinstance(op, dict):
                 continue
@@ -520,6 +614,7 @@ class PlanEditNodes:
                 agg["function"] = str(value)
             elif action == "replace" and path == "aggregation.column":
                 agg["column"] = str(value)
+                patch_meta["aggregation_column"] = str(value)
                 if value:
                     if str(agg.get("function")).upper() == "COUNT" and str(value) == "*":
                         agg["alias"] = "count_all"
@@ -530,6 +625,7 @@ class PlanEditNodes:
                             else f"{str(agg.get('function')).lower()}_{value}"
                         )
             elif action == "replace" and path == "aggregation.distinct":
+                patch_meta["aggregation_distinct"] = bool(value)
                 if value:
                     agg["distinct"] = True
                 else:
@@ -609,22 +705,39 @@ class PlanEditNodes:
                 bp["order_by"] = current_order_by.replace(old_alias, new_alias, 1)
             bp["aggregation"] = agg
         bp["where_conditions"] = where_conditions
-        return bp
+        return bp, patch_meta
 
     def plan_patcher(self, state: AgentState) -> dict[str, Any]:
         iterations = state.get("graph_iterations", 0) + 1
         payload = state.get("plan_edit_payload") or {}
         operations = list(payload.get("operations") or [])
         old_blueprint = copy.deepcopy(state.get("sql_blueprint") or {})
-        new_blueprint = self._apply_patch_operations(
+        new_blueprint, patch_meta = self._apply_patch_operations(
             old_blueprint,
             operations,
             state.get("selected_columns") or {},
         )
+        user_hints = copy.deepcopy(state.get("user_hints") or {})
+        agg_prefs = dict(user_hints.get("aggregation_preferences") or {})
+        agg = new_blueprint.get("aggregation") or {}
+        if patch_meta.get("aggregation_column") is not None:
+            agg_prefs["function"] = str(agg.get("function") or "COUNT").lower()
+            agg_prefs["column"] = str(agg.get("column") or "")
+            if "distinct" in agg:
+                agg_prefs["distinct"] = bool(agg.get("distinct"))
+            else:
+                agg_prefs["distinct"] = False
+            if agg_prefs.get("column") != "*":
+                agg_prefs.pop("force_count_star", None)
+            else:
+                agg_prefs["force_count_star"] = True
+        if agg_prefs:
+            user_hints["aggregation_preferences"] = agg_prefs
         logger.info("plan_patcher: applied %d operations", len(operations))
         return {
             "previous_sql_blueprint": old_blueprint,
             "sql_blueprint": new_blueprint,
+            "user_hints": user_hints,
             "plan_edit_applied": True,
             "plan_edit_history": _ensure_history_entry(
                 state,

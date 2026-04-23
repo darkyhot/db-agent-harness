@@ -190,6 +190,7 @@ _TABLE_ARTIFACT_TOKENS = frozenset({
     'schema', 'data', 'dwh', 'fact', 'dim', 'split', 'funnel', 'mart', 'table', 'tbl',
 })
 _DIMENSION_QUERY_STEMS = ('сегмент', 'регион', 'госб', 'тб', 'филиал')
+_COUNT_DATE_SUFFIXES = ("_dt", "_date", "_dttm", "_timestamp", "_ts", "date", "dttm", "report_dt")
 _TRANSLIT_TABLE = str.maketrans({
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
     'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
@@ -293,6 +294,17 @@ def _is_trustworthy_dimension(slot: str) -> bool:
     if len(parts) == 1 and not any(parts[0].startswith(stem) for stem in _DIMENSION_QUERY_STEMS) and parts[0] != 'date':
         return False
     return True
+
+
+def _is_count_unsafe_time_axis(col_name: str, dtype: str, sem_class: str) -> bool:
+    lower_name = str(col_name or "").lower().strip()
+    lower_dtype = str(dtype or "").lower().strip()
+    lower_sem = str(sem_class or "").lower().strip()
+    return (
+        lower_name.endswith(_COUNT_DATE_SUFFIXES)
+        or lower_sem in {"date", "datetime", "timestamp", "system_timestamp"}
+        or bool(_DATE_RE.match(lower_dtype))
+    )
 
 
 def _is_label_slot(slot: str) -> bool:
@@ -627,6 +639,8 @@ def _choose_single_entity_count_column(
     cols_df = schema_loader.get_table_columns(schema_name, table_name)
     if cols_df.empty:
         return None
+    table_semantics = schema_loader.get_table_semantics(schema_name, table_name) or {}
+    table_grain = str(table_semantics.get("grain") or "").strip().lower()
 
     best: tuple[float, str] | None = None
     subject = str(subject or "").strip().lower()
@@ -657,6 +671,10 @@ def _choose_single_entity_count_column(
             score += 20.0
         if _is_numeric(dtype):
             score -= 40.0
+        if _is_count_unsafe_time_axis(col_name, dtype, sem_class):
+            score -= 220.0
+            if subject == "task":
+                score -= 80.0
 
         entity_match = _entity_score(col_name, desc, query_entities + subject_tokens)
         score += entity_match * 90.0
@@ -679,6 +697,10 @@ def _choose_single_entity_count_column(
 
     if best is None or best[0] < 60.0:
         return None
+    if subject == "task" and table_grain not in {"task", "ticket", "issue"}:
+        chosen_lower = best[1].lower()
+        if "task" not in chosen_lower and not chosen_lower.endswith(("_code", "_id")):
+            return None
     return best[1]
 
 

@@ -133,10 +133,96 @@ class PlanEditNodes:
         r"\bcount\s*\(\s*distinct\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)|\bcount\s+distinct\s+([a-zA-Z_][a-zA-Z0-9_]*)",
         re.IGNORECASE,
     )
+    _PATCH_COUNT_STAR = re.compile(
+        r"(?:count\s*\(\s*\*\s*\)|посчита[йи]\w*\s+просто\s+количеств\w*\s+строк|"
+        r"прост\w*\s+количеств\w*\s+строк|count\s+all|count\s+rows)",
+        re.IGNORECASE,
+    )
+    _PATCH_NO_DISTINCT = re.compile(
+        r"(?:без\s+distinct|не\s+надо\s+distinct|не\s+надо\s+счита\w*\s+по\s+уникальн\w+|"
+        r"не\s+счита\w*\s+по\s+уникальн\w+|не\s+по\s+уникальн\w+)",
+        re.IGNORECASE,
+    )
+    _PATCH_COUNT_BY_FIELD = re.compile(
+        r"(?:посчита[йи]\w*\s+по|count\s+by)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+        re.IGNORECASE,
+    )
     _PATCH_DATE_SHIFT = re.compile(
         r"(?:с|от)\s+(\d{1,2})\s*(?:числ[ао]?)?\s+(?:на|до)\s+(\d{1,2})\s*(?:числ[ао]?)?",
         re.IGNORECASE,
     )
+
+    def _sanitize_patch_operations(
+        self,
+        operations: list[dict[str, Any]],
+        selected_columns: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        allowed_paths = {
+            "aggregation.function",
+            "aggregation.column",
+            "aggregation.distinct",
+            "aggregation.alias",
+            "order_by.direction",
+            "limit",
+            "group_by",
+            "where.date.from",
+            "where.date.to",
+        }
+        known_columns = _collect_known_columns(selected_columns)
+        sanitized: list[dict[str, Any]] = []
+        for op in operations:
+            if not isinstance(op, dict):
+                continue
+            action = str(op.get("op") or "").strip()
+            path = str(op.get("path") or "").strip()
+            if action == "remove_filter":
+                column = str(op.get("column") or "").strip()
+                if column and column in known_columns:
+                    sanitized.append({"op": "remove_filter", "column": column})
+                continue
+            if path not in allowed_paths or action not in {"replace", "remove", "add"}:
+                continue
+            cleaned = {"op": action, "path": path}
+            if "value" in op:
+                cleaned["value"] = op.get("value")
+            if path in {"aggregation.column", "group_by"}:
+                value = cleaned.get("value")
+                if action == "replace" and path == "aggregation.column":
+                    if value not in known_columns and value != "*":
+                        continue
+                if path == "group_by":
+                    if action == "add" and value not in known_columns:
+                        continue
+                    if action == "replace" and value not in ([], None):
+                        values = [item for item in (value if isinstance(value, list) else [value]) if item in known_columns]
+                        cleaned["value"] = values
+            sanitized.append(cleaned)
+        return sanitized
+
+    def _llm_generate_patch_operations(self, blueprint: dict[str, Any], edit_text: str, state: AgentState) -> list[dict[str, Any]]:
+        system_prompt = (
+            "Ты строишь список операций для правки SQL-плана. "
+            'Каждая операция — JSON: {"op":"replace|remove|add|remove_filter","path":"...","value":...}. '
+            'Допустимые path: "aggregation.function", "aggregation.column", "aggregation.distinct", '
+            '"aggregation.alias", "order_by.direction", "limit", "group_by", "where.date.from", "where.date.to". '
+            'Для remove_filter используй поле "column". Верни только JSON {"operations":[...]}.'
+        )
+        user_prompt = (
+            f"Текущий план:\n{_render_compact_plan(blueprint)}\n\n"
+            f"Правка пользователя: {edit_text}\n\n"
+            "Если пользователь просит считать просто строки, используй aggregation.column='*' и aggregation.distinct=false. "
+            "Если просит убрать distinct, верни replace для aggregation.distinct=false."
+        )
+        try:
+            response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.0)
+            parsed = _parse_json_response(response) or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("plan_edit patch operations LLM fallback failed: %s", exc)
+            return []
+        operations = parsed.get("operations") if isinstance(parsed, dict) else []
+        if not isinstance(operations, list):
+            return []
+        return self._sanitize_patch_operations(operations, state.get("selected_columns") or {})
 
     def _resolve_table_name(self, table_token: str) -> str | None:
         token = str(table_token or "").strip()
@@ -209,6 +295,9 @@ class PlanEditNodes:
             parsed.setdefault("confidence", 0.5)
             parsed.setdefault("explanation", "LLM fallback")
             parsed.setdefault("needs_clarification", parsed.get("edit_kind") == "clarify")
+            if parsed.get("edit_kind") == "patch" and not (parsed.get("payload") or {}).get("operations"):
+                parsed["payload"] = parsed.get("payload") or {}
+                parsed["payload"]["operations"] = self._llm_generate_patch_operations(blueprint, edit_text, state)
             return parsed
         return {
             "edit_kind": "clarify",
@@ -280,6 +369,12 @@ class PlanEditNodes:
             }
 
         operations: list[dict[str, Any]] = []
+        if self._PATCH_COUNT_STAR.search(edit_text):
+            operations.extend([
+                {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
+                {"op": "replace", "path": "aggregation.column", "value": "*"},
+                {"op": "replace", "path": "aggregation.distinct", "value": False},
+            ])
         match = self._PATCH_COUNT_DISTINCT.search(edit_text)
         if match:
             column = (match.group(1) or match.group(2) or "").strip()
@@ -289,6 +384,16 @@ class PlanEditNodes:
                     {"op": "replace", "path": "aggregation.column", "value": column},
                     {"op": "replace", "path": "aggregation.distinct", "value": True},
                 ])
+        count_by_match = self._PATCH_COUNT_BY_FIELD.search(edit_text)
+        if count_by_match:
+            column = count_by_match.group(1).strip()
+            if column:
+                operations.extend([
+                    {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
+                    {"op": "replace", "path": "aggregation.column", "value": column},
+                ])
+        if self._PATCH_NO_DISTINCT.search(edit_text):
+            operations.append({"op": "replace", "path": "aggregation.distinct", "value": False})
 
         if self._PATCH_SORT_DESC.search(edit_text):
             operations.append({"op": "replace", "path": "order_by.direction", "value": "DESC"})
@@ -356,6 +461,7 @@ class PlanEditNodes:
             }
 
         if operations:
+            operations = self._sanitize_patch_operations(operations, state.get("selected_columns") or {})
             return {
                 "edit_kind": "patch",
                 "confidence": 0.95,
@@ -403,6 +509,7 @@ class PlanEditNodes:
         known_columns = _collect_known_columns(selected_columns)
         agg = dict(bp.get("aggregation") or {})
         where_conditions = list(bp.get("where_conditions") or [])
+        old_alias = str(agg.get("alias") or "").strip()
         for op in operations:
             if not isinstance(op, dict):
                 continue
@@ -414,9 +521,19 @@ class PlanEditNodes:
             elif action == "replace" and path == "aggregation.column":
                 agg["column"] = str(value)
                 if value:
-                    agg["alias"] = f"count_{value}" if str(agg.get("function")).upper() == "COUNT" else f"{str(agg.get('function')).lower()}_{value}"
+                    if str(agg.get("function")).upper() == "COUNT" and str(value) == "*":
+                        agg["alias"] = "count_all"
+                    else:
+                        agg["alias"] = (
+                            f"count_{value}"
+                            if str(agg.get("function")).upper() == "COUNT"
+                            else f"{str(agg.get('function')).lower()}_{value}"
+                        )
             elif action == "replace" and path == "aggregation.distinct":
-                agg["distinct"] = bool(value)
+                if value:
+                    agg["distinct"] = True
+                else:
+                    agg.pop("distinct", None)
             elif action == "replace" and path == "order_by.direction":
                 current = str(bp.get("order_by") or "").strip()
                 if current:
@@ -486,6 +603,10 @@ class PlanEditNodes:
                     if column not in cond.lower()
                 ]
         if agg:
+            new_alias = str(agg.get("alias") or "").strip()
+            current_order_by = str(bp.get("order_by") or "").strip()
+            if old_alias and new_alias and current_order_by.startswith(old_alias):
+                bp["order_by"] = current_order_by.replace(old_alias, new_alias, 1)
             bp["aggregation"] = agg
         bp["where_conditions"] = where_conditions
         return bp

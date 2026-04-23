@@ -151,6 +151,24 @@ _COUNT_DISTINCT_PATTERNS: list[re.Pattern[str]] = [
         re.IGNORECASE,
     ),
 ]
+_COUNT_STAR_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"(?:count\s*\(\s*\*\s*\)|count\s+all|count\s+rows|count\s+of\s+rows)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:count\s+по\s+всем\s+строкам|посчита[йи]\w*\s+просто\s+количеств\w*\s+строк|"
+        r"прост\w*\s+количеств\w*\s+строк|все\s+строк[аи]\s+посчита[йи]\w*)",
+        re.IGNORECASE,
+    ),
+]
+_COUNT_NO_DISTINCT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"(?:без\s+distinct|не\s+надо\s+count\s+distinct|не\s+надо\s+distinct|"
+        r"не\s+надо\s+счита\w*\s+по\s+уникальн\w+|не\s+счита\w*\s+по\s+уникальн\w+|не\s+по\s+уникальн\w+)",
+        re.IGNORECASE,
+    ),
+]
 
 # Нормализация гранулярности времени.
 # Ключ — каноническое значение; список — паттерны (подстроки/regex).
@@ -546,19 +564,36 @@ def extract_user_hints(
     result["aggregate_hints"] = aggregate_hints
 
     aggregation_preferences: dict[str, Any] = {}
-    for pattern in _COUNT_DISTINCT_PATTERNS:
-        match = pattern.search(user_input)
-        if not match:
-            continue
-        column = match.group(1).strip().lower()
-        if not column:
-            continue
+    for pattern in _COUNT_STAR_PATTERNS:
+        if pattern.search(user_input):
+            aggregation_preferences = {
+                "function": "count",
+                "column": "*",
+                "distinct": False,
+                "force_count_star": True,
+            }
+            break
+    if not aggregation_preferences:
+        for pattern in _COUNT_DISTINCT_PATTERNS:
+            match = pattern.search(user_input)
+            if not match:
+                continue
+            column = match.group(1).strip().lower()
+            if not column:
+                continue
+            aggregation_preferences = {
+                "function": "count",
+                "column": column,
+                "distinct": True,
+            }
+            break
+    if not aggregation_preferences and any(pattern.search(user_input) for pattern in _COUNT_NO_DISTINCT_PATTERNS):
         aggregation_preferences = {
             "function": "count",
-            "column": column,
-            "distinct": True,
+            "distinct": False,
         }
-        break
+    elif aggregation_preferences and any(pattern.search(user_input) for pattern in _COUNT_NO_DISTINCT_PATTERNS):
+        aggregation_preferences["distinct"] = False
     result["aggregation_preferences"] = aggregation_preferences
 
     # 8. Time granularity: "помесячно" → "month", "по кварталам" → "quarter"

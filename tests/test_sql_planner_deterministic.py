@@ -8,6 +8,7 @@ from core.sql_planner_deterministic import (
     _determine_strategy,
     _compute_group_by,
     _compute_aggregation,
+    _choose_count_identifier_column,
     _compute_where_from_intent,
     _find_date_column,
     _apply_time_granularity,
@@ -156,6 +157,195 @@ class TestComputeAggregation:
         assert agg["function"] == "COUNT"
         assert agg["column"] == "task_code"
         assert agg["distinct"] is True
+
+    def test_simple_select_no_distinct_even_when_aggregate_role_set(self, tmp_path):
+        from core.schema_loader import SchemaLoader
+
+        tables_df = pd.DataFrame({
+            "schema_name": ["dm"],
+            "table_name": ["snapshot_x"],
+            "description": ["Снимок задач"],
+            "grain": ["snapshot"],
+        })
+        attrs_df = pd.DataFrame({
+            "schema_name": ["dm"] * 2,
+            "table_name": ["snapshot_x"] * 2,
+            "column_name": ["task_code", "report_dt"],
+            "dType": ["text", "date"],
+            "description": ["Код задачи", "Отчетная дата"],
+            "is_primary_key": [True, True],
+            "unique_perc": [100.0, 100.0],
+            "not_null_perc": [100.0, 100.0],
+        })
+        tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+        attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+        loader = SchemaLoader(data_dir=tmp_path)
+
+        agg = _compute_aggregation(
+            {"aggregation_hint": "count"},
+            self._cols(["task_code"]),
+            schema_loader=loader,
+            semantic_frame={"requires_single_entity_count": True},
+            strategy="simple_select",
+        )
+        assert agg["column"] == "task_code"
+        assert "distinct" not in agg
+
+    def test_aggregation_preferences_distinct_false_drops_flag(self):
+        intent = {"aggregation_hint": "count"}
+        agg = _compute_aggregation(
+            intent,
+            self._cols(["task_code"]),
+            user_hints={
+                "aggregation_preferences": {
+                    "function": "count",
+                    "column": "task_code",
+                    "distinct": False,
+                }
+            },
+            semantic_frame={"requires_single_entity_count": True},
+            strategy="fact_dim_join",
+        )
+        assert agg["column"] == "task_code"
+        assert "distinct" not in agg
+
+    def test_force_count_star_disables_safety_net_preference(self):
+        intent = {"aggregation_hint": "count"}
+        agg = _compute_aggregation(
+            intent,
+            self._cols(["task_code"]),
+            user_hints={
+                "aggregation_preferences": {
+                    "function": "count",
+                    "column": "*",
+                    "distinct": False,
+                    "force_count_star": True,
+                }
+            },
+            semantic_frame={"requires_single_entity_count": True},
+            strategy="fact_dim_join",
+        )
+        assert agg == {"function": "COUNT", "column": "*", "alias": "count_all"}
+
+
+def _build_snapshot_loader(tmp_path):
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm"],
+        "table_name": ["outflow_snapshot", "gosb_dim"],
+        "description": ["Снимок фактического оттока", "Справочник ГОСБ"],
+        "grain": ["snapshot", "organization"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 6,
+        "table_name": [
+            "outflow_snapshot", "outflow_snapshot", "outflow_snapshot", "outflow_snapshot",
+            "gosb_dim", "gosb_dim",
+        ],
+        "column_name": ["report_dt", "gosb_id", "inn", "task_code", "gosb_id", "gosb_name"],
+        "dType": ["date", "text", "text", "text", "text", "text"],
+        "description": [
+            "Отчетная дата", "Код ГОСБ", "ИНН клиента", "Код задачи",
+            "Код ГОСБ", "Название ГОСБ",
+        ],
+        "is_primary_key": [True, True, True, False, True, False],
+        "unique_perc": [100.0, 100.0, 100.0, 100.0, 100.0, 20.0],
+        "not_null_perc": [100.0] * 6,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_simple_select_count_skips_single_entity_safety(tmp_path):
+    loader = _build_snapshot_loader(tmp_path)
+    blueprint = build_blueprint(
+        {"aggregation_hint": "count", "date_filters": {"from": "2026-02-01", "to": "2026-03-01"}},
+        {"dm.outflow_snapshot": {"select": [], "filter": ["report_dt"], "aggregate": ["*"], "group_by": []}},
+        [],
+        {"dm.outflow_snapshot": "fact"},
+        {},
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 2026",
+        schema_loader=loader,
+        semantic_frame={"requires_single_entity_count": True, "subject": "task"},
+    )
+    assert blueprint["strategy"] == "simple_select"
+    assert blueprint["aggregation"] == {"function": "COUNT", "column": "*", "alias": "count_all"}
+
+
+def test_join_strategy_still_uses_distinct(tmp_path):
+    loader = _build_snapshot_loader(tmp_path)
+    blueprint = build_blueprint(
+        {"aggregation_hint": "count"},
+        {
+            "dm.outflow_snapshot": {
+                "select": ["report_dt"],
+                "filter": ["report_dt"],
+                "aggregate": ["*"],
+                "group_by": ["report_dt"],
+            },
+            "dm.gosb_dim": {
+                "select": ["gosb_name"],
+                "filter": [],
+                "aggregate": [],
+                "group_by": ["gosb_name"],
+            },
+        },
+        [{"left": "dm.outflow_snapshot.gosb_id", "right": "dm.gosb_dim.gosb_id"}],
+        {"dm.outflow_snapshot": "fact", "dm.gosb_dim": "dim"},
+        {},
+        user_input="Сколько задач по ГОСБ",
+        schema_loader=loader,
+        semantic_frame={"requires_single_entity_count": True, "subject": "task"},
+    )
+    assert blueprint["strategy"] == "fact_dim_join"
+    assert blueprint["aggregation"]["function"] == "COUNT"
+    assert blueprint["aggregation"]["column"] in {"gosb_id", "inn", "task_code"}
+    assert blueprint["aggregation"]["column"] != "report_dt"
+    assert blueprint["aggregation"]["distinct"] is True
+
+
+def test_choose_count_identifier_avoids_date_in_composite_pk(tmp_path):
+    loader = _build_snapshot_loader(tmp_path)
+    chosen = _choose_count_identifier_column(
+        "dm.outflow_snapshot",
+        loader,
+        semantic_frame={"subject": "organization"},
+        user_input="Сколько организаций по оттоку",
+    )
+    assert chosen in {"gosb_id", "inn"}
+    assert chosen != "report_dt"
+
+
+def test_choose_count_identifier_uses_subject_stems(tmp_path):
+    loader = _build_snapshot_loader(tmp_path)
+    chosen = _choose_count_identifier_column(
+        "dm.outflow_snapshot",
+        loader,
+        semantic_frame={"subject": "task"},
+        user_input="Сколько задач по оттоку",
+    )
+    assert chosen == "task_code"
+
+
+def test_force_count_star_disables_safety_net(tmp_path):
+    loader = _build_snapshot_loader(tmp_path)
+    blueprint = build_blueprint(
+        {"aggregation_hint": "count"},
+        {
+            "dm.outflow_snapshot": {"select": [], "filter": ["report_dt"], "aggregate": ["*"], "group_by": ["report_dt"]},
+            "dm.gosb_dim": {"select": ["gosb_name"], "filter": [], "aggregate": [], "group_by": ["gosb_name"]},
+        },
+        [{"left": "dm.outflow_snapshot.gosb_id", "right": "dm.gosb_dim.gosb_id"}],
+        {"dm.outflow_snapshot": "fact", "dm.gosb_dim": "dim"},
+        {},
+        user_input="Посчитай просто количество строк",
+        schema_loader=loader,
+        semantic_frame={"requires_single_entity_count": True, "subject": "task"},
+        user_hints={"aggregation_preferences": {"function": "count", "column": "*", "distinct": False, "force_count_star": True}},
+    )
+    assert blueprint["aggregation"] == {"function": "COUNT", "column": "*", "alias": "count_all"}
 
 
 # ---------------------------------------------------------------------------
@@ -665,11 +855,11 @@ def test_build_blueprint_single_entity_count_clears_spurious_group_by():
         },
     )
     assert bp["aggregation"]["column"] == "task_code"
-    assert bp["aggregation"]["distinct"] is True
+    assert "distinct" not in bp["aggregation"]
     assert bp["group_by"] == []
 
 
-def test_build_blueprint_for_outflow_tasks_uses_distinct_task_code(tmp_path):
+def test_build_blueprint_for_outflow_tasks_uses_count_task_code_without_distinct(tmp_path):
     from core.schema_loader import SchemaLoader
 
     tables_df = pd.DataFrame({
@@ -724,11 +914,11 @@ def test_build_blueprint_for_outflow_tasks_uses_distinct_task_code(tmp_path):
         },
     )
     assert bp["aggregation"]["column"] == "task_code"
-    assert bp["aggregation"]["distinct"] is True
+    assert "distinct" not in bp["aggregation"]
     assert bp["group_by"] == []
 
 
-def test_build_blueprint_single_entity_safety_net_rewrites_count_star(tmp_path):
+def test_build_blueprint_simple_select_keeps_count_star_without_safety_net(tmp_path):
     from core.schema_loader import SchemaLoader
 
     tables_df = pd.DataFrame({
@@ -772,6 +962,6 @@ def test_build_blueprint_single_entity_safety_net_rewrites_count_star(tmp_path):
             "output_dimensions": [],
         },
     )
-    assert bp["aggregation"]["column"] == "task_code"
-    assert bp["aggregation"]["distinct"] is True
+    assert bp["aggregation"]["column"] == "*"
+    assert "distinct" not in bp["aggregation"]
     assert bp["group_by"] == []

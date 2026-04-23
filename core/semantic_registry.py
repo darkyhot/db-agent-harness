@@ -16,6 +16,12 @@ _STOPWORDS = {
 
 _FLAG_WORDS = {"признак", "flag", "is", "bool", "boolean"}
 _DATE_WORDS = {"date", "дата", "period", "период", "report"}
+_BUILTIN_SUBJECT_ALIASES: dict[str, list[str]] = {
+    "task": ["task", "ticket", "issue", "задача", "задачи", "задач", "воронка"],
+    "client": ["client", "customer", "клиент", "клиента", "клиенты"],
+    "employee": ["employee", "staff", "сотрудник", "сотрудника", "сотрудники"],
+    "organization": ["organization", "org", "branch", "госб", "тб", "организация"],
+}
 
 
 def _normalize_phrase(text: str) -> str:
@@ -122,6 +128,11 @@ def _is_overly_generic_match_phrase(column: str, phrase: str) -> bool:
     return False
 
 
+def builtin_subject_aliases() -> dict[str, list[str]]:
+    """Вернуть встроенную карту subject -> aliases для fallback-эвристик."""
+    return {key: list(values) for key, values in _BUILTIN_SUBJECT_ALIASES.items()}
+
+
 def build_semantic_lexicon(
     tables_df,
     attrs_df,
@@ -150,6 +161,12 @@ def build_semantic_lexicon(
                     entry["aliases"].append(alias)
             if key not in entry["tables"]:
                 entry["tables"].append(key)
+
+    for subject, aliases in builtin_subject_aliases().items():
+        entry = lexicon["subjects"].setdefault(subject, {"aliases": [], "tables": []})
+        for alias in _collect_aliases(subject, *aliases):
+            if alias not in entry["aliases"]:
+                entry["aliases"].append(alias)
 
     if attrs_df is not None and not attrs_df.empty:
         for _, row in attrs_df.iterrows():

@@ -18,7 +18,14 @@ class _DummyDB:
 
 
 class _DummyLLM:
+    def __init__(self, responses=None):
+        self.responses = list(responses or [])
+        self.calls: list[tuple[str, str, float | None]] = []
+
     def invoke_with_system(self, system_prompt: str, user_prompt: str, temperature: float | None = None) -> str:
+        self.calls.append((system_prompt, user_prompt, temperature))
+        if self.responses:
+            return self.responses.pop(0)
         raise AssertionError("LLM fallback should not be used in deterministic tests")
 
 
@@ -169,6 +176,31 @@ def test_router_patch_sort_desc(node):
     assert {"op": "replace", "path": "order_by.direction", "value": "DESC"} in ops
 
 
+def test_router_patch_count_star_russian(node):
+    result = node.plan_edit_router(_state(plan_edit_text="посчитай просто количество строк и сортируй по убыванию"))
+    assert result["plan_edit_kind"] == "patch"
+    ops = result["plan_edit_payload"]["operations"]
+    assert {"op": "replace", "path": "aggregation.column", "value": "*"} in ops
+    assert {"op": "replace", "path": "aggregation.distinct", "value": False} in ops
+    assert {"op": "replace", "path": "order_by.direction", "value": "DESC"} in ops
+
+
+def test_router_patch_no_distinct_only(node):
+    result = node.plan_edit_router(_state(plan_edit_text="не надо считать по уникальной дате"))
+    assert result["plan_edit_kind"] == "patch"
+    assert result["plan_edit_payload"]["operations"] == [
+        {"op": "replace", "path": "aggregation.distinct", "value": False},
+    ]
+
+
+def test_router_count_by_field(node):
+    result = node.plan_edit_router(_state(plan_edit_text="посчитай по task_code"))
+    assert result["plan_edit_kind"] == "patch"
+    ops = result["plan_edit_payload"]["operations"]
+    assert {"op": "replace", "path": "aggregation.function", "value": "COUNT"} in ops
+    assert {"op": "replace", "path": "aggregation.column", "value": "task_code"} in ops
+
+
 def test_router_patch_date_shift(node):
     result = node.plan_edit_router(_state(plan_edit_text="поменяй фильтр на дате с 1 числа на 2"))
     assert result["plan_edit_kind"] == "patch"
@@ -199,6 +231,39 @@ def test_patcher_applies_count_distinct(node):
     result = node.plan_patcher(state)
     assert result["sql_blueprint"]["aggregation"]["distinct"] is True
     assert result["sql_blueprint"]["aggregation"]["column"] == "task_code"
+
+
+def test_patcher_count_star_strips_distinct_and_updates_order_by(node):
+    state = _state(
+        sql_blueprint={
+            "strategy": "simple_select",
+            "main_table": "schema_a.fact_x",
+            "where_conditions": [],
+            "aggregation": {
+                "function": "COUNT",
+                "column": "task_code",
+                "alias": "count_task_code",
+                "distinct": True,
+            },
+            "group_by": [],
+            "order_by": "count_task_code DESC",
+            "limit": None,
+        },
+        plan_edit_payload={
+            "operations": [
+                {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
+                {"op": "replace", "path": "aggregation.column", "value": "*"},
+                {"op": "replace", "path": "aggregation.distinct", "value": False},
+            ]
+        },
+    )
+    result = node.plan_patcher(state)
+    assert result["sql_blueprint"]["aggregation"] == {
+        "function": "COUNT",
+        "column": "*",
+        "alias": "count_all",
+    }
+    assert result["sql_blueprint"]["order_by"] == "count_all DESC"
 
 
 def test_source_rebinder_replace_main_table(node):
@@ -255,3 +320,25 @@ def test_diff_renderer_reports_change(node):
     changed_fields = {item["field"] for item in result["plan_diff"]["changed"]}
     assert "aggregation" in changed_fields
     assert "order_by" in changed_fields
+
+
+def test_fallback_llm_emits_operations(synthetic_loader):
+    llm = _DummyLLM([
+        '{"edit_kind":"patch","confidence":0.4,"payload":{}}',
+        '{"operations":[{"op":"replace","path":"aggregation.column","value":"*"},{"op":"replace","path":"aggregation.distinct","value":false}]}',
+    ])
+    node = _Node(
+        llm,
+        _DummyDB(),
+        synthetic_loader,
+        _DummyMemory(),
+        _DummyValidator(),
+        [],
+    )
+    result = node.plan_edit_router(_state(plan_edit_text="считай просто строки"))
+    assert result["plan_edit_kind"] == "patch"
+    assert result["plan_edit_payload"]["operations"] == [
+        {"op": "replace", "path": "aggregation.column", "value": "*"},
+        {"op": "replace", "path": "aggregation.distinct", "value": False},
+    ]
+    assert len(llm.calls) == 2

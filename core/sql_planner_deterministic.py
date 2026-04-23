@@ -309,9 +309,12 @@ def _count_column_should_be_distinct(
     column: str,
     schema_loader=None,
     semantic_frame: dict | None = None,
+    strategy: str = "",
 ) -> bool:
     """Определить, нужно ли считать COUNT по колонке как DISTINCT."""
     if not column or column == "*":
+        return False
+    if strategy == "simple_select":
         return False
     if (semantic_frame or {}).get("requires_single_entity_count"):
         return True
@@ -343,6 +346,8 @@ def _count_column_should_be_distinct(
 def _choose_count_identifier_column(
     main_table: str,
     schema_loader,
+    semantic_frame: dict | None = None,
+    user_input: str = "",
 ) -> str | None:
     """Подобрать identifier/PK-колонку для COUNT(DISTINCT ...) safety net."""
     if not main_table or schema_loader is None or "." not in main_table:
@@ -351,6 +356,17 @@ def _choose_count_identifier_column(
     cols_df = schema_loader.get_table_columns(schema_name, table_name)
     if cols_df.empty:
         return None
+    try:
+        from core.filter_ranking import _stem_set, _subject_alias_stems, _text_score
+    except Exception:  # noqa: BLE001
+        _stem_set = None
+        _subject_alias_stems = None
+        _text_score = None
+
+    subject = str((semantic_frame or {}).get("subject") or "").strip().lower()
+    subject_stems = _subject_alias_stems(subject, schema_loader) if _subject_alias_stems and subject else set()
+    query_stems = _stem_set(user_input) if _stem_set else set()
+    grain = str(schema_loader.get_table_semantics(schema_name, table_name).get("grain") or "").strip().lower()
 
     best: tuple[float, str] | None = None
     for _, row in cols_df.iterrows():
@@ -368,14 +384,24 @@ def _choose_count_identifier_column(
         if sem_class == "identifier":
             score += 60.0
         lower_name = col_name.lower()
+        col_stems = _stem_set(col_name.replace("_", " ")) if _stem_set else set()
+        if col_stems & (subject_stems | query_stems):
+            score += 90.0
+        if _text_score is not None:
+            score += min(_text_score(subject or user_input, col_name, str(row.get("description", "") or "")), 14.0)
         if lower_name.endswith("_code"):
             score += 20.0
         if lower_name.endswith("_id"):
             score += 10.0
+        is_date_axis = lower_name.endswith(_DATE_AXIS_SUFFIXES) or sem_class in {"date", "datetime", "timestamp"}
+        if is_date_axis:
+            score -= 80.0
+            if grain == "snapshot" and unique_perc >= 95.0:
+                score -= 40.0
         candidate = (score, col_name)
         if best is None or candidate > best:
             best = candidate
-    if best is None or best[0] < 50.0:
+    if best is None or best[0] < 40.0:
         return None
     return best[1]
 
@@ -387,6 +413,7 @@ def _compute_aggregation(
     user_hints: dict | None = None,
     schema_loader=None,
     semantic_frame: dict | None = None,
+    strategy: str = "",
 ) -> dict | None:
     """Вычислить агрегацию из intent.aggregation_hint + aggregate-роли колонок."""
     hint = (intent.get("aggregation_hint") or "").lower().strip()
@@ -410,6 +437,7 @@ def _compute_aggregation(
                     col,
                     schema_loader=schema_loader,
                     semantic_frame=semantic_frame,
+                    strategy=strategy,
                 )
             ):
                 distinct = True
@@ -427,11 +455,24 @@ def _compute_aggregation(
                         for role_name in ("aggregate", "select", "group_by", "filter")
                         for c in (roles.get(role_name, []) or [])
                     }
-                    if override_col in selected_cols:
+                    if override_col == "*":
+                        result["column"] = "*"
+                        result["alias"] = "count_all"
+                        result.pop("distinct", None)
+                    elif override_col in selected_cols:
                         result["column"] = override_col
                         result["alias"] = f"count_{override_col}"
-                if override.get("distinct"):
-                    result["distinct"] = True
+                if override.get("force_count_star"):
+                    result["column"] = "*"
+                    result["alias"] = "count_all"
+                    result.pop("distinct", None)
+                if "distinct" in override:
+                    if override.get("distinct") and result["column"] != "*":
+                        result["distinct"] = True
+                    else:
+                        result.pop("distinct", None)
+            if strategy == "simple_select" and result["function"] == "COUNT":
+                result.pop("distinct", None)
             return result
 
     # Нет явной aggregate-роли — COUNT(*) как fallback для count
@@ -447,10 +488,16 @@ def _compute_aggregation(
                 for role_name in ("aggregate", "select", "group_by", "filter")
                 for c in (roles.get(role_name, []) or [])
             }
-            if override_col and override_col in selected_cols:
+            if override_col == "*":
+                result["column"] = "*"
+                result["alias"] = "count_all"
+            elif override_col and override_col in selected_cols:
                 result["column"] = override_col
                 result["alias"] = f"count_{override_col}"
-            if override.get("distinct") and result["column"] != "*":
+            if override.get("force_count_star"):
+                result["column"] = "*"
+                result["alias"] = "count_all"
+            if "distinct" in override and override.get("distinct") and result["column"] != "*":
                 result["distinct"] = True
         return result
 
@@ -713,14 +760,16 @@ def build_blueprint(
     Returns:
         dict совместимый с форматом sql_blueprint из AgentState.
     """
+    strategy, main_table = _determine_strategy(table_types, join_spec)
+    skip_single_entity_safety = strategy == "simple_select"
     aggregation = _compute_aggregation(
         intent,
         selected_columns,
         user_hints=user_hints,
         schema_loader=schema_loader,
         semantic_frame=semantic_frame,
+        strategy=strategy,
     )
-    strategy, main_table = _determine_strategy(table_types, join_spec)
 
     # --- Блок C: date-aligned JOIN (axis-join по дате) ---
     # Если join_spec указывает на date-колонки — это "аналитический JOIN по оси времени":
@@ -743,16 +792,24 @@ def build_blueprint(
         )
 
     if (
+        not skip_single_entity_safety
+        and
         str((intent or {}).get("aggregation_hint") or "").lower().strip() == "count"
         and (semantic_frame or {}).get("requires_single_entity_count")
         and schema_loader is not None
         and main_table
+        and not ((user_hints or {}).get("aggregation_preferences") or {}).get("force_count_star")
     ):
         main_roles = selected_columns.setdefault(main_table, {})
         suspicious_group_by = list(main_roles.get("group_by", []) or [])
         fallback_col = None
         if main_roles.get("aggregate") == ["*"] or suspicious_group_by:
-            fallback_col = _choose_count_identifier_column(main_table, schema_loader)
+            fallback_col = _choose_count_identifier_column(
+                main_table,
+                schema_loader,
+                semantic_frame=semantic_frame,
+                user_input=user_input,
+            )
         if fallback_col:
             main_roles["aggregate"] = [fallback_col]
             main_roles["select"] = [fallback_col]
@@ -763,6 +820,7 @@ def build_blueprint(
                 user_hints=user_hints,
                 schema_loader=schema_loader,
                 semantic_frame=semantic_frame,
+                strategy=strategy,
             )
             logger.info(
                 "DeterministicPlanner: single-entity safety net → %s.%s",

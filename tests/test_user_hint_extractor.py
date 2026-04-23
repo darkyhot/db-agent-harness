@@ -289,6 +289,26 @@ class TestAggregateHints:
             "distinct": True,
         }
 
+    def test_extract_force_count_star_for_prosto_stroki(self, synthetic_loader):
+        hints = extract_user_hints(
+            "посчитай просто количество строк", synthetic_loader,
+        )
+        assert hints["aggregation_preferences"] == {
+            "function": "count",
+            "column": "*",
+            "distinct": False,
+            "force_count_star": True,
+        }
+
+    def test_extract_no_distinct_phrase(self, synthetic_loader):
+        hints = extract_user_hints(
+            "не надо считать по уникальной дате", synthetic_loader,
+        )
+        assert hints["aggregation_preferences"] == {
+            "function": "count",
+            "distinct": False,
+        }
+
 
 class TestTimeGranularity:
     def test_pomesyachno(self, synthetic_loader):

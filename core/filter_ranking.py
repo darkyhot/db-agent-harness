@@ -6,6 +6,8 @@ import re
 from difflib import SequenceMatcher
 from typing import Any
 
+from core.semantic_registry import builtin_subject_aliases
+
 # Порог Левенштейна-подобного ratio для «нечёткого» сравнения стемов.
 # 0.85 покрывает опечатки вида замены/вставки/пропуска одной буквы на словах
 # длины 5+, но не срабатывает на разных словах («факт»/«акт»).
@@ -77,6 +79,7 @@ def _subject_alias_stems(subject: str, schema_loader) -> set[str]:
         lexicon = {}
     meta = ((lexicon or {}).get("subjects") or {}).get(subject) or {}
     aliases.extend(str(v) for v in (meta.get("aliases") or []) if str(v).strip())
+    aliases.extend(builtin_subject_aliases().get(subject, []))
     stems: set[str] = set()
     for alias in aliases:
         stems.update(_stem_set(alias))
@@ -101,6 +104,15 @@ def _column_looks_like_subject_flag(column: str, subject_stems: set[str]) -> boo
     if len(tokens) != 1:
         return False
     token_stem = _stem(tokens[0])
+    if token_stem in subject_stems:
+        return True
+    singular_stem = _stem(re.sub(r"(es|s)$", "", tokens[0], flags=re.IGNORECASE))
+    if singular_stem and singular_stem in subject_stems:
+        return True
+    if len(token_stem) >= 4:
+        for cand in subject_stems:
+            if len(cand) >= 4 and SequenceMatcher(None, token_stem, cand).ratio() >= 0.8:
+                return True
     return _fuzzy_stem_match(token_stem, subject_stems)
 
 
@@ -275,10 +287,18 @@ def _collect_implicit_subject_flag_requests(
     schema_loader,
     semantic_frame: dict[str, Any] | None,
     existing_requests: list[dict[str, Any]],
+    query_stems: set[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     subject = str((semantic_frame or {}).get("subject") or "").strip().lower()
     subject_stems = _subject_alias_stems(subject, schema_loader)
-    if not subject_stems:
+    relevant_stems = set(subject_stems) | set(query_stems)
+    for aliases in builtin_subject_aliases().values():
+        alias_stems: set[str] = set()
+        for alias in aliases:
+            alias_stems.update(_stem_set(alias))
+        if alias_stems & relevant_stems:
+            relevant_stems.update(alias_stems)
+    if not relevant_stems:
         return []
 
     existing_keys = {
@@ -309,12 +329,13 @@ def _collect_implicit_subject_flag_requests(
             semantic_class = str(semantics.get("semantic_class", "") or "")
             profile = schema_loader.get_value_profile(schema, table, column)
             value_mode = str(profile.get("value_mode", "") or "")
-            if semantic_class != "flag" and value_mode != "boolean_like":
+            dtype = str(row.get("dType") or row.get("dtype") or "").lower()
+            if semantic_class != "flag" and value_mode != "boolean_like" and "bool" not in dtype and not column.lower().startswith(("is_", "has_")):
                 continue
-            if not _column_looks_like_subject_flag(column, subject_stems):
+            if not _column_looks_like_subject_flag(column, relevant_stems):
                 continue
 
-            score = 100.0 + _text_score(subject, column, str(row.get("description", "") or ""))
+            score = 100.0 + _text_score(subject or " ".join(sorted(query_stems)), column, str(row.get("description", "") or ""))
             candidate = (score, column_key)
             if best_match is None or candidate > best_match:
                 best_match = candidate
@@ -342,12 +363,14 @@ def rank_filter_candidates(
 ) -> dict[str, list[dict[str, Any]]]:
     """Rank filter candidates for metadata-driven filter intents."""
     requests = _collect_requests(intent, semantic_frame)
+    query_stems = _stem_set(user_input)
     requests.extend(
         _collect_implicit_subject_flag_requests(
             selected_tables=selected_tables,
             schema_loader=schema_loader,
             semantic_frame=semantic_frame,
             existing_requests=requests,
+            query_stems=query_stems,
         )
     )
     ranked: dict[str, list[dict[str, Any]]] = {str(req.get("request_id")): [] for req in requests}
@@ -414,7 +437,8 @@ def rank_filter_candidates(
                         candidate_value = query_text
 
                 elif kind == "boolean_true":
-                    if semantic_class == "flag":
+                    dtype = str(row.get("dType") or row.get("dtype") or "").lower()
+                    if semantic_class == "flag" or str(profile.get("value_mode") or "") == "boolean_like" or "bool" in dtype:
                         score += 44.0
                         candidate_value = True
                         operator = "="

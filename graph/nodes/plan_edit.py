@@ -116,11 +116,8 @@ def _resolve_column_token(
 
 
 def _render_compact_plan(blueprint: dict[str, Any]) -> str:
-    agg = blueprint.get("aggregation") or {}
-    distinct_sql = "DISTINCT " if agg.get("distinct") else ""
-    agg_str = ""
-    if agg:
-        agg_str = f"{agg.get('function', '')}({distinct_sql}{agg.get('column', '')})"
+    aggs = _iter_blueprint_aggregations(blueprint)
+    agg_str = "; ".join(_format_aggregation_expr(agg) for agg in aggs if agg) if aggs else ""
     parts = [
         f"main_table={blueprint.get('main_table', '')}",
         f"strategy={blueprint.get('strategy', '')}",
@@ -131,6 +128,33 @@ def _render_compact_plan(blueprint: dict[str, Any]) -> str:
         f"limit={blueprint.get('limit')!r}",
     ]
     return "\n".join(parts)
+
+
+def _iter_blueprint_aggregations(blueprint: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = blueprint.get("aggregations")
+    if isinstance(raw, list) and raw:
+        return [dict(item) for item in raw if isinstance(item, dict)]
+    agg = blueprint.get("aggregation") or {}
+    return [dict(agg)] if agg else []
+
+
+def _format_aggregation_expr(agg: dict[str, Any]) -> str:
+    distinct_sql = "DISTINCT " if agg.get("distinct") else ""
+    func = str(agg.get("function") or "")
+    col = str(agg.get("column") or "")
+    alias = str(agg.get("alias") or "")
+    expr = f"{func}({distinct_sql}{col})" if func and col else ""
+    if alias and expr:
+        expr += f" AS {alias}"
+    return expr
+
+
+def _sync_legacy_aggregation_fields(blueprint: dict[str, Any]) -> dict[str, Any]:
+    bp = copy.deepcopy(blueprint)
+    aggs = [dict(item) for item in (_iter_blueprint_aggregations(bp)) if item]
+    bp["aggregations"] = aggs
+    bp["aggregation"] = aggs[0] if aggs else None
+    return bp
 
 
 def _parse_json_response(text: str) -> dict[str, Any] | None:
@@ -214,6 +238,10 @@ class PlanEditNodes:
         r"(?:давай\s+)?(?:посчита[йи]\w*|подсчита[йи]\w*|счита[йи]\w*|count)\s+(?:by|по|на)\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
         re.IGNORECASE,
     )
+    _PATCH_ADD_COUNT_FIELD = re.compile(
+        r"(?:и\s+ещ[её]|ещ[её]|добав[ььт]\w*)\s+(?:count\s+)?(?:by|по|на)\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
+        re.IGNORECASE,
+    )
     _PATCH_DATE_SHIFT = re.compile(
         r"(?:с|от)\s+(\d{1,2})\s*(?:числ[ао]?)?\s+(?:на|до)\s+(\d{1,2})\s*(?:числ[ао]?)?",
         re.IGNORECASE,
@@ -230,6 +258,7 @@ class PlanEditNodes:
             "aggregation.column",
             "aggregation.distinct",
             "aggregation.alias",
+            "aggregations.add",
             "order_by.direction",
             "limit",
             "group_by",
@@ -253,6 +282,25 @@ class PlanEditNodes:
             cleaned = {"op": action, "path": path}
             if "value" in op:
                 cleaned["value"] = op.get("value")
+            if path == "aggregations.add":
+                value = cleaned.get("value")
+                if not isinstance(value, dict):
+                    continue
+                resolved = _resolve_column_token(
+                    self.schema,
+                    main_table,
+                    str(value.get("column") or ""),
+                    selected_columns,
+                )
+                if resolved is None:
+                    continue
+                cleaned["value"] = {
+                    "function": str(value.get("function") or "COUNT").upper(),
+                    "column": resolved,
+                    "distinct": bool(value.get("distinct")),
+                }
+                sanitized.append(cleaned)
+                continue
             if path in {"aggregation.column", "group_by"}:
                 value = cleaned.get("value")
                 if action == "replace" and path == "aggregation.column":
@@ -274,7 +322,7 @@ class PlanEditNodes:
             "Ты строишь список операций для правки SQL-плана. "
             'Каждая операция — JSON: {"op":"replace|remove|add|remove_filter","path":"...","value":...}. '
             'Допустимые path: "aggregation.function", "aggregation.column", "aggregation.distinct", '
-            '"aggregation.alias", "order_by.direction", "limit", "group_by", "where.date.from", "where.date.to". '
+            '"aggregation.alias", "aggregations.add", "order_by.direction", "limit", "group_by", "where.date.from", "where.date.to". '
             'Для remove_filter используй поле "column". Верни только JSON {"operations":[...]}.'
         )
         user_prompt = (
@@ -481,6 +529,35 @@ class PlanEditNodes:
                     "needs_clarification": True,
                     "payload": {"question": f"Не удалось распознать колонку '{column}'. По какой колонке нужно считать?"},
                 }
+        add_count_match = self._PATCH_ADD_COUNT_FIELD.search(edit_text)
+        if add_count_match:
+            column = add_count_match.group(1).strip()
+            resolved_column = _resolve_column_token(
+                self.schema,
+                str(blueprint.get("main_table") or ""),
+                column,
+                state.get("selected_columns") or {},
+            )
+            if resolved_column:
+                current_aggs = _iter_blueprint_aggregations(blueprint)
+                inherit_distinct = bool(current_aggs[0].get("distinct")) if current_aggs else False
+                operations.append({
+                    "op": "add",
+                    "path": "aggregations.add",
+                    "value": {
+                        "function": "COUNT",
+                        "column": resolved_column,
+                        "distinct": inherit_distinct,
+                    },
+                })
+            else:
+                return {
+                    "edit_kind": "clarify",
+                    "confidence": 0.75,
+                    "explanation": "Пользователь хочет добавить метрику, но колонка не распознана",
+                    "needs_clarification": True,
+                    "payload": {"question": f"Не удалось распознать колонку '{column}'. Какую метрику нужно добавить?"},
+                }
         if self._PATCH_NO_DISTINCT.search(edit_text):
             operations.append({"op": "replace", "path": "aggregation.distinct", "value": False})
 
@@ -598,9 +675,10 @@ class PlanEditNodes:
         operations: list[dict[str, Any]],
         selected_columns: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        bp = copy.deepcopy(blueprint)
+        bp = _sync_legacy_aggregation_fields(blueprint)
         known_columns = _collect_known_columns(selected_columns)
-        agg = dict(bp.get("aggregation") or {})
+        aggs = [dict(item) for item in (bp.get("aggregations") or []) if isinstance(item, dict)]
+        agg = dict(aggs[0] if aggs else {})
         where_conditions = list(bp.get("where_conditions") or [])
         old_alias = str(agg.get("alias") or "").strip()
         patch_meta: dict[str, Any] = {}
@@ -612,9 +690,11 @@ class PlanEditNodes:
             value = op.get("value")
             if action == "replace" and path == "aggregation.function":
                 agg["function"] = str(value)
+                patch_meta["aggregations_changed"] = True
             elif action == "replace" and path == "aggregation.column":
                 agg["column"] = str(value)
                 patch_meta["aggregation_column"] = str(value)
+                patch_meta["aggregations_changed"] = True
                 if value:
                     if str(agg.get("function")).upper() == "COUNT" and str(value) == "*":
                         agg["alias"] = "count_all"
@@ -626,10 +706,28 @@ class PlanEditNodes:
                         )
             elif action == "replace" and path == "aggregation.distinct":
                 patch_meta["aggregation_distinct"] = bool(value)
+                patch_meta["aggregations_changed"] = True
                 if value:
                     agg["distinct"] = True
                 else:
                     agg.pop("distinct", None)
+            elif action == "add" and path == "aggregations.add":
+                value = dict(value or {})
+                func = str(value.get("function") or "COUNT").upper()
+                col = str(value.get("column") or "").strip()
+                if col:
+                    alias = "count_all" if func == "COUNT" and col == "*" else f"{func.lower()}_{col}"
+                    new_agg = {"function": func, "column": col, "alias": alias}
+                    if value.get("distinct") and col != "*":
+                        new_agg["distinct"] = True
+                    if not any(
+                        str(existing.get("function") or "").upper() == func
+                        and str(existing.get("column") or "") == col
+                        and bool(existing.get("distinct")) == bool(new_agg.get("distinct"))
+                        for existing in aggs
+                    ):
+                        aggs.append(new_agg)
+                        patch_meta["aggregations_changed"] = True
             elif action == "replace" and path == "order_by.direction":
                 current = str(bp.get("order_by") or "").strip()
                 if current:
@@ -699,13 +797,17 @@ class PlanEditNodes:
                     if column not in cond.lower()
                 ]
         if agg:
+            if aggs:
+                aggs[0] = agg
+            else:
+                aggs = [agg]
             new_alias = str(agg.get("alias") or "").strip()
             current_order_by = str(bp.get("order_by") or "").strip()
             if old_alias and new_alias and current_order_by.startswith(old_alias):
                 bp["order_by"] = current_order_by.replace(old_alias, new_alias, 1)
-            bp["aggregation"] = agg
+        bp["aggregations"] = aggs
         bp["where_conditions"] = where_conditions
-        return bp, patch_meta
+        return _sync_legacy_aggregation_fields(bp), patch_meta
 
     def plan_patcher(self, state: AgentState) -> dict[str, Any]:
         iterations = state.get("graph_iterations", 0) + 1
@@ -720,17 +822,24 @@ class PlanEditNodes:
         user_hints = copy.deepcopy(state.get("user_hints") or {})
         agg_prefs = dict(user_hints.get("aggregation_preferences") or {})
         agg = new_blueprint.get("aggregation") or {}
-        if patch_meta.get("aggregation_column") is not None:
+        aggs = _iter_blueprint_aggregations(new_blueprint)
+        if patch_meta.get("aggregation_column") is not None or patch_meta.get("aggregations_changed"):
             agg_prefs["function"] = str(agg.get("function") or "COUNT").lower()
             agg_prefs["column"] = str(agg.get("column") or "")
-            if "distinct" in agg:
-                agg_prefs["distinct"] = bool(agg.get("distinct"))
-            else:
-                agg_prefs["distinct"] = False
+            agg_prefs["distinct"] = bool(agg.get("distinct")) if agg else False
             if agg_prefs.get("column") != "*":
                 agg_prefs.pop("force_count_star", None)
             else:
                 agg_prefs["force_count_star"] = True
+            user_hints["aggregation_preferences_list"] = [
+                {
+                    "function": str(item.get("function") or "COUNT").lower(),
+                    "column": str(item.get("column") or ""),
+                    "distinct": bool(item.get("distinct")),
+                }
+                for item in aggs
+                if str(item.get("column") or "")
+            ]
         if agg_prefs:
             user_hints["aggregation_preferences"] = agg_prefs
         logger.info("plan_patcher: applied %d operations", len(operations))
@@ -956,7 +1065,7 @@ class PlanEditNodes:
         blueprint = state.get("sql_blueprint") or {}
         selected_columns = state.get("selected_columns") or {}
         main_table = str(blueprint.get("main_table") or "")
-        agg = blueprint.get("aggregation") or {}
+        aggs = _iter_blueprint_aggregations(blueprint)
         known_columns = _collect_known_columns(selected_columns)
         errors: list[str] = []
 
@@ -965,23 +1074,25 @@ class PlanEditNodes:
             if split is None or self.schema.get_table_columns(*split).empty:
                 errors.append(f"Таблица {main_table} не найдена в каталоге")
 
-        agg_col = str(agg.get("column") or "")
-        if agg_col == "*" and agg.get("distinct"):
-            errors.append("COUNT(DISTINCT *) недопустим")
-        if agg_col and agg_col != "*" and agg_col not in known_columns:
-            if main_table:
-                split = _split_table_name(main_table)
-                cols_df = self.schema.get_table_columns(*split) if split is not None else None
-                if cols_df is None or cols_df.empty or agg_col not in cols_df["column_name"].astype(str).tolist():
-                    errors.append(f"Агрегирующая колонка {agg_col} не найдена")
-            else:
+        catalog_columns: set[str] = set()
+        if main_table:
+            split = _split_table_name(main_table)
+            cols_df = self.schema.get_table_columns(*split) if split is not None else None
+            if cols_df is not None and not cols_df.empty:
+                catalog_columns = set(cols_df["column_name"].astype(str).tolist())
+
+        for agg in aggs:
+            agg_col = str(agg.get("column") or "")
+            if agg_col == "*" and agg.get("distinct"):
+                errors.append("COUNT(DISTINCT *) недопустим")
+            if agg_col and agg_col != "*" and agg_col not in known_columns and agg_col not in catalog_columns:
                 errors.append(f"Агрегирующая колонка {agg_col} не найдена")
 
         order_by = str(blueprint.get("order_by") or "").strip()
         if order_by:
             order_field = re.sub(r"\s+(ASC|DESC)\s*$", "", order_by, flags=re.IGNORECASE).strip()
             valid_aliases = {
-                str(agg.get("alias") or ""),
+                *(str(agg.get("alias") or "") for agg in aggs),
                 *(str(x) for x in (blueprint.get("group_by") or [])),
             }
             if order_field and order_field not in valid_aliases and order_field not in known_columns:
@@ -1059,6 +1170,7 @@ class PlanEditNodes:
 
         _record("main_table", before.get("main_table"), after.get("main_table"))
         _record("aggregation", before.get("aggregation"), after.get("aggregation"))
+        _record("aggregations", before.get("aggregations"), after.get("aggregations"))
         _record("where_conditions", before.get("where_conditions"), after.get("where_conditions"))
         _record("group_by", before.get("group_by"), after.get("group_by"))
         _record("order_by", before.get("order_by"), after.get("order_by"))

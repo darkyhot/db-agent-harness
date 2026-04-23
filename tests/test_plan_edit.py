@@ -117,6 +117,7 @@ def _state(**overrides):
                 "task_subtype ILIKE '%фактический отток%'",
             ],
             "aggregation": {"function": "COUNT", "column": "task_code", "alias": "count_task_code"},
+            "aggregations": [{"function": "COUNT", "column": "task_code", "alias": "count_task_code"}],
             "group_by": [],
             "order_by": "count_task_code DESC",
             "limit": None,
@@ -215,6 +216,12 @@ def test_router_count_by_unknown_field_clarifies(node):
     assert result["plan_edit_needs_clarification"] is True
 
 
+def test_router_add_count_metric(node):
+    result = node.plan_edit_router(_state(plan_edit_text="и еще по инн"))
+    assert result["plan_edit_kind"] == "patch"
+    assert {"op": "add", "path": "aggregations.add", "value": {"function": "COUNT", "column": "inn", "distinct": False}} in result["plan_edit_payload"]["operations"]
+
+
 def test_router_patch_date_shift(node):
     result = node.plan_edit_router(_state(plan_edit_text="поменяй фильтр на дате с 1 числа на 2"))
     assert result["plan_edit_kind"] == "patch"
@@ -245,6 +252,7 @@ def test_patcher_applies_count_distinct(node):
     result = node.plan_patcher(state)
     assert result["sql_blueprint"]["aggregation"]["distinct"] is True
     assert result["sql_blueprint"]["aggregation"]["column"] == "task_code"
+    assert result["sql_blueprint"]["aggregations"][0]["distinct"] is True
 
 
 def test_patcher_allows_main_table_column_not_in_selected_columns(node):
@@ -284,6 +292,30 @@ def test_patcher_allows_main_table_column_not_in_selected_columns(node):
     assert result["user_hints"]["aggregation_preferences"]["column"] == "inn"
     assert result["user_hints"]["aggregation_preferences"]["function"] == "count"
     assert result["user_hints"]["aggregation_preferences"]["distinct"] is False
+    assert result["user_hints"]["aggregation_preferences_list"][0]["column"] == "inn"
+
+
+def test_patcher_adds_second_aggregation_and_persists_hints(node):
+    state = _state(
+        plan_edit_payload={
+            "operations": [
+                {"op": "add", "path": "aggregations.add", "value": {"function": "COUNT", "column": "inn", "distinct": True}},
+            ]
+        },
+    )
+    result = node.plan_patcher(state)
+    assert len(result["sql_blueprint"]["aggregations"]) == 2
+    assert result["sql_blueprint"]["aggregations"][1] == {
+        "function": "COUNT",
+        "column": "inn",
+        "alias": "count_inn",
+        "distinct": True,
+    }
+    assert result["sql_blueprint"]["aggregation"]["column"] == "task_code"
+    assert result["user_hints"]["aggregation_preferences_list"] == [
+        {"function": "count", "column": "task_code", "distinct": False},
+        {"function": "count", "column": "inn", "distinct": True},
+    ]
 
 
 def test_patcher_count_star_strips_distinct_and_updates_order_by(node):
@@ -373,6 +405,33 @@ def test_validator_accepts_catalog_column_not_in_selected_columns(node):
     assert result["needs_clarification"] is False
 
 
+def test_validator_accepts_multiple_aggregations(node):
+    state = _state(
+        sql_blueprint={
+            "main_table": "schema_a.fact_x",
+            "aggregation": {"function": "COUNT", "column": "task_code", "alias": "count_task_code"},
+            "aggregations": [
+                {"function": "COUNT", "column": "task_code", "alias": "count_task_code"},
+                {"function": "COUNT", "column": "inn", "alias": "count_inn", "distinct": True},
+            ],
+            "where_conditions": [],
+            "group_by": [],
+            "order_by": "count_inn DESC",
+            "limit": None,
+        },
+        selected_columns={
+            "schema_a.fact_x": {
+                "select": ["task_code"],
+                "filter": ["report_dt"],
+                "aggregate": ["task_code"],
+                "group_by": [],
+            }
+        },
+    )
+    result = node.plan_edit_validator(state)
+    assert result["needs_clarification"] is False
+
+
 def test_diff_renderer_reports_change(node):
     state = _state(
         previous_sql_blueprint={
@@ -396,6 +455,35 @@ def test_diff_renderer_reports_change(node):
     changed_fields = {item["field"] for item in result["plan_diff"]["changed"]}
     assert "aggregation" in changed_fields
     assert "order_by" in changed_fields
+
+
+def test_diff_renderer_reports_aggregations_change(node):
+    state = _state(
+        previous_sql_blueprint={
+            "main_table": "schema_a.fact_x",
+            "aggregation": {"function": "COUNT", "column": "task_code", "alias": "count_task_code"},
+            "aggregations": [{"function": "COUNT", "column": "task_code", "alias": "count_task_code"}],
+            "where_conditions": [],
+            "group_by": [],
+            "order_by": "count_task_code DESC",
+            "limit": None,
+        },
+        sql_blueprint={
+            "main_table": "schema_a.fact_x",
+            "aggregation": {"function": "COUNT", "column": "task_code", "alias": "count_task_code"},
+            "aggregations": [
+                {"function": "COUNT", "column": "task_code", "alias": "count_task_code"},
+                {"function": "COUNT", "column": "inn", "alias": "count_inn", "distinct": True},
+            ],
+            "where_conditions": [],
+            "group_by": [],
+            "order_by": "count_task_code DESC",
+            "limit": None,
+        },
+    )
+    result = node.plan_diff_renderer(state)
+    changed_fields = {item["field"] for item in result["plan_diff"]["changed"]}
+    assert "aggregations" in changed_fields
 
 
 def test_fallback_llm_emits_operations(synthetic_loader):

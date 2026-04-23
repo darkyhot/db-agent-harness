@@ -19,6 +19,14 @@ from graph.state import AgentState
 logger = logging.getLogger(__name__)
 
 
+def _iter_aggregations(sql_blueprint: dict[str, Any]) -> list[dict[str, Any]]:
+    aggregations = sql_blueprint.get("aggregations")
+    if isinstance(aggregations, list) and aggregations:
+        return [dict(item) for item in aggregations if isinstance(item, dict)]
+    aggregation = sql_blueprint.get("aggregation") or {}
+    return [dict(aggregation)] if aggregation else []
+
+
 def _render_plan(
     sql_blueprint: dict[str, Any],
     selected_columns: dict[str, Any],
@@ -57,17 +65,32 @@ def _render_plan(
             lines.append(f"- **JOIN:** {', '.join(join_parts)}")
 
     # Агрегация
-    aggregation = sql_blueprint.get("aggregation") or {}
-    if aggregation:
-        func = aggregation.get("function") or ""
-        col = aggregation.get("column") or ""
-        alias = aggregation.get("alias") or ""
-        if func and col:
-            distinct_sql = "DISTINCT " if aggregation.get("distinct") else ""
-            agg_str = f"{func.upper()}({distinct_sql}{col})"
-            if alias:
-                agg_str += f" AS {alias}"
-            lines.append(f"- **Агрегация:** `{agg_str}`")
+    aggregations = _iter_aggregations(sql_blueprint)
+    if aggregations:
+        if len(aggregations) == 1:
+            aggregation = aggregations[0]
+            func = aggregation.get("function") or ""
+            col = aggregation.get("column") or ""
+            alias = aggregation.get("alias") or ""
+            if func and col:
+                distinct_sql = "DISTINCT " if aggregation.get("distinct") else ""
+                agg_str = f"{func.upper()}({distinct_sql}{col})"
+                if alias:
+                    agg_str += f" AS {alias}"
+                lines.append(f"- **Агрегация:** `{agg_str}`")
+        else:
+            lines.append("- **Агрегации:**")
+            for aggregation in aggregations:
+                func = aggregation.get("function") or ""
+                col = aggregation.get("column") or ""
+                alias = aggregation.get("alias") or ""
+                if not func or not col:
+                    continue
+                distinct_sql = "DISTINCT " if aggregation.get("distinct") else ""
+                agg_str = f"{func.upper()}({distinct_sql}{col})"
+                if alias:
+                    agg_str += f" AS {alias}"
+                lines.append(f"  - `{agg_str}`")
 
     # Фильтры
     where_conditions = sql_blueprint.get("where_conditions") or []

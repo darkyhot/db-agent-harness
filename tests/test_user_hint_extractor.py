@@ -34,34 +34,34 @@ def synthetic_loader(tmp_path):
     tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
 
     attrs_df = pd.DataFrame({
-        "schema_name": ["schema_a"] * 8,
+        "schema_name": ["schema_a"] * 10,
         "table_name": [
-            "fact_x", "fact_x", "fact_x",
+            "fact_x", "fact_x", "fact_x", "fact_x", "fact_x",
             "dim_y", "dim_y", "dim_y",
             "ref_segments_table", "ref_segments_table",
         ],
         "column_name": [
-            "event_id", "inn", "amount",
+            "event_id", "inn", "amount", "tb_id", "gosb_id",
             "client_id", "inn", "segment_name",
             "segment_id", "segment_name",
         ],
         "dType": [
-            "bigint", "varchar", "numeric",
+            "bigint", "varchar", "numeric", "varchar", "varchar",
             "bigint", "varchar", "varchar",
             "bigint", "varchar",
         ],
         "description": [
-            "PK события", "ИНН клиента", "Сумма",
+            "PK события", "ИНН клиента", "Сумма", "ТБ", "ГОСБ",
             "PK клиента", "ИНН клиента", "Сегмент",
             "PK сегмента", "Название сегмента",
         ],
         "is_primary_key": [
-            True, False, False,
+            True, False, False, False, False,
             True, False, False,
             True, False,
         ],
-        "unique_perc": [100.0, 50.0, 1.0, 100.0, 80.0, 5.0, 100.0, 100.0],
-        "not_null_perc": [100.0, 80.0, 99.0, 100.0, 95.0, 50.0, 100.0, 100.0],
+        "unique_perc": [100.0, 50.0, 1.0, 30.0, 20.0, 100.0, 80.0, 5.0, 100.0, 100.0],
+        "not_null_perc": [100.0, 80.0, 99.0, 100.0, 100.0, 100.0, 95.0, 50.0, 100.0, 100.0],
     })
     attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
 
@@ -308,6 +308,15 @@ class TestAggregateHints:
             "function": "count",
             "distinct": False,
         }
+
+    def test_extract_multiple_distinct_count_targets(self, synthetic_loader):
+        hints = extract_user_hints(
+            "сколько всего есть уникальных тб и госб", synthetic_loader,
+        )
+        assert hints["aggregation_preferences_list"] == [
+            {"function": "count", "column": "tb_id", "distinct": True},
+            {"function": "count", "column": "gosb_id", "distinct": True},
+        ]
 
 
 class TestTimeGranularity:

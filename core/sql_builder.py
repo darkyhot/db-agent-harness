@@ -49,6 +49,41 @@ def _normalize_aggregation(aggregation: dict | None) -> tuple[str | None, str | 
     return func, col, alias, distinct
 
 
+def _normalize_aggregations(blueprint: dict | None) -> list[dict[str, Any]]:
+    if not blueprint:
+        return []
+    raw = blueprint.get("aggregations")
+    source_items = raw if isinstance(raw, list) and raw else ([blueprint.get("aggregation")] if blueprint.get("aggregation") else [])
+    result: list[dict[str, Any]] = []
+    for item in source_items:
+        func, col, alias, distinct = _normalize_aggregation(item)
+        if not func or col is None:
+            continue
+        normalized: dict[str, Any] = {"function": func, "column": col, "alias": alias, "distinct": distinct}
+        if isinstance(item, dict) and item.get("source_table"):
+            normalized["source_table"] = item.get("source_table")
+        result.append(normalized)
+    return result
+
+
+def _find_aggregation_source_table(
+    aggregation: dict[str, Any],
+    selected_columns: dict[str, dict],
+    main_table: str,
+) -> str:
+    source = str(aggregation.get("source_table") or "").strip()
+    if source and source in selected_columns:
+        return source
+    col = str(aggregation.get("column") or "")
+    if col == "*":
+        return main_table or next(iter(selected_columns), "")
+    for table, roles in selected_columns.items():
+        for role_name in ("aggregate", "select", "group_by", "filter"):
+            if col in (roles.get(role_name, []) or []):
+                return table
+    return main_table or next(iter(selected_columns), "")
+
+
 def _short_alias(full_name: str, used: set[str]) -> str:
     """Сгенерировать короткий, уникальный алиас для таблицы.
 
@@ -113,7 +148,7 @@ def _derive_cte_alias(table_full: str, roles: dict[str, list[str]]) -> str:
 def _build_select_items(
     selected_columns: dict[str, dict],
     table_alias_map: dict[str, str],
-    aggregation: dict | None,
+    blueprint: dict | None,
 ) -> list[str]:
     """Сформировать список выражений для SELECT-клаузы.
 
@@ -121,45 +156,38 @@ def _build_select_items(
     """
     items: list[str] = []
     seen_cols: set[str] = set()
-
-    agg_func, agg_col, agg_alias, agg_distinct = _normalize_aggregation(aggregation)
+    blueprint = blueprint or {}
+    aggregations = _normalize_aggregations(blueprint)
+    main_table = str(blueprint.get("main_table") or next(iter(selected_columns), ""))
+    agg_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    aggregated_columns: set[str] = set()
+    for agg in aggregations:
+        source_table = _find_aggregation_source_table(agg, selected_columns, main_table)
+        key = (source_table, str(agg.get("column") or ""))
+        agg_by_key[key] = agg
+        aggregated_columns.add(str(agg.get("column") or ""))
 
     for table, roles in selected_columns.items():
         alias = table_alias_map.get(table, "t")
-        agg_set = set(roles.get("aggregate", []))
         for col in roles.get("select", []):
             if col in seen_cols:
                 continue
             seen_cols.add(col)
-            if col == agg_col and agg_func:
-                # Основная агрегируемая колонка
-                if col == "*":
-                    items.append(f"{agg_func}(*) AS {agg_alias}")
-                else:
-                    d = "DISTINCT " if agg_distinct else ""
-                    items.append(f"{agg_func}({d}{alias}.{col}) AS {agg_alias}")
-            elif col in agg_set and agg_func:
-                # Дополнительная агрегируемая колонка (напр. второй PK при COUNT DISTINCT).
-                # Агрегируем её вместо bare-select, чтобы не потребовался GROUP BY.
-                d = "DISTINCT " if agg_distinct else ""
-                items.append(f"{agg_func}({d}{alias}.{col}) AS {agg_func.lower()}_{col}")
-            else:
+            if col not in aggregated_columns:
                 items.append(f"{alias}.{col}")
 
-        # aggregate-роль (если не в select)
-        for col in roles.get("aggregate", []):
-            if col in seen_cols:
-                continue
-            seen_cols.add(col)
-            if agg_func:
-                if col == "*":
-                    items.append(f"{agg_func}(*) AS {agg_alias or 'agg_val'}")
-                else:
-                    d = "DISTINCT " if agg_distinct else ""
-                    items.append(
-                        f"{agg_func}({d}{alias}.{col}) AS "
-                        f"{agg_alias if col == agg_col else f'{agg_func.lower()}_{col}'}"
-                    )
+    for agg in aggregations:
+        func = str(agg.get("function") or "").upper()
+        col = str(agg.get("column") or "")
+        alias = str(agg.get("alias") or f"{func.lower()}_{col}")
+        distinct = bool(agg.get("distinct"))
+        source_table = _find_aggregation_source_table(agg, selected_columns, main_table)
+        table_alias = table_alias_map.get(source_table, "t")
+        if col == "*":
+            items.append(f"{func}(*) AS {alias}")
+        else:
+            d = "DISTINCT " if distinct else ""
+            items.append(f"{func}({d}{table_alias}.{col}) AS {alias}")
 
     if not items:
         # Совсем пусто — возвращаем count(*)
@@ -238,8 +266,7 @@ def _build_simple_select(
     alias = _short_alias(main_table, used)
     alias_map = {main_table: alias}
 
-    aggregation = blueprint.get("aggregation")
-    select_items = _build_select_items(selected_columns, alias_map, aggregation)
+    select_items = _build_select_items(selected_columns, alias_map, blueprint)
 
     group_by_cols = blueprint.get("group_by", [])
     where_clause = _build_where_clause(blueprint.get("where_conditions", []))

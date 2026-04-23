@@ -168,6 +168,25 @@ def test_render_plan_contains_distinct_aggregation():
     assert "COUNT(DISTINCT task_code)" in md
 
 
+def test_render_plan_contains_multiple_aggregations():
+    md = _render_plan(
+        sql_blueprint=_blueprint(
+            aggregation={"function": "COUNT", "column": "tb_id", "alias": "count_tb_id", "distinct": True},
+            aggregations=[
+                {"function": "COUNT", "column": "tb_id", "alias": "count_tb_id", "distinct": True},
+                {"function": "COUNT", "column": "gosb_id", "alias": "count_gosb_id", "distinct": True},
+            ],
+            order_by="count_tb_id DESC",
+        ),
+        selected_columns={},
+        join_spec=[],
+        where_resolution={},
+        user_hints={},
+    )
+    assert "COUNT(DISTINCT tb_id)" in md
+    assert "COUNT(DISTINCT gosb_id)" in md
+
+
 def test_render_plan_contains_diff_summary():
     md = _render_plan(
         sql_blueprint=_blueprint(),

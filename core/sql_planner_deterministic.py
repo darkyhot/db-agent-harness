@@ -446,94 +446,144 @@ def _compute_aggregation(
     schema_loader=None,
     semantic_frame: dict | None = None,
     strategy: str = "",
+    main_table: str = "",
 ) -> dict | None:
-    """Вычислить агрегацию из intent.aggregation_hint + aggregate-роли колонок."""
+    """Backward-compatible shim: вернуть первую агрегацию из canonical aggregations."""
+    aggregations = _compute_aggregations(
+        intent,
+        selected_columns,
+        user_hints=user_hints,
+        schema_loader=schema_loader,
+        semantic_frame=semantic_frame,
+        strategy=strategy,
+        main_table=main_table,
+    )
+    if not aggregations:
+        return None
+    first = dict(aggregations[0])
+    first.pop("source_table", None)
+    return first
+
+
+def _column_available_for_aggregation(
+    column: str,
+    selected_columns: dict[str, dict],
+    schema_loader=None,
+    main_table: str = "",
+) -> bool:
+    if column == "*":
+        return True
+    selected_cols = {
+        c
+        for roles in selected_columns.values()
+        for role_name in ("aggregate", "select", "group_by", "filter")
+        for c in (roles.get(role_name, []) or [])
+    }
+    if column in selected_cols:
+        return True
+    if schema_loader is None or "." not in main_table:
+        return False
+    schema_name, table_name = main_table.split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return False
+    return bool((cols_df["column_name"].astype(str).str.lower() == column.lower()).any())
+
+
+def _build_aggregation_result(
+    func: str,
+    col: str,
+    *,
+    distinct: bool = False,
+    source_table: str = "",
+) -> dict[str, str | bool]:
+    alias = "count_all" if func == "COUNT" and col == "*" else f"{func.lower()}_{col}"
+    result: dict[str, str | bool] = {"function": func, "column": col, "alias": alias}
+    if distinct and col != "*":
+        result["distinct"] = True
+    if source_table:
+        result["source_table"] = source_table
+    return result
+
+
+def _compute_aggregations(
+    intent: dict,
+    selected_columns: dict[str, dict],
+    *,
+    user_hints: dict | None = None,
+    schema_loader=None,
+    semantic_frame: dict | None = None,
+    strategy: str = "",
+    main_table: str = "",
+) -> list[dict]:
     hint = (intent.get("aggregation_hint") or "").lower().strip()
     func = _HINT_TO_FUNC.get(hint)
-
     if not func:
-        # Нет агрегации или «list» — просто выборка без агрегата
-        return None
+        return []
 
-    # Находим первую колонку с ролью aggregate
-    for _table, roles in selected_columns.items():
-        agg_cols = roles.get("aggregate", [])
-        if agg_cols:
-            col = agg_cols[0]
-            alias = "count_all" if hint == "count" and col == "*" else f"{func.lower()}_{col}"
-            distinct = False
-            if hint == "count" and (
-                col.lower().endswith("_count_distinct")
-                or _count_column_should_be_distinct(
-                    selected_columns,
-                    col,
-                    schema_loader=schema_loader,
-                    semantic_frame=semantic_frame,
-                    strategy=strategy,
-                )
-            ):
-                distinct = True
-            result: dict = {"function": func, "column": col, "alias": alias}
-            if distinct:
-                result["distinct"] = True
-            override = (user_hints or {}).get("aggregation_preferences", {}) or {}
+    user_hints = user_hints or {}
+    explicit_overrides = list(user_hints.get("aggregation_preferences_list") or [])
+    legacy_override = (user_hints.get("aggregation_preferences") or {}) if isinstance(user_hints, dict) else {}
+    if legacy_override and legacy_override not in explicit_overrides:
+        explicit_overrides.insert(0, legacy_override)
+
+    results: list[dict] = []
+    seen: set[tuple[str, str, bool]] = set()
+    preserve_distinct = False
+
+    if hint == "count" and explicit_overrides:
+        for override in explicit_overrides:
             override_func = str(override.get("function") or "").strip().lower()
-            override_col = str(override.get("column") or "").strip()
-            if override_func == "count" and result["function"] == "COUNT":
-                if override_col:
-                    selected_cols = {
-                        c
-                        for roles in selected_columns.values()
-                        for role_name in ("aggregate", "select", "group_by", "filter")
-                        for c in (roles.get(role_name, []) or [])
-                    }
-                    if override_col == "*":
-                        result["column"] = "*"
-                        result["alias"] = "count_all"
-                        result.pop("distinct", None)
-                    elif override_col in selected_cols:
-                        result["column"] = override_col
-                        result["alias"] = f"count_{override_col}"
-                if override.get("force_count_star"):
-                    result["column"] = "*"
-                    result["alias"] = "count_all"
-                    result.pop("distinct", None)
-                if "distinct" in override:
-                    if override.get("distinct") and result["column"] != "*":
-                        result["distinct"] = True
-                    else:
-                        result.pop("distinct", None)
-            if strategy == "simple_select" and result["function"] == "COUNT":
-                result.pop("distinct", None)
-            return result
+            col = str(override.get("column") or "").strip()
+            if override_func not in {"", "count"} or not col:
+                continue
+            if not _column_available_for_aggregation(col, selected_columns, schema_loader=schema_loader, main_table=main_table):
+                continue
+            distinct = bool(override.get("distinct")) and col != "*"
+            preserve_distinct = preserve_distinct or distinct
+            key = ("COUNT", col, distinct)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(_build_aggregation_result("COUNT", col, distinct=distinct, source_table=main_table))
+        if results:
+            if strategy == "simple_select" and not preserve_distinct:
+                for item in results:
+                    item.pop("distinct", None)
+            return results
 
-    # Нет явной aggregate-роли — COUNT(*) как fallback для count
-    if hint == "count":
-        result = {"function": "COUNT", "column": "*", "alias": "count_all"}
-        override = (user_hints or {}).get("aggregation_preferences", {}) or {}
-        override_func = str(override.get("function") or "").strip().lower()
-        override_col = str(override.get("column") or "").strip()
-        if override_func == "count":
-            selected_cols = {
-                c
-                for roles in selected_columns.values()
-                for role_name in ("aggregate", "select", "group_by", "filter")
-                for c in (roles.get(role_name, []) or [])
-            }
-            if override_col == "*":
-                result["column"] = "*"
-                result["alias"] = "count_all"
-            elif override_col and override_col in selected_cols:
-                result["column"] = override_col
-                result["alias"] = f"count_{override_col}"
-            if override.get("force_count_star"):
-                result["column"] = "*"
-                result["alias"] = "count_all"
-            if "distinct" in override and override.get("distinct") and result["column"] != "*":
-                result["distinct"] = True
-        return result
+    for table_key, roles in selected_columns.items():
+        agg_cols = list(roles.get("aggregate", []) or [])
+        if not agg_cols:
+            continue
+        col = agg_cols[0]
+        distinct = False
+        if hint == "count" and (
+            col.lower().endswith("_count_distinct")
+            or _count_column_should_be_distinct(
+                selected_columns,
+                col,
+                schema_loader=schema_loader,
+                semantic_frame=semantic_frame,
+                strategy=strategy,
+            )
+        ):
+            distinct = True
+        key = (func, col, distinct)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(_build_aggregation_result(func, col, distinct=distinct, source_table=table_key))
+        break
 
-    return None
+    if not results and hint == "count":
+        results.append(_build_aggregation_result("COUNT", "*", distinct=False, source_table=main_table))
+
+    if strategy == "simple_select" and func == "COUNT" and not preserve_distinct:
+        for item in results:
+            item.pop("distinct", None)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -793,15 +843,16 @@ def build_blueprint(
         dict совместимый с форматом sql_blueprint из AgentState.
     """
     strategy, main_table = _determine_strategy(table_types, join_spec)
-    skip_single_entity_safety = strategy == "simple_select"
-    aggregation = _compute_aggregation(
+    aggregations = _compute_aggregations(
         intent,
         selected_columns,
         user_hints=user_hints,
         schema_loader=schema_loader,
         semantic_frame=semantic_frame,
         strategy=strategy,
+        main_table=main_table,
     )
+    aggregation = aggregations[0] if aggregations else None
 
     # --- Блок C: date-aligned JOIN (axis-join по дате) ---
     # Если join_spec указывает на date-колонки — это "аналитический JOIN по оси времени":
@@ -824,8 +875,6 @@ def build_blueprint(
         )
 
     if (
-        not skip_single_entity_safety
-        and
         str((intent or {}).get("aggregation_hint") or "").lower().strip() == "count"
         and (semantic_frame or {}).get("requires_single_entity_count")
         and schema_loader is not None
@@ -856,14 +905,16 @@ def build_blueprint(
         if force_count_star:
             main_roles["aggregate"] = ["*"]
             main_roles.pop("group_by", None)
-            aggregation = _compute_aggregation(
+            aggregations = _compute_aggregations(
                 intent,
                 selected_columns,
                 user_hints=user_hints,
                 schema_loader=schema_loader,
                 semantic_frame=semantic_frame,
                 strategy=strategy,
+                main_table=main_table,
             )
+            aggregation = aggregations[0] if aggregations else None
             logger.info(
                 "DeterministicPlanner: single-entity safety net → %s.COUNT(*)",
                 main_table,
@@ -872,14 +923,16 @@ def build_blueprint(
             main_roles["aggregate"] = [fallback_col]
             main_roles["select"] = [fallback_col]
             main_roles.pop("group_by", None)
-            aggregation = _compute_aggregation(
+            aggregations = _compute_aggregations(
                 intent,
                 selected_columns,
                 user_hints=user_hints,
                 schema_loader=schema_loader,
                 semantic_frame=semantic_frame,
                 strategy=strategy,
+                main_table=main_table,
             )
+            aggregation = aggregations[0] if aggregations else None
             logger.info(
                 "DeterministicPlanner: single-entity safety net → %s.%s",
                 main_table, fallback_col,
@@ -1018,13 +1071,18 @@ def build_blueprint(
         main_table=main_table,
     )
 
+    legacy_aggregation = dict(aggregation) if aggregation else None
+    if legacy_aggregation:
+        legacy_aggregation.pop("source_table", None)
+
     blueprint = {
         "strategy": strategy,
         "main_table": main_table,
         "cte_needed": cte_needed,
         "subquery_for": subquery_for,
         "where_conditions": where_conditions,
-        "aggregation": aggregation,
+        "aggregation": legacy_aggregation,
+        "aggregations": aggregations,
         "group_by": group_by,
         "having": having_clauses,
         "order_by": order_by,

@@ -8,6 +8,7 @@ from core.sql_planner_deterministic import (
     _determine_strategy,
     _compute_group_by,
     _compute_aggregation,
+    _compute_aggregations,
     _choose_count_identifier_column,
     _compute_where_from_intent,
     _find_date_column,
@@ -77,6 +78,43 @@ class TestComputeAggregation:
         intent = {"aggregation_hint": "sum"}
         agg = _compute_aggregation(intent, self._cols(["amount"]))
         assert agg == {"function": "SUM", "column": "amount", "alias": "sum_amount"}
+
+    def test_multiple_distinct_aggregations_from_user_hints(self):
+        aggs = _compute_aggregations(
+            {"aggregation_hint": "count"},
+            {"dm.sales": {"select": [], "filter": [], "aggregate": ["tb_id", "gosb_id"], "group_by": []}},
+            user_hints={
+                "aggregation_preferences_list": [
+                    {"function": "count", "column": "tb_id", "distinct": True},
+                    {"function": "count", "column": "gosb_id", "distinct": True},
+                ]
+            },
+            main_table="dm.sales",
+        )
+        assert aggs == [
+            {"function": "COUNT", "column": "tb_id", "alias": "count_tb_id", "distinct": True, "source_table": "dm.sales"},
+            {"function": "COUNT", "column": "gosb_id", "alias": "count_gosb_id", "distinct": True, "source_table": "dm.sales"},
+        ]
+
+    def test_build_blueprint_keeps_multiple_aggregations(self):
+        bp = build_blueprint(
+            intent={"aggregation_hint": "count", "required_output": []},
+            selected_columns={"dm.sales": {"select": [], "filter": [], "aggregate": ["tb_id", "gosb_id"], "group_by": []}},
+            join_spec=[],
+            table_types={"dm.sales": "fact"},
+            join_analysis_data={},
+            user_hints={
+                "aggregation_preferences_list": [
+                    {"function": "count", "column": "tb_id", "distinct": True},
+                    {"function": "count", "column": "gosb_id", "distinct": True},
+                ]
+            },
+        )
+        assert bp["aggregation"] == {"function": "COUNT", "column": "tb_id", "alias": "count_tb_id", "distinct": True}
+        assert bp["aggregations"] == [
+            {"function": "COUNT", "column": "tb_id", "alias": "count_tb_id", "distinct": True, "source_table": "dm.sales"},
+            {"function": "COUNT", "column": "gosb_id", "alias": "count_gosb_id", "distinct": True, "source_table": "dm.sales"},
+        ]
 
     def test_count(self):
         intent = {"aggregation_hint": "count"}

@@ -169,6 +169,16 @@ _COUNT_NO_DISTINCT_PATTERNS: list[re.Pattern[str]] = [
         re.IGNORECASE,
     ),
 ]
+_MULTI_COUNT_DISTINCT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"(?:сколько|число|количество)\s+(?:всего\s+)?(?:есть\s+)?уникальн\w*\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_\s,]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bcount\s+distinct\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_\s,]+)",
+        re.IGNORECASE,
+    ),
+]
 
 # Нормализация гранулярности времени.
 # Ключ — каноническое значение; список — паттерны (подстроки/regex).
@@ -278,6 +288,8 @@ _KEY_SYNONYMS: dict[str, list[str]] = {
     "дата": ["date", "dt", "report_dt"],
     "сотрудник": ["employee", "emp", "staff"],
     "клиент": ["client", "customer"],
+    "тб": ["tb_id", "tb"],
+    "госб": ["gosb_id", "gosb", "old_gosb_id"],
 }
 
 
@@ -413,6 +425,30 @@ def _column_exists_in_catalog(column: str, schema_loader: Any) -> bool:
     return bool((attrs_df["column_name"].str.lower() == column.lower()).any())
 
 
+def _resolve_aggregate_targets(text: str, schema_loader: Any) -> list[str]:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return []
+    raw = re.sub(r"\b(?:всего|есть|уникальн\w*|distinct|count)\b", " ", raw, flags=re.IGNORECASE)
+    tokens = [
+        tok.strip()
+        for tok in re.split(r"\s+и\s+|,|/|;", raw)
+        if tok.strip()
+    ]
+    resolved: list[str] = []
+    for token in tokens:
+        cols = _resolve_join_field(token, schema_loader)
+        if cols:
+            for col in cols:
+                if col not in resolved:
+                    resolved.append(col)
+            continue
+        token_norm = _normalize_slot_key(token)
+        if _column_exists_in_catalog(token_norm, schema_loader) and token_norm not in resolved:
+            resolved.append(token_norm)
+    return resolved
+
+
 def extract_user_hints(
     user_input: str,
     schema_loader: Any,
@@ -432,6 +468,7 @@ def extract_user_hints(
             "group_by_hints": ["task_code", "region", ...],
             "aggregate_hints": [("count", "task"), ("sum", "revenue"), ...],
             "aggregation_preferences": {"function": "count", "column": "task_code", "distinct": True},
+            "aggregation_preferences_list": [{"function": "count", "column": "task_code", "distinct": True}],
             "time_granularity": "month" | "quarter" | "year" | "day" | "week" | None,
             "negative_filters": ["канцелярия", ...],
         }
@@ -444,6 +481,7 @@ def extract_user_hints(
         "group_by_hints": [],
         "aggregate_hints": [],
         "aggregation_preferences": {},
+        "aggregation_preferences_list": [],
         "time_granularity": None,
         "negative_filters": [],
     }
@@ -595,6 +633,24 @@ def extract_user_hints(
     elif aggregation_preferences and any(pattern.search(user_input) for pattern in _COUNT_NO_DISTINCT_PATTERNS):
         aggregation_preferences["distinct"] = False
     result["aggregation_preferences"] = aggregation_preferences
+    aggregation_preferences_list: list[dict[str, Any]] = []
+    for pattern in _MULTI_COUNT_DISTINCT_PATTERNS:
+        match = pattern.search(user_input)
+        if not match:
+            continue
+        for col in _resolve_aggregate_targets(match.group(1), schema_loader):
+            aggregation_preferences_list.append({
+                "function": "count",
+                "column": col,
+                "distinct": True,
+            })
+        if aggregation_preferences_list:
+            break
+    if aggregation_preferences:
+        base_entry = dict(aggregation_preferences)
+        if base_entry not in aggregation_preferences_list:
+            aggregation_preferences_list.insert(0, base_entry)
+    result["aggregation_preferences_list"] = aggregation_preferences_list
 
     # 8. Time granularity: "помесячно" → "month", "по кварталам" → "quarter"
     time_granularity: str | None = None

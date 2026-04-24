@@ -42,27 +42,11 @@ def _collect_text(user_input: str, intent: dict[str, Any] | None) -> str:
     return " ".join([user_input or ""] + entities + required).lower()
 
 
-def _normalize_text(text: str) -> str:
-    text = str(text or "").lower().replace("ё", "е")
-    text = re.sub(r"[^0-9a-zа-я_ ]+", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _tokenize(text: str) -> list[str]:
-    return [tok for tok in _normalize_text(text).split() if len(tok) >= 2]
-
-
-def _stem(token: str) -> str:
-    token = _normalize_text(token)
-    for suffix in (
-        "ыми", "ими", "ого", "его", "ому", "ему", "ая", "яя", "ое", "ее",
-        "ые", "ие", "ый", "ий", "ой", "ом", "ем", "ым", "им", "ах", "ях",
-        "ов", "ев", "ей", "ам", "ям", "у", "ю", "а", "я", "ы", "и", "е", "о",
-    ):
-        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
-            return token[: -len(suffix)]
-    return token
+from core.text_normalize import (  # noqa: E402
+    normalize_text as _normalize_text,
+    stem as _stem,
+    tokenize as _tokenize,
+)
 
 
 def _metric_intent(intent: dict[str, Any] | None, haystack: str) -> str | None:
@@ -322,11 +306,23 @@ def derive_semantic_frame(
     user_input: str,
     intent: dict[str, Any] | None = None,
     schema_loader=None,
+    user_hints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build semantic frame using metadata-driven lexicon when available."""
+    """Build semantic frame using metadata-driven lexicon when available.
+
+    Args:
+        user_input: Текст запроса пользователя.
+        intent: Результат intent_classifier (опционально).
+        schema_loader: SchemaLoader с каталогом (опционально).
+        user_hints: Финальные user_hints (после merge в hint_extractor). Если заданы,
+            используются как приоритетный источник для metric_intent,
+            output_dimensions и period_kind — регекс-эвристики вокруг
+            `haystack`/дат ничего не перезаписывают.
+    """
     clean_input = sanitize_user_input_for_semantics(user_input)
     haystack = _collect_text(clean_input, intent)
     lexicon = schema_loader.get_semantic_lexicon() if schema_loader is not None else {}
+    user_hints = user_hints or {}
 
     subject = find_best_subject(haystack, lexicon) if lexicon else None
     if subject is None:
@@ -341,14 +337,30 @@ def derive_semantic_frame(
     period_kind = None
     if re.search(r"\b(20\d{2}|\d{2})\b", haystack) or any(stem in haystack for stem in _RU_MONTH_STEMS):
         period_kind = "calendar"
+    if user_hints.get("time_granularity"):
+        # LLM/regex извлёк явную гранулярность → календарный period.
+        period_kind = "calendar"
 
     metric_intent = _metric_intent(intent, haystack)
+    hint_aggs = user_hints.get("aggregate_hints") or []
+    if hint_aggs and isinstance(hint_aggs[0], dict):
+        hint_fn = hint_aggs[0].get("function")
+        if hint_fn in {"count", "sum", "avg", "min", "max", "list"}:
+            metric_intent = hint_fn
+
     output_dimensions = (
         find_matching_dimensions(haystack, lexicon) if lexicon else []
     )
     output_dimensions = list(dict.fromkeys(output_dimensions + _extract_output_dimension_hints(clean_input)))
     required_output = [str(v).strip().lower() for v in ((intent or {}).get("required_output") or []) if str(v).strip()]
     output_dimensions = list(dict.fromkeys(required_output + output_dimensions))
+    hint_group_by = [
+        str(v).strip().lower()
+        for v in (user_hints.get("group_by_hints") or [])
+        if str(v).strip()
+    ]
+    if hint_group_by:
+        output_dimensions = list(dict.fromkeys(hint_group_by + output_dimensions))
     qualifier = None
     business_event = None
     ambiguities: list[str] = []

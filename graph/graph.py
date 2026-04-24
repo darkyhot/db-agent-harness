@@ -90,8 +90,8 @@ def _route_after_intent_classifier(state: AgentState) -> str:
     if intent.get("needs_search"):
         return "tool_dispatcher"
 
-    # Обычный путь — через hint_extractor к table_resolver
-    return "hint_extractor"
+    # Обычный путь — LLM-экстрактор подсказок → regex+merge hint_extractor → table_resolver
+    return "hint_extractor_llm"
 
 
 def _route_after_tool_dispatcher(state: AgentState) -> str:
@@ -345,6 +345,7 @@ def build_graph(
 
     # Добавляем все 15 узлов
     graph.add_node("intent_classifier", nodes.intent_classifier)
+    graph.add_node("hint_extractor_llm", nodes.hint_extractor_llm)
     graph.add_node("hint_extractor", nodes.hint_extractor)
     graph.add_node("explicit_mode_dispatcher", nodes.explicit_mode_dispatcher)
     graph.add_node("table_resolver", nodes.table_resolver)
@@ -375,12 +376,13 @@ def build_graph(
         END: END,
         "summarizer": "summarizer",
         "tool_dispatcher": "tool_dispatcher",
-        "hint_extractor": "hint_extractor",
+        "hint_extractor_llm": "hint_extractor_llm",
         "plan_edit_router": "plan_edit_router",
         "plan_preview": "plan_preview",
     })
 
-    # hint_extractor → explicit_mode_dispatcher (детерминированный) → table_resolver
+    # hint_extractor_llm → hint_extractor (merge LLM+regex) → explicit_mode_dispatcher → table_resolver
+    graph.add_edge("hint_extractor_llm", "hint_extractor")
     graph.add_edge("hint_extractor", "explicit_mode_dispatcher")
     graph.add_edge("explicit_mode_dispatcher", "table_resolver")
 

@@ -132,6 +132,12 @@ class AgentState(TypedDict):
     # column_selector (dim_sources/join_fields/group_by_hints),
     # sql_planner (HAVING, GROUP BY, DATE_TRUNC).
     user_hints: dict[str, Any]
+    # Промежуточный результат LLM-извлечения подсказок (перед merge с regex-ами).
+    # Заполняется hint_extractor_llm; merge-слой в hint_extractor сводит его с
+    # regex-результатом в финальное user_hints.
+    user_hints_llm: dict[str, Any]
+    # "llm" | "regex" | "merged" — источник финального user_hints для логирования.
+    hints_source: str
 
     # semantic frame запроса и результат where_resolver
     semantic_frame: dict[str, Any]

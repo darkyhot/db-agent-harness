@@ -32,17 +32,43 @@ def _apply_explicit_join_override(
     join_spec: list[dict[str, Any]],
     selected_columns: dict[str, Any],
     intent: dict[str, Any],
+    user_hints: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Применить explicit_join из интента как override join_spec.
+    """Применить explicit_join из интента / user_hints как override join_spec.
 
     Когда пользователь явно указал ключ JOIN ("по инн", "по дате") — он имеет
     абсолютный приоритет. Ищем колонку по col_hint семантически в selected_columns,
     подставляем в join_spec вместо auto-detected пары.
 
+    Источники (оба опциональны, обрабатываются в порядке приоритета):
+    - user_hints.join_fields — свежий результат LLM/regex-экстрактора, primary.
+    - intent.explicit_join — результат intent_classifier, secondary.
+
+    Конфликт разрешается так: ключи из user_hints применяются первыми;
+    ключи из intent.explicit_join — только для col_hint-ов, которые не
+    были покрыты user_hints.
+
     Returns:
-        Обновлённый join_spec (исходный если explicit_join пуст или не нашли совпадений).
+        Обновлённый join_spec (исходный если оба источника пусты / не нашли совпадений).
     """
-    explicit_joins = intent.get("explicit_join") or []
+    explicit_joins: list[dict[str, Any]] = []
+    covered_hints: set[str] = set()
+
+    for field in (user_hints or {}).get("join_fields") or []:
+        col = str(field).lower().strip()
+        if col and col not in covered_hints:
+            explicit_joins.append({"column_hint": col, "table_hint": ""})
+            covered_hints.add(col)
+
+    for ej in intent.get("explicit_join") or []:
+        if not isinstance(ej, dict):
+            continue
+        col = str(ej.get("column_hint") or "").lower().strip()
+        if not col or col in covered_hints:
+            continue
+        explicit_joins.append(ej)
+        covered_hints.add(col)
+
     if not explicit_joins:
         return join_spec
 
@@ -456,6 +482,7 @@ class ExplorerNodes:
                 _det_result["join_spec"],
                 _det_result["selected_columns"],
                 intent,
+                user_hints=state.get("user_hints"),
             )
             self.memory.add_message(
                 "assistant",
@@ -743,7 +770,10 @@ class ExplorerNodes:
                 join_spec.append(entry)
 
         # --- Блок B: explicit_join override (LLM путь) ---
-        join_spec = _apply_explicit_join_override(join_spec, selected_columns, intent)
+        join_spec = _apply_explicit_join_override(
+            join_spec, selected_columns, intent,
+            user_hints=state.get("user_hints"),
+        )
 
         # Hardening: дополнить LLM join_spec составными парами PK, которые LLM мог пропустить.
         # Если dim-таблица имеет составной PK, но LLM вернул только одну пару — добавляем остальные.

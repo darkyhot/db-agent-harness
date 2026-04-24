@@ -889,51 +889,82 @@ class PlanEditNodes:
             return f"{row['schema_name']}.{row['table_name']}"
         return None
 
+    def _llm_classify_edit(
+        self,
+        state: AgentState,
+        edit_text: str,
+        blueprint: dict[str, Any],
+    ) -> dict[str, Any]:
+        """LLM-классификатор edit_kind (PRIMARY путь после формальных regex).
+
+        Возвращает структурированный вердикт (edit_kind + confidence + payload).
+        На невалидный JSON (даже после retry) возвращает clarify с низкой
+        уверенностью — router тогда переходит к regex-fallback.
+        """
+        system_prompt = (
+            "Ты — классификатор правок SQL-плана. По тексту правки пользователя "
+            "определи её тип. Возвращай ТОЛЬКО JSON, без markdown, без пояснений.\n\n"
+            "Схема ответа:\n"
+            '{"edit_kind": "patch|rebind|rewrite|clarify", '
+            '"confidence": 0.0-1.0, '
+            '"explanation": "кратко почему", '
+            '"needs_clarification": true|false, '
+            '"payload": {}}\n\n'
+            "Правила классификации:\n"
+            "- patch — локальная правка внутри существующего плана: смена сортировки, "
+            "добавление/замена метрики, смена группировки, сдвиг дат, лимит, "
+            "COUNT(DISTINCT) ↔ COUNT, добавление/снятие фильтра.\n"
+            "- rebind — смена источника данных: \"возьми из другой таблицы\", "
+            "\"используй X вместо Y\", \"добавь таблицу\".\n"
+            "- rewrite — меняется сам смысл запроса: с агрегации на список, с count на sum, "
+            "\"передумал\", \"не считать, а показать\".\n"
+            "- clarify — правка неоднозначна: в payload.question положи короткий вопрос.\n"
+            "Не придумывай конкретные имена колонок/таблиц в payload — это сделает "
+            "следующий узел."
+        )
+        user_prompt = (
+            "Текущий план:\n"
+            f"{_render_compact_plan(blueprint)}\n\n"
+            "Известные таблицы: "
+            f"{', '.join(_full_table_name(t) for t in (state.get('selected_tables') or []))}\n"
+            f"Правка пользователя: {edit_text}\n\n"
+            "JSON:"
+        )
+        parsed = self._llm_json_with_retry(
+            system_prompt, user_prompt,
+            temperature=0.0,
+            failure_tag="plan_edit_classifier",
+            expect="object",
+        )
+        if not parsed:
+            return {
+                "edit_kind": "clarify",
+                "confidence": 0.0,
+                "explanation": "LLM-классификатор не вернул валидный JSON",
+                "needs_clarification": True,
+                "payload": {},
+            }
+        edit_kind = str(parsed.get("edit_kind") or "").lower().strip()
+        if edit_kind not in {"patch", "rebind", "rewrite", "clarify"}:
+            edit_kind = "clarify"
+        parsed["edit_kind"] = edit_kind
+        parsed.setdefault("payload", {})
+        parsed.setdefault("confidence", 0.5)
+        parsed.setdefault("explanation", "LLM classifier")
+        parsed.setdefault("needs_clarification", edit_kind == "clarify")
+        return parsed
+
     def _fallback_route_with_model(
         self,
         state: AgentState,
         edit_text: str,
         blueprint: dict[str, Any],
     ) -> dict[str, Any]:
-        system_prompt = (
-            "Ты определяешь тип правки плана SQL. "
-            "Верни только JSON формата:\n"
-            '{'
-            '"edit_kind":"patch|rebind|rewrite|clarify",'
-            '"confidence":0.0,'
-            '"explanation":"...",'
-            '"needs_clarification":false,'
-            '"payload":{}}'
-            "\nНе генерируй SQL. Не придумывай поля вне payload."
-        )
-        user_prompt = (
-            f"Текущий план:\n{_render_compact_plan(blueprint)}\n\n"
-            f"Известные таблицы: {', '.join(_full_table_name(t) for t in (state.get('selected_tables') or []))}\n"
-            f"Правка пользователя: {edit_text}\n\n"
-            "Если пользователь меняет таблицу/источник — это rebind.\n"
-            "Если меняет сам смысл запроса — rewrite.\n"
-            "Если правка локальная по сортировке/дате/агрегации/фильтру — patch.\n"
-            "Если неоднозначно — clarify и положи в payload.question короткий вопрос."
-        )
-        try:
-            response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.0)
-            parsed = _parse_json_response(response)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("plan_edit_router LLM fallback failed: %s", exc)
-            parsed = None
-        if isinstance(parsed, dict):
-            parsed.setdefault("payload", {})
-            parsed.setdefault("confidence", 0.5)
-            parsed.setdefault("explanation", "LLM fallback")
-            parsed.setdefault("needs_clarification", parsed.get("edit_kind") == "clarify")
-            return parsed
-        return {
-            "edit_kind": "clarify",
-            "confidence": 0.0,
-            "explanation": "Не удалось распознать правку",
-            "needs_clarification": True,
-            "payload": {"question": "Что именно нужно изменить в плане: фильтр, сортировку, таблицу или сам смысл запроса?"},
-        }
+        """Старый fallback — сохранён для совместимости. В новом порядке
+        router вызывает сначала _llm_classify_edit → _deterministic_route,
+        и только если оба ничего не дали — этот метод.
+        """
+        return self._llm_classify_edit(state, edit_text, blueprint)
 
     def _deterministic_route(
         self,
@@ -1022,11 +1053,54 @@ class PlanEditNodes:
         blueprint = state.get("sql_blueprint") or {}
         logger.info("plan_edit_router: edit=%r", edit_text)
 
-        parsed = self._deterministic_route(state, edit_text, blueprint)
+        # Архитектура: regex-first для быстрых однозначных случаев (экономим 5 сек),
+        # LLM подключается только когда regex дал clarify/низкую уверенность/None —
+        # т.е. именно для вариативных формулировок, где regex хрупок.
+
+        # 1. Regex: сильные паттерны (sort desc, count star, no distinct, rebind, rewrite)
+        #    обрабатываются без LLM. Возвращают confidence ~0.9+ при чётком совпадении.
+        parsed: dict[str, Any] | None = self._deterministic_route(state, edit_text, blueprint)
+
+        # 2. LLM-классификатор подключается когда regex:
+        #    - вернул None (совсем ничего не подошло), или
+        #    - вернул clarify с низкой уверенностью (<0.65) — т.е. regex не уверен.
+        #    Это лечит «вариативные формулировки», не замедляя очевидные правки.
+        regex_uncertain = (
+            parsed is None
+            or (
+                str(parsed.get("edit_kind") or "") == "clarify"
+                and float(parsed.get("confidence", 0.0) or 0.0) < 0.65
+            )
+        )
+        if regex_uncertain:
+            llm_result = self._llm_classify_edit(state, edit_text, blueprint)
+            llm_kind = str(llm_result.get("edit_kind") or "").lower()
+            llm_conf = float(llm_result.get("confidence", 0.0) or 0.0)
+            # Используем LLM-результат, только если он confident и не clarify,
+            # либо если regex был полностью None.
+            if parsed is None or (llm_kind in {"patch", "rebind", "rewrite"} and llm_conf >= 0.5):
+                parsed = llm_result
+                # Если LLM выбрал patch, но не наполнил payload — дособерём через regex-патчер.
+                if llm_kind == "patch":
+                    resolved = self._resolve_patch_route(state, edit_text, blueprint)
+                    if resolved is not None:
+                        parsed = resolved
+
+        # 3. Финальная нормализация: patch без operations → clarify.
         if parsed is None:
-            parsed = self._fallback_route_with_model(state, edit_text, blueprint)
-            if str(parsed.get("edit_kind") or "") == "patch":
-                parsed = self._resolve_patch_route(state, edit_text, blueprint) or {
+            parsed = {
+                "edit_kind": "clarify",
+                "confidence": 0.0,
+                "explanation": "Не удалось распознать правку",
+                "needs_clarification": True,
+                "payload": {"question": "Что именно нужно изменить в плане: фильтр, сортировку, таблицу или сам смысл запроса?"},
+            }
+        if str(parsed.get("edit_kind") or "") == "patch" and not (parsed.get("payload") or {}).get("operations"):
+            resolved = self._resolve_patch_route(state, edit_text, blueprint)
+            if resolved is not None:
+                parsed = resolved
+            else:
+                parsed = {
                     "edit_kind": "clarify",
                     "confidence": float(parsed.get("confidence", 0.0) or 0.0),
                     "explanation": "Недостаточно данных для безопасного patch без уточнения",

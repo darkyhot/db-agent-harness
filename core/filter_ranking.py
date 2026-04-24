@@ -7,6 +7,12 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from core.semantic_registry import builtin_subject_aliases
+from core.text_normalize import (
+    normalize_text as _normalize_text,
+    stem as _stem,
+    stem_set as _stem_set,
+    tokenize as _tokenize,
+)
 
 # Порог Левенштейна-подобного ratio для «нечёткого» сравнения стемов.
 # 0.85 покрывает опечатки вида замены/вставки/пропуска одной буквы на словах
@@ -15,33 +21,6 @@ _FUZZY_STEM_RATIO = 0.85
 _FUZZY_STEM_MIN_LEN = 5
 _FLAG_PREFIXES = {"is", "has", "flag", "flg", "bool", "boolean", "priznak", "признак"}
 _FLAG_SUFFIXES = {"flag", "flg", "ind", "indicator", "bool", "boolean", "priznak", "признак"}
-
-
-def _normalize_text(text: str) -> str:
-    text = str(text or "").lower().replace("ё", "е")
-    text = re.sub(r"[^0-9a-zа-я_ ]+", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _tokenize(text: str) -> list[str]:
-    return [tok for tok in _normalize_text(text).split() if len(tok) >= 2]
-
-
-def _stem(token: str) -> str:
-    token = _normalize_text(token)
-    for suffix in (
-        "ыми", "ими", "ого", "его", "ому", "ему", "ая", "яя", "ое", "ее",
-        "ые", "ие", "ый", "ий", "ой", "ом", "ем", "ым", "им", "ах", "ях",
-        "ов", "ев", "ей", "ам", "ям", "у", "ю", "а", "я", "ы", "и", "е", "о",
-    ):
-        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
-            return token[: -len(suffix)]
-    return token
-
-
-def _stem_set(text: str) -> set[str]:
-    return {_stem(tok) for tok in _tokenize(text)}
 
 
 def _fuzzy_stem_match(stem: str, candidates: set[str]) -> bool:

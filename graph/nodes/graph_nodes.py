@@ -3,6 +3,7 @@
 from graph.nodes.common import BaseNodeMixin
 from graph.nodes.intent import IntentNodes
 from graph.nodes.hint_extractor import HintExtractorNodes
+from graph.nodes.hint_extractor_llm import HintExtractorLLMNodes
 from graph.nodes.explicit_mode_dispatcher import ExplicitModeDispatcherNodes
 from graph.nodes.explorer import ExplorerNodes
 from graph.nodes.sql_pipeline import SqlPipelineNodes
@@ -15,6 +16,7 @@ from graph.nodes.dispatcher import DispatcherNodes
 
 class GraphNodes(
     IntentNodes,
+    HintExtractorLLMNodes,
     HintExtractorNodes,
     ExplicitModeDispatcherNodes,
     ExplorerNodes,
@@ -30,7 +32,8 @@ class GraphNodes(
 
     Каждый mixin содержит 1-3 узла графа:
     - IntentNodes: intent_classifier, table_resolver
-    - HintExtractorNodes: hint_extractor (детерминированный, без LLM)
+    - HintExtractorLLMNodes: hint_extractor_llm (LLM-экстрактор подсказок)
+    - HintExtractorNodes: hint_extractor (regex + merge с LLM-результатом)
     - ExplicitModeDispatcherNodes: explicit_mode_dispatcher (детерминированный)
     - ExplorerNodes: table_explorer, column_selector
     - SqlPipelineNodes: sql_planner, sql_writer, sql_static_checker, sql_validator_node

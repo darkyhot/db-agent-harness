@@ -343,6 +343,24 @@ def _count_column_should_be_distinct(
     return False
 
 
+def _list_pk_candidates(main_table: str, schema_loader) -> list[str]:
+    """Список PK-колонок таблицы (для LLM-резолвера при составном PK)."""
+    if not main_table or schema_loader is None or "." not in main_table:
+        return []
+    schema_name, table_name = main_table.split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return []
+    pks: list[str] = []
+    for _, row in cols_df.iterrows():
+        if not bool(row.get("is_primary_key", False)):
+            continue
+        name = str(row.get("column_name", "") or "").strip()
+        if name:
+            pks.append(name)
+    return pks
+
+
 def _choose_count_identifier_column(
     main_table: str,
     schema_loader,
@@ -826,6 +844,8 @@ def build_blueprint(
     semantic_frame: dict | None = None,
     user_filter_choices: dict[str, str] | None = None,
     rejected_filter_choices: dict[str, list[str]] | None = None,
+    count_identifier_resolver=None,
+    filter_tiebreaker=None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -838,6 +858,11 @@ def build_blueprint(
         user_input: Текст запроса (для derive date filters).
         user_hints: Подсказки из hint_extractor (having_hints используются здесь).
         schema_loader: SchemaLoader для подбора unit_col в HAVING.
+        count_identifier_resolver: Опциональный callable(main_table, pk_candidates, user_input) -> str | None,
+            который спрашивает LLM, какая колонка — identifier сущности для
+            COUNT(DISTINCT). Срабатывает ТОЛЬКО при составном PK (≥2 кандидатов)
+            в safety-net пути. При None/невалидном ответе — fallback на
+            детерминированный `_choose_count_identifier_column`.
 
     Returns:
         dict совместимый с форматом sql_blueprint из AgentState.
@@ -896,12 +921,37 @@ def build_blueprint(
             main_roles.get("aggregate") == ["*"] or suspicious_agg_col is not None
         )
         if (main_roles.get("aggregate") == ["*"] or suspicious_group_by or suspicious_agg_col) and not force_count_star:
-            fallback_col = _choose_count_identifier_column(
-                main_table,
-                schema_loader,
-                semantic_frame=semantic_frame,
-                user_input=user_input,
-            )
+            # 1. LLM-резолвер при составном PK — срабатывает только если
+            #    предоставлен callback И в таблице ≥2 PK-кандидата.
+            if count_identifier_resolver is not None:
+                pk_candidates = _list_pk_candidates(main_table, schema_loader)
+                if len(pk_candidates) >= 2:
+                    try:
+                        llm_choice = count_identifier_resolver(
+                            main_table=main_table,
+                            pk_candidates=pk_candidates,
+                            user_input=user_input,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "count_identifier_resolver упал: %s — fallback на detreministic",
+                            exc,
+                        )
+                        llm_choice = None
+                    if llm_choice and llm_choice in pk_candidates:
+                        fallback_col = llm_choice
+                        logger.info(
+                            "DeterministicPlanner: COUNT identifier выбран LLM → %s.%s",
+                            main_table, fallback_col,
+                        )
+            # 2. Fallback на детерминистику.
+            if fallback_col is None:
+                fallback_col = _choose_count_identifier_column(
+                    main_table,
+                    schema_loader,
+                    semantic_frame=semantic_frame,
+                    user_input=user_input,
+                )
         if force_count_star:
             main_roles["aggregate"] = ["*"]
             main_roles.pop("group_by", None)
@@ -971,6 +1021,7 @@ def build_blueprint(
         base_conditions=base_where_conditions,
         user_filter_choices=user_filter_choices,
         rejected_filter_choices=rejected_filter_choices,
+        filter_tiebreaker=filter_tiebreaker,
     )
     where_conditions = where_resolution.get("conditions", base_where_conditions)
 

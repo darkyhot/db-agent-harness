@@ -296,6 +296,175 @@ class SqlPipelineNodes:
     """Миксин с узлами sql_planner, sql_writer и sql_validator_node для GraphNodes."""
 
     # --------------------------------------------------------------------------
+    # Внутренний LLM-резолвер для выбора identifier-колонки в COUNT(DISTINCT ...)
+    # --------------------------------------------------------------------------
+
+    def _resolve_count_identifier_llm(
+        self,
+        *,
+        main_table: str,
+        pk_candidates: list[str],
+        user_input: str,
+    ) -> str | None:
+        """Спросить LLM, какая PK-колонка — identifier сущности для COUNT(DISTINCT).
+
+        Срабатывает только при составном PK (≥2 кандидатов). Промпт компактный,
+        результат валидируется: возвращаемая колонка должна быть из pk_candidates.
+        На невалидный JSON (после одного retry) возвращает None — вызывающая
+        сторона применяет детерминированный fallback.
+        """
+        if not pk_candidates or len(pk_candidates) < 2 or not main_table:
+            return None
+
+        descriptions: list[str] = []
+        if "." in main_table:
+            schema_name, table_name = main_table.split(".", 1)
+            cols_df = self.schema.get_table_columns(schema_name, table_name)
+            if not cols_df.empty:
+                for name in pk_candidates:
+                    row = cols_df[cols_df["column_name"].astype(str) == name]
+                    if row.empty:
+                        continue
+                    desc = str(row.iloc[0].get("description", "") or "").strip()
+                    semantics = self.schema.get_column_semantics(schema_name, table_name, name)
+                    sem_class = str(semantics.get("semantic_class", "") or "").strip()
+                    dtype = str(row.iloc[0].get("dType", "") or "").strip()
+                    parts = [f"- {name}"]
+                    if dtype:
+                        parts.append(f"тип: {dtype}")
+                    if sem_class:
+                        parts.append(f"семантика: {sem_class}")
+                    if desc:
+                        parts.append(f"описание: {desc[:120]}")
+                    descriptions.append("; ".join(parts))
+
+        if not descriptions:
+            descriptions = [f"- {name}" for name in pk_candidates]
+
+        system_prompt = (
+            "Ты — эксперт по SQL-аналитике. Задача: выбрать, какая из "
+            "PK-колонок составного ключа таблицы является identifier'ом "
+            "СУЩНОСТИ (клиента / заказа / задачи), которую пользователь "
+            "хочет посчитать уникальной через COUNT(DISTINCT ...).\n\n"
+            "Правила:\n"
+            "- Выбирай колонку, идентифицирующую ОБЪЕКТ подсчёта, не дату и "
+            "не срез.\n"
+            "- Если среди PK есть дата (_dt, _date, _timestamp, report_dt) "
+            "и нет-дата-колонка — выбирай не-дату.\n"
+            "- Если непонятно, по какому сущностному ключу считать — верни "
+            '"column": null.\n'
+            "- Возвращай ТОЛЬКО JSON, без markdown.\n\n"
+            "Схема ответа: "
+            '{"column": "имя_колонки_из_списка_или_null", "rationale": "кратко"}'
+        )
+        user_prompt = (
+            f"Таблица: {main_table}\n"
+            f"Вопрос пользователя: {user_input.strip()}\n"
+            "PK-колонки (составной ключ):\n"
+            + "\n".join(descriptions)
+            + "\n\nJSON:"
+        )
+
+        parsed = self._llm_json_with_retry(
+            system_prompt, user_prompt,
+            temperature=0.0,
+            failure_tag="count_identifier_resolver",
+            expect="object",
+        )
+        if not parsed:
+            return None
+        raw_col = parsed.get("column")
+        if not raw_col:
+            return None
+        chosen = str(raw_col).strip()
+        if chosen in pk_candidates:
+            return chosen
+        lowered = {p.lower(): p for p in pk_candidates}
+        if chosen.lower() in lowered:
+            return lowered[chosen.lower()]
+        logger.warning(
+            "_resolve_count_identifier_llm: LLM вернул %r, но это не из pk_candidates=%s",
+            chosen, pk_candidates,
+        )
+        return None
+
+    # --------------------------------------------------------------------------
+    # LLM-tiebreaker для ничьи scoring'а фильтр-кандидатов
+    # --------------------------------------------------------------------------
+
+    def _tiebreak_filter_candidates_llm(
+        self,
+        *,
+        request_id: str,
+        user_input: str,
+        candidates: list[dict[str, Any]],
+    ) -> str | None:
+        """Спросить LLM, какая из близких по score фильтр-колонок подходит лучше.
+
+        Вызывается where_resolver'ом только при ambiguity (узкий gap или низкая
+        абсолютная уверенность). Возвращает имя колонки или None (→ fallback на
+        clarification-вопрос к пользователю).
+        """
+        if not candidates or len(candidates) < 2:
+            return None
+
+        def _fmt(c: dict[str, Any]) -> str:
+            parts = [f"- {c.get('column')}"]
+            desc = str(c.get("description") or "").strip()
+            if desc:
+                parts.append(f"описание: {desc[:150]}")
+            sem = str(c.get("semantic_class") or "").strip()
+            if sem:
+                parts.append(f"семантика: {sem}")
+            ex = c.get("example_values") or []
+            if ex:
+                parts.append(f"примеры: {', '.join(str(v) for v in ex[:2])}")
+            score = c.get("score")
+            if score is not None:
+                parts.append(f"score={score}")
+            return "; ".join(parts)
+
+        system_prompt = (
+            "Ты — эксперт по SQL-аналитике. Пользователь задал запрос, и "
+            "scoring-логика нашла несколько кандидатов-колонок для фильтрации "
+            "с близкими оценками. Выбери, какая из них лучше соответствует "
+            "смыслу запроса.\n\n"
+            "Правила:\n"
+            "- Верни ТОЛЬКО JSON: "
+            '{"chosen_column": "имя_колонки_из_списка_или_null", "rationale": "кратко"}\n'
+            "- Если ни одна не подходит уверенно — верни null.\n"
+            "- Выбирай колонку, чья семантика/описание ближе к смыслу запроса, "
+            "а не просто чей score выше.\n"
+        )
+        user_prompt = (
+            f"Запрос пользователя: {user_input.strip()}\n"
+            f"Request ID: {request_id}\n"
+            "Кандидаты (из одной группы scoring'а):\n"
+            + "\n".join(_fmt(c) for c in candidates[:3])
+            + "\n\nJSON:"
+        )
+        parsed = self._llm_json_with_retry(
+            system_prompt, user_prompt,
+            temperature=0.0,
+            failure_tag="filter_tiebreaker",
+            expect="object",
+        )
+        if not parsed:
+            return None
+        chosen = parsed.get("chosen_column")
+        if not chosen:
+            return None
+        chosen_str = str(chosen).strip()
+        col_names_lower = {str(c.get("column") or "").strip().lower(): str(c.get("column") or "") for c in candidates}
+        if chosen_str.lower() in col_names_lower:
+            return col_names_lower[chosen_str.lower()]
+        logger.warning(
+            "_tiebreak_filter_candidates_llm: LLM вернул %r, но это не из кандидатов",
+            chosen_str,
+        )
+        return None
+
+    # --------------------------------------------------------------------------
     # sql_planner
     # --------------------------------------------------------------------------
 
@@ -346,6 +515,8 @@ class SqlPipelineNodes:
             semantic_frame=state.get("semantic_frame", {}) or {},
             user_filter_choices=state.get("user_filter_choices", {}) or {},
             rejected_filter_choices=state.get("rejected_filter_choices", {}) or {},
+            count_identifier_resolver=self._resolve_count_identifier_llm,
+            filter_tiebreaker=self._tiebreak_filter_candidates_llm,
         )
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))

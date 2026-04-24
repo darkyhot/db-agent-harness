@@ -9,31 +9,13 @@ from typing import Any
 from core.domain_rules import table_can_satisfy_frame
 from core.filter_ranking import rank_filter_candidates
 from core.log_safety import summarize_dict_keys
+from core.text_normalize import (
+    normalize_text as _normalize_text,
+    stem as _stem,
+    tokenize as _tokenize,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _normalize_text(text: str) -> str:
-    text = str(text or "").lower().replace("ё", "е")
-    text = re.sub(r"[^0-9a-zа-я_ ]+", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _tokenize(text: str) -> list[str]:
-    return [tok for tok in _normalize_text(text).split() if len(tok) >= 2]
-
-
-def _stem(token: str) -> str:
-    token = _normalize_text(token)
-    for suffix in (
-        "ыми", "ими", "ого", "его", "ому", "ему", "ая", "яя", "ое", "ее",
-        "ые", "ие", "ый", "ий", "ой", "ом", "ем", "ым", "им", "ах", "ях",
-        "ов", "ев", "ей", "ам", "ям", "у", "ю", "а", "я", "ы", "и", "е", "о",
-    ):
-        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
-            return token[: -len(suffix)]
-    return token
 
 
 def _business_event_is_already_encoded_in_table(
@@ -182,6 +164,7 @@ def resolve_where(
     base_conditions: list[str] | None = None,
     user_filter_choices: dict[str, str] | None = None,
     rejected_filter_choices: dict[str, list[str]] | None = None,
+    filter_tiebreaker=None,
 ) -> dict[str, Any]:
     """Достроить WHERE доменными правилами и value profiles.
 
@@ -255,6 +238,42 @@ def resolve_where(
                 score_gap = float(best.get("score", 0.0)) - float((second or {}).get("score", 0.0))
         if best.get("confidence") == "low":
             continue
+        # Триггеры для LLM-tiebreaker: относительный gap < 15 ИЛИ абсолютная
+        # уверенность <= medium при низком score (<50). LLM разруливает ничьи
+        # только для top-3 кандидатов, не ранжирует весь каталог.
+        top_score = float(best.get("score", 0.0) or 0.0)
+        absolute_low_confidence = (
+            best.get("confidence") == "medium" and top_score < 50.0
+        )
+        if (
+            filter_tiebreaker is not None
+            and second is not None
+            and (score_gap < 15.0 or absolute_low_confidence)
+            and best.get("confidence") != "high"
+            and str(request_id) not in user_filter_choices
+        ):
+            try:
+                top_candidates = [c for c in candidates[:3]]
+                chosen_column = filter_tiebreaker(
+                    request_id=str(request_id),
+                    user_input=user_input,
+                    candidates=top_candidates,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "filter_tiebreaker упал: %s — fallback на clarification", exc,
+                )
+                chosen_column = None
+            if chosen_column:
+                for cand in candidates[:3]:
+                    if str(cand.get("column") or "").strip().lower() == str(chosen_column).strip().lower():
+                        best = cand
+                        second = None
+                        reasoning.append(
+                            f"tiebreaker_llm:{request_id}:{best.get('column')}"
+                        )
+                        break
+
         if second and best.get("confidence") == "medium" and score_gap < 15.0:
             _is_explicit, _chosen = _user_explicitly_named(user_input, best, second)
             if _is_explicit and _chosen is not None:

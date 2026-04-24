@@ -556,7 +556,22 @@ class IntentNodes:
         query_norm = _normalize_query_text(user_input)
         semantic_input = sanitize_user_input_for_semantics(user_input)
         requested = _derive_requested_slots(semantic_input, intent)
-        semantic_frame = state.get("semantic_frame", {}) or derive_semantic_frame(semantic_input, intent, schema_loader=self.schema)
+        _hints_for_frame = state.get("user_hints") or {}
+        _has_hint_signal = any(
+            _hints_for_frame.get(k)
+            for k in ("aggregate_hints", "group_by_hints", "time_granularity")
+        )
+        _cached_frame = state.get("semantic_frame", {}) or None
+        # Пересчитываем semantic_frame с user_hints, если хинты есть и могут
+        # перезаписать metric_intent / output_dimensions / period_kind.
+        if _has_hint_signal or not _cached_frame:
+            semantic_frame = derive_semantic_frame(
+                semantic_input, intent,
+                schema_loader=self.schema,
+                user_hints=_hints_for_frame,
+            )
+        else:
+            semantic_frame = _cached_frame
         logger.info("TableResolver: user_input_full=%r", user_input)
         logger.info("TableResolver: semantic_frame_full=%s", semantic_frame)
         tables_df = self.schema.tables_df

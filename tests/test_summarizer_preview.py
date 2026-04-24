@@ -26,6 +26,19 @@ def _make_nodes(answer: str):
     return GraphNodes(llm, db, schema, memory, validator, [], debug_prompt=False)
 
 
+def _state(user_input: str):
+    return {
+        "messages": [],
+        "plan": [],
+        "tool_calls": [],
+        "query_spec": {},
+        "table_structures": {},
+        "tables_context": "",
+        "user_input": user_input,
+        "correction_examples": [],
+    }
+
+
 def test_summarizer_system_prompt_contains_is_empty_guidance():
     """Системный промпт должен содержать инструкции по обработке 0 строк."""
     nodes = _make_nodes("answer")
@@ -66,7 +79,6 @@ def test_summarizer_is_empty_prompt_passed_to_llm():
             return "нет данных за февраль 2026 по фильтру reason_code='actual_churn'"
 
     from graph.nodes import GraphNodes
-    from graph.graph import create_initial_state
     from unittest.mock import MagicMock
 
     llm = CapturingLLM()
@@ -80,7 +92,7 @@ def test_summarizer_is_empty_prompt_passed_to_llm():
     validator = MagicMock()
     nodes = GraphNodes(llm, db, schema, memory, validator, [], debug_prompt=False)
 
-    state = create_initial_state("покажи отток за февраль 2026")
+    state = _state("покажи отток за февраль 2026")
     state["plan"] = ["Выполнить SQL"]
     state["tool_calls"] = [
         {
@@ -100,10 +112,8 @@ def test_summarizer_is_empty_prompt_passed_to_llm():
 
 
 def test_summarizer_appends_preview_markdown_from_execute_query():
-    from graph.graph import create_initial_state
-
     nodes = _make_nodes("Готово. Ниже результат запроса.")
-    state = create_initial_state("Покажи клиентов")
+    state = _state("Покажи клиентов")
     state["plan"] = ["Выполнить SQL"]
     state["tool_calls"] = [
         {
@@ -124,3 +134,52 @@ def test_summarizer_appends_preview_markdown_from_execute_query():
     assert "Предварительный результат:" in answer
     assert "| id | name |" in answer
     assert "| 1 | Alice |" in answer
+
+
+def test_summarizer_blocks_answer_data_without_successful_execute_query():
+    nodes = _make_nodes("```sql\nSELECT COUNT(*) FROM dm.clients\n```")
+    state = _state("Сколько клиентов?")
+    state["query_spec"] = {
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": "client_id"}],
+    }
+    state["tool_calls"] = [
+        {
+            "tool": "execute_query",
+            "args": {"sql": "SELECT COUNT(*) AS cnt FROM dm.clients"},
+            "result": "awaiting_validation",
+        }
+    ]
+
+    result = nodes.summarizer(state)
+
+    assert "SQL не был выполнен" in result["final_answer"]
+    assert "```sql" not in result["final_answer"]
+
+
+def test_summarizer_prepends_scalar_summary_from_single_row_preview():
+    nodes = _make_nodes("Запрос выполнен.")
+    state = _state("Сколько всего есть ТБ и ГОСБ?")
+    state["query_spec"] = {
+        "task": "answer_data",
+        "metrics": [
+            {"operation": "count", "target": "tb_id"},
+            {"operation": "count", "target": "old_gosb_id"},
+        ],
+    }
+    state["tool_calls"] = [
+        {
+            "tool": "execute_query",
+            "args": {"sql": "SELECT COUNT(DISTINCT tb_id) AS total_tb FROM dm.gosb_dim"},
+            "result": (
+                '{"message": "Preview выполнен.", '
+                '"preview_markdown": "| total_tb | total_gosb |\\n| --- | --- |\\n| 5 | 11 |", '
+                '"rows_returned": 1, "rows_saved": 1, "is_empty": false, '
+                '"is_truncated": false, "saved_file": null, "mode": "preview"}'
+            ),
+        }
+    ]
+
+    result = nodes.summarizer(state)
+
+    assert result["final_answer"].startswith("Итог: total_tb = 5, total_gosb = 11.")

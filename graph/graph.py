@@ -618,6 +618,7 @@ def create_initial_state(
         error_diagnosis={},
         pending_sql_tool_call=None,
         column_selector_hint="",
+        column_selector_retry_count=int(ctx.get("column_selector_retry_count", 0) or 0),
         # Multi-turn context
         prev_sql=prev_sql,
         prev_result_summary=prev_result_summary,

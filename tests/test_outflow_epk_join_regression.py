@@ -2,9 +2,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from core.column_selector_deterministic import select_columns
+from core.catalog_grounding import ground_query_spec
 from core.join_analysis import detect_table_type
+from core.query_ir import QuerySpec
 from core.schema_loader import SchemaLoader
 from core.semantic_frame import derive_semantic_frame
+from core.sql_builder import SqlBuilder
 from core.sql_planner_deterministic import build_blueprint
 from core.user_hint_extractor import extract_user_hints
 from core.where_resolver import resolve_where
@@ -161,6 +164,80 @@ def test_column_selector_and_planner_build_fact_dim_outflow_epk_join():
     assert blueprint["aggregation"]["column"] == "outflow_qty"
     assert blueprint["group_by"] == ["report_dt", "segment_name"]
     assert blueprint["where_resolution"]["needs_clarification"] is False
+
+
+def test_implicit_outflow_segment_uses_more_complete_joinable_dimension_source():
+    loader = _loader()
+    user_input = "Посчитай сумму оттока по дате и сегменту"
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "sum", "target": "outflow", "distinct_policy": "auto", "confidence": 0.8}],
+        "dimensions": [
+            {"target": "date", "confidence": 0.8},
+            {"target": "segment", "confidence": 0.8},
+        ],
+        "filters": [],
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.8,
+    })
+    assert spec is not None, errors
+
+    grounding = ground_query_spec(query_spec=spec, schema_loader=loader, user_input=user_input)
+    tables = [source.full_name for source in grounding.sources]
+    assert "schema.uzp_dwh_fact_outflow" in tables
+    assert "schema.uzp_data_epk_consolidation" in tables
+
+    intent = spec.to_legacy_intent()
+    hints = spec.to_legacy_user_hints()
+    frame = derive_semantic_frame(user_input, intent, schema_loader=loader, user_hints=hints)
+    table_structures = {table: loader.get_table_info(*table.split(".", 1)) for table in tables}
+    table_types = {
+        table: detect_table_type(table.split(".", 1)[1], loader.get_table_columns(*table.split(".", 1)))
+        for table in tables
+    }
+
+    selected = select_columns(
+        intent,
+        table_structures,
+        table_types,
+        {},
+        loader,
+        user_input=user_input,
+        user_hints=hints,
+        semantic_frame=frame,
+    )
+    blueprint = build_blueprint(
+        intent,
+        selected["selected_columns"],
+        selected["join_spec"],
+        table_types,
+        {},
+        user_input=user_input,
+        user_hints=hints,
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+    sql = SqlBuilder().build(
+        blueprint["strategy"],
+        selected["selected_columns"],
+        selected["join_spec"],
+        blueprint,
+        table_types,
+    )
+
+    assert selected["selected_columns"]["schema.uzp_dwh_fact_outflow"]["aggregate"] == ["outflow_qty"]
+    assert selected["selected_columns"]["schema.uzp_dwh_fact_outflow"]["group_by"] == ["report_dt"]
+    assert selected["selected_columns"]["schema.uzp_data_epk_consolidation"]["group_by"] == ["segment_name"]
+    assert selected["join_spec"][0]["left"] == "schema.uzp_dwh_fact_outflow.inn"
+    assert selected["join_spec"][0]["right"] == "schema.uzp_data_epk_consolidation.inn"
+    assert blueprint["group_by"] == ["report_dt", "segment_name"]
+    assert sql is not None
+    normalized = " ".join(sql.split()).upper()
+    assert "SUM(" in normalized and "OUTFLOW_QTY" in normalized
+    assert "GROUP BY" in normalized and "REPORT_DT" in normalized and "SEGMENT_NAME" in normalized
+    assert "DISTINCT ON (INN)" in normalized
 
 
 def test_where_resolver_suppresses_stale_outflow_filter_when_aggregate_covers_it():

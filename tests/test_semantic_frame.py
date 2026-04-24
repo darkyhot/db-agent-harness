@@ -179,6 +179,18 @@ def test_sanitize_user_input_removes_table_choice_suffix():
     assert "Сколько задач по фактическому оттоку поставили в феврале 26" in cleaned
 
 
+def test_sanitize_user_input_removes_clarification_question_but_keeps_answer():
+    cleaned = sanitize_user_input_for_semantics(
+        "Сколько задач по фактическому оттоку поставили в феврале 26\n"
+        "Вопрос уточнения: Уточните год, к которому относится дата \"февраль 26\"?\n"
+        "Уточнение пользователя: 2026"
+    )
+
+    assert "Вопрос уточнения" not in cleaned
+    assert "к которому относится дата" not in cleaned
+    assert "Уточнение пользователя: 2026" in cleaned
+
+
 def test_semantic_frame_ignores_table_choice_suffix_and_value_after_po(tmp_path):
     loader = _loader(tmp_path)
     loader._rule_registry = {

@@ -1,4 +1,8 @@
-from graph.nodes.sql_pipeline import _build_specific_clarification, _build_specific_clarification_spec
+from graph.nodes.sql_pipeline import (
+    _build_specific_clarification,
+    _build_specific_clarification_spec,
+    _collect_required_tables,
+)
 
 
 def test_build_specific_clarification_prefers_candidate_details():
@@ -123,3 +127,41 @@ def test_build_specific_clarification_spec_skips_when_table_context_covers_busin
     }
     spec = _build_specific_clarification_spec(where_resolution)
     assert spec == {}
+
+
+def test_join_analysis_table_is_not_required_without_blueprint_or_query_need():
+    required = _collect_required_tables(
+        join_spec=[],
+        blueprint={
+            "strategy": "simple_select",
+            "main_table": "dm.gosb_dim",
+            "aggregations": [
+                {"function": "COUNT", "column": "tb_id", "source_table": "dm.gosb_dim"}
+            ],
+        },
+        query_spec={
+            "task": "answer_data",
+            "metrics": [{"operation": "count", "target": "tb_id"}],
+            "source_constraints": [],
+        },
+    )
+
+    assert required == {"dm.gosb_dim"}
+    assert "dm.unused_join_neighbor" not in required
+
+
+def test_required_tables_include_join_spec_and_required_source_constraints():
+    required = _collect_required_tables(
+        join_spec=[
+            {"left": "dm.fact.client_id", "right": "dm.clients.client_id"},
+        ],
+        blueprint={"strategy": "fact_dim_join", "main_table": "dm.fact"},
+        query_spec={
+            "source_constraints": [
+                {"schema": "dm", "table": "calendar", "required": True},
+            ],
+            "dimensions": [{"target": "region", "source_table": "dm.clients"}],
+        },
+    )
+
+    assert {"dm.fact", "dm.clients", "dm.calendar"} <= required

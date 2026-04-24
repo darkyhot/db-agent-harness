@@ -119,3 +119,35 @@ def test_sql_self_corrector_rejects_semantic_mismatch():
     assert result["sql_to_validate"] is None
     assert "self-correction" in result["last_error"]
     assert result["sql_self_correction"]["verdict"] == "reject"
+
+
+def test_sql_self_corrector_rejects_sql_missing_blueprint_metric_before_llm_pass():
+    sql = "SELECT COUNT(*) AS total_rows FROM dm.sales"
+    state = _state(sql)
+    state["query_spec"] = {
+        "task": "answer_data",
+        "metrics": [{"operation": "sum", "target": "amount"}],
+    }
+    state["sql_blueprint"] = {
+        "aggregation": {"function": "SUM", "column": "amount", "alias": "total_amount"},
+        "aggregations": [{"function": "SUM", "column": "amount", "alias": "total_amount"}],
+    }
+    nodes = _nodes({"verdict": "pass", "issues": [], "rationale": "ok"})
+
+    result = nodes.sql_self_corrector(state)
+
+    assert result["sql_to_validate"] is None
+    assert result["sql_self_correction"]["mode"] == "deterministic_blueprint_guard"
+    assert "metric:amount" in result["last_error"]
+    assert not nodes.llm.calls
+
+
+def test_sql_self_corrector_prompt_requires_answer_data_metrics():
+    sql = "SELECT region, SUM(amount) AS total_amount FROM dm.sales GROUP BY region"
+    nodes = _nodes({"verdict": "pass", "issues": [], "rationale": "ok"})
+
+    nodes.sql_self_corrector(_state(sql))
+
+    system_prompt = nodes.llm.calls[0][0]
+    assert "task='answer_data'" in system_prompt
+    assert "metrics/dimensions" in system_prompt

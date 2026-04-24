@@ -77,6 +77,149 @@ def _resolve_order_target(target: str, blueprint: dict[str, Any]) -> str:
     return target
 
 
+def _table_from_colref(ref: Any) -> str:
+    text = str(ref or "").strip()
+    parts = text.rsplit(".", 1)
+    return parts[0] if len(parts) == 2 and "." in parts[0] else ""
+
+
+def _collect_required_tables(
+    *,
+    join_spec: list[dict[str, Any]],
+    blueprint: dict[str, Any],
+    query_spec: dict[str, Any],
+) -> set[str]:
+    """Tables that are semantically required, not merely present in join analysis."""
+    required: set[str] = set()
+
+    main_table = str(blueprint.get("main_table") or "").strip()
+    if "." in main_table:
+        required.add(main_table)
+
+    for agg in (blueprint.get("aggregations") or []):
+        if isinstance(agg, dict):
+            source = str(agg.get("source_table") or "").strip()
+            if "." in source:
+                required.add(source)
+    aggregation = blueprint.get("aggregation") or {}
+    if isinstance(aggregation, dict):
+        source = str(aggregation.get("source_table") or "").strip()
+        if "." in source:
+            required.add(source)
+
+    for entry in join_spec or []:
+        if not isinstance(entry, dict):
+            continue
+        for side in ("left", "right"):
+            table = _table_from_colref(entry.get(side))
+            if table:
+                required.add(table)
+
+    for dim in (query_spec.get("dimensions") or []):
+        if isinstance(dim, dict):
+            source = str(dim.get("source_table") or "").strip()
+            if "." in source:
+                required.add(source)
+    for source_constraint in (query_spec.get("source_constraints") or []):
+        if not isinstance(source_constraint, dict) or not source_constraint.get("required"):
+            continue
+        schema = str(source_constraint.get("schema") or source_constraint.get("schema_name") or "").strip()
+        table = str(source_constraint.get("table") or "").strip()
+        if table and "." in table:
+            required.add(table)
+        elif schema and table:
+            required.add(f"{schema}.{table}")
+
+    return required
+
+
+def _missing_blueprint_outputs(sql: str, blueprint: dict[str, Any]) -> list[str]:
+    """Cheap semantic guard: SQL text should mention planned metrics/dimensions."""
+    sql_l = str(sql or "").lower()
+    missing: list[str] = []
+    aggregations = blueprint.get("aggregations") or []
+    if not aggregations and blueprint.get("aggregation"):
+        aggregations = [blueprint.get("aggregation")]
+    for agg in aggregations:
+        if not isinstance(agg, dict):
+            continue
+        col = str(agg.get("column") or "").strip()
+        alias = str(agg.get("alias") or "").strip()
+        if col == "*":
+            continue
+        names = [name for name in (col, alias) if name]
+        if names and not any(re.search(rf"\b{re.escape(name.lower())}\b", sql_l) for name in names):
+            missing.append(f"metric:{col}")
+    for dim in blueprint.get("required_output") or []:
+        name = str(dim or "").strip()
+        if name and not re.search(rf"\b{re.escape(name.lower())}\b", sql_l):
+            missing.append(f"dimension:{name}")
+    return missing
+
+
+def _table_pair_key(entry: dict[str, Any]) -> frozenset[str]:
+    tables = []
+    for side in ("left", "right"):
+        table = _table_from_colref(entry.get(side))
+        if table:
+            tables.append(table)
+    return frozenset(tables)
+
+
+def _sql_on_sections(sql: str) -> str:
+    text = re.sub(r"\s+", " ", str(sql or "").lower())
+    sections = re.findall(
+        r"\bon\b\s+(.*?)(?=\b(?:join|where|group\s+by|having|order\s+by|limit|union)\b|$)",
+        text,
+        flags=re.I,
+    )
+    return " ".join(sections)
+
+
+def _has_join_condition(on_text: str, left_col: str, right_col: str) -> bool:
+    left = re.escape(left_col.lower())
+    right = re.escape(right_col.lower())
+    ident = r'(?:[a-z_][a-z0-9_]*\.)?'
+    direct = rf"\b{ident}{left}\b\s*=\s*\b{ident}{right}\b"
+    reverse = rf"\b{ident}{right}\b\s*=\s*\b{ident}{left}\b"
+    return bool(re.search(direct, on_text) or re.search(reverse, on_text))
+
+
+def _composite_join_issues(sql: str, join_spec: list[dict[str, Any]]) -> list[str]:
+    """Return missing ON conditions for composite joins from join_spec."""
+    if not sql or not join_spec:
+        return []
+
+    grouped: dict[frozenset[str], list[dict[str, Any]]] = {}
+    for entry in join_spec:
+        if not isinstance(entry, dict):
+            continue
+        key = _table_pair_key(entry)
+        if len(key) == 2:
+            grouped.setdefault(key, []).append(entry)
+
+    on_text = _sql_on_sections(sql)
+    issues: list[str] = []
+    for tables, entries in grouped.items():
+        if len(entries) < 2:
+            continue
+        missing: list[str] = []
+        for entry in entries:
+            left_col = str(entry.get("left") or "").rsplit(".", 1)[-1].strip()
+            right_col = str(entry.get("right") or "").rsplit(".", 1)[-1].strip()
+            if not left_col or not right_col:
+                continue
+            if not _has_join_condition(on_text, left_col, right_col):
+                missing.append(f"{left_col} = {right_col}")
+        if missing:
+            table_list = " ↔ ".join(sorted(tables))
+            issues.append(
+                f"Неполный составной JOIN для {table_list}: отсутствует "
+                + ", ".join(missing)
+            )
+    return issues
+
+
 # === Примеры SQL, отфильтрованные по типу стратегии ===
 
 _STRATEGY_EXAMPLES: dict[str, str] = {
@@ -526,7 +669,9 @@ class SqlPipelineNodes:
 
         logger.info("SqlPlanner (deterministic): строю blueprint")
 
-        # --- Проверка согласованности: join_analysis_data vs selected_columns ---
+        # --- Диагностика согласованности: join_analysis_data vs selected_columns ---
+        # join_analysis_data is exploratory context. Its tables are not mandatory
+        # by themselves; mandatory sources are derived after blueprint construction.
         missing_from_columns: list[str] = []
         if join_analysis_data and selected_columns:
             for _pair_key, data in join_analysis_data.items():
@@ -537,7 +682,7 @@ class SqlPipelineNodes:
         missing_from_columns = list(dict.fromkeys(missing_from_columns))
 
         if missing_from_columns:
-            logger.warning(
+            logger.info(
                 "SqlPlanner: таблицы из join_analysis_data отсутствуют в selected_columns: %s",
                 missing_from_columns,
             )
@@ -558,10 +703,26 @@ class SqlPipelineNodes:
             count_identifier_resolver=self._resolve_count_identifier_llm,
             filter_tiebreaker=self._tiebreak_filter_candidates_llm,
             filter_specs=list((state.get("query_spec") or {}).get("filters") or []),
+            time_range=(state.get("query_spec") or {}).get("time_range") or {},
         )
         _apply_query_spec_blueprint_overrides(blueprint, state.get("query_spec") or {})
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
+
+        required_tables = _collect_required_tables(
+            join_spec=join_spec,
+            blueprint=blueprint,
+            query_spec=state.get("query_spec") or {},
+        )
+        required_missing_from_columns = [
+            tbl for tbl in missing_from_columns
+            if tbl in required_tables
+        ]
+        if required_missing_from_columns:
+            logger.warning(
+                "SqlPlanner: обязательные таблицы отсутствуют в selected_columns: %s",
+                required_missing_from_columns,
+            )
 
         where_resolution = blueprint.get("where_resolution", {}) or {}
         filter_confidence = evaluate_filter_confidence(
@@ -671,10 +832,31 @@ class SqlPipelineNodes:
 
         # Если dim-таблица пропущена — формируем подсказку для повторного column_selector
         new_hint = ""
-        if missing_from_columns and not state.get("column_selector_hint", ""):
-            miss_str = ", ".join(missing_from_columns)
+        if required_missing_from_columns and not state.get("column_selector_hint", ""):
+            attempts = int(state.get("column_selector_retry_count", 0) or 0)
+            if attempts >= 2:
+                miss_str = ", ".join(required_missing_from_columns)
+                msg = (
+                    "Не удалось подобрать обязательные таблицы/колонки для SQL "
+                    f"после повторной коррекции: {miss_str}. "
+                    "Нужно уточнить источник или запрошенные поля."
+                )
+                logger.error("SqlPlanner: %s", msg)
+                return {
+                    "needs_clarification": True,
+                    "clarification_message": msg,
+                    "sql_blueprint": blueprint,
+                    "where_resolution": where_resolution,
+                    "planning_confidence": planning_confidence,
+                    "evidence_trace": evidence_trace,
+                    "graph_iterations": iterations,
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": msg}
+                    ],
+                }
+            miss_str = ", ".join(required_missing_from_columns)
             name_col_examples: list[str] = []
-            for tbl in missing_from_columns:
+            for tbl in required_missing_from_columns:
                 parts = tbl.split(".", 1)
                 if len(parts) == 2:
                     try:
@@ -706,9 +888,14 @@ class SqlPipelineNodes:
                 )
             new_hint = " ".join(hint_lines)
             logger.warning(
-                "SqlPlanner: dim-таблица пропущена (%s) — отправляю обратно в column_selector",
+                "SqlPlanner: обязательная таблица пропущена (%s) — отправляю обратно в column_selector (attempt=%d)",
                 miss_str,
+                attempts + 1,
             )
+            evidence_trace["column_selector_retry"] = {
+                "attempt": attempts + 1,
+                "missing_required_tables": required_missing_from_columns,
+            }
 
         return {
             "sql_blueprint": blueprint,
@@ -716,6 +903,10 @@ class SqlPipelineNodes:
             "planning_confidence": planning_confidence,
             "evidence_trace": evidence_trace,
             "column_selector_hint": new_hint,
+            "column_selector_retry_count": (
+                int(state.get("column_selector_retry_count", 0) or 0) + 1
+                if new_hint else 0
+            ),
             "graph_iterations": iterations,
             "messages": state["messages"] + [
                 {"role": "assistant",
@@ -776,6 +967,7 @@ class SqlPipelineNodes:
         )
         if template_sql:
             template_sql = _format_sql(template_sql)
+            composite_issues = _composite_join_issues(template_sql, join_spec_check)
             # Проверяем статическим чекером до принятия (включая белый список таблиц)
             check_result = check_sql(
                 template_sql,
@@ -784,10 +976,10 @@ class SqlPipelineNodes:
             )
             fallback_policy = build_fallback_policy(
                 planning_confidence=planning_confidence,
-                deterministic_sql_valid=check_result.is_valid,
+                deterministic_sql_valid=check_result.is_valid and not composite_issues,
                 has_template_sql=True,
             )
-            if check_result.is_valid:
+            if check_result.is_valid and not composite_issues:
                 logger.info("SqlWriter: SQL сгенерирован детерминированно, минуем LLM")
                 step_idx = state["current_step"]
                 evidence_trace["sql_generation"] = {
@@ -815,7 +1007,8 @@ class SqlPipelineNodes:
                 }
             else:
                 logger.info(
-                    "SqlWriter: шаблонный SQL не прошёл статический чекер (%s) — передаём LLM",
+                    "SqlWriter: шаблонный SQL не прошёл guard/static checker (%s%s) — передаём LLM",
+                    "; ".join(composite_issues) + "; " if composite_issues else "",
                     check_result.summary()[:200],
                 )
                 if not fallback_policy.get("allow_llm_fallback"):
@@ -1009,6 +1202,30 @@ class SqlPipelineNodes:
         tool_name = tool_call.get("tool", "execute_query")
 
         if sql and tool_name in self.SQL_TOOL_NAMES:
+            composite_issues = _composite_join_issues(sql, join_spec_check)
+            if composite_issues:
+                error_msg = (
+                    "SqlWriter: LLM сгенерировал SQL с неполным составным JOIN: "
+                    + "; ".join(composite_issues)
+                )
+                evidence_trace["sql_generation"] = {
+                    "mode": "llm_fallback_rejected",
+                    "strategy": strategy,
+                    "fallback_policy": fallback_policy,
+                    "composite_join_issues": composite_issues,
+                }
+                logger.error(error_msg)
+                return {
+                    "last_error": error_msg,
+                    "sql_to_validate": None,
+                    "pending_sql_tool_call": None,
+                    "graph_iterations": iterations,
+                    "fallback_policy": fallback_policy,
+                    "evidence_trace": evidence_trace,
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": error_msg}
+                    ],
+                }
             logger.info("SqlWriter: SQL готов, отправляю на валидацию")
             step_idx = state["current_step"]
             evidence_trace["sql_generation"] = {
@@ -1107,8 +1324,79 @@ class SqlPipelineNodes:
         iterations = state.get("graph_iterations", 0) + 1
         evidence_trace = dict(state.get("evidence_trace") or {})
         allowed_tables: list[str] = state.get("allowed_tables") or []
+        blueprint = state.get("sql_blueprint") or {}
 
         logger.info("SqlSelfCorrector: review SQL against user request")
+
+        missing_outputs = _missing_blueprint_outputs(sql, blueprint)
+        query_spec = state.get("query_spec") or {}
+        composite_issues = _composite_join_issues(sql, state.get("join_spec") or [])
+        if composite_issues:
+            error_msg = (
+                "SQL self-correction отклонил запрос: SQL не содержит полный "
+                "составной JOIN из join_spec: "
+                + "; ".join(composite_issues)
+            )
+            correction = {
+                "verdict": "reject",
+                "issues": composite_issues,
+                "mode": "deterministic_composite_join_guard",
+            }
+            evidence_trace["sql_self_correction"] = correction
+            return {
+                "last_error": error_msg,
+                "sql_to_validate": None,
+                "pending_sql_tool_call": None,
+                "sql_self_correction": correction,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": error_msg}
+                ],
+            }
+        if (
+            isinstance(query_spec, dict)
+            and query_spec.get("task") == "answer_data"
+            and missing_outputs
+        ):
+            error_msg = (
+                "SQL self-correction отклонил запрос: SQL не содержит "
+                "запрошенные показатели/измерения из blueprint: "
+                + ", ".join(missing_outputs)
+            )
+            correction = {
+                "verdict": "reject",
+                "issues": missing_outputs,
+                "mode": "deterministic_blueprint_guard",
+            }
+            evidence_trace["sql_self_correction"] = correction
+            return {
+                "last_error": error_msg,
+                "sql_to_validate": None,
+                "pending_sql_tool_call": None,
+                "sql_self_correction": correction,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": error_msg}
+                ],
+            }
+
+        if (evidence_trace.get("sql_generation") or {}).get("mode") == "deterministic":
+            correction = {
+                "verdict": "pass",
+                "mode": "deterministic_passthrough",
+                "issues": [],
+            }
+            evidence_trace["sql_self_correction"] = correction
+            logger.info("SqlSelfCorrector: deterministic SQL accepted without LLM review")
+            return {
+                "sql_to_validate": sql,
+                "pending_sql_tool_call": pending_call,
+                "sql_self_correction": correction,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+            }
 
         system_prompt = (
             "Ты — ревьюер SQL аналитического агента для Greenplum.\n"
@@ -1119,6 +1407,10 @@ class SqlPipelineNodes:
             "они также есть в GROUP BY.\n"
             "- Метрика, фильтры, даты, гранулярность и сортировка соответствуют "
             "вопросу и структурированному плану.\n"
+            "- Для task='answer_data' SQL обязан вычислять все metrics/dimensions "
+            "из QuerySpec. Если вопрос просит конкретный расчёт, SQL должен "
+            "вернуть исполнимый результат для ответа, а не только служебную "
+            "выборку или неполный показатель.\n"
             "- Используются только разрешённые таблицы и реальные выбранные колонки.\n"
             "- JOIN не меняет смысл результата и не выглядит как размножение строк.\n"
             "- SQL в целом корректен для PostgreSQL/Greenplum.\n\n"
@@ -1131,7 +1423,8 @@ class SqlPipelineNodes:
             "Правила verdict:\n"
             "- pass: SQL можно выполнять как есть.\n"
             "- fix: можешь исправить SQL без новых сведений от пользователя.\n"
-            "- reject: SQL неверен, но для исправления нужен новый проход коррекции.\n"
+            "- reject: SQL неверен, пропускает запрошенные metrics/dimensions или "
+            "для исправления нужен новый проход коррекции.\n"
             "- clarify: без уточнения пользователя невозможно выбрать правильный смысл."
         )
 
@@ -1142,7 +1435,7 @@ class SqlPipelineNodes:
         for label, value in (
             ("QuerySpec", state.get("query_spec") or {}),
             ("Физическое связывание", state.get("query_grounding") or {}),
-            ("SQL blueprint", state.get("sql_blueprint") or {}),
+            ("SQL blueprint", blueprint),
             ("Выбранные колонки", state.get("selected_columns") or {}),
             ("JOIN ключи", state.get("join_spec") or []),
         ):
@@ -1233,6 +1526,32 @@ class SqlPipelineNodes:
                 verdict = "reject"
             else:
                 corrected_sql = _format_sql(corrected_sql)
+                corrected_composite_issues = _composite_join_issues(
+                    corrected_sql,
+                    state.get("join_spec") or [],
+                )
+                if corrected_composite_issues:
+                    error_msg = (
+                        "SQL self-correction вернул исправление с неполным "
+                        "составным JOIN: "
+                        + "; ".join(corrected_composite_issues)
+                    )
+                    return {
+                        "last_error": error_msg,
+                        "sql_to_validate": None,
+                        "pending_sql_tool_call": None,
+                        "sql_self_correction": {
+                            **correction,
+                            "verdict": "reject",
+                            "invalid_correction": True,
+                            "composite_join_issues": corrected_composite_issues,
+                        },
+                        "evidence_trace": evidence_trace,
+                        "graph_iterations": iterations,
+                        "messages": state["messages"] + [
+                            {"role": "assistant", "content": error_msg}
+                        ],
+                    }
                 check_result = check_sql(
                     corrected_sql,
                     schema_loader=self.schema,

@@ -426,6 +426,16 @@ def rank_filter_candidates(
                         score -= 20.0
 
                 else:
+                    exact_value_binding = (
+                        bool(request_column_key)
+                        and key == request_column_key
+                        and str(request.get("match_source") or "") == "value_candidate"
+                    )
+                    if exact_value_binding:
+                        score += 72.0
+                        if candidate_value is None:
+                            candidate_value = query_text
+                        evidence.append("semantic_frame_value_candidate")
                     if semantic_class in {"enum_like", "label", "free_text"}:
                         score += 20.0
                         if kind == "phrase_filter":

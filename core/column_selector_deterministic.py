@@ -1556,45 +1556,44 @@ def _build_join_spec(
         pair_entries.extend(extra)
         _apply_composite_safety(pair_entries, schema_loader, table_types)
 
-    if hint_join_fields:
-        tables = list(selected_columns.keys())
-        for i, t1 in enumerate(tables):
-            for t2 in tables[i + 1:]:
-                pair = frozenset([t1, t2])
-                if pair in processed:
-                    continue
-                cand = _pick_join_candidate(
-                    "", t1, t2, schema_loader,
-                    user_input=user_input,
-                    hint_join_fields=hint_join_fields,
-                )
-                if not cand:
-                    continue
-                processed.add(pair)
-                col1, col2 = cand['col1'], cand['col2']
-                safe = _check_safe(t2, col2, schema_loader)
-                t1_type = table_types.get(t1, 'unknown')
-                t2_type = table_types.get(t2, 'unknown')
-                entry: dict[str, Any] = {
-                    'left': f'{t1}.{col1}',
-                    'right': f'{t2}.{col2}',
-                    'safe': safe,
-                    'strategy': _infer_strategy(t1_type, t2_type, safe),
-                }
-                if not safe:
-                    entry['risk'] = f'{col2} не уникален в {t2}'
-                pair_entries = [entry]
-                join_spec.append(entry)
-                extra = _complete_composite_join(entry, t1, t2, table_types, schema_loader)
-                join_spec.extend(extra)
-                pair_entries.extend(extra)
-                _apply_composite_safety(pair_entries, schema_loader, table_types)
-                logger.info(
-                    "ColumnSelectorDet: JOIN по user_hints без join_analysis → %s.%s = %s.%s",
-                    t1, col1, t2, col2,
-                )
+    tables = list(selected_columns.keys())
+    for i, t1 in enumerate(tables):
+        for t2 in tables[i + 1:]:
+            pair = frozenset([t1, t2])
+            if pair in processed:
+                continue
+            cand = _pick_join_candidate(
+                "", t1, t2, schema_loader,
+                user_input=user_input,
+                hint_join_fields=hint_join_fields,
+            )
+            if not cand:
+                continue
+            processed.add(pair)
+            col1, col2 = cand['col1'], cand['col2']
+            safe = _check_safe(t2, col2, schema_loader)
+            t1_type = table_types.get(t1, 'unknown')
+            t2_type = table_types.get(t2, 'unknown')
+            entry: dict[str, Any] = {
+                'left': f'{t1}.{col1}',
+                'right': f'{t2}.{col2}',
+                'safe': safe,
+                'strategy': _infer_strategy(t1_type, t2_type, safe),
+            }
+            if not safe:
+                entry['risk'] = f'{col2} не уникален в {t2}'
+            pair_entries = [entry]
+            join_spec.append(entry)
+            extra = _complete_composite_join(entry, t1, t2, table_types, schema_loader)
+            join_spec.extend(extra)
+            pair_entries.extend(extra)
+            _apply_composite_safety(pair_entries, schema_loader, table_types)
+            logger.info(
+                "ColumnSelectorDet: JOIN по metadata fallback → %s.%s = %s.%s",
+                t1, col1, t2, col2,
+            )
 
-    return join_spec
+    return normalize_join_spec(join_spec, schema_loader, table_types)
 
 
 def _apply_composite_safety(
@@ -1636,6 +1635,99 @@ def _apply_composite_safety(
             return
 
 
+def normalize_join_spec(
+    join_spec: list[dict[str, Any]],
+    schema_loader: Any,
+    table_types: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Complete composite join keys and validate safety on the full key set.
+
+    This is the shared post-processing step for deterministic joins, LLM joins,
+    and explicit user overrides. A single key that points to a dim/ref composite
+    PK is not allowed to stay "safe" just because the LLM marked it so; safety is
+    recalculated for the full table-pair key set.
+    """
+    if not join_spec:
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(entry: dict[str, Any]) -> None:
+        left = str(entry.get("left") or "").strip()
+        right = str(entry.get("right") or "").strip()
+        if not left or not right:
+            return
+        left_table = ".".join(left.split(".")[:2])
+        right_table = ".".join(right.split(".")[:2])
+        if (
+            table_types.get(left_table, "unknown") != "fact"
+            and table_types.get(right_table, "unknown") == "fact"
+        ):
+            left, right = right, left
+            left_table, right_table = right_table, left_table
+        key = tuple(sorted((left.lower(), right.lower())))
+        if key in seen:
+            return
+        seen.add(key)
+        clean = dict(entry)
+        clean["left"] = left
+        clean["right"] = right
+        clean["safe"] = bool(clean.get("safe", False))
+        clean["strategy"] = str(clean.get("strategy") or "direct")
+        normalized.append(clean)
+
+    for entry in join_spec:
+        if not isinstance(entry, dict):
+            continue
+        _add(entry)
+        left_table = ".".join(str(entry.get("left") or "").split(".")[:2])
+        right_table = ".".join(str(entry.get("right") or "").split(".")[:2])
+        if not left_table or not right_table:
+            continue
+        for extra in _complete_composite_join(
+            entry,
+            left_table,
+            right_table,
+            table_types,
+            schema_loader,
+        ):
+            _add(extra)
+
+    groups: dict[frozenset[str], list[dict[str, Any]]] = {}
+    for entry in normalized:
+        left_table = ".".join(entry["left"].split(".")[:2])
+        right_table = ".".join(entry["right"].split(".")[:2])
+        if left_table and right_table:
+            groups.setdefault(frozenset((left_table, right_table)), []).append(entry)
+
+    for entries in groups.values():
+        if len(entries) > 1:
+            _apply_composite_safety(entries, schema_loader, table_types)
+        else:
+            entry = entries[0]
+            right_parts = entry["right"].rsplit(".", 2)
+            if len(right_parts) != 3:
+                continue
+            r_schema, r_table, r_col = right_parts
+            try:
+                uniq = schema_loader.check_key_uniqueness(r_schema, r_table, [r_col])
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("normalize_join_spec: uniqueness check failed for %s: %s", entry["right"], exc)
+                continue
+            if uniq.get("is_unique") is True:
+                entry["safe"] = True
+                entry.pop("risk", None)
+            elif uniq.get("is_unique") is False:
+                entry["safe"] = False
+                entry["risk"] = (
+                    f"{r_col} не уникален в {r_schema}.{r_table} "
+                    f"(~{uniq.get('duplicate_pct', '?')}% дублей)"
+                )
+
+    return normalized
+
+
 def _pick_join_candidate(
     text: str,
     t1: str,
@@ -1657,7 +1749,7 @@ def _pick_join_candidate(
     hint_join_fields = hint_join_fields or []
     t1_parts = t1.split('.', 1)
     t2_parts = t2.split('.', 1)
-    if (query or hint_join_fields) and len(t1_parts) == 2 and len(t2_parts) == 2:
+    if len(t1_parts) == 2 and len(t2_parts) == 2:
         cols1 = schema_loader.get_table_columns(t1_parts[0], t1_parts[1])
         cols2 = schema_loader.get_table_columns(t2_parts[0], t2_parts[1])
         if cols1.empty or cols2.empty:
@@ -1736,6 +1828,37 @@ def _pick_join_candidate(
                 and (_is_key_like(rows1[left_name]) or _is_key_like(rows2[right_name]))
             ):
                 return {'col1': left_name, 'col2': right_name}
+
+        parsed = _parse_top_candidate(text, t1, t2)
+        if parsed:
+            return parsed
+
+        # Metadata fallback for selected table pairs when join_analysis is not
+        # present: pick the strongest common key-like column. This keeps the
+        # selector useful for catalog-enriched dimension sources without relying
+        # on table-specific names.
+        best_common: tuple[float, str, str] | None = None
+        for left_name in names1:
+            right_name = names2_lower.get(left_name.lower())
+            if not right_name:
+                continue
+            left_row = rows1[left_name]
+            right_row = rows2[right_name]
+            if not (_is_key_like(left_row) or _is_key_like(right_row)):
+                continue
+            left_nn = float(left_row.get('not_null_perc', 0) or 0)
+            right_nn = float(right_row.get('not_null_perc', 0) or 0)
+            left_unique = float(left_row.get('unique_perc', 0) or 0)
+            right_unique = float(right_row.get('unique_perc', 0) or 0)
+            lower = left_name.lower()
+            score = left_nn + right_nn + min(left_unique, 100) * 0.5 + min(right_unique, 100) * 0.5
+            if lower.endswith(('_id', '_code')) or lower in {'inn', 'kpp', 'ogrn'}:
+                score += 20.0
+            candidate = (score, left_name, right_name)
+            if best_common is None or candidate > best_common:
+                best_common = candidate
+        if best_common:
+            return {'col1': best_common[1], 'col2': best_common[2]}
 
     return _parse_top_candidate(text, t1, t2)
 

@@ -33,6 +33,16 @@ def sanitize_user_input_for_semantics(user_input: str) -> str:
     """Убрать служебные CLI-аннотации, не относящиеся к бизнес-смыслу запроса."""
     text = str(user_input or "")
     text = _SERVICE_SUFFIX_RE.sub("", text)
+    # Clarification question text is UI/service context. Keeping it in semantic
+    # extraction makes phrases like "к февралю 26" look like real filters or
+    # dimensions. The user's answer is kept because it can carry useful values
+    # such as a year.
+    lines = []
+    for line in text.splitlines():
+        if re.match(r"^\s*Вопрос\s+уточнения\s*:", line, flags=re.IGNORECASE):
+            continue
+        lines.append(line)
+    text = "\n".join(lines)
     return re.sub(r"\s+", " ", text).strip()
 
 

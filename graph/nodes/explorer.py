@@ -14,7 +14,7 @@ from typing import Any
 from core.join_analysis import detect_table_type, format_join_analysis
 from core.column_selector_deterministic import (
     select_columns as _det_select_columns,
-    _complete_composite_join,
+    normalize_join_spec,
 )
 from graph.state import AgentState
 
@@ -484,6 +484,11 @@ class ExplorerNodes:
                 intent,
                 user_hints=state.get("user_hints"),
             )
+            _det_join_spec = normalize_join_spec(
+                _det_join_spec,
+                self.schema,
+                state.get("table_types", {}) or {},
+            )
             self.memory.add_message(
                 "assistant",
                 f"[column_selector/det] confidence={_det_conf:.2f}; "
@@ -506,10 +511,18 @@ class ExplorerNodes:
                 "graph_iterations": state.get("graph_iterations", 0) + 1,
             }
 
+        _fallback_reasons: list[str] = []
+        if _det_conf < _DET_CONFIDENCE_THRESHOLD:
+            _fallback_reasons.append(
+                f"confidence {_det_conf:.2f} < {_DET_CONFIDENCE_THRESHOLD:.2f}"
+            )
+        if state.get("column_selector_hint", ""):
+            _fallback_reasons.append("corrective_hint")
+        if _has_explicit_group:
+            _fallback_reasons.append("explicit_group_by_hints")
         logger.info(
-            "ColumnSelector: confidence=%.2f < %.2f → запускаем LLM",
-            _det_conf,
-            _DET_CONFIDENCE_THRESHOLD,
+            "ColumnSelector: запускаем LLM (%s)",
+            ", ".join(_fallback_reasons) or "fallback_reason=unknown",
         )
 
         # --- Системный промпт ---
@@ -732,41 +745,6 @@ class ExplorerNodes:
                     "strategy": str(jk.get("strategy", "direct")),
                 }
 
-                # Post-validation: проверяем уникальность правой стороны по схеме.
-                # Если колонка не уникальна — корректируем safe=False и добавляем risk.
-                # Это информационная коррекция, не блокирующая — sql_writer учтёт её.
-                right_parts = entry["right"].rsplit(".", 2)
-                if len(right_parts) == 3:
-                    r_schema, r_table, r_col = right_parts
-                    try:
-                        uniq = self.schema.check_key_uniqueness(r_schema, r_table, [r_col])
-                        if uniq.get("is_unique") is False:
-                            if entry["safe"]:
-                                entry["safe"] = False
-                                entry["risk"] = (
-                                    f"{r_col} не уникален в {r_schema}.{r_table} "
-                                    f"(~{uniq.get('duplicate_pct', '?')}% дублей)"
-                                )
-                                logger.warning(
-                                    "ColumnSelector post-validation: %s.%s.%s "
-                                    "помечен safe=True, но не уникален — исправляем на safe=False",
-                                    r_schema, r_table, r_col,
-                                )
-                        elif uniq.get("is_unique") is True:
-                            # Подтверждаем safe=True данными схемы
-                            if not entry["safe"]:
-                                entry["safe"] = True
-                                logger.info(
-                                    "ColumnSelector post-validation: %s.%s.%s "
-                                    "уникален по схеме — исправляем на safe=True",
-                                    r_schema, r_table, r_col,
-                                )
-                    except Exception as e:
-                        logger.debug(
-                            "ColumnSelector post-validation: ошибка проверки %s — %s",
-                            entry["right"], e,
-                        )
-
                 join_spec.append(entry)
 
         # --- Блок B: explicit_join override (LLM путь) ---
@@ -775,34 +753,17 @@ class ExplorerNodes:
             user_hints=state.get("user_hints"),
         )
 
-        # Hardening: дополнить LLM join_spec составными парами PK, которые LLM мог пропустить.
-        # Если dim-таблица имеет составной PK, но LLM вернул только одну пару — добавляем остальные.
-        _table_types_for_composite = state.get("table_types", {})
-        if join_spec and _table_types_for_composite:
-            _extra: list[dict[str, Any]] = []
-            for _entry in list(join_spec):
-                try:
-                    _extra_pairs = _complete_composite_join(
-                        _entry,
-                        ".".join(_entry["left"].split(".")[:2]),
-                        ".".join(_entry["right"].split(".")[:2]),
-                        _table_types_for_composite,
-                        self.schema,
-                    )
-                    for _ep in _extra_pairs:
-                        # Не добавляем дубли (проверяем по left+right)
-                        if not any(
-                            x["left"] == _ep["left"] and x["right"] == _ep["right"]
-                            for x in join_spec + _extra
-                        ):
-                            _extra.append(_ep)
-                except Exception as _ce:
-                    logger.debug("ColumnSelector composite hardening: %s", _ce)
-            if _extra:
-                join_spec.extend(_extra)
-                logger.info(
-                    "ColumnSelector: дополнено %d составных join-пар после LLM", len(_extra)
-                )
+        before_normalize = len(join_spec)
+        join_spec = normalize_join_spec(
+            join_spec,
+            self.schema,
+            state.get("table_types", {}) or {},
+        )
+        if len(join_spec) > before_normalize:
+            logger.info(
+                "ColumnSelector: дополнено %d составных join-пар после LLM/override",
+                len(join_spec) - before_normalize,
+            )
 
         logger.info(
             "ColumnSelector: выбрано колонок для %d таблиц, %d join-ключей",

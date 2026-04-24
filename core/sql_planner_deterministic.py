@@ -693,6 +693,22 @@ def _compute_where_from_intent(
 
             if not hint or not value:
                 continue
+            if (
+                (date_from or date_to)
+                and operator.strip().upper() in {"=", "=="}
+                and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+                and (
+                    any(token in hint for token in ("date", "dt", "dttm", "timestamp"))
+                    or hint.endswith(("_ts",))
+                )
+            ):
+                logger.debug(
+                    "DeterministicPlanner: literal date filter %s=%s пропущен, "
+                    "так как уже есть календарный диапазон",
+                    hint,
+                    value,
+                )
+                continue
 
             # Проверяем оператор на допустимость
             if not _OPERATOR_RE.match(operator):
@@ -847,6 +863,7 @@ def build_blueprint(
     count_identifier_resolver=None,
     filter_tiebreaker=None,
     filter_specs: list[dict] | None = None,
+    time_range: dict | None = None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -868,7 +885,12 @@ def build_blueprint(
     Returns:
         dict совместимый с форматом sql_blueprint из AgentState.
     """
-    strategy, main_table = _determine_strategy(table_types, join_spec)
+    effective_table_types = {
+        table: table_types.get(table, "unknown")
+        for table in selected_columns
+    }
+    table_types = effective_table_types
+    strategy, main_table = _determine_strategy(effective_table_types, join_spec)
     aggregations = _compute_aggregations(
         intent,
         selected_columns,
@@ -1025,6 +1047,7 @@ def build_blueprint(
         rejected_filter_choices=rejected_filter_choices,
         filter_tiebreaker=filter_tiebreaker,
         filter_specs=filter_specs,
+        time_range=time_range,
     )
     where_conditions = where_resolution.get("conditions", base_where_conditions)
 
@@ -1145,7 +1168,7 @@ def build_blueprint(
         "axis_column": axis_column,
         "required_output": required_output,
         "where_resolution": where_resolution,
-        "notes": f"[deterministic] strategy={strategy}, tables={list(table_types.keys())}",
+        "notes": f"[deterministic] strategy={strategy}, tables={list(effective_table_types.keys())}",
     }
 
     logger.info(

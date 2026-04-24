@@ -235,6 +235,7 @@ def resolve_where(
     rejected_filter_choices: dict[str, list[str]] | None = None,
     filter_tiebreaker=None,
     filter_specs: list[FilterSpec | dict[str, Any]] | None = None,
+    time_range: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Достроить WHERE доменными правилами и value profiles.
 
@@ -259,16 +260,36 @@ def resolve_where(
         conditions,
         selected_columns,
         direct_filter_specs,
+        schema_loader=schema_loader,
+        time_range=time_range,
     )
     applied_rules.extend(direct_applied)
+    semantic_filter_specs = _filter_specs_for_semantic_frame(
+        selected_columns,
+        direct_filter_specs,
+        schema_loader=schema_loader,
+        time_range=time_range,
+    )
     effective_semantic_frame = _semantic_frame_with_filter_specs(
         semantic_frame,
-        direct_filter_specs,
+        semantic_filter_specs,
+    )
+    effective_semantic_frame = _semantic_frame_without_redundant_calendar_filters(
+        effective_semantic_frame,
+        selected_columns,
+        schema_loader=schema_loader,
+        time_range=time_range,
+    )
+    effective_intent = _intent_without_redundant_calendar_filters(
+        intent,
+        selected_columns,
+        schema_loader=schema_loader,
+        time_range=time_range,
     )
 
     ranked_candidates = rank_filter_candidates(
         user_input=user_input,
-        intent=intent,
+        intent=effective_intent,
         selected_tables=selected_tables,
         schema_loader=schema_loader,
         semantic_frame=effective_semantic_frame,
@@ -483,6 +504,118 @@ def _normalize_filter_specs(raw: list[FilterSpec | dict[str, Any]] | None) -> li
     return specs
 
 
+def _filter_specs_for_semantic_frame(
+    selected_columns: dict[str, dict[str, Any]],
+    filter_specs: list[FilterSpec],
+    *,
+    schema_loader=None,
+    time_range: dict[str, Any] | None = None,
+) -> list[FilterSpec]:
+    specs: list[FilterSpec] = []
+    for spec in filter_specs:
+        column_match = _find_selected_column(selected_columns, spec.target)
+        if column_match and _should_skip_exact_calendar_date_filter(
+            column=column_match[0],
+            table_key=column_match[1],
+            spec=spec,
+            schema_loader=schema_loader,
+            time_range=time_range,
+        ):
+            continue
+        specs.append(spec)
+    return specs
+
+
+def _semantic_frame_without_redundant_calendar_filters(
+    semantic_frame: dict[str, Any] | None,
+    selected_columns: dict[str, dict[str, Any]],
+    *,
+    schema_loader=None,
+    time_range: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not semantic_frame or not time_range:
+        return semantic_frame
+    frame = dict(semantic_frame)
+    filtered = []
+    changed = False
+    for item in list(frame.get("filter_intents") or []):
+        if not isinstance(item, dict):
+            filtered.append(item)
+            continue
+        spec = FilterSpec(
+            target=str(item.get("column_hint") or item.get("target") or ""),
+            operator=str(item.get("operator") or "="),
+            value=item.get("value"),
+        )
+        column_match = _find_selected_column(selected_columns, spec.target)
+        if column_match and _should_skip_exact_calendar_date_filter(
+            column=column_match[0],
+            table_key=column_match[1],
+            spec=spec,
+            schema_loader=schema_loader,
+            time_range=time_range,
+        ):
+            changed = True
+            continue
+        filtered.append(item)
+    if not changed:
+        return semantic_frame
+    frame["filter_intents"] = filtered
+    return frame
+
+
+def _intent_without_redundant_calendar_filters(
+    intent: dict[str, Any],
+    selected_columns: dict[str, dict[str, Any]],
+    *,
+    schema_loader=None,
+    time_range: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not time_range:
+        return intent
+    cleaned = []
+    changed = False
+    for item in (intent or {}).get("filter_conditions", []) or []:
+        if not isinstance(item, dict):
+            cleaned.append(item)
+            continue
+        spec = FilterSpec(
+            target=str(item.get("column_hint") or ""),
+            operator=str(item.get("operator") or "="),
+            value=item.get("value"),
+        )
+        column_match = _find_selected_column(selected_columns, spec.target)
+        if column_match and _should_skip_exact_calendar_date_filter(
+            column=column_match[0],
+            table_key=column_match[1],
+            spec=spec,
+            schema_loader=schema_loader,
+            time_range=time_range,
+        ):
+            changed = True
+            continue
+        cleaned.append(item)
+    if not changed:
+        return intent
+    return {**(intent or {}), "filter_conditions": cleaned}
+
+
+def _find_selected_column(
+    selected_columns: dict[str, dict[str, Any]],
+    target: str | None,
+) -> tuple[str, str] | None:
+    target_norm = str(target or "").strip().lower()
+    if not target_norm:
+        return None
+    for table_key, roles in selected_columns.items():
+        for role in ("filter", "select", "group_by", "aggregate"):
+            for col in roles.get(role, []) or []:
+                col_str = str(col or "").strip()
+                if col_str and col_str.lower() == target_norm:
+                    return col_str, str(table_key)
+    return None
+
+
 def _semantic_frame_with_filter_specs(
     semantic_frame: dict[str, Any] | None,
     filter_specs: list[FilterSpec],
@@ -490,7 +623,8 @@ def _semantic_frame_with_filter_specs(
     if not filter_specs:
         return semantic_frame
     frame = dict(semantic_frame or {})
-    frame["filter_intents"] = [
+    existing = list(frame.get("filter_intents") or [])
+    additions = [
         {
             "request_id": f"query_spec:{idx}",
             "kind": "query_spec_filter",
@@ -503,6 +637,10 @@ def _semantic_frame_with_filter_specs(
         }
         for idx, spec in enumerate(filter_specs)
     ]
+    seen = {str(item.get("request_id") or "") for item in existing}
+    frame["filter_intents"] = existing + [
+        item for item in additions if str(item.get("request_id") or "") not in seen
+    ]
     if filter_specs and not frame.get("business_event"):
         frame["business_event"] = filter_specs[0].target
     return frame
@@ -512,26 +650,73 @@ def _apply_exact_filter_specs(
     conditions: list[str],
     selected_columns: dict[str, dict[str, Any]],
     filter_specs: list[FilterSpec],
+    *,
+    schema_loader=None,
+    time_range: dict[str, Any] | None = None,
 ) -> list[str]:
     applied: list[str] = []
     if not filter_specs:
         return applied
-    known_columns: dict[str, str] = {}
-    for roles in selected_columns.values():
+    known_columns: dict[str, tuple[str, str]] = {}
+    for table_key, roles in selected_columns.items():
         for role in ("filter", "select", "group_by", "aggregate"):
             for col in roles.get(role, []) or []:
                 col_str = str(col or "").strip()
                 if col_str and col_str != "*":
-                    known_columns.setdefault(col_str.lower(), col_str)
+                    known_columns.setdefault(col_str.lower(), (col_str, str(table_key)))
     for idx, spec in enumerate(filter_specs):
-        column = known_columns.get(str(spec.target or "").strip().lower())
-        if not column:
+        column_match = known_columns.get(str(spec.target or "").strip().lower())
+        if not column_match:
+            continue
+        column, table_key = column_match
+        if _should_skip_exact_calendar_date_filter(
+            column=column,
+            table_key=table_key,
+            spec=spec,
+            schema_loader=schema_loader,
+            time_range=time_range,
+        ):
             continue
         condition = _condition_from_filter_spec(column, spec)
         if condition:
             _add_unique(conditions, condition)
             applied.append(f"query_spec:{idx}")
     return applied
+
+
+def _should_skip_exact_calendar_date_filter(
+    *,
+    column: str,
+    table_key: str,
+    spec: FilterSpec,
+    schema_loader=None,
+    time_range: dict[str, Any] | None = None,
+) -> bool:
+    if not time_range or not time_range.get("start") or not time_range.get("end"):
+        return False
+    if str(spec.operator or "=").strip().upper() not in {"=", "=="}:
+        return False
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(spec.value or "")):
+        return False
+    col_lower = str(column or "").lower()
+    date_like = any(
+        col_lower.endswith(suffix)
+        for suffix in ("_dt", "_date", "_dttm", "_timestamp", "_ts", "date", "dttm")
+    ) or "date" in col_lower or "dttm" in col_lower or "timestamp" in col_lower
+    if not date_like:
+        return False
+
+    if schema_loader is not None and "." in table_key:
+        schema, table = table_key.split(".", 1)
+        semantics = schema_loader.get_column_semantics(schema, table, column)
+        semantic_class = str(semantics.get("semantic_class") or "").lower()
+        if semantic_class == "system_timestamp":
+            return True
+
+    # A calendar period already became a range predicate. A second equality on
+    # a date column usually comes from over-binding the natural-language date
+    # to an arbitrary physical column and would narrow a month to one day.
+    return True
 
 
 def _condition_from_filter_spec(column: str, spec: FilterSpec) -> str:

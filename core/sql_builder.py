@@ -203,7 +203,21 @@ def _build_where_clause(
     """Сформировать WHERE-клаузу из списка условий."""
     if not where_conditions:
         return ""
-    return "WHERE " + "\n  AND ".join(where_conditions)
+    conditions = list(where_conditions)
+    if alias:
+        qualified: list[str] = []
+        for condition in conditions:
+            text = str(condition)
+            qualified.append(
+                re.sub(
+                    r"^([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\.)",
+                    rf"{alias}.\1",
+                    text,
+                    count=1,
+                )
+            )
+        conditions = qualified
+    return "WHERE " + "\n  AND ".join(conditions)
 
 
 def _build_group_by(group_by: list[str], alias: str = "") -> str:
@@ -274,7 +288,7 @@ def _build_simple_select(
     select_items = _build_select_items(selected_columns, alias_map, blueprint)
 
     group_by_cols = blueprint.get("group_by", [])
-    where_clause = _build_where_clause(blueprint.get("where_conditions", []))
+    where_clause = _build_where_clause(blueprint.get("where_conditions", []), alias)
     group_by_clause = _build_group_by(group_by_cols, alias)
     having_clause = _build_having_clause(blueprint.get("having", []))
     order_by_clause = _build_order_by(blueprint.get("order_by"))
@@ -437,7 +451,7 @@ def _build_fact_dim_join(
         select_items = [f"COUNT(*) AS cnt"]
 
     # WHERE
-    where_clause = _build_where_clause(blueprint.get("where_conditions", []))
+    where_clause = _build_where_clause(blueprint.get("where_conditions", []), f_alias)
 
     group_by_cols = blueprint.get("group_by", [])
     order_by_clause = _build_order_by(blueprint.get("order_by"))
@@ -464,8 +478,11 @@ def _build_fact_dim_join(
         join_sql = f"JOIN {dim_table} ON {on_conditions}"
     elif len(join_pairs) == 1 and dim_extra_cols:
         cte_alias = _derive_cte_alias(dim_table, dim_roles)
-        cte_alias_short = cte_alias[0].lower()
-        if cte_alias_short in used:
+        alias_seed = _significant_tokens(" ".join(dim_extra_cols), _GENERIC_COL_TOKENS)
+        cte_alias_short = (alias_seed[0][0] if alias_seed else cte_alias[0]).lower()
+        if cte_alias_short == initial_d_alias:
+            d_alias = initial_d_alias
+        elif cte_alias_short in used:
             d_alias = _short_alias(cte_alias, used)
         else:
             used.add(cte_alias_short)

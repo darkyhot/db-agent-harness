@@ -213,6 +213,36 @@ def _has_explicit_grouping_request(
     return bool(_extract_output_dimension_hints(user_input))
 
 
+def _looks_like_aggregate_metric_filter(
+    item: dict[str, Any],
+    user_input: str,
+    metric_intent: str | None,
+) -> bool:
+    """Отсечь value-candidate фильтр, если слово является метрикой агрегации.
+
+    Пример: в `сумма оттока` слово `отток` задаёт измеряемую величину, а не
+    фильтр по enum-значению вроде `task_subtype = 'Фактический отток'`.
+    """
+    if metric_intent not in {"sum", "avg", "min", "max"}:
+        return False
+
+    normalized_input = _normalize_text(user_input)
+    event_pattern = r"(?:отток\w*|outflow|churn|attrition)"
+    aggregate_pattern = (
+        r"(?:сумм\w*|sum|средн\w*|avg|average|min|max|миним\w*|максим\w*)"
+        rf"(?:\s+\w+){{0,2}}\s+{event_pattern}"
+    )
+    if not re.search(aggregate_pattern, normalized_input):
+        return False
+
+    phrase = " ".join(
+        str(item.get(key) or "")
+        for key in ("query_text", "matched_phrase", "column_key", "request_id")
+    )
+    phrase_norm = _normalize_text(phrase)
+    return bool(re.search(event_pattern, phrase_norm))
+
+
 def _derive_filter_intents(
     *,
     user_input: str,
@@ -365,7 +395,10 @@ def derive_semantic_frame(
     business_event = None
     ambiguities: list[str] = []
 
-    filter_intents = raw_filter_intents
+    filter_intents = [
+        item for item in raw_filter_intents
+        if not _looks_like_aggregate_metric_filter(item, clean_input, metric_intent)
+    ]
     filter_intents = [
         item for item in filter_intents
         if not _looks_like_output_dimension_filter(item, output_dimensions)

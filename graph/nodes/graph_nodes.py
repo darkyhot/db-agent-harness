@@ -1,6 +1,7 @@
 """Фасад GraphNodes: объединяет все mixin-узлы в один класс для графа."""
 
 from graph.nodes.common import BaseNodeMixin
+from graph.nodes.query_ir import QueryIRNodes
 from graph.nodes.intent import IntentNodes
 from graph.nodes.hint_extractor import HintExtractorNodes
 from graph.nodes.hint_extractor_llm import HintExtractorLLMNodes
@@ -15,6 +16,7 @@ from graph.nodes.dispatcher import DispatcherNodes
 
 
 class GraphNodes(
+    QueryIRNodes,
     IntentNodes,
     HintExtractorLLMNodes,
     HintExtractorNodes,
@@ -31,6 +33,7 @@ class GraphNodes(
     """Узлы графа агента — фасад, объединяющий все mixin-классы.
 
     Каждый mixin содержит 1-3 узла графа:
+    - QueryIRNodes: query_interpreter, catalog_grounder
     - IntentNodes: intent_classifier, table_resolver
     - HintExtractorLLMNodes: hint_extractor_llm (LLM-экстрактор подсказок)
     - HintExtractorNodes: hint_extractor (regex + merge с LLM-результатом)

@@ -700,7 +700,14 @@ class MetadataRefreshService:
         if not tables:
             return {"refreshed": [], "failed": []}
 
-        inspector = inspect(self.db.get_engine())
+        try:
+            inspector = inspect(self.db.get_engine())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось создать SQLAlchemy inspector: %s", exc)
+            return {
+                "refreshed": [],
+                "failed": [f"{schema}.{table}" for schema, table in tables],
+            }
         current_tables = self.schema_loader.tables_df.copy()
         current_attrs = self.schema_loader.attrs_df.copy()
         if current_tables.empty:

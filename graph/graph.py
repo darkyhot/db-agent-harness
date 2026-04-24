@@ -94,6 +94,43 @@ def _route_after_intent_classifier(state: AgentState) -> str:
     return "hint_extractor_llm"
 
 
+def _route_after_query_interpreter(state: AgentState) -> str:
+    """Маршрутизация после нового QuerySpec-интерпретатора."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("plan_preview_approved") and state.get("sql_blueprint"):
+        return "plan_preview"
+
+    if state.get("plan_edit_text") and state.get("sql_blueprint"):
+        return "plan_edit_router"
+
+    if state.get("use_legacy_interpreter"):
+        return "intent_classifier"
+
+    if state.get("needs_clarification"):
+        return END
+
+    return "catalog_grounder"
+
+
+def _route_after_catalog_grounder(state: AgentState) -> str:
+    """Маршрутизация после связывания QuerySpec с каталогом."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("needs_clarification"):
+        return END
+
+    intent = state.get("intent", {}) or {}
+    if intent.get("intent") == "schema_question":
+        return "summarizer"
+
+    return "table_explorer"
+
+
 def _route_after_tool_dispatcher(state: AgentState) -> str:
     """Маршрутизация после tool_dispatcher."""
     limit = _check_limits(state)
@@ -343,7 +380,9 @@ def build_graph(
 
     graph = StateGraph(AgentState)
 
-    # Добавляем все 15 узлов
+    # Добавляем все узлы
+    graph.add_node("query_interpreter", nodes.query_interpreter)
+    graph.add_node("catalog_grounder", nodes.catalog_grounder)
     graph.add_node("intent_classifier", nodes.intent_classifier)
     graph.add_node("hint_extractor_llm", nodes.hint_extractor_llm)
     graph.add_node("hint_extractor", nodes.hint_extractor)
@@ -368,9 +407,24 @@ def build_graph(
     graph.add_node("tool_dispatcher", nodes.tool_dispatcher)
 
     # Точка входа
-    graph.set_entry_point("intent_classifier")
+    graph.set_entry_point("query_interpreter")
 
-    # === Линейная цепочка: intent → tables → explore → columns → plan → write ===
+    # === Новый primary path: QuerySpec → catalog grounding → explore → columns → plan → write ===
+    graph.add_conditional_edges("query_interpreter", _route_after_query_interpreter, {
+        END: END,
+        "catalog_grounder": "catalog_grounder",
+        "intent_classifier": "intent_classifier",
+        "plan_edit_router": "plan_edit_router",
+        "plan_preview": "plan_preview",
+        "summarizer": "summarizer",
+    })
+    graph.add_conditional_edges("catalog_grounder", _route_after_catalog_grounder, {
+        END: END,
+        "table_explorer": "table_explorer",
+        "summarizer": "summarizer",
+    })
+
+    # === Legacy compatibility path: intent → tables → explore → columns → plan → write ===
     # intent_classifier → conditional routing
     graph.add_conditional_edges("intent_classifier", _route_after_intent_classifier, {
         END: END,
@@ -525,6 +579,12 @@ def create_initial_state(
         replan_count=0,
         needs_replan=False,
         replan_context="",
+        query_spec=dict(ctx.get("query_spec") or {}),
+        query_spec_validation_errors=list(ctx.get("query_spec_validation_errors") or []),
+        use_legacy_interpreter=bool(ctx.get("use_legacy_interpreter", False)),
+        query_grounding=dict(ctx.get("query_grounding") or {}),
+        plan_ir=dict(ctx.get("plan_ir") or {}),
+        clarification_spec=dict(ctx.get("clarification_spec") or {}),
         # Новые структурированные поля
         intent=dict(ctx.get("intent") or {}),
         selected_tables=selected_tables,

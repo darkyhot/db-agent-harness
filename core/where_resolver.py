@@ -14,6 +14,7 @@ from core.text_normalize import (
     stem as _stem,
     tokenize as _tokenize,
 )
+from core.query_ir import FilterSpec
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,74 @@ def _business_event_is_already_encoded_in_table(
         )
         for token_stem in business_stems
     )
+
+
+def _event_stems(business_event: str) -> set[str]:
+    stems = {_stem(tok) for tok in _tokenize(business_event) if len(tok) >= 4}
+    normalized = _normalize_text(business_event)
+    if any(tok in normalized for tok in ("outflow", "churn", "attrition", "отток")):
+        stems.update({_stem("outflow"), _stem("отток"), _stem("churn"), _stem("attrition")})
+    return {stem for stem in stems if stem}
+
+
+def _text_has_event_stem(text: str, event_stems: set[str]) -> bool:
+    if not event_stems:
+        return False
+    text_stems = {_stem(tok) for tok in _tokenize(text)}
+    for left in event_stems:
+        for right in text_stems:
+            if left == right:
+                return True
+            if min(len(left), len(right)) >= 5 and (left.startswith(right) or right.startswith(left)):
+                return True
+    return False
+
+
+def _business_event_is_aggregate_metric(
+    *,
+    schema_loader,
+    selected_columns: dict[str, dict[str, Any]],
+    semantic_frame: dict[str, Any] | None,
+) -> bool:
+    """Определить, что unresolved filter на самом деле является агрегируемой метрикой."""
+    metric_intent = str((semantic_frame or {}).get("metric_intent") or "").lower()
+    if metric_intent not in {"sum", "avg", "min", "max"}:
+        return False
+
+    business_event = str((semantic_frame or {}).get("business_event") or "").strip()
+    filter_intents = list((semantic_frame or {}).get("filter_intents") or [])
+    event_stems = _event_stems(business_event)
+    if not event_stems or not filter_intents:
+        return False
+
+    for item in filter_intents:
+        item_text = " ".join(
+            str(item.get(key) or "")
+            for key in ("request_id", "query_text", "matched_phrase", "column_key")
+        )
+        if not _text_has_event_stem(item_text, event_stems):
+            return False
+
+    for table_key, roles in (selected_columns or {}).items():
+        if "." not in table_key:
+            continue
+        schema, table = table_key.split(".", 1)
+        table_info = schema_loader.get_table_info(schema, table)
+        for column in roles.get("aggregate", []) or []:
+            column = str(column or "").strip()
+            if not column or column == "*":
+                continue
+            description = ""
+            cols_df = schema_loader.get_table_columns(schema, table)
+            if not cols_df.empty and "column_name" in cols_df.columns:
+                match = cols_df[
+                    cols_df["column_name"].astype(str).str.lower() == column.lower()
+                ]
+                if not match.empty:
+                    description = str(match.iloc[0].get("description", "") or "")
+            if _text_has_event_stem(f"{table_key} {table_info} {column} {description}", event_stems):
+                return True
+    return False
 
 
 def _add_unique(conditions: list[str], condition: str) -> None:
@@ -165,6 +234,7 @@ def resolve_where(
     user_filter_choices: dict[str, str] | None = None,
     rejected_filter_choices: dict[str, list[str]] | None = None,
     filter_tiebreaker=None,
+    filter_specs: list[FilterSpec | dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Достроить WHERE доменными правилами и value profiles.
 
@@ -184,22 +254,36 @@ def resolve_where(
         str(k): [str(vv).strip().lower() for vv in (v or []) if str(vv).strip()]
         for k, v in dict(rejected_filter_choices or {}).items()
     }
+    direct_filter_specs = _normalize_filter_specs(filter_specs)
+    direct_applied = _apply_exact_filter_specs(
+        conditions,
+        selected_columns,
+        direct_filter_specs,
+    )
+    applied_rules.extend(direct_applied)
+    effective_semantic_frame = _semantic_frame_with_filter_specs(
+        semantic_frame,
+        direct_filter_specs,
+    )
+
     ranked_candidates = rank_filter_candidates(
         user_input=user_input,
         intent=intent,
         selected_tables=selected_tables,
         schema_loader=schema_loader,
-        semantic_frame=semantic_frame,
+        semantic_frame=effective_semantic_frame,
     )
 
     for request_id, candidates in ranked_candidates.items():
+        if str(request_id) in set(direct_applied):
+            continue
         if not candidates:
             continue
         compatible_candidates = []
         for candidate in candidates:
             schema = candidate.get("schema")
             table = candidate.get("table")
-            if schema and table and not table_can_satisfy_frame(schema_loader, schema, table, semantic_frame):
+            if schema and table and not table_can_satisfy_frame(schema_loader, schema, table, effective_semantic_frame):
                 continue
             compatible_candidates.append(candidate)
         candidates = compatible_candidates or candidates
@@ -311,7 +395,7 @@ def resolve_where(
             + (f" ({evidence})" if evidence else "")
         )
 
-    filter_intents = list((semantic_frame or {}).get("filter_intents") or [])
+    filter_intents = list((effective_semantic_frame or {}).get("filter_intents") or [])
     all_rejected_request_ids = {
         str(reason).split(":", 1)[1]
         for reason in reasoning
@@ -332,10 +416,11 @@ def resolve_where(
     if (
         clarification_message
         and not applied_rules
+        and not direct_filter_specs
         and _business_event_is_already_encoded_in_table(
             schema_loader=schema_loader,
             selected_tables=selected_tables,
-            semantic_frame=semantic_frame,
+            semantic_frame=effective_semantic_frame,
         )
     ):
         clarification_message = ""
@@ -343,6 +428,22 @@ def resolve_where(
         logger.info(
             "WhereResolver: suppress clarification — business_event уже покрыт выбранной таблицей %s",
             selected_tables[0] if selected_tables else "",
+        )
+
+    if (
+        clarification_message
+        and not applied_rules
+        and not direct_filter_specs
+        and _business_event_is_aggregate_metric(
+            schema_loader=schema_loader,
+            selected_columns=selected_columns,
+            semantic_frame=effective_semantic_frame,
+        )
+    ):
+        clarification_message = ""
+        reasoning.append("aggregate_metric_covers_business_event")
+        logger.info(
+            "WhereResolver: suppress clarification — business_event покрыт aggregate-метрикой"
         )
 
     logger.info(
@@ -366,3 +467,93 @@ def resolve_where(
         "user_filter_choices": user_filter_choices,
         "rejected_filter_choices": rejected_filter_choices,
     }
+
+
+def _normalize_filter_specs(raw: list[FilterSpec | dict[str, Any]] | None) -> list[FilterSpec]:
+    specs: list[FilterSpec] = []
+    for item in raw or []:
+        if isinstance(item, FilterSpec):
+            specs.append(item)
+            continue
+        if isinstance(item, dict):
+            try:
+                specs.append(FilterSpec.model_validate(item))
+            except Exception:  # noqa: BLE001
+                continue
+    return specs
+
+
+def _semantic_frame_with_filter_specs(
+    semantic_frame: dict[str, Any] | None,
+    filter_specs: list[FilterSpec],
+) -> dict[str, Any] | None:
+    if not filter_specs:
+        return semantic_frame
+    frame = dict(semantic_frame or {})
+    frame["filter_intents"] = [
+        {
+            "request_id": f"query_spec:{idx}",
+            "kind": "query_spec_filter",
+            "query_text": str(spec.value if spec.value is not None else spec.target),
+            "column_hint": spec.target,
+            "operator": spec.operator,
+            "value": spec.value,
+            "match_score": spec.confidence,
+            "match_source": "query_spec",
+        }
+        for idx, spec in enumerate(filter_specs)
+    ]
+    if filter_specs and not frame.get("business_event"):
+        frame["business_event"] = filter_specs[0].target
+    return frame
+
+
+def _apply_exact_filter_specs(
+    conditions: list[str],
+    selected_columns: dict[str, dict[str, Any]],
+    filter_specs: list[FilterSpec],
+) -> list[str]:
+    applied: list[str] = []
+    if not filter_specs:
+        return applied
+    known_columns: dict[str, str] = {}
+    for roles in selected_columns.values():
+        for role in ("filter", "select", "group_by", "aggregate"):
+            for col in roles.get(role, []) or []:
+                col_str = str(col or "").strip()
+                if col_str and col_str != "*":
+                    known_columns.setdefault(col_str.lower(), col_str)
+    for idx, spec in enumerate(filter_specs):
+        column = known_columns.get(str(spec.target or "").strip().lower())
+        if not column:
+            continue
+        condition = _condition_from_filter_spec(column, spec)
+        if condition:
+            _add_unique(conditions, condition)
+            applied.append(f"query_spec:{idx}")
+    return applied
+
+
+def _condition_from_filter_spec(column: str, spec: FilterSpec) -> str:
+    operator = str(spec.operator or "=").strip().upper()
+    if operator not in {"=", "!=", "<>", "<", ">", "<=", ">=", "LIKE", "ILIKE", "IN", "NOT IN"}:
+        operator = "="
+    value = spec.value
+    if value is None:
+        return f"{column} IS NULL" if operator in {"=", "IS"} else f"{column} IS NOT NULL"
+    if operator in {"IN", "NOT IN"}:
+        values = value if isinstance(value, list) else [item.strip() for item in str(value).split(",")]
+        rendered = ", ".join(_render_literal(item) for item in values)
+        return f"{column} {operator} ({rendered})"
+    if operator in {"LIKE", "ILIKE"}:
+        return f"{column} {operator} {_render_literal(str(value))}"
+    return f"{column} {operator} {_render_literal(value)}"
+
+
+def _render_literal(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    text = str(value).replace("'", "''")
+    return f"'{text}'"

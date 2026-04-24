@@ -846,6 +846,7 @@ def build_blueprint(
     rejected_filter_choices: dict[str, list[str]] | None = None,
     count_identifier_resolver=None,
     filter_tiebreaker=None,
+    filter_specs: list[dict] | None = None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -1022,6 +1023,7 @@ def build_blueprint(
         user_filter_choices=user_filter_choices,
         rejected_filter_choices=rejected_filter_choices,
         filter_tiebreaker=filter_tiebreaker,
+        filter_specs=filter_specs,
     )
     where_conditions = where_resolution.get("conditions", base_where_conditions)
 

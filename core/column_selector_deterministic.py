@@ -312,7 +312,13 @@ def _is_label_slot(slot: str) -> bool:
 
 
 def _is_metric_slot(slot: str) -> bool:
-    return slot.endswith(_METRIC_SUFFIXES) or slot.endswith(('_code', '_score'))
+    lower = (slot or '').lower().strip()
+    parts = set(lower.split('_'))
+    return (
+        lower.endswith(_METRIC_SUFFIXES)
+        or lower.endswith(('_code', '_score'))
+        or bool(parts & _METRIC_PARTS)
+    )
 
 
 def _is_dimension_slot(slot: str) -> bool:
@@ -376,9 +382,20 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
     if metric_cols:
         metric = metric_cols[0]
         metric_requires_numeric = metric.endswith(_METRIC_SUFFIXES)
+    elif agg_hint in {'sum', 'avg', 'min', 'max'} and re.search(
+        r'\b(outflow|churn|attrition)\b|отток', query,
+    ):
+        metric = 'outflow_отток'
     elif agg_hint in {'sum', 'avg', 'min', 'max', 'count'}:
         for entity in intent.get('entities') or []:
             seed = str(entity).strip()
+            seed_norm = _normalize_query_text(seed)
+            if _looks_like_table_artifact(seed_norm):
+                continue
+            if seed_norm in {'organization', 'организация', 'организации', 'date', 'дата', 'дате'}:
+                continue
+            if any(seed_norm.startswith(stem) for stem in _DIMENSION_QUERY_STEMS):
+                continue
             synonym_terms = sorted({str(term).strip() for term in expand_with_synonyms(seed) if str(term).strip()})
             expanded_terms = [seed] + [term for term in synonym_terms if term != seed]
             concept = _normalize_metric_concept(expanded_terms)
@@ -1538,6 +1555,44 @@ def _build_join_spec(
         join_spec.extend(extra)
         pair_entries.extend(extra)
         _apply_composite_safety(pair_entries, schema_loader, table_types)
+
+    if hint_join_fields:
+        tables = list(selected_columns.keys())
+        for i, t1 in enumerate(tables):
+            for t2 in tables[i + 1:]:
+                pair = frozenset([t1, t2])
+                if pair in processed:
+                    continue
+                cand = _pick_join_candidate(
+                    "", t1, t2, schema_loader,
+                    user_input=user_input,
+                    hint_join_fields=hint_join_fields,
+                )
+                if not cand:
+                    continue
+                processed.add(pair)
+                col1, col2 = cand['col1'], cand['col2']
+                safe = _check_safe(t2, col2, schema_loader)
+                t1_type = table_types.get(t1, 'unknown')
+                t2_type = table_types.get(t2, 'unknown')
+                entry: dict[str, Any] = {
+                    'left': f'{t1}.{col1}',
+                    'right': f'{t2}.{col2}',
+                    'safe': safe,
+                    'strategy': _infer_strategy(t1_type, t2_type, safe),
+                }
+                if not safe:
+                    entry['risk'] = f'{col2} не уникален в {t2}'
+                pair_entries = [entry]
+                join_spec.append(entry)
+                extra = _complete_composite_join(entry, t1, t2, table_types, schema_loader)
+                join_spec.extend(extra)
+                pair_entries.extend(extra)
+                _apply_composite_safety(pair_entries, schema_loader, table_types)
+                logger.info(
+                    "ColumnSelectorDet: JOIN по user_hints без join_analysis → %s.%s = %s.%s",
+                    t1, col1, t2, col2,
+                )
 
     return join_spec
 

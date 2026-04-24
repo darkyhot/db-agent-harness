@@ -517,6 +517,7 @@ class SqlPipelineNodes:
             rejected_filter_choices=state.get("rejected_filter_choices", {}) or {},
             count_identifier_resolver=self._resolve_count_identifier_llm,
             filter_tiebreaker=self._tiebreak_filter_candidates_llm,
+            filter_specs=list((state.get("query_spec") or {}).get("filters") or []),
         )
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))

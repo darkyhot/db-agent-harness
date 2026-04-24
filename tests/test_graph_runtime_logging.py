@@ -1,6 +1,7 @@
 """Проверки runtime-логирования при сборке графа."""
 
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock
 
 
@@ -51,3 +52,12 @@ def test_sql_planner_branch_allows_end():
 
     branch = graph.builder.branches["sql_planner"]["_route_after_sql_planner"]
     assert END in branch.ends
+
+
+def test_graph_nodes_import_uses_package_after_monolith_removal():
+    import graph.nodes as nodes_pkg
+    from graph.nodes import GraphNodes
+
+    assert nodes_pkg.__file__.endswith("graph/nodes/__init__.py")
+    assert GraphNodes.__module__ == "graph.nodes.graph_nodes"
+    assert not (Path(__file__).resolve().parents[1] / "graph" / "nodes.py").exists()

@@ -586,6 +586,7 @@ class IntentNodes:
             user_hints.get("dim_sources", {}) or {}
         )
         hint_join_fields: list[str] = list(user_hints.get("join_fields", []) or [])
+        dim_source_tables: set[tuple[str, str]] = set()
 
         # Таблицы, упомянутые через dim_sources, тоже считаются must_keep.
         for slot_key, binding in hint_dim_sources.items():
@@ -594,6 +595,7 @@ class IntentNodes:
                 continue
             s_part, t_part = tbl_full.split(".", 1)
             tup = (s_part, t_part)
+            dim_source_tables.add(tup)
             if tup not in hint_must_keep:
                 hint_must_keep.append(tup)
 
@@ -686,6 +688,7 @@ class IntentNodes:
             for _, row in cols.iterrows():
                 col_name = str(row.get("column_name", "") or "")
                 desc = str(row.get("description", "") or "")
+                dtype = str(row.get("dType", "") or "")
                 semantic = _semantic_match_score(col_name, desc, slot)
                 if semantic <= 0:
                     continue
@@ -707,6 +710,17 @@ class IntentNodes:
                         score += 35
                     else:
                         score -= 20
+                    lower_name = col_name.lower()
+                    lower_dtype = dtype.lower()
+                    lower_desc = desc.lower()
+                    if lower_name.endswith(("_qty", "_amt", "_sum", "_amount", "_value")):
+                        score += 140
+                    if (
+                        lower_name.startswith(("is_", "has_", "flag_"))
+                        or "boolean" in lower_dtype
+                        or "признак" in lower_desc
+                    ):
+                        score -= 320
                     # Штраф «dim-в-факте»: фактовая таблица, чьё имя/описание
                     # не близко к метрике — наверняка метрика тут флаг. Снижаем
                     # вес, чтобы не выиграть у настоящей фактовой таблицы.
@@ -883,6 +897,7 @@ class IntentNodes:
         ranked_main_candidates: list[dict[str, Any]] = []
         for st in candidate_tables:
             score = 0.0
+            metric_score = 0.0
             if metric_slot:
                 metric_score = _score_table_for_slot(
                     st[0], st[1], metric_slot, metric_entities=metric_entities,
@@ -893,19 +908,36 @@ class IntentNodes:
             score += table_bonus_for_frame(self.schema, st[0], st[1], semantic_frame)
             if st in explicit_tables:
                 score += 90
-            if st in hint_must_keep:
+            if st in hint_must_keep and st not in dim_source_tables:
                 score += 150
+            elif st in hint_must_keep:
+                score += 35
             if st in validated_tables:
                 score += 70
             ranked_main_candidates.append({
                 "table": st,
                 "score": score,
+                "metric_score": metric_score,
+                "is_dim_source": st in dim_source_tables,
                 "grain": _table_grain(st[0], st[1]),
                 "description": _table_description(st[0], st[1]),
             })
 
         ranked_main_candidates.sort(key=lambda item: item["score"], reverse=True)
-        if ranked_main_candidates and ranked_main_candidates[0]["score"] > 0:
+        metric_main_candidates = [
+            item for item in ranked_main_candidates
+            if float(item.get("metric_score", 0.0) or 0.0) > 0.0
+        ]
+        if metric_main_candidates:
+            metric_main_candidates.sort(
+                key=lambda item: (
+                    bool(item.get("is_dim_source")),
+                    -float(item.get("metric_score", 0.0) or 0.0),
+                    -float(item.get("score", 0.0) or 0.0),
+                )
+            )
+            main_table = metric_main_candidates[0]["table"]
+        elif ranked_main_candidates and ranked_main_candidates[0]["score"] > 0:
             main_table = ranked_main_candidates[0]["table"]
         if main_table is None:
             # Fallback: первая lock'нутая или первая explicit

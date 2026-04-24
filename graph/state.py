@@ -52,6 +52,18 @@ class AgentState(TypedDict):
 
     # === Структурированные данные (результаты экстракции каждого узла) ===
 
+    # query_interpreter → единый семантический IR запроса.
+    # Primary semantic contract. Старые intent/user_hints/semantic_frame ниже
+    # остаются compatibility projection до полного удаления legacy pipeline.
+    query_spec: dict[str, Any]
+    query_spec_validation_errors: list[str]
+    use_legacy_interpreter: bool
+
+    # catalog_grounder → физическое связывание QuerySpec с каталогом.
+    query_grounding: dict[str, Any]
+    plan_ir: dict[str, Any]
+    clarification_spec: dict[str, Any]
+
     # intent_classifier → структурированный интент
     intent: dict[str, Any]
     # Пример: {"intent": "analytics", "entities": [...], "date_filters": {...},

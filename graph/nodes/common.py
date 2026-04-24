@@ -198,6 +198,7 @@ class BaseNodeMixin:
         "column_selector": 80_000,   # нужен полный контекст всех таблиц
         "sql_planner": 40_000,
         "sql_writer": 60_000,
+        "sql_self_corrector": 50_000,
         "sql_static_checker": 20_000,
         "error_diagnoser": 30_000,
         "sql_fixer": 50_000,

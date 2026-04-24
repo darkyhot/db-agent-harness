@@ -16,6 +16,7 @@ import re
 from datetime import datetime
 from typing import Any
 
+from core.query_ir import QuerySpec, query_spec_json_schema
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -1047,11 +1048,112 @@ class PlanEditNodes:
             }
         return self._resolve_patch_route(state, edit_text, blueprint)
 
+    def _edit_query_spec(self, state: AgentState, edit_text: str) -> dict[str, Any]:
+        iterations = state.get("graph_iterations", 0) + 1
+        raw_spec = state.get("query_spec") or {}
+        current_spec, errors = QuerySpec.from_dict(raw_spec)
+        if current_spec is None:
+            return {
+                "plan_edit_kind": "clarify",
+                "plan_edit_needs_clarification": True,
+                "needs_clarification": True,
+                "clarification_message": "Текущий QuerySpec невалиден, поэтому правку нельзя применить безопасно.",
+                "query_spec_validation_errors": errors,
+                "graph_iterations": iterations,
+            }
+
+        system_prompt = (
+            "Ты редактируешь QuerySpec аналитического SQL-агента. "
+            "Получишь текущий QuerySpec, preview/blueprint и текст правки пользователя. "
+            "Верни ПОЛНЫЙ обновлённый QuerySpec JSON по схеме, без markdown. "
+            "Не пиши SQL. Не удаляй существующие метрики, фильтры, даты, источники и "
+            "измерения, если пользователь явно не попросил удалить или заменить их. "
+            "Для сортировки заполняй order_by.target и order_by.direction. "
+            "Для просьб вроде 'а где ТБ?' добавляй недостающую metric/dimension, "
+            "а не заменяй существующую."
+        )
+        user_prompt = (
+            f"JSON Schema:\n{json.dumps(query_spec_json_schema(), ensure_ascii=False)}\n\n"
+            f"Исходный запрос:\n{state.get('user_input', '')}\n\n"
+            f"Текущий QuerySpec:\n{json.dumps(current_spec.to_dict(), ensure_ascii=False, indent=2)}\n\n"
+            f"Текущий SQL blueprint:\n{json.dumps(state.get('sql_blueprint') or {}, ensure_ascii=False, indent=2)}\n\n"
+            f"Правка пользователя:\n{edit_text}\n\n"
+            "Верни полный обновлённый QuerySpec JSON:"
+        )
+        parsed = self._llm_json_with_retry(
+            system_prompt,
+            user_prompt,
+            temperature=0.0,
+            failure_tag="query_spec_editor",
+            expect="object",
+        )
+        edited_spec, edit_errors = QuerySpec.from_dict(parsed or {})
+        if edited_spec is None:
+            return {
+                "plan_edit_kind": "clarify",
+                "plan_edit_confidence": 0.0,
+                "plan_edit_payload": {"errors": edit_errors},
+                "plan_edit_needs_clarification": True,
+                "needs_clarification": True,
+                "clarification_message": "Не удалось применить правку к QuerySpec. Уточните, пожалуйста, что именно изменить.",
+                "query_spec_validation_errors": edit_errors,
+                "graph_iterations": iterations,
+            }
+
+        legacy_intent = edited_spec.to_legacy_intent()
+        legacy_hints = edited_spec.to_legacy_user_hints()
+        semantic_frame = edited_spec.to_semantic_frame()
+        return {
+            "query_spec": edited_spec.to_dict(),
+            "query_spec_validation_errors": [],
+            "intent": legacy_intent,
+            "user_hints_llm": legacy_hints,
+            "user_hints": legacy_hints,
+            "hints_source": "query_spec_edit",
+            "semantic_frame": semantic_frame,
+            "query_grounding": {},
+            "plan_ir": {},
+            "selected_tables": [],
+            "allowed_tables": [],
+            "table_structures": {},
+            "table_samples": {},
+            "table_types": {},
+            "join_analysis_data": {},
+            "selected_columns": {},
+            "join_spec": [],
+            "where_resolution": {},
+            "sql_blueprint": {},
+            "previous_sql_blueprint": copy.deepcopy(state.get("sql_blueprint") or {}),
+            "plan_diff": {},
+            "plan_diff_summary": "",
+            "plan_edit_text": "",
+            "plan_edit_kind": "query_spec",
+            "plan_edit_confidence": edited_spec.confidence,
+            "plan_edit_payload": {"query_spec": edited_spec.to_dict()},
+            "plan_edit_resolution": {"edit_goal": "query_spec_update"},
+            "plan_edit_explanation": "QuerySpec updated by LLM editor",
+            "plan_edit_needs_clarification": bool(edited_spec.clarification_needed),
+            "plan_edit_applied": not bool(edited_spec.clarification_needed),
+            "plan_edit_history": _ensure_history_entry(
+                state,
+                kind="query_spec",
+                text=edit_text,
+                payload={"query_spec": edited_spec.to_dict()},
+                applied=not bool(edited_spec.clarification_needed),
+            ),
+            "needs_clarification": bool(edited_spec.clarification_needed),
+            "clarification_message": edited_spec.clarification.question if edited_spec.clarification else "",
+            "graph_iterations": iterations,
+        }
+
     def plan_edit_router(self, state: AgentState) -> dict[str, Any]:
         iterations = state.get("graph_iterations", 0) + 1
         edit_text = str(state.get("plan_edit_text") or "").strip()
         blueprint = state.get("sql_blueprint") or {}
         logger.info("plan_edit_router: edit=%r", edit_text)
+
+        if state.get("query_spec"):
+            return self._edit_query_spec(state, edit_text)
 
         # Архитектура: regex-first для быстрых однозначных случаев (экономим 5 сек),
         # LLM подключается только когда regex дал clarify/низкую уверенность/None —

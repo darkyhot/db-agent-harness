@@ -15,6 +15,7 @@ QueryTask = Literal["answer_data", "inspect_schema", "edit_plan", "clarify"]
 MetricOperation = Literal["count", "sum", "avg", "min", "max", "list"]
 DistinctPolicy = Literal["auto", "distinct", "all"]
 TimeGrain = Literal["day", "week", "month", "quarter", "year"]
+OrderDirection = Literal["ASC", "DESC"]
 
 
 class StrictModel(BaseModel):
@@ -68,6 +69,8 @@ class DimensionSpec(StrictModel):
 
     target: str
     role: str = "group_by"
+    source_table: str | None = None
+    join_key: str | None = None
     evidence: list[Evidence] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     alternatives: list[Alternative] = Field(default_factory=list)
@@ -140,6 +143,20 @@ class ClarificationSpec(StrictModel):
     evidence: list[Evidence] = Field(default_factory=list)
 
 
+class OrderBySpec(StrictModel):
+    """Requested result ordering before binding to a SQL expression."""
+
+    target: str
+    direction: OrderDirection = "DESC"
+    evidence: list[Evidence] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _normalize_direction(cls, value: Any) -> str:
+        return str(value or "DESC").strip().upper()
+
+
 class QuerySpec(StrictModel):
     """Single semantic source of truth for a user request."""
 
@@ -148,6 +165,9 @@ class QuerySpec(StrictModel):
     dimensions: list[DimensionSpec] = Field(default_factory=list)
     filters: list[FilterSpec] = Field(default_factory=list)
     time_range: TimeRangeSpec | None = None
+    having: list[FilterSpec] = Field(default_factory=list)
+    order_by: OrderBySpec | None = None
+    limit: int | None = None
     source_constraints: list[SourceConstraint] = Field(default_factory=list)
     join_constraints: list[JoinConstraint] = Field(default_factory=list)
     clarification_needed: bool = False
@@ -230,11 +250,17 @@ class QuerySpec(StrictModel):
             }
             for metric in self.metrics
         ]
-        preferences = {}
-        if len(agg_hints) == 1:
-            preferences = dict(agg_hints[0])
-            if preferences.get("distinct") is False and self.metrics[0].distinct_policy == "all":
+        preferences_list = [dict(item) for item in agg_hints if item.get("function")]
+        for idx, preferences in enumerate(preferences_list):
+            if preferences.get("column") == "*":
+                preferences["force_count_star"] = True
+            if (
+                idx < len(self.metrics)
+                and preferences.get("distinct") is False
+                and self.metrics[idx].distinct_policy == "all"
+            ):
                 preferences["distinct"] = False
+        preferences = dict(preferences_list[0]) if preferences_list else {}
 
         must_keep: list[tuple[str, str]] = []
         for source in self.source_constraints:
@@ -245,15 +271,30 @@ class QuerySpec(StrictModel):
             if schema and table:
                 must_keep.append((schema, table))
 
+        dim_sources: dict[str, dict[str, str]] = {}
+        for dim in self.dimensions:
+            if dim.source_table:
+                dim_sources[dim.target] = {"table": dim.source_table}
+                if dim.join_key:
+                    dim_sources[dim.target]["join_col"] = dim.join_key
+
         return {
             "must_keep_tables": must_keep,
             "join_fields": [j.key for j in self.join_constraints if j.key],
-            "dim_sources": {},
-            "having_hints": [],
+            "dim_sources": dim_sources,
+            "having_hints": [
+                {
+                    "op": item.operator,
+                    "value": item.value,
+                    "unit_hint": item.target,
+                }
+                for item in self.having
+                if item.value not in (None, "")
+            ],
             "group_by_hints": [dim.target for dim in self.dimensions],
             "aggregate_hints": agg_hints,
             "aggregation_preferences": preferences,
-            "aggregation_preferences_list": [preferences] if preferences else [],
+            "aggregation_preferences_list": preferences_list,
             "time_granularity": self.time_range.grain if self.time_range else None,
             "negative_filters": [
                 str(f.value)
@@ -323,6 +364,9 @@ class PlanIR(StrictModel):
     filters: list[FilterSpec] = Field(default_factory=list)
     joins: list[JoinConstraint] = Field(default_factory=list)
     time_range: TimeRangeSpec | None = None
+    having: list[FilterSpec] = Field(default_factory=list)
+    order_by: OrderBySpec | None = None
+    limit: int | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     warnings: list[str] = Field(default_factory=list)
 

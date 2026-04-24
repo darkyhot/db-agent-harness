@@ -37,6 +37,46 @@ from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_query_spec_blueprint_overrides(blueprint: dict[str, Any], query_spec: dict[str, Any]) -> None:
+    """Apply final QuerySpec-only knobs not represented in legacy intent."""
+    order_spec = query_spec.get("order_by") if isinstance(query_spec, dict) else None
+    if isinstance(order_spec, dict):
+        target = str(order_spec.get("target") or "").strip()
+        direction = str(order_spec.get("direction") or "DESC").strip().upper()
+        if direction not in {"ASC", "DESC"}:
+            direction = "DESC"
+        if target:
+            order_field = _resolve_order_target(target, blueprint)
+            blueprint["order_by"] = f"{order_field} {direction}"
+
+    if isinstance(query_spec, dict) and query_spec.get("limit") not in (None, ""):
+        try:
+            limit = int(query_spec["limit"])
+        except (TypeError, ValueError):
+            limit = None
+        if limit and limit > 0:
+            blueprint["limit"] = limit
+
+
+def _resolve_order_target(target: str, blueprint: dict[str, Any]) -> str:
+    target_norm = target.strip().lower()
+    for metric in blueprint.get("aggregations") or []:
+        if not isinstance(metric, dict):
+            continue
+        alias = str(metric.get("alias") or "").strip()
+        column = str(metric.get("column") or "").strip()
+        function = str(metric.get("function") or "").strip().lower()
+        if target_norm in {alias.lower(), column.lower(), f"{function}_{column}".lower()}:
+            return alias or target
+    aggregation = blueprint.get("aggregation") or {}
+    alias = str(aggregation.get("alias") or "").strip()
+    column = str(aggregation.get("column") or "").strip()
+    if target_norm in {alias.lower(), column.lower()} and alias:
+        return alias
+    return target
+
+
 # === Примеры SQL, отфильтрованные по типу стратегии ===
 
 _STRATEGY_EXAMPLES: dict[str, str] = {
@@ -519,6 +559,7 @@ class SqlPipelineNodes:
             filter_tiebreaker=self._tiebreak_filter_candidates_llm,
             filter_specs=list((state.get("query_spec") or {}).get("filters") or []),
         )
+        _apply_query_spec_blueprint_overrides(blueprint, state.get("query_spec") or {})
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
 
@@ -1040,6 +1081,232 @@ class SqlPipelineNodes:
             "graph_iterations": iterations,
             "messages": state["messages"] + [
                 {"role": "assistant", "content": f"Результат: {result_str[:1000]}"}
+            ],
+        }
+
+    # --------------------------------------------------------------------------
+    # sql_self_corrector
+    # --------------------------------------------------------------------------
+
+    def sql_self_corrector(self, state: AgentState) -> dict[str, Any]:
+        """LLM self-correction for generated SQL before static/DB validation.
+
+        The reviewer checks the agent's SQL against the user's request and the
+        structured plan: required output fields, filters, grouping, table scope,
+        and overall SQL shape. It can pass the SQL, return a corrected SQL, ask
+        for clarification, or reject the query so the normal correction loop can
+        rewrite it.
+        """
+        sql = state.get("sql_to_validate")
+        pending_call = state.get("pending_sql_tool_call")
+        if not sql and pending_call:
+            sql = pending_call.get("args", {}).get("sql")
+        if not sql:
+            return {"sql_to_validate": None, "pending_sql_tool_call": None}
+
+        iterations = state.get("graph_iterations", 0) + 1
+        evidence_trace = dict(state.get("evidence_trace") or {})
+        allowed_tables: list[str] = state.get("allowed_tables") or []
+
+        logger.info("SqlSelfCorrector: review SQL against user request")
+
+        system_prompt = (
+            "Ты — ревьюер SQL аналитического агента для Greenplum.\n"
+            "Проверь SQL другого агента перед выполнением.\n\n"
+            "Что проверять:\n"
+            "- SQL отвечает ровно на вопрос пользователя.\n"
+            "- Все явно запрошенные поля/измерения есть в SELECT; при агрегации "
+            "они также есть в GROUP BY.\n"
+            "- Метрика, фильтры, даты, гранулярность и сортировка соответствуют "
+            "вопросу и структурированному плану.\n"
+            "- Используются только разрешённые таблицы и реальные выбранные колонки.\n"
+            "- JOIN не меняет смысл результата и не выглядит как размножение строк.\n"
+            "- SQL в целом корректен для PostgreSQL/Greenplum.\n\n"
+            "Верни ТОЛЬКО JSON без markdown по схеме:\n"
+            '{"verdict": "pass|fix|reject|clarify", '
+            '"issues": ["краткая проблема"], '
+            '"corrected_sql": "исправленный SQL или пустая строка", '
+            '"clarification_message": "вопрос пользователю или пустая строка", '
+            '"rationale": "кратко"}\n\n'
+            "Правила verdict:\n"
+            "- pass: SQL можно выполнять как есть.\n"
+            "- fix: можешь исправить SQL без новых сведений от пользователя.\n"
+            "- reject: SQL неверен, но для исправления нужен новый проход коррекции.\n"
+            "- clarify: без уточнения пользователя невозможно выбрать правильный смысл."
+        )
+
+        user_parts = [
+            f"Вопрос пользователя:\n{state.get('user_input', '').strip()}",
+            f"SQL на ревью:\n{sql}",
+        ]
+        for label, value in (
+            ("QuerySpec", state.get("query_spec") or {}),
+            ("Физическое связывание", state.get("query_grounding") or {}),
+            ("SQL blueprint", state.get("sql_blueprint") or {}),
+            ("Выбранные колонки", state.get("selected_columns") or {}),
+            ("JOIN ключи", state.get("join_spec") or []),
+        ):
+            if value:
+                user_parts.append(
+                    f"{label}:\n{json.dumps(value, ensure_ascii=False, indent=2, default=str)}"
+                )
+        if allowed_tables:
+            user_parts.append("Разрешённые таблицы:\n" + "\n".join(f"- {t}" for t in allowed_tables))
+
+        system_prompt, user_prompt = self._trim_to_budget(system_prompt, "\n\n".join(user_parts))
+
+        if self.debug_prompt:
+            print(
+                f"\n{'=' * 80}\n[DEBUG PROMPT — sql_self_corrector]\n{'=' * 80}\n"
+                f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'=' * 80}\n"
+            )
+
+        review = self._llm_json_with_retry(
+            system_prompt,
+            user_prompt,
+            temperature=0.0,
+            failure_tag="sql_self_corrector",
+            expect="object",
+        )
+
+        if not isinstance(review, dict) or not review.get("verdict"):
+            # Не блокируем выполнение только из-за неформатного review: дальше
+            # остаются deterministic static checker и DB validator.
+            correction = {
+                "verdict": "pass",
+                "mode": "review_unavailable",
+                "issues": ["LLM review did not return a valid verdict"],
+            }
+            evidence_trace["sql_self_correction"] = correction
+            logger.warning("SqlSelfCorrector: invalid review response, passing to static checker")
+            return {
+                "sql_to_validate": sql,
+                "pending_sql_tool_call": pending_call,
+                "sql_self_correction": correction,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+            }
+
+        verdict = str(review.get("verdict") or "").strip().lower()
+        if verdict in {"ok", "valid", "approve"}:
+            verdict = "pass"
+        if verdict not in {"pass", "fix", "reject", "clarify"}:
+            verdict = "reject"
+
+        issues = [str(item) for item in (review.get("issues") or []) if str(item).strip()]
+        correction = {
+            "verdict": verdict,
+            "issues": issues,
+            "rationale": str(review.get("rationale") or "").strip(),
+        }
+        evidence_trace["sql_self_correction"] = correction
+
+        if verdict == "pass":
+            return {
+                "sql_to_validate": sql,
+                "pending_sql_tool_call": pending_call,
+                "sql_self_correction": correction,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+            }
+
+        if verdict == "clarify":
+            message = str(review.get("clarification_message") or "").strip()
+            if not message:
+                message = "Нужно уточнить запрос перед выполнением SQL."
+            return {
+                "needs_clarification": True,
+                "clarification_message": message,
+                "sql_to_validate": None,
+                "pending_sql_tool_call": None,
+                "sql_self_correction": correction,
+                "evidence_trace": evidence_trace,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": message}
+                ],
+            }
+
+        if verdict == "fix":
+            corrected_sql = str(review.get("corrected_sql") or "").strip()
+            if not corrected_sql:
+                verdict = "reject"
+            else:
+                corrected_sql = _format_sql(corrected_sql)
+                check_result = check_sql(
+                    corrected_sql,
+                    schema_loader=self.schema,
+                    allowed_tables=allowed_tables if allowed_tables else None,
+                )
+                if check_result.fixed_sql and check_result.is_valid:
+                    corrected_sql = _format_sql(check_result.fixed_sql)
+                if not check_result.is_valid:
+                    error_msg = (
+                        "SQL self-correction вернул исправление, но оно не прошло "
+                        f"статическую проверку: {check_result.summary()}"
+                    )
+                    return {
+                        "last_error": error_msg,
+                        "sql_to_validate": None,
+                        "pending_sql_tool_call": None,
+                        "sql_self_correction": {
+                            **correction,
+                            "verdict": "reject",
+                            "invalid_correction": True,
+                        },
+                        "evidence_trace": evidence_trace,
+                        "graph_iterations": iterations,
+                        "messages": state["messages"] + [
+                            {"role": "assistant", "content": error_msg}
+                        ],
+                    }
+
+                pending = dict(pending_call or {})
+                pending_args = dict(pending.get("args") or {})
+                pending_args["sql"] = corrected_sql
+                pending["args"] = pending_args
+                if "tool" not in pending:
+                    pending["tool"] = "execute_query"
+                if "step_idx" not in pending:
+                    pending["step_idx"] = state["current_step"]
+
+                tool_calls = list(state.get("tool_calls") or [])
+                if tool_calls:
+                    last_tool = dict(tool_calls[-1])
+                    last_args = dict(last_tool.get("args") or {})
+                    if last_tool.get("result") == "awaiting_validation" or last_args.get("sql") == sql:
+                        last_args["sql"] = corrected_sql
+                        last_tool["args"] = last_args
+                        tool_calls[-1] = last_tool
+
+                correction = {
+                    **correction,
+                    "corrected": True,
+                }
+                evidence_trace["sql_self_correction"] = correction
+                return {
+                    "sql_to_validate": corrected_sql,
+                    "pending_sql_tool_call": pending,
+                    "tool_calls": tool_calls,
+                    "sql_self_correction": correction,
+                    "evidence_trace": evidence_trace,
+                    "graph_iterations": iterations,
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": "SQL проверен и скорректирован self-correction review"}
+                    ],
+                }
+
+        issue_text = "; ".join(issues) if issues else "SQL не прошёл смысловое self-correction review"
+        error_msg = f"SQL self-correction отклонил запрос: {issue_text}"
+        return {
+            "last_error": error_msg,
+            "sql_to_validate": None,
+            "pending_sql_tool_call": None,
+            "sql_self_correction": {**correction, "verdict": "reject"},
+            "evidence_trace": evidence_trace,
+            "graph_iterations": iterations,
+            "messages": state["messages"] + [
+                {"role": "assistant", "content": error_msg}
             ],
         }
 

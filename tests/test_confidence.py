@@ -48,7 +48,7 @@ def test_fallback_policy_allows_llm_only_for_high_confidence():
     assert policy["action"] == "llm_fallback"
 
 
-def test_fallback_policy_blocks_medium_confidence():
+def test_fallback_policy_allows_medium_confidence_with_self_correction_guard():
     planning = {
         "score": 0.55,
         "level": "medium",
@@ -59,8 +59,24 @@ def test_fallback_policy_blocks_medium_confidence():
         deterministic_sql_valid=False,
         has_template_sql=True,
     )
+    assert policy["allow_llm_fallback"] is True
+    assert policy["action"] == "llm_fallback"
+    assert policy["guard"] == "sql_self_corrector"
+
+
+def test_fallback_policy_still_blocks_low_confidence():
+    planning = {
+        "score": 0.25,
+        "level": "low",
+        "action": "stop",
+    }
+    policy = build_fallback_policy(
+        planning_confidence=planning,
+        deterministic_sql_valid=False,
+        has_template_sql=False,
+    )
     assert policy["allow_llm_fallback"] is False
-    assert policy["action"] == "clarify"
+    assert policy["action"] == "stop"
 
 
 def test_filter_confidence_treats_user_choices_as_resolved():

@@ -210,7 +210,12 @@ def _build_group_by(group_by: list[str], alias: str = "") -> str:
     """Сформировать GROUP BY клаузу."""
     if not group_by:
         return ""
-    cols = [f"{alias}.{c}" if alias and "." not in c else c for c in group_by]
+    cols = [
+        f"{alias}.{c}"
+        if alias and "." not in c and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(c))
+        else c
+        for c in group_by
+    ]
     return "GROUP BY " + ", ".join(cols)
 
 

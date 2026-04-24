@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 
@@ -541,6 +543,97 @@ def test_diff_renderer_reports_aggregations_change(node):
     result = node.plan_diff_renderer(state)
     changed_fields = {item["field"] for item in result["plan_diff"]["changed"]}
     assert "aggregations" in changed_fields
+
+
+def test_query_spec_editor_adds_missing_tb_metric(synthetic_loader):
+    response = {
+        "task": "answer_data",
+        "metrics": [
+            {"operation": "count", "target": "old_gosb_id", "distinct_policy": "distinct", "confidence": 0.9},
+            {"operation": "count", "target": "tb_id", "distinct_policy": "distinct", "confidence": 0.9},
+        ],
+        "dimensions": [],
+        "filters": [],
+        "source_constraints": [{"schema": "schema_a", "table": "dim_y", "required": True, "confidence": 0.9}],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.9,
+    }
+    node = _Node(
+        _DummyLLM([json.dumps(response, ensure_ascii=False)]),
+        _DummyDB(),
+        synthetic_loader,
+        _DummyMemory(),
+        _DummyValidator(),
+        [],
+    )
+    state = _state(
+        plan_edit_text="Ты посчитал только ГОСБ, а где ТБ?",
+        query_spec={
+            "task": "answer_data",
+            "metrics": [
+                {"operation": "count", "target": "old_gosb_id", "distinct_policy": "distinct", "confidence": 0.9}
+            ],
+            "dimensions": [],
+            "filters": [],
+            "source_constraints": [{"schema": "schema_a", "table": "dim_y", "required": True, "confidence": 0.9}],
+            "join_constraints": [],
+            "clarification_needed": False,
+            "confidence": 0.9,
+        },
+    )
+
+    result = node.plan_edit_router(state)
+
+    assert result["plan_edit_kind"] == "query_spec"
+    assert result["sql_blueprint"] == {}
+    assert result["user_hints"]["aggregation_preferences_list"] == [
+        {"function": "count", "column": "old_gosb_id", "distinct": True},
+        {"function": "count", "column": "tb_id", "distinct": True},
+    ]
+
+
+def test_query_spec_editor_changes_sort_direction_without_losing_metric(synthetic_loader):
+    response = {
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": "inn", "distinct_policy": "all", "confidence": 0.9}],
+        "dimensions": [],
+        "filters": [],
+        "order_by": {"target": "inn", "direction": "ASC", "confidence": 0.9},
+        "source_constraints": [{"schema": "schema_a", "table": "fact_x", "required": True, "confidence": 0.9}],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.9,
+    }
+    node = _Node(
+        _DummyLLM([json.dumps(response, ensure_ascii=False)]),
+        _DummyDB(),
+        synthetic_loader,
+        _DummyMemory(),
+        _DummyValidator(),
+        [],
+    )
+    state = _state(
+        plan_edit_text="сделай сортировку asc",
+        query_spec={
+            "task": "answer_data",
+            "metrics": [{"operation": "count", "target": "inn", "distinct_policy": "all", "confidence": 0.9}],
+            "dimensions": [],
+            "filters": [],
+            "order_by": {"target": "inn", "direction": "DESC", "confidence": 0.9},
+            "source_constraints": [{"schema": "schema_a", "table": "fact_x", "required": True, "confidence": 0.9}],
+            "join_constraints": [],
+            "clarification_needed": False,
+            "confidence": 0.9,
+        },
+    )
+
+    result = node.plan_edit_router(state)
+
+    assert result["query_spec"]["order_by"] == {"target": "inn", "direction": "ASC", "confidence": 0.9}
+    assert result["query_spec"]["metrics"] == [
+        {"operation": "count", "target": "inn", "distinct_policy": "all", "confidence": 0.9}
+    ]
 
 
 def test_fallback_llm_emits_operations(synthetic_loader):

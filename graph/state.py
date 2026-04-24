@@ -158,6 +158,9 @@ class AgentState(TypedDict):
     planning_confidence: dict[str, Any]
     evidence_trace: dict[str, Any]
     fallback_policy: dict[str, Any]
+    # sql_self_corrector → LLM review of generated/fixed SQL against user intent.
+    # Stores verdict/issues/correction source for audit and debugging.
+    sql_self_correction: dict[str, Any]
 
     # === Explicit mode (Задача 2.2) ===
     # Устанавливается explicit_mode_dispatcher если пользователь явно задал ≥2 параметра

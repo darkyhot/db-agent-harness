@@ -4,6 +4,7 @@ from core.catalog_grounding import ground_query_spec
 from core.query_ir import FilterSpec, QuerySpec, query_spec_json_schema
 from core.schema_loader import SchemaLoader
 from core.where_resolver import resolve_where
+from graph.nodes.sql_pipeline import _apply_query_spec_blueprint_overrides
 
 
 def _loader(tmp_path):
@@ -55,6 +56,59 @@ def test_query_spec_accepts_valid_payload():
     assert spec is not None
     assert spec.to_legacy_intent()["aggregation_hint"] == "sum"
     assert spec.to_legacy_user_hints()["group_by_hints"] == ["order_dt"]
+
+
+def test_query_spec_projects_multiple_count_metrics_without_loss():
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [
+            {"operation": "count", "target": "tb_id", "distinct_policy": "distinct", "confidence": 0.9},
+            {"operation": "count", "target": "gosb_id", "distinct_policy": "distinct", "confidence": 0.9},
+        ],
+        "dimensions": [],
+        "filters": [],
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.9,
+    })
+    assert spec is not None, errors
+
+    hints = spec.to_legacy_user_hints()
+
+    assert hints["aggregation_preferences"] == {
+        "function": "count",
+        "column": "tb_id",
+        "distinct": True,
+    }
+    assert hints["aggregation_preferences_list"] == [
+        {"function": "count", "column": "tb_id", "distinct": True},
+        {"function": "count", "column": "gosb_id", "distinct": True},
+    ]
+
+
+def test_query_spec_order_by_overrides_blueprint_direction():
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": "inn", "distinct_policy": "all", "confidence": 0.9}],
+        "dimensions": [],
+        "filters": [],
+        "order_by": {"target": "inn", "direction": "ASC", "confidence": 0.9},
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.9,
+    })
+    assert spec is not None, errors
+    blueprint = {
+        "aggregation": {"function": "COUNT", "column": "inn", "alias": "count_inn"},
+        "aggregations": [{"function": "COUNT", "column": "inn", "alias": "count_inn"}],
+        "order_by": "count_inn DESC",
+    }
+
+    _apply_query_spec_blueprint_overrides(blueprint, spec.to_dict())
+
+    assert blueprint["order_by"] == "count_inn ASC"
 
 
 def test_query_spec_rejects_invalid_metric_operation():

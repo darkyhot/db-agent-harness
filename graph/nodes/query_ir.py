@@ -20,9 +20,9 @@ class QueryIRNodes:
     def query_interpreter(self, state: AgentState) -> dict[str, Any]:
         """Interpret user language into a single QuerySpec.
 
-        This is the primary language-understanding node.  If the model cannot
-        produce a valid QuerySpec after retry, we explicitly mark the legacy
-        pipeline fallback instead of silently relying on partial parsing.
+        This is the primary language-understanding node. If the model cannot
+        produce a valid QuerySpec after retry, we ask for clarification instead
+        of switching to a second interpretation path.
         """
         iterations = state.get("graph_iterations", 0) + 1
 
@@ -58,11 +58,10 @@ class QueryIRNodes:
             expect="object",
         )
         if not isinstance(parsed, dict) or "task" not in parsed:
-            logger.warning(
-                "QueryInterpreter: LLM did not return QuerySpec.task, falling back to legacy pipeline"
-            )
+            logger.warning("QueryInterpreter: LLM did not return QuerySpec.task")
             return {
-                "use_legacy_interpreter": True,
+                "needs_clarification": True,
+                "clarification_message": "Не удалось разобрать смысл запроса в QuerySpec. Переформулируйте, пожалуйста.",
                 "query_spec_validation_errors": ["missing task"],
                 "graph_iterations": iterations,
             }
@@ -70,11 +69,12 @@ class QueryIRNodes:
         spec, errors = QuerySpec.from_dict(parsed)
         if spec is None:
             logger.warning(
-                "QueryInterpreter: QuerySpec invalid, falling back to legacy pipeline: %s",
+                "QueryInterpreter: QuerySpec invalid: %s",
                 "; ".join(errors),
             )
             return {
-                "use_legacy_interpreter": True,
+                "needs_clarification": True,
+                "clarification_message": "QuerySpec получился невалидным. Уточните запрос или укажите нужные метрики/измерения.",
                 "query_spec_validation_errors": errors,
                 "graph_iterations": iterations,
             }
@@ -124,20 +124,33 @@ class QueryIRNodes:
             schema_loader=self.schema,
             user_input=state.get("user_input", "") or "",
         )
+        if result.sources and not result.needs_clarification:
+            self._review_grounding_with_llm(state, result)
         logger.info(
             "CatalogGrounder: sources=%s confidence=%.2f",
             [s.full_name for s in result.sources],
             result.confidence,
         )
+        prev_planning = state.get("planning_confidence") or {}
+        prev_components = prev_planning.get("components", {}) if isinstance(prev_planning, dict) else {}
+        table_level = "high" if result.confidence >= 0.8 else ("medium" if result.confidence >= 0.5 else "low")
 
         update: dict[str, Any] = {
             "query_grounding": result.to_dict(),
             "plan_ir": result.plan_ir.to_dict() if result.plan_ir else {},
             "graph_iterations": iterations,
             "planning_confidence": {
-                **(state.get("planning_confidence") or {}),
+                **prev_planning,
                 "query_spec_confidence": spec.confidence,
                 "catalog_grounding_confidence": result.confidence,
+                "components": {
+                    **prev_components,
+                    "table_confidence": {
+                        "score": round(result.confidence, 3),
+                        "level": table_level,
+                        "evidence": [source.full_name for source in result.sources],
+                    },
+                },
             },
             "evidence_trace": {
                 **(state.get("evidence_trace") or {}),
@@ -207,6 +220,63 @@ class QueryIRNodes:
             )
         return "\n".join(lines)
 
+    def _review_grounding_with_llm(self, state: AgentState, result) -> None:
+        """Let LLM reorder/drop only already grounded real source candidates."""
+        if len(result.sources) < 2:
+            return
+        options = [
+            {
+                "table": source.full_name,
+                "reason": source.reason,
+                "confidence": source.confidence,
+            }
+            for source in result.sources
+        ]
+        system_prompt = (
+            "Ты проверяешь выбор таблиц для SQL-агента. Можно выбирать ТОЛЬКО из "
+            "переданного списка реальных таблиц. Верни JSON: "
+            '{"tables": ["schema.table", ...], "rationale": "кратко"}. '
+            "Сохрани все таблицы, которые нужны для метрик, измерений или join."
+        )
+        user_prompt = (
+            "Запрос пользователя:\n"
+            f"{state.get('user_input', '')}\n\n"
+            "QuerySpec:\n"
+            f"{json.dumps(state.get('query_spec') or {}, ensure_ascii=False)}\n\n"
+            "Кандидаты:\n"
+            f"{json.dumps(options, ensure_ascii=False)}\n\n"
+            "JSON:"
+        )
+        try:
+            parsed = self._llm_json_with_retry(
+                system_prompt,
+                user_prompt,
+                temperature=0.0,
+                failure_tag="catalog_grounding_reviewer",
+                expect="object",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CatalogGrounder reviewer failed: %s", exc)
+            return
+        requested = parsed.get("tables") if isinstance(parsed, dict) else None
+        if not isinstance(requested, list):
+            return
+        by_name = {source.full_name.lower(): source for source in result.sources}
+        reviewed = []
+        for item in requested:
+            source = by_name.get(str(item or "").strip().lower())
+            if source and source not in reviewed:
+                reviewed.append(source)
+        if not reviewed:
+            return
+        for source in result.sources:
+            if source not in reviewed:
+                reviewed.append(source)
+        result.sources = reviewed[: len(result.sources)]
+        if result.plan_ir is not None:
+            result.plan_ir.sources = result.sources
+            result.plan_ir.main_source = result.sources[0] if result.sources else None
+
 
 def _build_query_interpreter_system_prompt() -> str:
     schema = json.dumps(query_spec_json_schema(), ensure_ascii=False)
@@ -223,6 +293,9 @@ def _build_query_interpreter_system_prompt() -> str:
         "- task='answer_data' для расчётов/выборок; 'inspect_schema' для вопросов о каталоге; "
         "'edit_plan' для правки прошлого плана; 'clarify' для неоднозначности.\n"
         "- filters описывают бизнес-смысл, не SQL.\n"
+        "- Если пользователь просит несколько показателей (например ТБ и ГОСБ), "
+        "верни несколько объектов в metrics, не один.\n"
+        "- order_by заполняй для просьб о сортировке; direction должен быть ASC или DESC.\n"
         "- source_constraints заполняй только если источник явно назван или сильно следует из каталога.\n"
         "- Каждое важное поле снабжай confidence и evidence.\n\n"
         f"JSON Schema:\n{schema}"

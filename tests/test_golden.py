@@ -17,6 +17,7 @@
   max_retries: int            — максимально допустимое число retry (0 = с первой попытки)
 """
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,8 @@ class MockLLM:
         self.intent = intent
         self.complexity = complexity
         self._call_count = 0
+        self._active_scenario: str | None = None
+        self.calls: list[tuple[str, str]] = []
 
     @staticmethod
     def _extract_query(user_prompt: str) -> str:
@@ -124,10 +127,242 @@ class MockLLM:
             return "outflow_count"
         return "outflow_count"
 
+    @staticmethod
+    def _source(table: str, *, confidence: float = 0.9) -> dict[str, Any]:
+        return {"schema": "schema", "table": table, "required": True, "confidence": confidence}
+
+    @staticmethod
+    def _metric(operation: str, target: str | None = None, *, confidence: float = 0.9) -> dict[str, Any]:
+        return {
+            "operation": operation,
+            "target": target,
+            "distinct_policy": "auto",
+            "confidence": confidence,
+        }
+
+    @staticmethod
+    def _dimension(target: str, *, source_table: str | None = None, join_key: str | None = None) -> dict[str, Any]:
+        item: dict[str, Any] = {"target": target, "confidence": 0.9}
+        if source_table:
+            item["source_table"] = source_table
+        if join_key:
+            item["join_key"] = join_key
+        return item
+
+    def _query_spec_for_scenario(self, scenario: str) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "task": "answer_data",
+            "metrics": [self._metric("count")],
+            "dimensions": [],
+            "filters": [],
+            "source_constraints": [self._source("uzp_dwh_fact_outflow")],
+            "join_constraints": [],
+            "clarification_needed": False,
+            "confidence": 0.9,
+        }
+
+        if scenario == "schema_question":
+            return {
+                **base,
+                "task": "inspect_schema",
+                "metrics": [],
+                "source_constraints": [{"schema": "schema", "semantic": "schema", "required": True, "confidence": 0.9}],
+            }
+        if scenario == "outflow_count":
+            return base
+        if scenario == "outflow_january":
+            return {
+                **base,
+                "metrics": [self._metric("sum", "outflow_qty")],
+                "dimensions": [self._dimension("report_dt")],
+                "time_range": {"start": "2024-01-01", "end": "2024-02-01", "grain": "day", "confidence": 0.9},
+            }
+        if scenario == "outflow_sum_by_segment_month":
+            if self.complexity == "join":
+                return {
+                    **base,
+                    "metrics": [self._metric("sum", "outflow_qty")],
+                    "dimensions": [
+                        self._dimension(
+                            "segment_name",
+                            source_table="schema.uzp_data_epk_consolidation",
+                            join_key="inn",
+                        )
+                    ],
+                    "time_range": {"start": "2024-01-01", "end": "2024-02-01", "grain": "month", "confidence": 0.9},
+                    "source_constraints": [
+                        self._source("uzp_dwh_fact_outflow"),
+                        self._source("uzp_data_epk_consolidation"),
+                    ],
+                    "join_constraints": [{"left": "schema.uzp_dwh_fact_outflow", "right": "schema.uzp_data_epk_consolidation", "key": "inn", "confidence": 0.9}],
+                }
+            return {
+                **base,
+                "metrics": [self._metric("sum", "outflow_qty")],
+                "dimensions": [self._dimension("segment_name")],
+                "time_range": {"start": "2024-01-01", "end": "2024-02-01", "grain": "month", "confidence": 0.9},
+            }
+        if scenario == "count_by_segment":
+            return {
+                **base,
+                "metrics": [self._metric("count")],
+                "dimensions": [self._dimension("segment_name")],
+            }
+        if scenario == "tasks_by_segment":
+            return {
+                **base,
+                "metrics": [self._metric("count", "task_code")],
+                "dimensions": [self._dimension("segment_name")],
+                "source_constraints": [self._source("uzp_data_split_mzp_sale_funnel")],
+            }
+        if scenario == "outflow_by_region":
+            return {
+                **base,
+                "metrics": [self._metric("sum", "outflow_qty")],
+                "dimensions": [self._dimension("region_name", source_table="schema.uzp_dim_gosb", join_key="gosb_id")],
+                "source_constraints": [self._source("uzp_dwh_fact_outflow"), self._source("uzp_dim_gosb")],
+                "join_constraints": [{"left": "schema.uzp_dwh_fact_outflow", "right": "schema.uzp_dim_gosb", "key": "gosb_id", "confidence": 0.9}],
+            }
+        if scenario == "outflow_by_date_gosb_name":
+            return {
+                **base,
+                "metrics": [self._metric("sum", "outflow_qty")],
+                "dimensions": [
+                    self._dimension("report_dt"),
+                    self._dimension("new_gosb_name", source_table="schema.uzp_dim_gosb", join_key="old_gosb_id"),
+                ],
+                "source_constraints": [self._source("uzp_dwh_fact_outflow"), self._source("uzp_dim_gosb")],
+                "join_constraints": [
+                    {"left": "schema.uzp_dwh_fact_outflow", "right": "schema.uzp_dim_gosb", "key": "old_gosb_id", "confidence": 0.9},
+                    {"left": "schema.uzp_dwh_fact_outflow", "right": "schema.uzp_dim_gosb", "key": "tb_id", "confidence": 0.9},
+                ],
+                "order_by": {"target": "outflow_qty", "direction": "DESC", "confidence": 0.9},
+            }
+        if scenario == "payroll_epk_join":
+            return {
+                **base,
+                "metrics": [self._metric("count")],
+                "dimensions": [
+                    self._dimension(
+                        "segment_name",
+                        source_table="schema.uzp_data_epk_consolidation",
+                        join_key="inn",
+                    )
+                ],
+                "source_constraints": [
+                    self._source("uzp_data_payroll_m"),
+                    self._source("uzp_data_epk_consolidation"),
+                ],
+                "join_constraints": [{"left": "schema.uzp_data_payroll_m", "right": "schema.uzp_data_epk_consolidation", "key": "inn", "confidence": 0.9}],
+            }
+        return base
+
+    def _reviewed_tables_for_scenario(self, scenario: str) -> list[str]:
+        spec = self._query_spec_for_scenario(scenario)
+        tables = []
+        for source in spec.get("source_constraints", []):
+            schema = source.get("schema") or "schema"
+            table = source.get("table")
+            if table:
+                tables.append(f"{schema}.{table}")
+        return tables
+
+    def _columns_for_scenario(self, scenario: str) -> dict[str, Any]:
+        fact = "schema.uzp_dwh_fact_outflow"
+        epk = "schema.uzp_data_epk_consolidation"
+        gosb = "schema.uzp_dim_gosb"
+        funnel = "schema.uzp_data_split_mzp_sale_funnel"
+        payroll = "schema.uzp_data_payroll_m"
+
+        if scenario == "outflow_count":
+            return {"columns": {fact: {"aggregate": []}}, "join_keys": [], "null_warnings": []}
+        if scenario == "outflow_january":
+            return {
+                "columns": {fact: {"select": ["report_dt"], "filter": ["report_dt"], "aggregate": ["outflow_qty"], "group_by": ["report_dt"]}},
+                "join_keys": [],
+                "null_warnings": [],
+            }
+        if scenario == "outflow_sum_by_segment_month":
+            if self.complexity == "join":
+                return {
+                    "columns": {
+                        fact: {"filter": ["report_dt"], "aggregate": ["outflow_qty"], "select": ["inn"]},
+                        epk: {"select": ["segment_name", "inn"], "group_by": ["segment_name"]},
+                    },
+                    "join_keys": [{"left": f"{fact}.inn", "right": f"{epk}.inn", "safe": False, "strategy": "subquery"}],
+                    "null_warnings": [],
+                }
+            return {
+                "columns": {fact: {"select": ["segment_name"], "filter": ["report_dt"], "aggregate": ["outflow_qty"], "group_by": ["segment_name"]}},
+                "join_keys": [],
+                "null_warnings": [],
+            }
+        if scenario == "count_by_segment":
+            return {
+                "columns": {fact: {"select": ["segment_name"], "aggregate": [], "group_by": ["segment_name"]}},
+                "join_keys": [],
+                "null_warnings": [],
+            }
+        if scenario == "tasks_by_segment":
+            return {
+                "columns": {funnel: {"select": ["segment_name"], "aggregate": ["task_code"], "group_by": ["segment_name"]}},
+                "join_keys": [],
+                "null_warnings": [],
+            }
+        if scenario == "outflow_by_region":
+            return {
+                "columns": {
+                    fact: {"aggregate": ["outflow_qty"], "select": ["gosb_id"]},
+                    gosb: {"select": ["region_name", "old_gosb_id"], "group_by": ["region_name"]},
+                },
+                "join_keys": [{"left": f"{fact}.gosb_id", "right": f"{gosb}.old_gosb_id", "safe": True, "strategy": "direct"}],
+                "null_warnings": [],
+            }
+        if scenario == "outflow_by_date_gosb_name":
+            return {
+                "columns": {
+                    fact: {"select": ["report_dt", "gosb_id", "tb_id"], "aggregate": ["outflow_qty"], "group_by": ["report_dt"]},
+                    gosb: {"select": ["new_gosb_name", "old_gosb_id", "tb_id"], "group_by": ["new_gosb_name"]},
+                },
+                "join_keys": [
+                    {"left": f"{fact}.gosb_id", "right": f"{gosb}.old_gosb_id", "safe": True, "strategy": "direct"},
+                    {"left": f"{fact}.tb_id", "right": f"{gosb}.tb_id", "safe": True, "strategy": "direct"},
+                ],
+                "null_warnings": [],
+            }
+        if scenario == "payroll_epk_join":
+            return {
+                "columns": {
+                    payroll: {"select": ["inn"], "aggregate": []},
+                    epk: {"select": ["segment_name", "inn"], "group_by": ["segment_name"]},
+                },
+                "join_keys": [{"left": f"{payroll}.inn", "right": f"{epk}.inn", "safe": False, "strategy": "direct"}],
+                "null_warnings": [],
+            }
+        return {"columns": {fact: {"aggregate": []}}, "join_keys": [], "null_warnings": []}
+
     def invoke_with_system(self, system_prompt: str, user_prompt: str, **kwargs) -> str:
         self._call_count += 1
+        self.calls.append((system_prompt, user_prompt))
         query = self._extract_query(user_prompt)
-        scenario = self._scenario(query)
+        scenario = self._active_scenario or self._scenario(query)
+
+        # query_interpreter
+        if "query_interpreter" in system_prompt or "QuerySpec" in system_prompt:
+            scenario = self._scenario(query)
+            self._active_scenario = scenario
+            return json.dumps(self._query_spec_for_scenario(scenario), ensure_ascii=False)
+
+        # catalog_grounding_reviewer
+        if "проверяешь выбор таблиц" in system_prompt:
+            return json.dumps(
+                {"tables": self._reviewed_tables_for_scenario(scenario), "rationale": "golden mock"},
+                ensure_ascii=False,
+            )
+
+        # column_selector
+        if "селектор колонок" in system_prompt:
+            return json.dumps(self._columns_for_scenario(scenario), ensure_ascii=False)
 
         # intent_classifier
         if "классификатор запросов" in system_prompt or "intent" in system_prompt.lower():
@@ -403,7 +638,16 @@ class GraphRunner:
         self._final_state: dict = {}
         self._tool_calls: list[dict] = []
 
-    def run(self, query: str, patch_sql_writer: bool = False) -> dict[str, Any]:
+    def run(
+        self,
+        query: str,
+        patch_sql_writer: bool = False,
+        *,
+        show_plan: bool = False,
+        plan_preview_approved: bool = False,
+        plan_context: dict[str, Any] | None = None,
+        plan_edit_text: str = "",
+    ) -> dict[str, Any]:
         """Запустить граф с mock компонентами.
 
         Returns:
@@ -411,6 +655,10 @@ class GraphRunner:
         """
         import time
         from unittest.mock import patch, MagicMock
+
+        self._visited_nodes = []
+        self._final_state = {}
+        self._tool_calls = []
 
         mock_db = _make_mock_db()
         mock_schema = _make_mock_schema()
@@ -492,9 +740,15 @@ class GraphRunner:
                     self.mock_llm, mock_db, mock_schema, mock_memory,
                     mock_validator, [exec_tool, sample_tool, search_tool],
                     debug_prompt=False,
+                    show_plan=show_plan,
                 )
-                state = create_initial_state(query)
-                result: dict = {}
+                state = create_initial_state(
+                    query,
+                    plan_preview_approved=plan_preview_approved,
+                    plan_edit_text=plan_edit_text,
+                    plan_context=plan_context,
+                )
+                result: dict = dict(state)
 
                 for event in graph.stream(state):
                     node_name = list(event.keys())[0]
@@ -520,6 +774,14 @@ class GraphRunner:
                     "visited_nodes": visited,
                     "final_answer": result.get("final_answer", ""),
                     "tool_calls": self._tool_calls,
+                    "final_state": self._final_state,
+                    "query_spec": result.get("query_spec", {}),
+                    "query_grounding": result.get("query_grounding", {}),
+                    "selected_columns": result.get("selected_columns", {}),
+                    "join_spec": result.get("join_spec", []),
+                    "sql_blueprint": result.get("sql_blueprint", {}),
+                    "plan_preview_pending": bool(result.get("plan_preview_pending")),
+                    "confirmation_message": result.get("confirmation_message", ""),
                 }
             except Exception as e:
                 return {
@@ -609,6 +871,114 @@ def test_golden(case_name: str, spec: dict) -> None:
         assert actual_retries <= spec["max_retries"], (
             f"[{case_name}] retry_count={actual_retries} > max_retries={spec['max_retries']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression: show_plan (/plan) должен отличаться только preview/resume
+# ---------------------------------------------------------------------------
+
+_PLAN_EQ_QUERY = "Посчитай сумму оттока по дате и названию ГОСБ"
+_PLAN_EQ_FIELDS = (
+    "query_spec",
+    "query_grounding",
+    "selected_columns",
+    "join_spec",
+    "sql_blueprint",
+)
+
+
+def _route_without_plan_preview(nodes: list[str]) -> list[str]:
+    return [node for node in nodes if node != "plan_preview"]
+
+
+def _approved_route_without_resume(nodes: list[str]) -> list[str]:
+    return [
+        node for node in nodes
+        if node not in {"query_interpreter", "plan_preview"}
+    ]
+
+
+def _prompts_text(llm: MockLLM) -> str:
+    return "\n".join(f"{system}\n{user}" for system, user in llm.calls)
+
+
+def test_same_query_with_and_without_plan_produces_same_sql() -> None:
+    normal_llm = MockLLM()
+    normal = GraphRunner(normal_llm).run(_PLAN_EQ_QUERY)
+
+    plan_llm = MockLLM()
+    plan_runner = GraphRunner(plan_llm)
+    preview = plan_runner.run(_PLAN_EQ_QUERY, show_plan=True)
+    approved = plan_runner.run(
+        _PLAN_EQ_QUERY,
+        show_plan=True,
+        plan_preview_approved=True,
+        plan_context=preview["final_state"],
+    )
+
+    assert "error" not in normal
+    assert "error" not in preview
+    assert "error" not in approved
+    assert preview["plan_preview_pending"] is True
+    assert preview["sql"] == ""
+    assert normal["sql"] == approved["sql"]
+
+    plan_route = [
+        node for node in preview["visited_nodes"] if node != "plan_preview"
+    ] + _approved_route_without_resume(approved["visited_nodes"])
+    assert _route_without_plan_preview(normal["visited_nodes"]) == plan_route
+
+    prompt_text = _prompts_text(plan_llm)
+    assert "/plan" not in prompt_text
+    assert "show_plan" not in prompt_text
+    assert "/plan" not in approved["sql"]
+    assert "show_plan" not in approved["sql"]
+
+
+def test_plan_preview_resume_preserves_query_spec_and_blueprint() -> None:
+    normal = GraphRunner(MockLLM()).run(_PLAN_EQ_QUERY)
+    plan_runner = GraphRunner(MockLLM())
+    preview = plan_runner.run(_PLAN_EQ_QUERY, show_plan=True)
+    approved = plan_runner.run(
+        _PLAN_EQ_QUERY,
+        show_plan=True,
+        plan_preview_approved=True,
+        plan_context=preview["final_state"],
+    )
+
+    for field in _PLAN_EQ_FIELDS:
+        assert approved[field] == normal[field], field
+        assert approved[field] == preview[field], field
+
+
+def test_plan_edit_resume_uses_same_sql_pipeline_after_correction() -> None:
+    runner = GraphRunner(MockLLM())
+    preview = runner.run(_PLAN_EQ_QUERY, show_plan=True)
+    edited_preview = runner.run(
+        _PLAN_EQ_QUERY,
+        show_plan=True,
+        plan_edit_text="сделай сортировку asc",
+        plan_context=preview["final_state"],
+    )
+    approved = runner.run(
+        _PLAN_EQ_QUERY,
+        show_plan=True,
+        plan_preview_approved=True,
+        plan_context=edited_preview["final_state"],
+    )
+
+    assert "error" not in edited_preview
+    assert "error" not in approved
+    assert edited_preview["plan_preview_pending"] is True
+    assert "plan_edit_router" in edited_preview["visited_nodes"]
+    assert "catalog_grounder" in edited_preview["visited_nodes"]
+    assert "plan_preview" in edited_preview["visited_nodes"]
+
+    assert "sql_writer" in approved["visited_nodes"]
+    assert "sql_self_corrector" in approved["visited_nodes"]
+    assert "sql_static_checker" in approved["visited_nodes"]
+    assert "sql_validator" in approved["visited_nodes"]
+    assert approved["sql"]
 
 
 # ---------------------------------------------------------------------------

@@ -903,6 +903,7 @@ def build_blueprint(
     if (
         str((intent or {}).get("aggregation_hint") or "").lower().strip() == "count"
         and (semantic_frame or {}).get("requires_single_entity_count")
+        and not list((semantic_frame or {}).get("output_dimensions") or [])
         and schema_loader is not None
         and main_table
         and not ((user_hints or {}).get("aggregation_preferences") or {}).get("force_count_star")

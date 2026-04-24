@@ -39,7 +39,8 @@ class GraphNodes(
     - HintExtractorNodes: hint_extractor (regex + merge с LLM-результатом)
     - ExplicitModeDispatcherNodes: explicit_mode_dispatcher (детерминированный)
     - ExplorerNodes: table_explorer, column_selector
-    - SqlPipelineNodes: sql_planner, sql_writer, sql_static_checker, sql_validator_node
+    - SqlPipelineNodes: sql_planner, sql_writer, sql_self_corrector,
+      sql_static_checker, sql_validator_node
     - PlanPreviewNodes: plan_preview (детерминированный)
     - PlanEditNodes: plan_edit_router, plan_patcher, source_rebinder, intent_rewriter,
       plan_edit_validator, plan_diff_renderer

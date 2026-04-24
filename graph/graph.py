@@ -1,9 +1,9 @@
 """Сборка графа LangGraph с логикой переходов.
 
-Новая архитектура: 12 узлов.
+Новая архитектура: 13 узлов.
 intent_classifier → table_resolver → table_explorer → column_selector
-  → sql_planner → sql_writer → sql_static_checker → sql_validator
-      → [ошибка] → error_diagnoser → sql_fixer → sql_static_checker → sql_validator
+  → sql_planner → sql_writer → sql_self_corrector → sql_static_checker → sql_validator
+      → [ошибка] → error_diagnoser → sql_fixer → sql_self_corrector → sql_static_checker → sql_validator
       → [успех] → summarizer → END
 """
 
@@ -106,9 +106,6 @@ def _route_after_query_interpreter(state: AgentState) -> str:
     if state.get("plan_edit_text") and state.get("sql_blueprint"):
         return "plan_edit_router"
 
-    if state.get("use_legacy_interpreter"):
-        return "intent_classifier"
-
     if state.get("needs_clarification"):
         return END
 
@@ -176,7 +173,7 @@ def _route_after_sql_writer(state: AgentState) -> str:
         return END
 
     if state.get("sql_to_validate"):
-        return "sql_static_checker"
+        return "sql_self_corrector"
 
     if state.get("last_error"):
         return "error_diagnoser"
@@ -188,6 +185,30 @@ def _route_after_sql_writer(state: AgentState) -> str:
         return "summarizer"
 
     # Ещё есть шаги — возврат к column_selector для следующего шага
+    return "column_selector"
+
+
+def _route_after_sql_self_corrector(state: AgentState) -> str:
+    """Маршрутизация после LLM self-correction SQL."""
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("needs_clarification"):
+        return END
+
+    if state.get("last_error"):
+        return "error_diagnoser"
+
+    if state.get("sql_to_validate"):
+        return "sql_static_checker"
+
+    if state.get("final_answer"):
+        return "summarizer"
+
+    if state["current_step"] >= len(state["plan"]):
+        return "summarizer"
+
     return "column_selector"
 
 
@@ -275,6 +296,8 @@ def _route_after_plan_edit_router(state: AgentState) -> str:
         return END
 
     kind = str(state.get("plan_edit_kind") or "")
+    if kind == "query_spec":
+        return "catalog_grounder"
     if kind == "patch":
         return "plan_patcher"
     if kind == "rebind":
@@ -306,9 +329,9 @@ def _route_after_error_diagnoser(state: AgentState) -> str:
     if state.get("needs_replan"):
         return "table_resolver"
 
-    # Тривиальный фикс кодом — SQL уже исправлен, к валидатору
+    # Тривиальный фикс кодом — SQL уже исправлен, к self-correction перед валидатором
     if state.get("sql_to_validate"):
-        return "sql_validator"
+        return "sql_self_corrector"
 
     # Нужен sample — к tool_dispatcher
     diagnosis = state.get("error_diagnosis", {})
@@ -330,7 +353,7 @@ def _route_after_sql_fixer(state: AgentState) -> str:
         return limit
 
     if state.get("sql_to_validate"):
-        return "sql_validator"
+        return "sql_self_corrector"
 
     if state.get("final_answer"):
         return "summarizer"
@@ -360,10 +383,10 @@ def build_graph(
 ) -> StateGraph:
     """Собрать граф агента.
 
-    Новая архитектура с 11 узлами:
+    Новая архитектура с 13 узлами:
     intent_classifier → table_resolver → table_explorer → column_selector
-      → sql_planner → sql_writer → sql_validator
-          → [ошибка] → error_diagnoser → sql_fixer → sql_validator
+      → sql_planner → sql_writer → sql_self_corrector → sql_validator
+          → [ошибка] → error_diagnoser → sql_fixer → sql_self_corrector → sql_validator
           → [успех] → summarizer → END
     """
     logger.info(
@@ -399,6 +422,7 @@ def build_graph(
     graph.add_node("plan_edit_validator", nodes.plan_edit_validator)
     graph.add_node("plan_diff_renderer", nodes.plan_diff_renderer)
     graph.add_node("sql_writer", nodes.sql_writer)
+    graph.add_node("sql_self_corrector", nodes.sql_self_corrector)
     graph.add_node("sql_static_checker", nodes.sql_static_checker)
     graph.add_node("sql_validator", nodes.sql_validator_node)
     graph.add_node("error_diagnoser", nodes.error_diagnoser)
@@ -413,7 +437,6 @@ def build_graph(
     graph.add_conditional_edges("query_interpreter", _route_after_query_interpreter, {
         END: END,
         "catalog_grounder": "catalog_grounder",
-        "intent_classifier": "intent_classifier",
         "plan_edit_router": "plan_edit_router",
         "plan_preview": "plan_preview",
         "summarizer": "summarizer",
@@ -424,21 +447,8 @@ def build_graph(
         "summarizer": "summarizer",
     })
 
-    # === Legacy compatibility path: intent → tables → explore → columns → plan → write ===
-    # intent_classifier → conditional routing
-    graph.add_conditional_edges("intent_classifier", _route_after_intent_classifier, {
-        END: END,
-        "summarizer": "summarizer",
-        "tool_dispatcher": "tool_dispatcher",
-        "hint_extractor_llm": "hint_extractor_llm",
-        "plan_edit_router": "plan_edit_router",
-        "plan_preview": "plan_preview",
-    })
-
-    # hint_extractor_llm → hint_extractor (merge LLM+regex) → explicit_mode_dispatcher → table_resolver
-    graph.add_edge("hint_extractor_llm", "hint_extractor")
-    graph.add_edge("hint_extractor", "explicit_mode_dispatcher")
-    graph.add_edge("explicit_mode_dispatcher", "table_resolver")
+    # Legacy nodes are still registered for direct tests and emergency tooling,
+    # but the main graph no longer routes through a second interpretation path.
 
     # tool_dispatcher → conditional routing (back to resolver or diagnoser)
     graph.add_conditional_edges("tool_dispatcher", _route_after_tool_dispatcher, {
@@ -473,6 +483,7 @@ def build_graph(
 
     graph.add_conditional_edges("plan_edit_router", _route_after_plan_edit_router, {
         END: END,
+        "catalog_grounder": "catalog_grounder",
         "plan_patcher": "plan_patcher",
         "source_rebinder": "source_rebinder",
         "intent_rewriter": "intent_rewriter",
@@ -488,8 +499,17 @@ def build_graph(
     })
     graph.add_edge("plan_diff_renderer", "plan_preview")
 
-    # sql_writer → sql_static_checker → sql_validator (или error_diagnoser)
+    # sql_writer → sql_self_corrector → sql_static_checker → sql_validator
+    # (или error_diagnoser)
     graph.add_conditional_edges("sql_writer", _route_after_sql_writer, {
+        END: END,
+        "sql_self_corrector": "sql_self_corrector",
+        "error_diagnoser": "error_diagnoser",
+        "summarizer": "summarizer",
+        "column_selector": "column_selector",
+    })
+
+    graph.add_conditional_edges("sql_self_corrector", _route_after_sql_self_corrector, {
         END: END,
         "sql_static_checker": "sql_static_checker",
         "error_diagnoser": "error_diagnoser",
@@ -516,15 +536,15 @@ def build_graph(
     # error_diagnoser → conditional routing
     graph.add_conditional_edges("error_diagnoser", _route_after_error_diagnoser, {
         "table_resolver": "table_resolver",
-        "sql_validator": "sql_validator",
+        "sql_self_corrector": "sql_self_corrector",
         "tool_dispatcher": "tool_dispatcher",
         "sql_fixer": "sql_fixer",
         "summarizer": "summarizer",
     })
 
-    # sql_fixer → sql_static_checker → sql_validator (через тот же static check)
+    # sql_fixer → sql_self_corrector → sql_static_checker → sql_validator
     graph.add_conditional_edges("sql_fixer", _route_after_sql_fixer, {
-        "sql_validator": "sql_static_checker",
+        "sql_self_corrector": "sql_self_corrector",
         "error_diagnoser": "error_diagnoser",
         "summarizer": "summarizer",
         "column_selector": "column_selector",
@@ -610,6 +630,7 @@ def create_initial_state(
             "group_by_hints": [],
             "aggregate_hints": [],
             "aggregation_preferences": {},
+            "aggregation_preferences_list": [],
             "time_granularity": None,
             "negative_filters": [],
         },
@@ -619,6 +640,7 @@ def create_initial_state(
         planning_confidence=dict(ctx.get("planning_confidence") or {}),
         evidence_trace=dict(ctx.get("evidence_trace") or {}),
         fallback_policy=dict(ctx.get("fallback_policy") or {}),
+        sql_self_correction=dict(ctx.get("sql_self_correction") or {}),
         # Белый список таблиц (заполняется в table_resolver)
         allowed_tables=list(ctx.get("allowed_tables") or [_full_table_name(t) for t in selected_tables if _full_table_name(t)]),
         # Explicit mode (задача 2.2)

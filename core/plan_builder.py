@@ -22,6 +22,9 @@ def build_plan_ir(
         filters=query_spec.filters,
         joins=query_spec.join_constraints,
         time_range=query_spec.time_range,
+        having=query_spec.having,
+        order_by=query_spec.order_by,
+        limit=query_spec.limit,
         confidence=confidence,
         warnings=list(warnings or []),
     )

@@ -215,35 +215,30 @@ def build_fallback_policy(
         }
 
     if not has_template_sql:
+        allow_reviewed_llm = level != "low" and action != "stop"
         return {
-            "allow_llm_fallback": level == "high",
-            "action": "llm_fallback" if level == "high" else action,
+            "allow_llm_fallback": allow_reviewed_llm,
+            "action": "llm_fallback" if allow_reviewed_llm else action,
             "reason": "no_deterministic_template",
+            "guard": "sql_self_corrector",
             "message": (
-                "" if level == "high"
+                "" if allow_reviewed_llm
                 else "Не хватает уверенности, чтобы безопасно строить SQL через LLM без детерминированной основы."
             ),
         }
 
-    if level == "high":
+    if level in {"high", "medium"} and action != "stop":
         return {
             "allow_llm_fallback": True,
             "action": "llm_fallback",
-            "reason": "deterministic_failed_but_plan_high_confidence",
+            "reason": "deterministic_failed_but_plan_reviewable",
+            "guard": "sql_self_corrector",
             "message": "",
-        }
-
-    if level == "medium":
-        return {
-            "allow_llm_fallback": False,
-            "action": "clarify",
-            "reason": "medium_confidence_requires_clarification",
-            "message": "Есть несколько правдоподобных интерпретаций запроса. Нужна короткая уточняющая деталь перед генерацией SQL.",
         }
 
     return {
         "allow_llm_fallback": False,
-        "action": "stop",
+        "action": action if action == "stop" else "stop",
         "reason": "low_confidence_blocks_llm_fallback",
         "message": "Недостаточно уверенности в выборе источника или фильтров, поэтому генерация SQL остановлена до уточнения.",
     }

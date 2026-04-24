@@ -226,7 +226,8 @@ class PlanEditNodes:
     )
     _PATCH_COUNT_STAR = re.compile(
         r"(?:count\s*\(\s*\*\s*\)|посчита[йи]\w*\s+просто\s+количеств\w*\s+строк|"
-        r"прост\w*\s+количеств\w*\s+строк|count\s+all|count\s+rows)",
+        r"прост\w*\s+количеств\w*\s+строк|счита[йи]\w*\s+просто\s+строк\w*|"
+        r"прост\w*\s+строк\w*|count\s+all|count\s+rows)",
         re.IGNORECASE,
     )
     _PATCH_NO_DISTINCT = re.compile(
@@ -239,13 +240,520 @@ class PlanEditNodes:
         re.IGNORECASE,
     )
     _PATCH_ADD_COUNT_FIELD = re.compile(
-        r"(?:и\s+ещ[её]|ещ[её]|добав[ььт]\w*)\s+(?:count\s+)?(?:by|по|на)\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
+        r"(?:и\s+ещ[её]|ещ[её]|добав[ььт]\w*|надо\s+ещ[её]|нужно\s+ещ[её])\s+"
+        r"(?:count\s+)?(?:(?:by|по|на)\s+)?([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
+        re.IGNORECASE,
+    )
+    _PATCH_REPLACE_METRIC = re.compile(
+        r"не\s+(?:по\s+)?([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)\s*,?\s+а\s+(?:по\s+)?([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
+        re.IGNORECASE,
+    )
+    _PATCH_REPLACE_DIRECT = re.compile(
+        r"(?:вместо|замени\s+на)\s+(?:по\s+)?([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
         re.IGNORECASE,
     )
     _PATCH_DATE_SHIFT = re.compile(
         r"(?:с|от)\s+(\d{1,2})\s*(?:числ[ао]?)?\s+(?:на|до)\s+(\d{1,2})\s*(?:числ[ао]?)?",
         re.IGNORECASE,
     )
+
+    def _build_plan_edit_resolution(
+        self,
+        *,
+        edit_goal: str,
+        requested_changes: list[dict[str, Any]] | None = None,
+        candidate_targets: list[dict[str, Any]] | None = None,
+        chosen_patch: list[dict[str, Any]] | None = None,
+        confidence: float = 0.0,
+        clarification_reason: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "edit_goal": edit_goal,
+            "requested_changes": list(requested_changes or []),
+            "candidate_targets": list(candidate_targets or []),
+            "chosen_patch": list(chosen_patch or []),
+            "confidence": float(confidence or 0.0),
+            "clarification_reason": str(clarification_reason or ""),
+        }
+
+    def _patch_result(
+        self,
+        resolution: dict[str, Any],
+        *,
+        explanation: str,
+    ) -> dict[str, Any]:
+        return {
+            "edit_kind": "patch",
+            "confidence": float(resolution.get("confidence", 0.0) or 0.0),
+            "explanation": explanation,
+            "needs_clarification": False,
+            "payload": {
+                "resolution": resolution,
+                "chosen_patch": list(resolution.get("chosen_patch") or []),
+            },
+        }
+
+    def _clarify_result(
+        self,
+        resolution: dict[str, Any],
+        question: str,
+        *,
+        explanation: str,
+        confidence: float | None = None,
+    ) -> dict[str, Any]:
+        if confidence is not None:
+            resolution["confidence"] = float(confidence)
+        return {
+            "edit_kind": "clarify",
+            "confidence": float(resolution.get("confidence", 0.0) or 0.0),
+            "explanation": explanation,
+            "needs_clarification": True,
+            "payload": {
+                "question": question,
+                "resolution": resolution,
+            },
+        }
+
+    def _metric_alias(self, function: str, column: str) -> str:
+        func = str(function or "").upper()
+        col = str(column or "")
+        if func == "COUNT" and col == "*":
+            return "count_all"
+        return f"{func.lower()}_{col}"
+
+    def _build_metric(self, *, function: str, column: str, distinct: bool = False) -> dict[str, Any]:
+        metric = {
+            "function": str(function or "COUNT").upper(),
+            "column": str(column or ""),
+            "alias": self._metric_alias(function, column),
+        }
+        if distinct and column != "*":
+            metric["distinct"] = True
+        return metric
+
+    def _build_editable_plan_state(self, blueprint: dict[str, Any]) -> dict[str, Any]:
+        bp = _sync_legacy_aggregation_fields(blueprint)
+        metrics = [dict(item) for item in (_iter_blueprint_aggregations(bp)) if item]
+        return {
+            "metrics": metrics,
+            "metric_aliases": [str(item.get("alias") or "") for item in metrics if str(item.get("alias") or "")],
+            "group_by": list(bp.get("group_by") or []),
+            "where_conditions": list(bp.get("where_conditions") or []),
+            "order_by": str(bp.get("order_by") or "").strip(),
+            "limit": bp.get("limit"),
+        }
+
+    def _resolve_column_candidates(
+        self,
+        token: str,
+        *,
+        main_table: str,
+        selected_columns: dict[str, Any],
+    ) -> list[str]:
+        raw = str(token or "").strip()
+        if not raw:
+            return []
+        if raw == "*":
+            return ["*"]
+
+        raw_lower = raw.lower()
+        scores: dict[str, int] = {}
+
+        def _push(column: str, score: int) -> None:
+            if not column:
+                return
+            if score > scores.get(column, -1):
+                scores[column] = score
+
+        known_columns = _collect_known_columns(selected_columns)
+        for col in known_columns:
+            col_lower = col.lower()
+            normalized = col_lower.replace("_", " ")
+            if raw_lower == col_lower:
+                _push(col, 100)
+            elif raw_lower == normalized:
+                _push(col, 96)
+            elif raw_lower in col_lower or raw_lower in normalized:
+                _push(col, 70)
+
+        cols_map = _table_columns_map(self.schema, main_table)
+        split = _split_table_name(main_table)
+        for meta in cols_map.values():
+            col_name = str(meta.get("column_name") or "")
+            desc = str(meta.get("description") or "").strip().lower()
+            col_lower = col_name.lower()
+            normalized = col_lower.replace("_", " ")
+            if raw_lower == col_lower:
+                _push(col_name, 99)
+            if raw_lower == normalized:
+                _push(col_name, 95)
+            if raw_lower and desc == raw_lower:
+                _push(col_name, 94)
+            elif raw_lower and raw_lower in desc:
+                _push(col_name, 72)
+            elif raw_lower and (raw_lower in col_lower or raw_lower in normalized):
+                _push(col_name, 68)
+
+        if split is not None:
+            schema_name, table_name = split
+            for meta in cols_map.values():
+                col_name = str(meta.get("column_name") or "")
+                synonyms = self.schema.get_column_synonyms(schema_name, table_name, col_name)
+                for synonym in synonyms:
+                    syn = str(synonym or "").strip().lower()
+                    if not syn:
+                        continue
+                    if raw_lower == syn:
+                        _push(col_name, 93)
+                    elif raw_lower in syn:
+                        _push(col_name, 69)
+
+        return [col for col, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))]
+
+    def _resolve_metric_target(
+        self,
+        token: str,
+        *,
+        blueprint: dict[str, Any],
+        selected_columns: dict[str, Any],
+        current_metrics: list[dict[str, Any]],
+    ) -> tuple[str | None, list[str], str]:
+        candidates = self._resolve_column_candidates(
+            token,
+            main_table=str(blueprint.get("main_table") or ""),
+            selected_columns=selected_columns,
+        )
+        if not candidates:
+            return None, [], "missing"
+
+        current_columns = [str(metric.get("column") or "") for metric in current_metrics if str(metric.get("column") or "")]
+        unseen_candidates = [col for col in candidates if col not in current_columns]
+        if len(unseen_candidates) == 1:
+            return unseen_candidates[0], candidates, "ok"
+        if len(unseen_candidates) > 1:
+            return None, candidates, "ambiguous"
+
+        if len(candidates) == 1:
+            return candidates[0], candidates, "ok"
+        return None, candidates, "ambiguous"
+
+    def _metric_clarification_question(
+        self,
+        token: str,
+        candidates: list[str],
+        *,
+        action: str,
+        current_metrics: list[dict[str, Any]],
+    ) -> str:
+        token_norm = str(token or "").strip()
+        current_label = ", ".join(
+            _format_aggregation_expr(metric)
+            for metric in current_metrics
+            if metric
+        )
+        if not candidates:
+            prefix = "добавить" if action == "add_metric" else "считать"
+            return f"Не удалось распознать колонку '{token_norm}'. По какой колонке нужно {prefix}?"
+        options = ", ".join(f"`{item}`" for item in candidates[:3])
+        if action == "add_metric" and current_label:
+            return f"Добавить вторую метрику к текущему {current_label}? Под `{token_norm}` имеется в виду {options}?"
+        if action == "replace_primary_metric" and current_label:
+            return f"Заменить текущую метрику {current_label}? Под `{token_norm}` имеется в виду {options}?"
+        return f"Под `{token_norm}` имеется в виду {options}?"
+
+    def _extract_shifted_date_range(
+        self,
+        blueprint: dict[str, Any],
+        edit_text: str,
+    ) -> tuple[str, str] | None:
+        date_shift = self._PATCH_DATE_SHIFT.search(edit_text)
+        if not date_shift:
+            return None
+        old_day = int(date_shift.group(1))
+        new_day = int(date_shift.group(2))
+        current_from = None
+        current_to = None
+        for cond in blueprint.get("where_conditions") or []:
+            m_from = re.search(r"[a-zA-Z_][a-zA-Z0-9_]*\s*>=\s*'(\d{4}-\d{2}-\d{2})'::date", cond)
+            m_to = re.search(r"[a-zA-Z_][a-zA-Z0-9_]*\s*<\s*'(\d{4}-\d{2}-\d{2})'::date", cond)
+            if m_from and current_from is None:
+                current_from = m_from.group(1)
+            if m_to and current_to is None:
+                current_to = m_to.group(1)
+        if not current_from:
+            return None
+        dt = datetime.strptime(current_from, "%Y-%m-%d")
+        if dt.day != old_day:
+            return None
+        new_from_dt = dt.replace(day=new_day)
+        if not current_to:
+            return new_from_dt.strftime("%Y-%m-%d"), ""
+        current_to_dt = datetime.strptime(current_to, "%Y-%m-%d")
+        delta = current_to_dt - dt
+        new_to_dt = new_from_dt + delta
+        return new_from_dt.strftime("%Y-%m-%d"), new_to_dt.strftime("%Y-%m-%d")
+
+    def _resolve_patch_route(
+        self,
+        state: AgentState,
+        edit_text: str,
+        blueprint: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        text = str(edit_text or "").lower().strip()
+        selected_columns = state.get("selected_columns") or {}
+        plan_state = self._build_editable_plan_state(blueprint)
+        current_metrics = list(plan_state.get("metrics") or [])
+        requested_changes: list[dict[str, Any]] = []
+        candidate_targets: list[dict[str, Any]] = []
+        chosen_patch: list[dict[str, Any]] = []
+
+        if re.fullmatch(r"поменяй\s+порядок", text):
+            resolution = self._build_plan_edit_resolution(
+                edit_goal="clarify",
+                confidence=0.7,
+                clarification_reason="ambiguous_sort_or_columns",
+            )
+            return self._clarify_result(
+                resolution,
+                "Нужно изменить сортировку или порядок колонок в выдаче?",
+                explanation="Неясно, меняется сортировка или порядок колонок",
+            )
+
+        replace_metric_match = self._PATCH_REPLACE_METRIC.search(edit_text)
+        replace_direct_match = self._PATCH_REPLACE_DIRECT.search(edit_text)
+        add_metric_match = self._PATCH_ADD_COUNT_FIELD.search(edit_text)
+        count_by_match = self._PATCH_COUNT_BY_FIELD.search(edit_text)
+        distinct_metric_match = self._PATCH_COUNT_DISTINCT.search(edit_text)
+        has_count_metric = any(str(item.get("function") or "").upper() == "COUNT" for item in current_metrics)
+        explicit_count_context = bool(
+            distinct_metric_match
+            or self._PATCH_COUNT_STAR.search(edit_text)
+            or re.search(r"(счита[йе]\w*|подсчита[йе]\w*|\bcount\b)", text)
+        )
+        if add_metric_match and not (has_count_metric or explicit_count_context):
+            add_metric_match = None
+
+        if self._PATCH_COUNT_STAR.search(edit_text):
+            requested_changes.append({"action": "set_count_star"})
+            chosen_patch.append({"command": "set_count_star"})
+
+        if replace_metric_match:
+            old_token = replace_metric_match.group(1).strip()
+            new_token = replace_metric_match.group(2).strip()
+            requested_changes.append({"action": "replace_primary_metric", "from": old_token, "to": new_token})
+            resolved_column, candidates, status = self._resolve_metric_target(
+                new_token,
+                blueprint=blueprint,
+                selected_columns=selected_columns,
+                current_metrics=current_metrics,
+            )
+            candidate_targets.append({"slot": "metric", "token": new_token, "matches": candidates})
+            if status != "ok" or not resolved_column:
+                resolution = self._build_plan_edit_resolution(
+                    edit_goal="clarify",
+                    requested_changes=requested_changes,
+                    candidate_targets=candidate_targets,
+                    confidence=0.78,
+                    clarification_reason=f"replace_metric_{status}",
+                )
+                return self._clarify_result(
+                    resolution,
+                    self._metric_clarification_question(new_token, candidates, action="replace_primary_metric", current_metrics=current_metrics),
+                    explanation="Не удалось однозначно подобрать замену метрики",
+                )
+            inherit_distinct = bool(current_metrics[0].get("distinct")) if current_metrics else False
+            chosen_patch.append({
+                "command": "replace_primary_metric",
+                "function": "COUNT",
+                "column": resolved_column,
+                "distinct": inherit_distinct,
+            })
+        elif replace_direct_match:
+            token = replace_direct_match.group(1).strip()
+            requested_changes.append({"action": "replace_primary_metric", "target": token})
+            resolved_column, candidates, status = self._resolve_metric_target(
+                token,
+                blueprint=blueprint,
+                selected_columns=selected_columns,
+                current_metrics=current_metrics,
+            )
+            candidate_targets.append({"slot": "metric", "token": token, "matches": candidates})
+            if status != "ok" or not resolved_column:
+                resolution = self._build_plan_edit_resolution(
+                    edit_goal="clarify",
+                    requested_changes=requested_changes,
+                    candidate_targets=candidate_targets,
+                    confidence=0.8,
+                    clarification_reason=f"replace_metric_{status}",
+                )
+                return self._clarify_result(
+                    resolution,
+                    self._metric_clarification_question(token, candidates, action="replace_primary_metric", current_metrics=current_metrics),
+                    explanation="Не удалось однозначно определить заменяющую метрику",
+                )
+            chosen_patch.append({
+                "command": "replace_primary_metric",
+                "function": "COUNT",
+                "column": resolved_column,
+                "distinct": bool(current_metrics[0].get("distinct")) if current_metrics else False,
+            })
+        elif distinct_metric_match:
+            token = (distinct_metric_match.group(1) or distinct_metric_match.group(2) or "").strip()
+            requested_changes.append({"action": "replace_primary_metric", "mode": "count_distinct", "target": token})
+            resolved_column, candidates, status = self._resolve_metric_target(
+                token,
+                blueprint=blueprint,
+                selected_columns=selected_columns,
+                current_metrics=current_metrics,
+            )
+            candidate_targets.append({"slot": "metric", "token": token, "matches": candidates})
+            if status != "ok" or not resolved_column:
+                resolution = self._build_plan_edit_resolution(
+                    edit_goal="clarify",
+                    requested_changes=requested_changes,
+                    candidate_targets=candidate_targets,
+                    confidence=0.8,
+                    clarification_reason=f"distinct_metric_{status}",
+                )
+                return self._clarify_result(
+                    resolution,
+                    self._metric_clarification_question(token, candidates, action="replace_primary_metric", current_metrics=current_metrics),
+                    explanation="Не удалось однозначно определить колонку для COUNT DISTINCT",
+                )
+            chosen_patch.append({
+                "command": "replace_primary_metric",
+                "function": "COUNT",
+                "column": resolved_column,
+                "distinct": True,
+            })
+        elif add_metric_match:
+            token = add_metric_match.group(1).strip()
+            requested_changes.append({"action": "add_metric", "target": token})
+            resolved_column, candidates, status = self._resolve_metric_target(
+                token,
+                blueprint=blueprint,
+                selected_columns=selected_columns,
+                current_metrics=current_metrics,
+            )
+            candidate_targets.append({"slot": "metric", "token": token, "matches": candidates})
+            if status != "ok" or not resolved_column:
+                resolution = self._build_plan_edit_resolution(
+                    edit_goal="clarify",
+                    requested_changes=requested_changes,
+                    candidate_targets=candidate_targets,
+                    confidence=0.82,
+                    clarification_reason=f"add_metric_{status}",
+                )
+                return self._clarify_result(
+                    resolution,
+                    self._metric_clarification_question(token, candidates, action="add_metric", current_metrics=current_metrics),
+                    explanation="Не удалось однозначно определить добавляемую метрику",
+                )
+            inherit_distinct = bool(current_metrics[0].get("distinct")) if current_metrics else False
+            command = "add_metric" if current_metrics else "replace_primary_metric"
+            chosen_patch.append({
+                "command": command,
+                "function": "COUNT",
+                "column": resolved_column,
+                "distinct": inherit_distinct,
+            })
+        elif count_by_match:
+            token = count_by_match.group(1).strip()
+            requested_changes.append({"action": "replace_primary_metric", "target": token})
+            resolved_column, candidates, status = self._resolve_metric_target(
+                token,
+                blueprint=blueprint,
+                selected_columns=selected_columns,
+                current_metrics=current_metrics,
+            )
+            candidate_targets.append({"slot": "metric", "token": token, "matches": candidates})
+            if status != "ok" or not resolved_column:
+                resolution = self._build_plan_edit_resolution(
+                    edit_goal="clarify",
+                    requested_changes=requested_changes,
+                    candidate_targets=candidate_targets,
+                    confidence=0.8,
+                    clarification_reason=f"replace_metric_{status}",
+                )
+                return self._clarify_result(
+                    resolution,
+                    self._metric_clarification_question(token, candidates, action="replace_primary_metric", current_metrics=current_metrics),
+                    explanation="Не удалось однозначно определить колонку для COUNT",
+                )
+            chosen_patch.append({
+                "command": "replace_primary_metric",
+                "function": "COUNT",
+                "column": resolved_column,
+                "distinct": bool(current_metrics[0].get("distinct")) if current_metrics else False,
+            })
+
+        if self._PATCH_NO_DISTINCT.search(edit_text):
+            requested_changes.append({"action": "set_distinct", "value": False})
+            chosen_patch.append({"command": "set_distinct", "value": False, "target": "primary"})
+
+        if self._PATCH_SORT_DESC.search(edit_text):
+            requested_changes.append({"action": "set_order", "direction": "DESC"})
+            chosen_patch.append({"command": "set_order", "direction": "DESC"})
+        elif self._PATCH_SORT_ASC.search(edit_text):
+            requested_changes.append({"action": "set_order", "direction": "ASC"})
+            chosen_patch.append({"command": "set_order", "direction": "ASC"})
+
+        limit_match = self._PATCH_LIMIT.search(edit_text)
+        if limit_match:
+            requested_changes.append({"action": "set_limit", "value": int(limit_match.group(1))})
+            chosen_patch.append({"command": "set_limit", "value": int(limit_match.group(1))})
+        elif re.search(r"(убери|удали)\s+(?:лимит|limit)", text):
+            requested_changes.append({"action": "set_limit", "value": None})
+            chosen_patch.append({"command": "set_limit", "value": None})
+
+        group_by_match = self._PATCH_GROUP_BY.search(edit_text)
+        if group_by_match:
+            token = group_by_match.group(1).strip()
+            candidates = self._resolve_column_candidates(
+                token,
+                main_table=str(blueprint.get("main_table") or ""),
+                selected_columns=selected_columns,
+            )
+            candidate_targets.append({"slot": "group_by", "token": token, "matches": candidates})
+            if len(candidates) != 1:
+                resolution = self._build_plan_edit_resolution(
+                    edit_goal="clarify",
+                    requested_changes=requested_changes + [{"action": "add_group_by", "target": token}],
+                    candidate_targets=candidate_targets,
+                    confidence=0.78,
+                    clarification_reason="group_by_ambiguous",
+                )
+                return self._clarify_result(
+                    resolution,
+                    self._metric_clarification_question(token, candidates, action="add_group_by", current_metrics=current_metrics),
+                    explanation="Не удалось однозначно определить колонку для группировки",
+                )
+            requested_changes.append({"action": "add_group_by", "target": token})
+            chosen_patch.append({"command": "add_group_by", "column": candidates[0]})
+        elif re.search(r"(убери|удали)\s+группиров", text):
+            requested_changes.append({"action": "remove_group_by", "all": True})
+            chosen_patch.append({"command": "remove_group_by", "all": True})
+
+        shifted_range = self._extract_shifted_date_range(blueprint, edit_text)
+        if shifted_range:
+            date_from, date_to = shifted_range
+            requested_changes.append({"action": "set_date_range", "from": date_from, "to": date_to or None})
+            chosen_patch.append({"command": "set_date_range", "from": date_from, "to": date_to or None})
+
+        if not chosen_patch:
+            return None
+
+        resolution = self._build_plan_edit_resolution(
+            edit_goal="patch",
+            requested_changes=requested_changes,
+            candidate_targets=candidate_targets,
+            chosen_patch=chosen_patch,
+            confidence=0.95,
+        )
+        return self._patch_result(
+            resolution,
+            explanation="Локальная правка текущего плана через state-based resolver",
+        )
 
     def _sanitize_patch_operations(
         self,
@@ -418,9 +926,6 @@ class PlanEditNodes:
             parsed.setdefault("confidence", 0.5)
             parsed.setdefault("explanation", "LLM fallback")
             parsed.setdefault("needs_clarification", parsed.get("edit_kind") == "clarify")
-            if parsed.get("edit_kind") == "patch" and not (parsed.get("payload") or {}).get("operations"):
-                parsed["payload"] = parsed.get("payload") or {}
-                parsed["payload"]["operations"] = self._llm_generate_patch_operations(blueprint, edit_text, state)
             return parsed
         return {
             "edit_kind": "clarify",
@@ -459,7 +964,14 @@ class PlanEditNodes:
                 "confidence": 0.95,
                 "explanation": "Пользователь меняет сам тип результата",
                 "needs_clarification": False,
-                "payload": payload,
+                "payload": {
+                    **payload,
+                    "resolution": self._build_plan_edit_resolution(
+                        edit_goal="rewrite",
+                        requested_changes=[{"action": "rewrite_intent", "changes": dict(payload.get("intent_changes") or {})}],
+                        confidence=0.95,
+                    ),
+                },
             }
 
         table_token = _extract_table_token(edit_text)
@@ -481,165 +993,28 @@ class PlanEditNodes:
                     "confidence": 0.6,
                     "explanation": "Пользователь хочет сменить источник, но таблица не распознана",
                     "needs_clarification": True,
-                    "payload": {"question": "Какую именно таблицу нужно добавить или использовать вместо текущей?"},
+                    "payload": {
+                        "question": "Какую именно таблицу нужно добавить или использовать вместо текущей?",
+                        "resolution": self._build_plan_edit_resolution(
+                            edit_goal="clarify",
+                            confidence=0.6,
+                            clarification_reason="unresolved_rebind_table",
+                        ),
+                    },
                 }
+            resolution = self._build_plan_edit_resolution(
+                edit_goal="rebind",
+                requested_changes=[{"action": str(item.get("op") or ""), "table": str(item.get("table") or "")} for item in ops],
+                confidence=0.92,
+            )
             return {
                 "edit_kind": "rebind",
                 "confidence": 0.92,
                 "explanation": "Пользователь меняет источник данных",
                 "needs_clarification": False,
-                "payload": {"operations": ops},
+                "payload": {"operations": ops, "resolution": resolution},
             }
-
-        operations: list[dict[str, Any]] = []
-        if self._PATCH_COUNT_STAR.search(edit_text):
-            operations.extend([
-                {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
-                {"op": "replace", "path": "aggregation.column", "value": "*"},
-                {"op": "replace", "path": "aggregation.distinct", "value": False},
-            ])
-        match = self._PATCH_COUNT_DISTINCT.search(edit_text)
-        if match:
-            column = (match.group(1) or match.group(2) or "").strip()
-            if column:
-                operations.extend([
-                    {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
-                    {"op": "replace", "path": "aggregation.column", "value": column},
-                    {"op": "replace", "path": "aggregation.distinct", "value": True},
-                ])
-        count_by_match = self._PATCH_COUNT_BY_FIELD.search(edit_text)
-        if count_by_match:
-            column = count_by_match.group(1).strip()
-            resolved_column = _resolve_column_token(
-                self.schema,
-                str(blueprint.get("main_table") or ""),
-                column,
-                state.get("selected_columns") or {},
-            )
-            if resolved_column:
-                operations.extend([
-                    {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
-                    {"op": "replace", "path": "aggregation.column", "value": resolved_column},
-                ])
-            else:
-                return {
-                    "edit_kind": "clarify",
-                    "confidence": 0.75,
-                    "explanation": "Пользователь указал колонку для COUNT, но она не распознана",
-                    "needs_clarification": True,
-                    "payload": {"question": f"Не удалось распознать колонку '{column}'. По какой колонке нужно считать?"},
-                }
-        add_count_match = self._PATCH_ADD_COUNT_FIELD.search(edit_text)
-        if add_count_match:
-            column = add_count_match.group(1).strip()
-            resolved_column = _resolve_column_token(
-                self.schema,
-                str(blueprint.get("main_table") or ""),
-                column,
-                state.get("selected_columns") or {},
-            )
-            if resolved_column:
-                current_aggs = _iter_blueprint_aggregations(blueprint)
-                inherit_distinct = bool(current_aggs[0].get("distinct")) if current_aggs else False
-                operations.append({
-                    "op": "add",
-                    "path": "aggregations.add",
-                    "value": {
-                        "function": "COUNT",
-                        "column": resolved_column,
-                        "distinct": inherit_distinct,
-                    },
-                })
-            else:
-                return {
-                    "edit_kind": "clarify",
-                    "confidence": 0.75,
-                    "explanation": "Пользователь хочет добавить метрику, но колонка не распознана",
-                    "needs_clarification": True,
-                    "payload": {"question": f"Не удалось распознать колонку '{column}'. Какую метрику нужно добавить?"},
-                }
-        if self._PATCH_NO_DISTINCT.search(edit_text):
-            operations.append({"op": "replace", "path": "aggregation.distinct", "value": False})
-
-        if self._PATCH_SORT_DESC.search(edit_text):
-            operations.append({"op": "replace", "path": "order_by.direction", "value": "DESC"})
-        elif self._PATCH_SORT_ASC.search(edit_text):
-            operations.append({"op": "replace", "path": "order_by.direction", "value": "ASC"})
-
-        limit_match = self._PATCH_LIMIT.search(edit_text)
-        if limit_match:
-            operations.append({"op": "replace", "path": "limit", "value": int(limit_match.group(1))})
-        elif re.search(r"(убери|удали)\s+(?:лимит|limit)", text):
-            operations.append({"op": "remove", "path": "limit"})
-
-        group_by_match = self._PATCH_GROUP_BY.search(edit_text)
-        if group_by_match:
-            operations.append({"op": "add", "path": "group_by", "value": group_by_match.group(1).strip()})
-        elif re.search(r"(убери|удали)\s+группиров", text):
-            operations.append({"op": "replace", "path": "group_by", "value": []})
-
-        remove_filter_match = self._PATCH_REMOVE_FILTER.search(edit_text)
-        if remove_filter_match:
-            operations.append({"op": "remove_filter", "column": remove_filter_match.group(1).strip()})
-
-        date_shift = self._PATCH_DATE_SHIFT.search(edit_text)
-        if date_shift:
-            old_day = int(date_shift.group(1))
-            new_day = int(date_shift.group(2))
-            current_from = None
-            for cond in blueprint.get("where_conditions") or []:
-                m = re.search(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*>=\s*'(\d{4}-\d{2}-\d{2})'::date", cond)
-                if m:
-                    current_from = m.group(2)
-                    break
-            if current_from:
-                dt = datetime.strptime(current_from, "%Y-%m-%d")
-                if dt.day == old_day:
-                    new_from = dt.replace(day=new_day)
-                    operations.append({"op": "replace", "path": "where.date.from", "value": new_from.strftime("%Y-%m-%d")})
-                    current_to = None
-                    date_col = None
-                    for cond in blueprint.get("where_conditions") or []:
-                        m_to = re.search(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*<\s*'(\d{4}-\d{2}-\d{2})'::date", cond)
-                        if m_to:
-                            date_col = m_to.group(1)
-                            current_to = m_to.group(2)
-                            break
-                        if not date_col:
-                            m_col = re.search(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*>=\s*'\d{4}-\d{2}-\d{2}'::date", cond)
-                            if m_col:
-                                date_col = m_col.group(1)
-                    try:
-                        if current_to and date_col:
-                            current_to_dt = datetime.strptime(current_to, "%Y-%m-%d")
-                            delta = current_to_dt - dt
-                            operations.append({"op": "replace", "path": "where.date.to", "value": (new_from + delta).strftime("%Y-%m-%d")})
-                    except ValueError:
-                        pass
-
-        if re.fullmatch(r"поменяй\s+порядок", text):
-            return {
-                "edit_kind": "clarify",
-                "confidence": 0.7,
-                "explanation": "Неясно, меняется сортировка или порядок колонок",
-                "needs_clarification": True,
-                "payload": {"question": "Нужно изменить сортировку или порядок колонок в выдаче?"},
-            }
-
-        if operations:
-            operations = self._sanitize_patch_operations(
-                operations,
-                state.get("selected_columns") or {},
-                str(blueprint.get("main_table") or ""),
-            )
-            return {
-                "edit_kind": "patch",
-                "confidence": 0.95,
-                "explanation": "Локальная правка текущего плана",
-                "needs_clarification": False,
-                "payload": {"operations": operations},
-            }
-        return None
+        return self._resolve_patch_route(state, edit_text, blueprint)
 
     def plan_edit_router(self, state: AgentState) -> dict[str, Any]:
         iterations = state.get("graph_iterations", 0) + 1
@@ -650,12 +1025,29 @@ class PlanEditNodes:
         parsed = self._deterministic_route(state, edit_text, blueprint)
         if parsed is None:
             parsed = self._fallback_route_with_model(state, edit_text, blueprint)
+            if str(parsed.get("edit_kind") or "") == "patch":
+                parsed = self._resolve_patch_route(state, edit_text, blueprint) or {
+                    "edit_kind": "clarify",
+                    "confidence": float(parsed.get("confidence", 0.0) or 0.0),
+                    "explanation": "Недостаточно данных для безопасного patch без уточнения",
+                    "needs_clarification": True,
+                    "payload": {
+                        "question": "Что именно нужно поменять в плане: метрику, сортировку, группировку или фильтр?",
+                        "resolution": self._build_plan_edit_resolution(
+                            edit_goal="clarify",
+                            confidence=float(parsed.get("confidence", 0.0) or 0.0),
+                            clarification_reason="fallback_patch_without_resolved_diff",
+                        ),
+                    },
+                }
 
         question = str((parsed.get("payload") or {}).get("question") or "").strip()
+        resolution = dict((parsed.get("payload") or {}).get("resolution") or {})
         update = {
             "plan_edit_kind": parsed.get("edit_kind") or "clarify",
             "plan_edit_confidence": float(parsed.get("confidence", 0.0) or 0.0),
             "plan_edit_payload": parsed.get("payload") or {},
+            "plan_edit_resolution": resolution,
             "plan_edit_explanation": str(parsed.get("explanation") or ""),
             "plan_edit_needs_clarification": bool(parsed.get("needs_clarification")),
             "clarification_message": question if parsed.get("needs_clarification") else "",
@@ -669,168 +1061,236 @@ class PlanEditNodes:
         )
         return update
 
-    def _apply_patch_operations(
+    def _apply_patch_commands(
         self,
         blueprint: dict[str, Any],
-        operations: list[dict[str, Any]],
+        commands: list[dict[str, Any]],
         selected_columns: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         bp = _sync_legacy_aggregation_fields(blueprint)
         known_columns = _collect_known_columns(selected_columns)
         aggs = [dict(item) for item in (bp.get("aggregations") or []) if isinstance(item, dict)]
-        agg = dict(aggs[0] if aggs else {})
         where_conditions = list(bp.get("where_conditions") or [])
-        old_alias = str(agg.get("alias") or "").strip()
-        patch_meta: dict[str, Any] = {}
-        for op in operations:
-            if not isinstance(op, dict):
+        patch_meta: dict[str, Any] = {"metrics_changed": False}
+
+        for command in commands:
+            if not isinstance(command, dict):
                 continue
-            action = op.get("op")
-            path = op.get("path", "")
-            value = op.get("value")
-            if action == "replace" and path == "aggregation.function":
-                agg["function"] = str(value)
-                patch_meta["aggregations_changed"] = True
-            elif action == "replace" and path == "aggregation.column":
-                agg["column"] = str(value)
-                patch_meta["aggregation_column"] = str(value)
-                patch_meta["aggregations_changed"] = True
-                if value:
-                    if str(agg.get("function")).upper() == "COUNT" and str(value) == "*":
-                        agg["alias"] = "count_all"
-                    else:
-                        agg["alias"] = (
-                            f"count_{value}"
-                            if str(agg.get("function")).upper() == "COUNT"
-                            else f"{str(agg.get('function')).lower()}_{value}"
-                        )
-            elif action == "replace" and path == "aggregation.distinct":
-                patch_meta["aggregation_distinct"] = bool(value)
-                patch_meta["aggregations_changed"] = True
-                if value:
-                    agg["distinct"] = True
+            name = str(command.get("command") or "").strip()
+            if not name:
+                continue
+
+            if name == "replace_primary_metric":
+                function = str(command.get("function") or "COUNT").upper()
+                column = str(command.get("column") or "").strip()
+                distinct = bool(command.get("distinct")) and column != "*"
+                if not column:
+                    continue
+                old_alias = str(aggs[0].get("alias") or "").strip() if aggs else ""
+                metric = self._build_metric(function=function, column=column, distinct=distinct)
+                if aggs:
+                    aggs[0] = metric
                 else:
-                    agg.pop("distinct", None)
-            elif action == "add" and path == "aggregations.add":
-                value = dict(value or {})
-                func = str(value.get("function") or "COUNT").upper()
-                col = str(value.get("column") or "").strip()
-                if col:
-                    alias = "count_all" if func == "COUNT" and col == "*" else f"{func.lower()}_{col}"
-                    new_agg = {"function": func, "column": col, "alias": alias}
-                    if value.get("distinct") and col != "*":
-                        new_agg["distinct"] = True
-                    if not any(
-                        str(existing.get("function") or "").upper() == func
-                        and str(existing.get("column") or "") == col
-                        and bool(existing.get("distinct")) == bool(new_agg.get("distinct"))
-                        for existing in aggs
-                    ):
-                        aggs.append(new_agg)
-                        patch_meta["aggregations_changed"] = True
-            elif action == "replace" and path == "order_by.direction":
-                current = str(bp.get("order_by") or "").strip()
-                if current:
-                    if re.search(r"\b(ASC|DESC)\b$", current, re.IGNORECASE):
-                        bp["order_by"] = re.sub(r"\b(ASC|DESC)\b$", str(value).upper(), current, flags=re.IGNORECASE)
-                    else:
-                        bp["order_by"] = f"{current} {str(value).upper()}"
-                elif agg.get("alias"):
-                    bp["order_by"] = f"{agg['alias']} {str(value).upper()}"
-            elif action == "replace" and path == "limit":
-                bp["limit"] = int(value)
-            elif action == "remove" and path == "limit":
-                bp["limit"] = None
-            elif action == "add" and path == "group_by":
-                gb = list(bp.get("group_by") or [])
-                if value not in gb:
-                    gb.append(str(value))
-                bp["group_by"] = gb
-            elif action == "replace" and path == "group_by":
-                bp["group_by"] = list(value or [])
-            elif action == "replace" and path == "where.date.from":
-                replaced = False
-                new_conditions = []
-                for cond in where_conditions:
-                    new_cond = re.sub(
-                        r"(>=\s*')(\d{4}-\d{2}-\d{2})('::date)",
-                        rf"\g<1>{value}\3",
-                        cond,
+                    aggs = [metric]
+                current_order_by = str(bp.get("order_by") or "").strip()
+                if old_alias and current_order_by.startswith(old_alias):
+                    bp["order_by"] = current_order_by.replace(old_alias, metric["alias"], 1)
+                patch_meta["metrics_changed"] = True
+            elif name == "add_metric":
+                function = str(command.get("function") or "COUNT").upper()
+                column = str(command.get("column") or "").strip()
+                distinct = bool(command.get("distinct")) and column != "*"
+                if not column:
+                    continue
+                metric = self._build_metric(function=function, column=column, distinct=distinct)
+                duplicate = any(
+                    str(existing.get("function") or "").upper() == metric["function"]
+                    and str(existing.get("column") or "") == metric["column"]
+                    and bool(existing.get("distinct")) == bool(metric.get("distinct"))
+                    for existing in aggs
+                )
+                if not duplicate:
+                    aggs.append(metric)
+                    patch_meta["metrics_changed"] = True
+            elif name == "remove_metric":
+                column = str(command.get("column") or "").strip()
+                function = str(command.get("function") or "").upper().strip()
+                if not column:
+                    continue
+                old_alias = str(aggs[0].get("alias") or "").strip() if aggs else ""
+                new_aggs = [
+                    metric for metric in aggs
+                    if not (
+                        str(metric.get("column") or "") == column
+                        and (not function or str(metric.get("function") or "").upper() == function)
                     )
-                    if new_cond != cond and ">=" in cond and "::date" in cond:
-                        replaced = True
-                    new_conditions.append(new_cond)
-                if not replaced:
-                    date_col = ""
-                    for col in known_columns:
-                        if col.lower().endswith(("dt", "date")):
-                            date_col = col
-                            break
-                    if date_col:
-                        new_conditions.append(f"{date_col} >= '{value}'::date")
-                where_conditions = new_conditions
-            elif action == "replace" and path == "where.date.to":
-                replaced = False
-                new_conditions = []
-                for cond in where_conditions:
-                    new_cond = re.sub(
-                        r"(<\s*')(\d{4}-\d{2}-\d{2})('::date)",
-                        rf"\g<1>{value}\3",
-                        cond,
-                    )
-                    if new_cond != cond and "<" in cond and "::date" in cond:
-                        replaced = True
-                    new_conditions.append(new_cond)
-                if not replaced:
-                    date_col = ""
-                    for col in known_columns:
-                        if col.lower().endswith(("dt", "date")):
-                            date_col = col
-                            break
-                    if date_col:
-                        new_conditions.append(f"{date_col} < '{value}'::date")
-                where_conditions = new_conditions
-            elif action == "remove_filter":
-                column = str(op.get("column") or "").lower()
-                where_conditions = [
-                    cond for cond in where_conditions
-                    if column not in cond.lower()
                 ]
-        if agg:
-            if aggs:
-                aggs[0] = agg
-            else:
-                aggs = [agg]
-            new_alias = str(agg.get("alias") or "").strip()
-            current_order_by = str(bp.get("order_by") or "").strip()
-            if old_alias and new_alias and current_order_by.startswith(old_alias):
-                bp["order_by"] = current_order_by.replace(old_alias, new_alias, 1)
+                if len(new_aggs) != len(aggs):
+                    aggs = new_aggs
+                    patch_meta["metrics_changed"] = True
+                    current_order_by = str(bp.get("order_by") or "").strip()
+                    if old_alias and current_order_by.startswith(old_alias):
+                        bp["order_by"] = f"{str(aggs[0].get('alias') or '').strip()} DESC" if aggs else ""
+            elif name == "set_distinct":
+                value = bool(command.get("value"))
+                target = str(command.get("target") or "primary").strip()
+                index = 0 if target == "primary" else None
+                if index is None or index >= len(aggs):
+                    continue
+                column = str(aggs[index].get("column") or "")
+                if value and column == "*":
+                    continue
+                if value:
+                    aggs[index]["distinct"] = True
+                else:
+                    aggs[index].pop("distinct", None)
+                patch_meta["metrics_changed"] = True
+            elif name == "set_count_star":
+                old_alias = str(aggs[0].get("alias") or "").strip() if aggs else ""
+                metric = self._build_metric(function="COUNT", column="*", distinct=False)
+                if aggs:
+                    aggs[0] = metric
+                else:
+                    aggs = [metric]
+                current_order_by = str(bp.get("order_by") or "").strip()
+                if old_alias and current_order_by.startswith(old_alias):
+                    bp["order_by"] = current_order_by.replace(old_alias, metric["alias"], 1)
+                patch_meta["metrics_changed"] = True
+            elif name == "set_order":
+                direction = str(command.get("direction") or "DESC").upper()
+                field = str(command.get("field") or "").strip()
+                if not field:
+                    field = str(aggs[0].get("alias") or "").strip() if aggs else ""
+                if field:
+                    bp["order_by"] = f"{field} {direction}"
+            elif name == "set_limit":
+                value = command.get("value")
+                bp["limit"] = None if value in ("", None) else int(value)
+            elif name == "add_group_by":
+                column = str(command.get("column") or "").strip()
+                if not column:
+                    continue
+                gb = list(bp.get("group_by") or [])
+                if column not in gb:
+                    gb.append(column)
+                bp["group_by"] = gb
+            elif name == "remove_group_by":
+                if command.get("all"):
+                    bp["group_by"] = []
+                else:
+                    column = str(command.get("column") or "").strip()
+                    bp["group_by"] = [col for col in (bp.get("group_by") or []) if col != column]
+            elif name == "set_date_range":
+                date_from = str(command.get("from") or "").strip()
+                date_to = str(command.get("to") or "").strip()
+                date_col = ""
+                for cond in where_conditions:
+                    match = re.search(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:>=|<)\s*'\d{4}-\d{2}-\d{2}'::date", cond)
+                    if match:
+                        date_col = match.group(1)
+                        break
+                if not date_col:
+                    for col in known_columns:
+                        if col.lower().endswith(("dt", "date")):
+                            date_col = col
+                            break
+                new_conditions = [
+                    cond for cond in where_conditions
+                    if not (
+                        date_col
+                        and re.search(rf"\b{re.escape(date_col)}\b\s*(?:>=|<)\s*'\d{{4}}-\d{{2}}-\d{{2}}'::date", cond)
+                    )
+                ]
+                if date_col and date_from:
+                    new_conditions.append(f"{date_col} >= '{date_from}'::date")
+                if date_col and date_to:
+                    new_conditions.append(f"{date_col} < '{date_to}'::date")
+                where_conditions = new_conditions
+
         bp["aggregations"] = aggs
         bp["where_conditions"] = where_conditions
         return _sync_legacy_aggregation_fields(bp), patch_meta
 
+    def _apply_legacy_patch_operations(
+        self,
+        blueprint: dict[str, Any],
+        operations: list[dict[str, Any]],
+        selected_columns: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        commands: list[dict[str, Any]] = []
+        pending_date_range: dict[str, Any] = {"command": "set_date_range", "from": "", "to": ""}
+        for op in operations:
+            if not isinstance(op, dict):
+                continue
+            action = str(op.get("op") or "").strip()
+            path = str(op.get("path") or "").strip()
+            value = op.get("value")
+            if action == "replace" and path == "aggregation.column":
+                commands.append({"command": "replace_primary_metric", "function": "COUNT", "column": str(value or ""), "distinct": False})
+            elif action == "replace" and path == "aggregation.distinct":
+                commands.append({"command": "set_distinct", "target": "primary", "value": bool(value)})
+            elif action == "add" and path == "aggregations.add" and isinstance(value, dict):
+                commands.append({
+                    "command": "add_metric",
+                    "function": str(value.get("function") or "COUNT").upper(),
+                    "column": str(value.get("column") or ""),
+                    "distinct": bool(value.get("distinct")),
+                })
+            elif action == "replace" and path == "order_by.direction":
+                commands.append({"command": "set_order", "direction": str(value or "DESC").upper()})
+            elif action == "replace" and path == "limit":
+                commands.append({"command": "set_limit", "value": value})
+            elif action == "remove" and path == "limit":
+                commands.append({"command": "set_limit", "value": None})
+            elif action == "add" and path == "group_by":
+                commands.append({"command": "add_group_by", "column": str(value or "")})
+            elif action == "replace" and path == "group_by":
+                commands.append({"command": "remove_group_by", "all": True})
+            elif action == "replace" and path == "where.date.from":
+                pending_date_range["from"] = str(value or "")
+            elif action == "replace" and path == "where.date.to":
+                pending_date_range["to"] = str(value or "")
+            elif action == "remove_filter":
+                column = str(op.get("column") or "").lower()
+                new_blueprint = copy.deepcopy(blueprint)
+                new_blueprint["where_conditions"] = [
+                    cond for cond in (new_blueprint.get("where_conditions") or [])
+                    if column not in cond.lower()
+                ]
+                return new_blueprint, {"metrics_changed": False}
+        if pending_date_range["from"] or pending_date_range["to"]:
+            commands.append({
+                "command": "set_date_range",
+                "from": pending_date_range["from"] or "",
+                "to": pending_date_range["to"] or "",
+            })
+        return self._apply_patch_commands(blueprint, commands, selected_columns)
+
     def plan_patcher(self, state: AgentState) -> dict[str, Any]:
         iterations = state.get("graph_iterations", 0) + 1
         payload = state.get("plan_edit_payload") or {}
+        resolution = dict(state.get("plan_edit_resolution") or payload.get("resolution") or {})
+        commands = list(payload.get("chosen_patch") or resolution.get("chosen_patch") or [])
         operations = list(payload.get("operations") or [])
         old_blueprint = copy.deepcopy(state.get("sql_blueprint") or {})
-        new_blueprint, patch_meta = self._apply_patch_operations(
-            old_blueprint,
-            operations,
-            state.get("selected_columns") or {},
-        )
+        if commands:
+            new_blueprint, patch_meta = self._apply_patch_commands(old_blueprint, commands, state.get("selected_columns") or {})
+        else:
+            new_blueprint, patch_meta = self._apply_legacy_patch_operations(old_blueprint, operations, state.get("selected_columns") or {})
         user_hints = copy.deepcopy(state.get("user_hints") or {})
-        agg_prefs = dict(user_hints.get("aggregation_preferences") or {})
-        agg = new_blueprint.get("aggregation") or {}
         aggs = _iter_blueprint_aggregations(new_blueprint)
-        if patch_meta.get("aggregation_column") is not None or patch_meta.get("aggregations_changed"):
-            agg_prefs["function"] = str(agg.get("function") or "COUNT").lower()
-            agg_prefs["column"] = str(agg.get("column") or "")
-            agg_prefs["distinct"] = bool(agg.get("distinct")) if agg else False
-            if agg_prefs.get("column") != "*":
-                agg_prefs.pop("force_count_star", None)
-            else:
-                agg_prefs["force_count_star"] = True
+        if patch_meta.get("metrics_changed"):
+            agg = new_blueprint.get("aggregation") or {}
+            agg_prefs = {}
+            if agg:
+                agg_prefs = {
+                    "function": str(agg.get("function") or "COUNT").lower(),
+                    "column": str(agg.get("column") or ""),
+                    "distinct": bool(agg.get("distinct")),
+                }
+                if agg_prefs.get("column") == "*":
+                    agg_prefs["force_count_star"] = True
+            user_hints["aggregation_preferences"] = agg_prefs
             user_hints["aggregation_preferences_list"] = [
                 {
                     "function": str(item.get("function") or "COUNT").lower(),
@@ -840,9 +1300,7 @@ class PlanEditNodes:
                 for item in aggs
                 if str(item.get("column") or "")
             ]
-        if agg_prefs:
-            user_hints["aggregation_preferences"] = agg_prefs
-        logger.info("plan_patcher: applied %d operations", len(operations))
+        logger.info("plan_patcher: applied %d patch commands", len(commands) if commands else len(operations))
         return {
             "previous_sql_blueprint": old_blueprint,
             "sql_blueprint": new_blueprint,
@@ -865,6 +1323,7 @@ class PlanEditNodes:
         temp_state["plan_edit_text"] = ""
         temp_state["plan_edit_kind"] = ""
         temp_state["plan_edit_payload"] = {}
+        temp_state["plan_edit_resolution"] = {}
         temp_state["plan_edit_needs_clarification"] = False
         temp_state["needs_clarification"] = False
         temp_state["clarification_message"] = ""
@@ -979,6 +1438,7 @@ class PlanEditNodes:
                 "plan_edit_text": "",
                 "plan_edit_kind": "",
                 "plan_edit_payload": {},
+                "plan_edit_resolution": {},
                 "plan_edit_needs_clarification": False,
                 "needs_clarification": False,
                 "clarification_message": "",
@@ -1014,6 +1474,7 @@ class PlanEditNodes:
         temp_state.update({
             "user_input": rewritten_query,
             "plan_edit_text": "",
+            "plan_edit_resolution": {},
             "sql_blueprint": {},
             "selected_tables": [],
             "table_structures": {},

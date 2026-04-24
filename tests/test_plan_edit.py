@@ -153,6 +153,7 @@ def _state(**overrides):
         "plan_edit_history": [],
         "previous_sql_blueprint": {},
         "plan_edit_payload": {},
+        "plan_edit_resolution": {},
         "needs_clarification": False,
         "clarification_message": "",
         "allowed_tables": ["schema_a.fact_x"],
@@ -173,41 +174,38 @@ def _state(**overrides):
 def test_router_patch_sort_desc(node):
     result = node.plan_edit_router(_state(plan_edit_text="поменяй порядок сортировки по убыванию"))
     assert result["plan_edit_kind"] == "patch"
-    ops = result["plan_edit_payload"]["operations"]
-    assert {"op": "replace", "path": "order_by.direction", "value": "DESC"} in ops
+    patch = result["plan_edit_resolution"]["chosen_patch"]
+    assert {"command": "set_order", "direction": "DESC"} in patch
 
 
 def test_router_patch_count_star_russian(node):
     result = node.plan_edit_router(_state(plan_edit_text="посчитай просто количество строк и сортируй по убыванию"))
     assert result["plan_edit_kind"] == "patch"
-    ops = result["plan_edit_payload"]["operations"]
-    assert {"op": "replace", "path": "aggregation.column", "value": "*"} in ops
-    assert {"op": "replace", "path": "aggregation.distinct", "value": False} in ops
-    assert {"op": "replace", "path": "order_by.direction", "value": "DESC"} in ops
+    patch = result["plan_edit_resolution"]["chosen_patch"]
+    assert {"command": "set_count_star"} in patch
+    assert {"command": "set_order", "direction": "DESC"} in patch
 
 
 def test_router_patch_no_distinct_only(node):
     result = node.plan_edit_router(_state(plan_edit_text="не надо считать по уникальной дате"))
     assert result["plan_edit_kind"] == "patch"
-    assert result["plan_edit_payload"]["operations"] == [
-        {"op": "replace", "path": "aggregation.distinct", "value": False},
+    assert result["plan_edit_resolution"]["chosen_patch"] == [
+        {"command": "set_distinct", "value": False, "target": "primary"},
     ]
 
 
 def test_router_count_by_field(node):
     result = node.plan_edit_router(_state(plan_edit_text="посчитай по task_code"))
     assert result["plan_edit_kind"] == "patch"
-    ops = result["plan_edit_payload"]["operations"]
-    assert {"op": "replace", "path": "aggregation.function", "value": "COUNT"} in ops
-    assert {"op": "replace", "path": "aggregation.column", "value": "task_code"} in ops
+    patch = result["plan_edit_resolution"]["chosen_patch"]
+    assert {"command": "replace_primary_metric", "function": "COUNT", "column": "task_code", "distinct": False} in patch
 
 
 def test_router_count_by_field_supports_count_po_inn(node):
     result = node.plan_edit_router(_state(plan_edit_text="Давай count по инн"))
     assert result["plan_edit_kind"] == "patch"
-    ops = result["plan_edit_payload"]["operations"]
-    assert {"op": "replace", "path": "aggregation.function", "value": "COUNT"} in ops
-    assert {"op": "replace", "path": "aggregation.column", "value": "inn"} in ops
+    patch = result["plan_edit_resolution"]["chosen_patch"]
+    assert {"command": "replace_primary_metric", "function": "COUNT", "column": "inn", "distinct": False} in patch
 
 
 def test_router_count_by_unknown_field_clarifies(node):
@@ -219,14 +217,42 @@ def test_router_count_by_unknown_field_clarifies(node):
 def test_router_add_count_metric(node):
     result = node.plan_edit_router(_state(plan_edit_text="и еще по инн"))
     assert result["plan_edit_kind"] == "patch"
-    assert {"op": "add", "path": "aggregations.add", "value": {"function": "COUNT", "column": "inn", "distinct": False}} in result["plan_edit_payload"]["operations"]
+    assert {"command": "add_metric", "function": "COUNT", "column": "inn", "distinct": False} in result["plan_edit_resolution"]["chosen_patch"]
+
+
+def test_router_and_patcher_add_second_count_metric_from_natural_feedback(node):
+    state = _state(
+        plan_edit_text="ты считаешь только task_code, надо еще инн",
+        selected_columns={
+            "schema_a.fact_x": {
+                "select": ["task_code"],
+                "filter": ["report_dt", "task_subtype", "task_category"],
+                "aggregate": ["task_code", "inn"],
+                "group_by": [],
+            }
+        },
+    )
+    routed = node.plan_edit_router(state)
+    assert routed["plan_edit_kind"] == "patch"
+    assert {"command": "add_metric", "function": "COUNT", "column": "inn", "distinct": False} in routed["plan_edit_resolution"]["chosen_patch"]
+
+    patched = node.plan_patcher({**state, **routed})
+    assert patched["sql_blueprint"]["aggregation"]["column"] == "task_code"
+    assert patched["sql_blueprint"]["aggregations"] == [
+        {"function": "COUNT", "column": "task_code", "alias": "count_task_code"},
+        {"function": "COUNT", "column": "inn", "alias": "count_inn"},
+    ]
+    assert patched["user_hints"]["aggregation_preferences_list"] == [
+        {"function": "count", "column": "task_code", "distinct": False},
+        {"function": "count", "column": "inn", "distinct": False},
+    ]
 
 
 def test_router_patch_date_shift(node):
     result = node.plan_edit_router(_state(plan_edit_text="поменяй фильтр на дате с 1 числа на 2"))
     assert result["plan_edit_kind"] == "patch"
-    ops = result["plan_edit_payload"]["operations"]
-    assert any(op["path"] == "where.date.from" and op["value"] == "2026-02-02" for op in ops)
+    patch = result["plan_edit_resolution"]["chosen_patch"]
+    assert {"command": "set_date_range", "from": "2026-02-02", "to": "2026-03-02"} in patch
 
 
 def test_router_rebind_replace_table(node):
@@ -242,13 +268,23 @@ def test_router_rewrite(node):
 
 
 def test_patcher_applies_count_distinct(node):
-    state = _state(plan_edit_payload={
-        "operations": [
-            {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
-            {"op": "replace", "path": "aggregation.column", "value": "task_code"},
-            {"op": "replace", "path": "aggregation.distinct", "value": True},
-        ]
-    })
+    state = _state(
+        plan_edit_payload={
+            "chosen_patch": [
+                {"command": "replace_primary_metric", "function": "COUNT", "column": "task_code", "distinct": True},
+            ],
+        },
+        plan_edit_resolution={
+            "edit_goal": "patch",
+            "requested_changes": [],
+            "candidate_targets": [],
+            "chosen_patch": [
+                {"command": "replace_primary_metric", "function": "COUNT", "column": "task_code", "distinct": True},
+            ],
+            "confidence": 0.95,
+            "clarification_reason": "",
+        },
+    )
     result = node.plan_patcher(state)
     assert result["sql_blueprint"]["aggregation"]["distinct"] is True
     assert result["sql_blueprint"]["aggregation"]["column"] == "task_code"
@@ -279,10 +315,19 @@ def test_patcher_allows_main_table_column_not_in_selected_columns(node):
             }
         },
         plan_edit_payload={
-            "operations": [
-                {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
-                {"op": "replace", "path": "aggregation.column", "value": "inn"},
+            "chosen_patch": [
+                {"command": "replace_primary_metric", "function": "COUNT", "column": "inn", "distinct": False},
             ]
+        },
+        plan_edit_resolution={
+            "edit_goal": "patch",
+            "requested_changes": [],
+            "candidate_targets": [],
+            "chosen_patch": [
+                {"command": "replace_primary_metric", "function": "COUNT", "column": "inn", "distinct": False},
+            ],
+            "confidence": 0.95,
+            "clarification_reason": "",
         },
     )
     result = node.plan_patcher(state)
@@ -298,9 +343,19 @@ def test_patcher_allows_main_table_column_not_in_selected_columns(node):
 def test_patcher_adds_second_aggregation_and_persists_hints(node):
     state = _state(
         plan_edit_payload={
-            "operations": [
-                {"op": "add", "path": "aggregations.add", "value": {"function": "COUNT", "column": "inn", "distinct": True}},
+            "chosen_patch": [
+                {"command": "add_metric", "function": "COUNT", "column": "inn", "distinct": True},
             ]
+        },
+        plan_edit_resolution={
+            "edit_goal": "patch",
+            "requested_changes": [],
+            "candidate_targets": [],
+            "chosen_patch": [
+                {"command": "add_metric", "function": "COUNT", "column": "inn", "distinct": True},
+            ],
+            "confidence": 0.95,
+            "clarification_reason": "",
         },
     )
     result = node.plan_patcher(state)
@@ -334,12 +389,14 @@ def test_patcher_count_star_strips_distinct_and_updates_order_by(node):
             "order_by": "count_task_code DESC",
             "limit": None,
         },
-        plan_edit_payload={
-            "operations": [
-                {"op": "replace", "path": "aggregation.function", "value": "COUNT"},
-                {"op": "replace", "path": "aggregation.column", "value": "*"},
-                {"op": "replace", "path": "aggregation.distinct", "value": False},
-            ]
+        plan_edit_payload={"chosen_patch": [{"command": "set_count_star"}]},
+        plan_edit_resolution={
+            "edit_goal": "patch",
+            "requested_changes": [],
+            "candidate_targets": [],
+            "chosen_patch": [{"command": "set_count_star"}],
+            "confidence": 0.95,
+            "clarification_reason": "",
         },
     )
     result = node.plan_patcher(state)
@@ -489,7 +546,6 @@ def test_diff_renderer_reports_aggregations_change(node):
 def test_fallback_llm_emits_operations(synthetic_loader):
     llm = _DummyLLM([
         '{"edit_kind":"patch","confidence":0.4,"payload":{}}',
-        '{"operations":[{"op":"replace","path":"aggregation.column","value":"*"},{"op":"replace","path":"aggregation.distinct","value":false}]}',
     ])
     node = _Node(
         llm,
@@ -501,8 +557,5 @@ def test_fallback_llm_emits_operations(synthetic_loader):
     )
     result = node.plan_edit_router(_state(plan_edit_text="считай просто строки"))
     assert result["plan_edit_kind"] == "patch"
-    assert result["plan_edit_payload"]["operations"] == [
-        {"op": "replace", "path": "aggregation.column", "value": "*"},
-        {"op": "replace", "path": "aggregation.distinct", "value": False},
-    ]
-    assert len(llm.calls) == 2
+    assert result["plan_edit_resolution"]["chosen_patch"] == [{"command": "set_count_star"}]
+    assert len(llm.calls) == 0

@@ -570,6 +570,7 @@ def create_initial_state(
         plan_edit_kind="",
         plan_edit_confidence=0.0,
         plan_edit_payload={},
+        plan_edit_resolution={},
         plan_edit_explanation="",
         plan_edit_needs_clarification=False,
         plan_edit_applied=False,

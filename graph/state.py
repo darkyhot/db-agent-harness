@@ -160,6 +160,7 @@ class AgentState(TypedDict):
     plan_edit_kind: str
     plan_edit_confidence: float
     plan_edit_payload: dict[str, Any]
+    plan_edit_resolution: dict[str, Any]
     plan_edit_explanation: str
     plan_edit_needs_clarification: bool
     plan_edit_applied: bool

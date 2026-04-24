@@ -221,6 +221,9 @@ HELP_TEXT = """
   /refresh metadata    — пересобрать metadata для всех таблиц из manifest
   /memory              — просмотр и управление долгосрочной памятью
   /metrics             — метрики качества генерации SQL (последние 30 дней)
+  /deep_table_analysis schema.table [--mode=fast|deep] [гипотеза свободным текстом]
+                       — глубокий поиск закономерностей (сезонность, выбросы, массовые отклонения).
+                         Без текста гипотезы — полный автоскан. С текстом — план проверки показывается на аппрув.
   /reset               — сбросить контекст текущей сессии
   /clear               — очистить вывод ячейки
   /exit                — завершить работу (сохранить резюме сессии)
@@ -430,9 +433,12 @@ class CLIInterface:
         command = tokens[0].lower()
         if command.startswith("/"):
             command = command[1:]
-        elif command not in {"help", "config", "metadata", "refresh", "memory", "metrics", "reset", "clear", "exit"}:
+        elif command not in {"help", "config", "metadata", "refresh", "memory", "metrics", "reset", "clear", "exit", "deep_table_analysis"}:
             return (None, [])
 
+        # deep_table_analysis preserves argument casing (schema/table + free-form hypothesis).
+        if command == "deep_table_analysis":
+            return (command, tokens[1:])
         return (command, [token.lower() for token in tokens[1:]])
 
     def _refresh_runtime_flags(self) -> None:
@@ -857,6 +863,122 @@ class CLIInterface:
             print("✓ Отзыв записан. Спасибо — это улучшает качество ответов.")
             return
 
+    def _handle_deep_table_analysis(self, args: list[str]) -> None:
+        """Run deep pattern-discovery analysis on a single table.
+
+        Usage:
+            /deep_table_analysis schema.table [--mode=fast|deep] [free-form hypothesis]
+        """
+        from core.deep_analysis import AnalysisMode
+        from core.deep_analysis.orchestrator import run_deep_analysis
+        from core.deep_analysis.user_hypothesis import apply_user_plan_edit, build_user_hypothesis_plan
+
+        if not args:
+            print(
+                "Использование: /deep_table_analysis schema.table [--mode=fast|deep] "
+                "[текст гипотезы]"
+            )
+            return
+
+        mode = AnalysisMode.FAST
+        table_ref = None
+        hypothesis_tokens: list[str] = []
+        for tok in args:
+            if tok.startswith("--mode="):
+                raw = tok.split("=", 1)[1].lower()
+                if raw not in ("fast", "deep"):
+                    print("Режим должен быть fast или deep.")
+                    return
+                mode = AnalysisMode(raw)
+                continue
+            if table_ref is None and "." in tok:
+                table_ref = tok
+                continue
+            hypothesis_tokens.append(tok)
+
+        if table_ref is None:
+            print("Нужно указать таблицу в формате schema.table.")
+            return
+        try:
+            schema_part, table_part = table_ref.split(".", 1)
+        except ValueError:
+            print("Некорректная ссылка на таблицу. Ожидается schema.table.")
+            return
+
+        hypothesis_text = " ".join(hypothesis_tokens).strip()
+
+        # If user provided a hypothesis, produce plan preview first.
+        user_plan = None
+        if hypothesis_text:
+            _status_print("Загружаю профиль таблицы для плана гипотезы...")
+            try:
+                from core.deep_analysis.loader import SafeLoader
+                from core.deep_analysis.profiler import profile_dataframe
+
+                loader = SafeLoader(self.db)
+                df, load_plan = loader.plan_and_load(schema_part, table_part, progress_cb=_status_print)
+                _, profile = profile_dataframe(df, load_plan)
+            except Exception as exc:
+                _status_print("")
+                logger.error("deep_table_analysis profile failed: %s", exc, exc_info=True)
+                print(f"Ошибка при загрузке таблицы: {exc}")
+                return
+            _status_print("")
+            user_plan = build_user_hypothesis_plan(self.llm, hypothesis_text, profile)
+            if user_plan is None:
+                print(
+                    "Не удалось превратить гипотезу в формальный план. "
+                    "Попробуйте переформулировать, указав конкретные колонки."
+                )
+                return
+            for _ in range(3):
+                print()
+                print(user_plan.plan_text)
+                try:
+                    reply = input("\nВаш ответ (ок/правка): ").strip()
+                except EOFError:
+                    reply = "ок"
+                if reply.lower() in self._PLAN_APPROVE_TOKENS or not reply:
+                    break
+                _status_print("Пересобираю план с учётом правки...")
+                edited = apply_user_plan_edit(self.llm, user_plan, reply, profile)
+                _status_print("")
+                if edited is None:
+                    print("Не смог применить правку. Попробуйте ещё раз.")
+                    continue
+                user_plan = edited
+            else:
+                print("Достигнут лимит правок, запускаю с последним планом.")
+
+        print(
+            f"\nЗапускаю глубокий анализ {schema_part}.{table_part} "
+            f"в режиме {mode.value}."
+        )
+        try:
+            result = run_deep_analysis(
+                schema_part, table_part,
+                mode=mode, db=self.db, llm=self.llm,
+                schema_loader=self.schema,
+                user_hypothesis=user_plan,
+                progress_cb=_status_print,
+            )
+        except Exception as exc:
+            _status_print("")
+            logger.error("deep_table_analysis failed: %s", exc, exc_info=True)
+            print(f"\nОшибка анализа: {exc}")
+            return
+
+        _status_print("")
+        print(
+            f"\nАнализ завершён за {result.wall_seconds:.0f}с. "
+            f"Находок: {len(result.findings)}. Отчёт: {result.report_path}"
+        )
+        try:
+            print()
+            print(result.report_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
     def _handle_exit(self) -> None:
         """Завершение работы с сохранением резюме."""
         _status_print("Сохранение резюме сессии...")
@@ -1223,6 +1345,8 @@ class CLIInterface:
                 self._handle_memory()
             elif command == "metrics":
                 self._handle_metrics()
+            elif command == "deep_table_analysis":
+                self._handle_deep_table_analysis(args)
             elif command == "reset":
                 self._handle_reset()
             elif command == "clear":

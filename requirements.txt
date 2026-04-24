@@ -10,3 +10,9 @@ sqlparse==0.5.3
 json-repair==0.30.3
 ipython==8.31.0
 scikit-learn>=1.4.0
+scipy>=1.11
+statsmodels>=0.14
+ruptures>=1.1
+pyod>=2.0
+matplotlib>=3.8
+psutil>=5.9

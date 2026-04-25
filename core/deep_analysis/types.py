@@ -98,6 +98,23 @@ class TableProfile:
     def id_columns(self) -> list[str]:
         return [name for name, c in self.columns.items() if c.role == ColumnRole.ID]
 
+    def entity_candidates(self, min_card: int = 5, max_card: int = 500) -> list[str]:
+        """Columns that can serve as cohort/entity keys for group_anomalies.
+
+        Includes both true entity IDs (high cardinality) and low-cardinality
+        categorical IDs like `tb_id` (15 territorial banks) — those are real
+        cohorts even when their count is small. Result is sorted by cardinality
+        descending so the catalog can pick multiple granularity levels.
+        """
+        out: list[tuple[str, int]] = []
+        for name, c in self.columns.items():
+            if c.role == ColumnRole.ID:
+                out.append((name, c.n_unique))
+            elif c.role == ColumnRole.CATEGORY and min_card <= c.n_unique <= max_card:
+                out.append((name, c.n_unique))
+        out.sort(key=lambda x: -x[1])
+        return [n for n, _ in out]
+
 
 @dataclass
 class HypothesisSpec:

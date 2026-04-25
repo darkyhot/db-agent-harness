@@ -33,8 +33,10 @@ from core.deep_analysis.types import (
     TableProfile,
 )
 
-_THRESHOLD = 2.5         # |robust-z| threshold for inclusion in violators list
-_MIN_ENTITY_SAMPLE = 10  # minimum observations per entity to consider it
+_THRESHOLD = 2.5          # |robust-z| threshold for inclusion in violators list
+_MIN_ENTITY_SAMPLE = 10   # minimum observations per entity to consider it
+_MIN_COHORT_SIZE = 8      # minimum #entities to form a meaningful cohort
+                          # (allows small entity sets like ~15 territorial banks)
 
 
 def run_group_anomalies(
@@ -90,7 +92,7 @@ def run_group_anomalies(
     # Drop entities with too little data to avoid spurious outliers.
     if "n_obs" in agg_df.columns:
         agg_df = agg_df[agg_df["n_obs"] >= _MIN_ENTITY_SAMPLE]
-    if len(agg_df) < 30:
+    if len(agg_df) < _MIN_COHORT_SIZE:
         # Not enough peers for cohort comparison.
         return []
 

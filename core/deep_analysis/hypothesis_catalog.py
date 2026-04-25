@@ -83,11 +83,16 @@ def _tpl_seasonality_counts(p: TableProfile) -> list[HypothesisSpec]:
 
 
 def _tpl_group_anomalies(p: TableProfile) -> list[HypothesisSpec]:
-    """Entity-level mass-deviation hypotheses — produce violators CSVs."""
+    """Entity-level mass-deviation hypotheses — produce violators CSVs.
+
+    We iterate up to 3 entity-candidate columns at different granularities so
+    that small dictionaries (e.g. `tb_id` with 15 territorial banks) and
+    larger entity sets (e.g. `employee_id` with thousands) both get checked.
+    """
     out: list[HypothesisSpec] = []
-    ids = p.id_columns()
+    candidates = p.entity_candidates(min_card=5, max_card=50_000)
     dates = p.date_columns()
-    if not ids:
+    if not candidates:
         return out
 
     best_date = max(dates, key=lambda c: p.columns[c].n_unique) if dates else None
@@ -95,89 +100,95 @@ def _tpl_group_anomalies(p: TableProfile) -> list[HypothesisSpec]:
     flag_cols = p.flag_columns()
     cat_cols = p.category_columns()
 
-    # Pick the most granular-looking id: smallest unique count that is still
-    # plausibly an entity (≤ 30% of rows). IDs that equal row count are primary
-    # keys; we want business entities like employee_id with ~thousands of values.
-    id_candidates = sorted(
-        ids,
-        key=lambda c: abs(p.columns[c].n_unique - max(100, p.n_rows // 1000)),
-    )
-    entity_id = id_candidates[0] if id_candidates else None
-    if entity_id is None:
-        return out
+    # Pick up to 3 distinct granularity levels. Sort descending and take both
+    # ends to capture finest + coarsest cohorts.
+    if len(candidates) > 3:
+        granular = candidates[:1] + candidates[len(candidates) // 2 : len(candidates) // 2 + 1] + candidates[-1:]
+        # Dedup while preserving order.
+        seen: set[str] = set()
+        granular = [c for c in granular if not (c in seen or seen.add(c))]
+    else:
+        granular = candidates
 
-    if best_date:
-        # Volume per entity vs peers.
-        out.append(HypothesisSpec(
-            hypothesis_id=_hid("grp_volume", entity_id, best_date),
-            runner="group_anomalies",
-            title=f"Аномальный объём записей по {entity_id}",
-            rationale=f"Ищем сущности ({entity_id}) с аномально высоким/низким объёмом событий относительно когорты.",
-            params={
-                "entity_col": entity_id,
-                "date_col": best_date,
-                "metric": "row_count",
-                "period": "quarter",
-            },
-            priority=0.85,
-            est_cost_seconds=30.0,
-        ))
+    # Coarser cohorts (low cardinality) get a slightly lower priority — they
+    # are statistically noisier, but still business-relevant.
+    def _prio(base: float, entity: str) -> float:
+        nu = p.columns[entity].n_unique
+        if nu < 30:
+            return base - 0.05
+        return base
 
-    for num in num_cols[:3]:
-        out.append(HypothesisSpec(
-            hypothesis_id=_hid("grp_num", entity_id, num),
-            runner="group_anomalies",
-            title=f"Аномальные значения {num} в разрезе {entity_id}",
-            rationale=f"Сущности ({entity_id}) с выбросами по средней/сумме {num}.",
-            params={
-                "entity_col": entity_id,
-                "date_col": best_date,
-                "metric": "mean",
-                "value_col": num,
-                "period": "quarter" if best_date else None,
-            },
-            priority=0.8,
-            est_cost_seconds=25.0,
-        ))
-
-    for flag in flag_cols[:2]:
-        out.append(HypothesisSpec(
-            hypothesis_id=_hid("grp_flag", entity_id, flag),
-            runner="group_anomalies",
-            title=f"Сущности с аномальной долей {flag}",
-            rationale=f"{entity_id} с экстремально высокой/низкой долей {flag} относительно когорты.",
-            params={
-                "entity_col": entity_id,
-                "date_col": best_date,
-                "metric": "rate",
-                "value_col": flag,
-                "period": "quarter" if best_date else None,
-            },
-            priority=0.9,
-            est_cost_seconds=25.0,
-        ))
-
-    # Exact vacation-fraud hypothesis if category column present with a date.
-    for cat in cat_cols[:2]:
+    for entity_id in granular:
         if best_date:
             out.append(HypothesisSpec(
-                hypothesis_id=_hid("grp_cat_shift", entity_id, cat, best_date),
+                hypothesis_id=_hid("grp_volume", entity_id, best_date),
                 runner="group_anomalies",
-                title=f"Сдвиг распределения {cat} к концу квартала по {entity_id}",
-                rationale=(
-                    f"Проверяем, не концентрируют ли отдельные {entity_id} значения "
-                    f"{cat} в последних неделях квартала (типичный fraud-паттерн)."
-                ),
+                title=f"Аномальный объём записей по {entity_id}",
+                rationale=f"Ищем сущности ({entity_id}) с аномально высоким/низким объёмом событий относительно когорты.",
                 params={
                     "entity_col": entity_id,
                     "date_col": best_date,
-                    "metric": "end_of_quarter_shift",
-                    "category_col": cat,
+                    "metric": "row_count",
                     "period": "quarter",
                 },
-                priority=0.95,
+                priority=_prio(0.85, entity_id),
                 est_cost_seconds=30.0,
             ))
+
+        for num in num_cols[:3]:
+            out.append(HypothesisSpec(
+                hypothesis_id=_hid("grp_num", entity_id, num),
+                runner="group_anomalies",
+                title=f"Аномальные значения {num} в разрезе {entity_id}",
+                rationale=f"Сущности ({entity_id}) с выбросами по средней/сумме {num}.",
+                params={
+                    "entity_col": entity_id,
+                    "date_col": best_date,
+                    "metric": "mean",
+                    "value_col": num,
+                    "period": "quarter" if best_date else None,
+                },
+                priority=_prio(0.8, entity_id),
+                est_cost_seconds=25.0,
+            ))
+
+        for flag in flag_cols[:2]:
+            out.append(HypothesisSpec(
+                hypothesis_id=_hid("grp_flag", entity_id, flag),
+                runner="group_anomalies",
+                title=f"Сущности с аномальной долей {flag} ({entity_id})",
+                rationale=f"{entity_id} с экстремально высокой/низкой долей {flag} относительно когорты.",
+                params={
+                    "entity_col": entity_id,
+                    "date_col": best_date,
+                    "metric": "rate",
+                    "value_col": flag,
+                    "period": "quarter" if best_date else None,
+                },
+                priority=_prio(0.9, entity_id),
+                est_cost_seconds=25.0,
+            ))
+
+        for cat in cat_cols[:2]:
+            if best_date and cat != entity_id:
+                out.append(HypothesisSpec(
+                    hypothesis_id=_hid("grp_cat_shift", entity_id, cat, best_date),
+                    runner="group_anomalies",
+                    title=f"Сдвиг распределения {cat} к концу квартала по {entity_id}",
+                    rationale=(
+                        f"Проверяем, не концентрируют ли отдельные {entity_id} значения "
+                        f"{cat} в последних неделях квартала (типичный fraud-паттерн)."
+                    ),
+                    params={
+                        "entity_col": entity_id,
+                        "date_col": best_date,
+                        "metric": "end_of_quarter_shift",
+                        "category_col": cat,
+                        "period": "quarter",
+                    },
+                    priority=_prio(0.95, entity_id),
+                    est_cost_seconds=30.0,
+                ))
     return out
 
 

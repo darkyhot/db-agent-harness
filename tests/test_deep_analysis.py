@@ -311,6 +311,49 @@ def test_integration_end_to_end_with_mock_loader():
         assert csvs, f"No entity CSVs written to {result.output_dir}"
 
 
+def test_group_anomalies_handles_small_cohort_like_tb_id():
+    """15-territorial-bank cohort: even with low cardinality, we want to flag
+    the 2 anomalous TBs. Mirrors the real corp tb_id (~15 values) case."""
+    rng = np.random.default_rng(0)
+    n_tb = 15
+    rows_per_tb = 400
+    rows = []
+    for tb in range(n_tb):
+        base_rate = 0.05 if tb >= 2 else 0.6   # first 2 TBs are anomalous
+        for _ in range(rows_per_tb):
+            rows.append((tb, int(rng.random() < base_rate)))
+    df = pd.DataFrame(rows, columns=["tb_id", "is_outflow"])
+    plan = LoadPlan(
+        schema="t", table="x", total_rows=len(df),
+        kept_columns=list(df.columns), dropped_wide_text=[],
+        strategy="full", sample_rows=None,
+        est_bytes_per_row=8, est_full_bytes=8 * len(df),
+    )
+    df, profile = profile_dataframe(df, plan)
+    # tb_id should be CATEGORY (15 values), but still surface as entity candidate.
+    assert "tb_id" in profile.entity_candidates(min_card=5)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = AnalysisContext(
+            schema="t", table="x", mode=AnalysisMode.FAST,
+            deadline_ts=1e18, output_dir=tmp, progress=ProgressReporter(),
+        )
+        spec = HypothesisSpec(
+            hypothesis_id="grp_tb_rate", runner="group_anomalies",
+            title="rate by tb", rationale="",
+            params={"entity_col": "tb_id", "metric": "rate", "value_col": "is_outflow"},
+            priority=1.0,
+        )
+        findings = run_group_anomalies(df, profile, spec, ctx)
+        assert findings, "Expected a finding on the small (15-entity) cohort"
+        f = findings[0]
+        assert f.entity_csv is not None
+        violators = pd.read_csv(Path(tmp) / f.entity_csv)
+        # The 2 anomalous TBs (tb_id 0 and 1) must be in the violator list.
+        flagged = set(int(v) for v in violators["tb_id"].tolist())
+        assert {0, 1}.issubset(flagged), f"Expected tb_ids 0 and 1 flagged, got {flagged}"
+
+
 def test_outliers_mad_flags_extreme_values():
     rng = np.random.default_rng(0)
     df = pd.DataFrame({

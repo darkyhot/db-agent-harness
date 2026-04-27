@@ -192,6 +192,25 @@ class Finding:
 
 
 @dataclass
+class BusinessInsight:
+    """LLM-curated business takeaway distilled from a subset of findings.
+
+    Sits above the mechanical TL;DR in the report. Each insight answers three
+    questions in business terms — куда смотреть → на что это влияет → что
+    сделать — and points back at the raw findings via `related_finding_ids`.
+    """
+
+    insight_id: str                           # short slug, used as MD anchor
+    title: str                                # one-line headline
+    priority: str                             # "top" | "high" | "medium"
+    where_to_look: str                        # concrete pointer (column/segment/period/CSV)
+    business_impact: str                      # what this affects ($/risk/ops), 1-3 sentences
+    recommended_action: str                   # what to do, who to involve
+    related_finding_ids: list[str] = field(default_factory=list)
+    confidence: str = "medium"                # "high" | "medium" | "low"
+
+
+@dataclass
 class AnalysisContext:
     """Runtime context threaded through the pipeline."""
 

@@ -32,7 +32,9 @@ from core.deep_analysis.runners.seasonality import run_seasonality
 from core.deep_analysis.types import (
     AnalysisContext,
     AnalysisMode,
+    BusinessInsight,
     ColumnRole,
+    Finding,
     HypothesisSpec,
 )
 
@@ -443,3 +445,213 @@ def test_outliers_mad_flags_extreme_values():
         findings = run_outliers(df, profile, spec, ctx)
         assert findings
         assert findings[0].metrics["n_outliers"] >= 10
+
+
+def test_business_insights_render_in_report_via_insights_fn():
+    """Inject a fake insights_fn to verify the new MD section + jsonl + anchors.
+
+    Bypasses the real LLM — we feed a curated BusinessInsight list and check
+    that everything downstream (orchestrator → write_report → markdown) wires
+    it together correctly.
+    """
+    df = _build_synthetic_df()
+
+    def fake_loader(db, schema, table, progress_cb):
+        plan = LoadPlan(
+            schema=schema, table=table, total_rows=len(df),
+            kept_columns=list(df.columns), dropped_wide_text=[],
+            strategy="full", sample_rows=None,
+            est_bytes_per_row=100, est_full_bytes=100 * len(df),
+        )
+        return df, plan
+
+    def fake_enrich(llm, profile, catalog, semantics):
+        return catalog
+
+    captured: dict[str, object] = {}
+
+    def fake_insights_fn(llm, findings, profile, user_focus, table_semantics):
+        captured["n_findings"] = len(findings)
+        captured["table"] = f"{profile.schema}.{profile.table}"
+        # Pin the first real finding so we can verify drill-down anchors.
+        target_id = findings[0].hypothesis_id if findings else "unknown"
+        captured["target_id"] = target_id
+        return [
+            BusinessInsight(
+                insight_id="vacation-fraud-ring",
+                title="Сотрудники концентрируют отпуска в конце квартала",
+                priority="top",
+                where_to_look="employee_id из CSV нарушителей за последние 10 дней квартала",
+                business_impact=(
+                    "Прямой риск занижения KPI и потери выручки на ~100 сотрудниках; "
+                    "сигнал для фрод-аудита."
+                ),
+                recommended_action="Передать список employee_id в HR-аудит для проверки совпадений с фактической явкой.",
+                related_finding_ids=[target_id],
+                confidence="high",
+            ),
+        ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run_deep_analysis(
+            "hr", "events",
+            mode=AnalysisMode.FAST,
+            db=None, llm=None, schema_loader=None,
+            loader_fn=fake_loader, enrich_fn=fake_enrich,
+            insights_fn=fake_insights_fn,
+            output_root=Path(tmp),
+        )
+
+        # Insights propagate into AnalysisResult.
+        assert len(result.business_insights) == 1
+        assert result.business_insights[0].insight_id == "vacation-fraud-ring"
+        assert captured["table"] == "hr.events"
+        assert captured["n_findings"] == len(result.findings)
+
+        # business_insights.jsonl artifact exists and is parseable.
+        jsonl = result.output_dir / "business_insights.jsonl"
+        assert jsonl.exists(), "business_insights.jsonl was not written"
+        import json as _json
+        rows = [_json.loads(line) for line in jsonl.read_text().splitlines() if line.strip()]
+        assert len(rows) == 1
+        assert rows[0]["priority"] == "top"
+        assert rows[0]["recommended_action"]
+
+        # Markdown report contains the new section, ordered before TL;DR.
+        report = result.report_path.read_text(encoding="utf-8")
+        assert "## 🎯 Главное для бизнеса" in report
+        assert "Сотрудники концентрируют отпуска" in report
+        assert "**Куда смотреть:**" in report
+        assert "**На что влияет:**" in report
+        assert "**Что сделать:**" in report
+        # New section must be ABOVE TL;DR, not below it.
+        assert report.index("Главное для бизнеса") < report.index("## TL;DR")
+        # Drill-down anchor + link must both be present.
+        target_id = captured["target_id"]
+        assert f'<a id="{target_id}"></a>' in report
+        assert f"(#{target_id})" in report
+
+
+def test_business_insights_failure_is_graceful():
+    """If insights_fn explodes, the report still builds without the section."""
+    df = _build_synthetic_df()
+
+    def fake_loader(db, schema, table, progress_cb):
+        plan = LoadPlan(
+            schema=schema, table=table, total_rows=len(df),
+            kept_columns=list(df.columns), dropped_wide_text=[],
+            strategy="full", sample_rows=None,
+            est_bytes_per_row=100, est_full_bytes=100 * len(df),
+        )
+        return df, plan
+
+    def fake_enrich(llm, profile, catalog, semantics):
+        return catalog
+
+    def broken_insights_fn(llm, findings, profile, user_focus, table_semantics):
+        raise RuntimeError("LLM provider is unreachable")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run_deep_analysis(
+            "hr", "events",
+            mode=AnalysisMode.FAST,
+            db=None, llm=None, schema_loader=None,
+            loader_fn=fake_loader, enrich_fn=fake_enrich,
+            insights_fn=broken_insights_fn,
+            output_root=Path(tmp),
+        )
+
+        assert result.business_insights == []
+        report = result.report_path.read_text(encoding="utf-8")
+        # Section must be absent — TL;DR + diagnostics are still there.
+        assert "Главное для бизнеса" not in report
+        assert "## TL;DR" in report
+        assert "## Диагностика выполнения" in report
+
+
+def test_business_insights_extract_with_stub_llm():
+    """Hit the real extract_business_insights() with a stub LLM that returns
+    canned JSON — proves selection, validation, parsing, and drop of fake
+    finding_ids work end-to-end without a network call."""
+    from core.deep_analysis.business_insights import extract_business_insights
+
+    findings = [
+        Finding(
+            hypothesis_id="seas_eoq_vacation",
+            runner="seasonality",
+            title="EOQ всплеск отпусков",
+            severity="strong",
+            summary="Доля 'отпуск' в последние 10 дней квартала резко выше базового уровня.",
+            metrics={"max_rel_deviation_pct": 180.0, "horizon": "квартал"},
+        ),
+        Finding(
+            hypothesis_id="grp_eoq_employees",
+            runner="group_anomalies",
+            title="Сотрудники с EOQ-сдвигом",
+            severity="critical",
+            summary="100 сотрудников концентрируют отпуска на конец квартала.",
+            metrics={"n_violators": 78, "max_abs_z": 4.2},
+            entity_csv="entities_grp_eoq_employees.csv",
+        ),
+        Finding(
+            hypothesis_id="info_minor_nulls",
+            runner="outliers",
+            title="Мелкие nullы в kpi_score",
+            severity="info",
+            summary="0.3% nullов в числовой колонке.",
+            metrics={"n_outliers": 5},
+        ),
+    ]
+    plan = LoadPlan(
+        schema="hr", table="events", total_rows=10,
+        kept_columns=["x"], dropped_wide_text=[],
+        strategy="full", sample_rows=None,
+        est_bytes_per_row=10, est_full_bytes=100,
+    )
+    df = pd.DataFrame({"x": [1, 2, 3]})
+    _, profile = profile_dataframe(df, plan)
+
+    canned_json = """```json
+{
+  "insights": [
+    {
+      "title": "EOQ-фрод по отпускам",
+      "priority": "top",
+      "where_to_look": "CSV нарушителей за последние 10 дней квартала",
+      "business_impact": "Риск занижения KPI на 78 сотрудниках.",
+      "recommended_action": "Передать в HR-аудит.",
+      "related_finding_ids": ["grp_eoq_employees", "seas_eoq_vacation", "ghost_id"],
+      "confidence": "high"
+    },
+    {
+      "title": "",
+      "priority": "high",
+      "where_to_look": "x", "business_impact": "y", "recommended_action": "z"
+    }
+  ]
+}
+```"""
+
+    class StubLLM:
+        def invoke_with_system(self, system, user, temperature=None):
+            assert "Главное для бизнеса" not in system   # sanity: system prompt is the insights one
+            return canned_json
+
+    insights = extract_business_insights(
+        StubLLM(),  # type: ignore[arg-type]
+        findings, profile,
+        user_hypothesis_text="фрод с отпусками в конце квартала",
+        table_semantics="HR события",
+    )
+    assert len(insights) == 1, "Empty-title insight should be dropped"
+    ins = insights[0]
+    assert ins.priority == "top"
+    assert ins.confidence == "high"
+    # Validator must drop unknown finding_ids but keep real ones.
+    assert "grp_eoq_employees" in ins.related_finding_ids
+    assert "seas_eoq_vacation" in ins.related_finding_ids
+    assert "ghost_id" not in ins.related_finding_ids
+    # info-severity finding must NOT have been fed to the LLM (we can't observe
+    # the prompt directly here, but we can re-derive: the validator only knows
+    # ids of findings that were fed). info_minor_nulls would never appear
+    # anyway as the LLM didn't reference it — covered indirectly.

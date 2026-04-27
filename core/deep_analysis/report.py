@@ -27,6 +27,7 @@ from core.deep_analysis.logging_setup import get_logger
 from core.deep_analysis.profiler import profile_to_brief
 from core.deep_analysis.types import (
     AnalysisMode,
+    BusinessInsight,
     Finding,
     HypothesisSpec,
     TableProfile,
@@ -52,6 +53,10 @@ _THEME_ORDER = list(_THEME_BY_RUNNER.values()) + ["Прочее"]
 
 _TLDR_MAX_ITEMS = 5
 
+_INSIGHT_PRIORITY_ORDER = {"top": 0, "high": 1, "medium": 2}
+_INSIGHT_PRIORITY_LABEL = {"top": "🔝 TOP", "high": "HIGH", "medium": "MEDIUM"}
+_INSIGHT_CONFIDENCE_LABEL = {"high": "высокое", "medium": "среднее", "low": "низкое"}
+
 
 def write_report(
     findings: list[Finding],
@@ -62,15 +67,24 @@ def write_report(
     *,
     run_records: "list[HypothesisRunRecord] | None" = None,
     wall_seconds: float = 0.0,
+    business_insights: list[BusinessInsight] | None = None,
 ) -> Path:
     log = get_logger()
     output_dir.mkdir(parents=True, exist_ok=True)
+    insights = business_insights or []
 
     jsonl_path = output_dir / "findings.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as f:
         for fnd in findings:
             f.write(json.dumps(dataclasses.asdict(fnd), ensure_ascii=False, default=str))
             f.write("\n")
+
+    if insights:
+        ins_path = output_dir / "business_insights.jsonl"
+        with ins_path.open("w", encoding="utf-8") as f:
+            for ins in insights:
+                f.write(json.dumps(dataclasses.asdict(ins), ensure_ascii=False, default=str))
+                f.write("\n")
 
     if run_records:
         diag_path = output_dir / "diagnostics.jsonl"
@@ -84,6 +98,7 @@ def write_report(
         _render_markdown(
             findings, profile, hypotheses, mode, output_dir,
             run_records=run_records or [], wall_seconds=wall_seconds,
+            business_insights=insights,
         ),
         encoding="utf-8",
     )
@@ -100,6 +115,7 @@ def _render_markdown(
     *,
     run_records: "list[HypothesisRunRecord]",
     wall_seconds: float,
+    business_insights: list[BusinessInsight] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append(f"# Глубокий анализ {profile.schema}.{profile.table}")
@@ -124,6 +140,11 @@ def _render_markdown(
             -f.metrics.get("n_violators", 0),
         ),
     )
+
+    # Business insights (LLM-curated) — sits above the mechanical TL;DR. If
+    # the stage didn't run / produced nothing, this is silently skipped.
+    if business_insights:
+        lines.extend(_render_business_insights(business_insights))
 
     # TL;DR — top-N business-relevant findings, surfaced before the dump.
     lines.extend(_render_tldr(sorted_findings))
@@ -229,6 +250,8 @@ def _severity_breakdown(findings: list[Finding]) -> str:
 
 def _render_finding(lines: list[str], fnd: Finding, profile: TableProfile) -> None:
     icon = _SEVERITY_ICON.get(fnd.severity, "•")
+    # Anchor lets business-insight links drill down to the underlying finding.
+    lines.append(f'<a id="{fnd.hypothesis_id}"></a>')
     lines.append(f"#### {icon} [{fnd.severity}] {fnd.title}")
     lines.append("")
     lines.append(fnd.summary)
@@ -388,6 +411,41 @@ def _impact_score(f: Finding) -> float:
 
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def _render_business_insights(insights: list[BusinessInsight]) -> list[str]:
+    """LLM-curated «куда смотреть → на что влияет → что сделать» block.
+
+    Sits above the mechanical TL;DR. Drill-down links use the per-finding
+    anchors emitted by _render_finding.
+    """
+    ordered = sorted(
+        insights,
+        key=lambda i: _INSIGHT_PRIORITY_ORDER.get(i.priority, 99),
+    )
+    lines = ["## 🎯 Главное для бизнеса", ""]
+    lines.append(
+        f"_LLM выделил {len(ordered)} "
+        f"{'инсайт' if len(ordered) == 1 else 'инсайтов' if len(ordered) >= 5 else 'инсайта'} "
+        "из всех находок ниже. Если нужна полная картина — смотрите TL;DR и тематические разделы._"
+    )
+    lines.append("")
+    for ins in ordered:
+        prio = _INSIGHT_PRIORITY_LABEL.get(ins.priority, ins.priority.upper())
+        lines.append(f"### [{prio}] {ins.title}")
+        lines.append("")
+        lines.append(f"- **Куда смотреть:** {ins.where_to_look}")
+        lines.append(f"- **На что влияет:** {ins.business_impact}")
+        lines.append(f"- **Что сделать:** {ins.recommended_action}")
+        if ins.related_finding_ids:
+            refs = ", ".join(f"[{fid}](#{fid})" for fid in ins.related_finding_ids)
+            confidence = _INSIGHT_CONFIDENCE_LABEL.get(ins.confidence, ins.confidence)
+            lines.append(f"- _Доверие: {confidence} · подробнее: {refs}_")
+        else:
+            confidence = _INSIGHT_CONFIDENCE_LABEL.get(ins.confidence, ins.confidence)
+            lines.append(f"- _Доверие: {confidence}_")
+        lines.append("")
+    return lines
 
 
 def _first_sentence(text: str, limit: int = 220) -> str:

@@ -25,6 +25,7 @@ from typing import Any
 import pandas as pd
 
 from core.database import DatabaseManager
+from core.deep_analysis.business_insights import extract_business_insights
 from core.deep_analysis.equivalence import compute_equivalence_groups
 from core.deep_analysis.hypothesis_catalog import generate_catalog_hypotheses
 from core.deep_analysis.hypothesis_llm import enrich_hypotheses
@@ -37,6 +38,7 @@ from core.deep_analysis.runners import get_runner
 from core.deep_analysis.types import (
     AnalysisContext,
     AnalysisMode,
+    BusinessInsight,
     Finding,
     HypothesisSpec,
     TableProfile,
@@ -58,6 +60,10 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent / "workspace" / "
 # always thread the user-supplied filter through.
 LoaderFn = Callable[..., tuple[pd.DataFrame, LoadPlan]]
 EnrichFn = Callable[[Any, TableProfile, list[HypothesisSpec], str], list[HypothesisSpec]]
+# Signature: insights_fn(llm, findings, profile, user_hypothesis_text, table_semantics)
+#   -> list[BusinessInsight]. Default wraps extract_business_insights; tests
+# inject a fake to bypass the LLM and return a canned list.
+InsightsFn = Callable[..., list[BusinessInsight]]
 
 
 def _default_loader(
@@ -98,6 +104,7 @@ class AnalysisResult:
     wall_seconds: float
     report_path: Path
     run_records: list[HypothesisRunRecord] = field(default_factory=list)
+    business_insights: list[BusinessInsight] = field(default_factory=list)
 
 
 def run_deep_analysis(
@@ -112,6 +119,7 @@ def run_deep_analysis(
     progress_cb: ProgressCallback | None = None,
     loader_fn: LoaderFn | None = None,
     enrich_fn: EnrichFn | None = None,
+    insights_fn: InsightsFn | None = None,
     output_root: Path | None = None,
     where: str | None = None,
 ) -> AnalysisResult:
@@ -184,12 +192,39 @@ def run_deep_analysis(
         progress.stage("Проверяю гипотезы")
         findings = _execute_hypotheses(df, profile, hypotheses, ctx, run_records)
 
+        # Stage 4b: business insights — distill findings into 0..5 actionable
+        # takeaways. Non-fatal: if the LLM fails or no findings qualify, the
+        # report still renders without the "Главное для бизнеса" section.
+        business_insights: list[BusinessInsight] = []
+        user_focus = (
+            user_hypothesis.hypothesis.rationale
+            if user_hypothesis is not None else None
+        )
+        if insights_fn is not None:
+            try:
+                business_insights = insights_fn(
+                    llm, findings, profile, user_focus, table_desc,
+                )
+            except Exception as exc:
+                log.warning("Injected insights_fn failed: %s", exc)
+        elif llm is not None and findings:
+            progress.sub("Формирую бизнес-инсайты")
+            try:
+                business_insights = extract_business_insights(
+                    llm, findings, profile,
+                    user_hypothesis_text=user_focus,
+                    table_semantics=table_desc,
+                )
+            except Exception as exc:
+                log.warning("Business insights stage failed: %s", exc)
+
         # Stage 5: report
         progress.stage("Формирую отчёт")
         report_path = write_report(
             findings, profile, hypotheses, mode, output_dir,
             run_records=run_records,
             wall_seconds=time.time() - started_at,
+            business_insights=business_insights,
         )
     finally:
         detach_run_log(log_handler)
@@ -204,6 +239,7 @@ def run_deep_analysis(
         mode=mode,
         wall_seconds=wall,
         report_path=report_path,
+        business_insights=business_insights if 'business_insights' in locals() else [],
         run_records=run_records,
     )
 

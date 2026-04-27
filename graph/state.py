@@ -192,3 +192,10 @@ class AgentState(TypedDict):
     previous_sql_blueprint: dict[str, Any]
     plan_diff: dict[str, Any]
     plan_diff_summary: str
+
+    # Set by table_explorer when explicit_source_guard fires and no explicit
+    # source survives filtering. Lets plan_edit_validator surface a precise
+    # diagnostic instead of the misleading "missing required source" error.
+    # Keys: "kind" ("conflict_with_excluded" | "no_eligible_source"),
+    #       "must_keep_filtered" (list[str]), "excluded_tables" (list[str]).
+    explorer_error: dict[str, Any]

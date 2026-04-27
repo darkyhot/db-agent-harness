@@ -208,7 +208,24 @@ class ExplorerNodes:
 
         # 2. Fallback: извлечение schema.table из плана и user_input
         if not found_tables and explicit_source_guard:
-            logger.info("TableExplorer: explicit source guard active, fallback search disabled")
+            must_keep_full = [
+                f"{item[0]}.{item[1]}"
+                for item in (state.get("user_hints") or {}).get("must_keep_tables", [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            ]
+            allowed_full = list(state.get("allowed_tables") or [])
+            explicit_full = list(dict.fromkeys(must_keep_full + allowed_full))
+            filtered_by_excluded = [
+                t for t in explicit_full if t.lower() in excluded_tables
+            ]
+            err_kind = (
+                "conflict_with_excluded" if filtered_by_excluded else "no_eligible_source"
+            )
+            logger.info(
+                "TableExplorer: explicit source guard active (kind=%s, filtered=%s)",
+                err_kind,
+                filtered_by_excluded,
+            )
             empty_ctx = (
                 "=== РАЗВЕДКА ТАБЛИЦ ===\n\n"
                 "Явные источники заданы, но после фильтрации доступных таблиц не осталось."
@@ -219,6 +236,12 @@ class ExplorerNodes:
                 "table_samples": {},
                 "table_types": {},
                 "join_analysis_data": {},
+                "explorer_error": {
+                    "kind": err_kind,
+                    "must_keep_filtered": filtered_by_excluded,
+                    "explicit_sources": explicit_full,
+                    "excluded_tables": sorted(excluded_tables),
+                },
             }
 
         if not found_tables:
@@ -235,6 +258,7 @@ class ExplorerNodes:
                     "table_samples": {},
                     "table_types": {},
                     "join_analysis_data": {},
+                    "explorer_error": {},
                 }
 
             pattern = re.compile(
@@ -295,6 +319,7 @@ class ExplorerNodes:
                 "table_samples": {},
                 "table_types": {},
                 "join_analysis_data": {},
+                "explorer_error": {},
             }
 
         logger.info(
@@ -437,6 +462,7 @@ class ExplorerNodes:
             "table_samples": table_samples,
             "table_types": table_types,
             "join_analysis_data": join_analysis_data,
+            "explorer_error": {},
             "messages": state["messages"] + [
                 {
                     "role": "assistant",

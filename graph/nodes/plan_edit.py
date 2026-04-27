@@ -1188,6 +1188,125 @@ class PlanEditNodes:
             "graph_iterations": iterations,
         }
 
+    def _resolve_remove_join_survivor(
+        self,
+        state: AgentState,
+        edit_text: str,
+        parsed: dict[str, Any],
+        llm_tables: list[str],
+        iterations: int,
+    ) -> dict[str, Any] | None:
+        """Convert a remove_join action into a set_sources_only with the surviving table.
+
+        Returns either a rebind update (single survivor) or a clarify update
+        (ambiguous / no survivor). Returns None only if there is literally no
+        join info at all — caller falls back to legacy logic in that case.
+        """
+        join_tables: list[str] = []
+        for join in parsed.get("joins") or []:
+            if not isinstance(join, dict):
+                continue
+            for side in ("left", "right"):
+                table_name = _table_name_from_column_ref(str(join.get(side) or ""))
+                if table_name:
+                    join_tables.append(table_name)
+
+        current_tables = _state_table_names(state)
+        join_lower = {t.lower() for t in join_tables}
+        current_lower = {t.lower() for t in current_tables}
+
+        # Empty join + empty current state — nothing to disambiguate; let caller fall back.
+        if not join_tables and not current_tables:
+            return None
+
+        # Survivor candidates in priority order, deduped.
+        survivor_candidates: list[str] = []
+
+        def add_candidate(token: str) -> None:
+            t = str(token or "").strip()
+            if t and t not in survivor_candidates:
+                survivor_candidates.append(t)
+
+        for token in llm_tables:
+            add_candidate(token)
+        for item in (state.get("user_hints") or {}).get("must_keep_tables", []) or []:
+            add_candidate(_full_table_name(item))
+        bp_main = str((state.get("sql_blueprint") or {}).get("main_table") or "")
+        if bp_main:
+            add_candidate(bp_main)
+        edit_lower = str(edit_text or "").lower()
+        if edit_lower:
+            for cur in current_tables:
+                short = cur.split(".")[-1].lower()
+                if short and short in edit_lower:
+                    add_candidate(cur)
+
+        eligible_pool = join_lower or current_lower
+        survivors_resolved: list[str] = []
+        for cand in survivor_candidates:
+            resolved = self._resolve_table_name(cand)
+            if not resolved:
+                continue
+            if eligible_pool and resolved.lower() not in eligible_pool:
+                continue
+            if resolved not in survivors_resolved:
+                survivors_resolved.append(resolved)
+
+        if len(survivors_resolved) == 1:
+            survivor = survivors_resolved[0]
+            excluded = list(
+                state.get("excluded_tables")
+                or (state.get("user_hints") or {}).get("excluded_tables")
+                or []
+            )
+            for table in current_tables:
+                if table != survivor and table not in excluded:
+                    excluded.append(table)
+            for jt in join_tables:
+                resolved_jt = self._resolve_table_name(jt) or jt
+                if resolved_jt != survivor and resolved_jt not in excluded:
+                    excluded.append(resolved_jt)
+            operations = [{"op": "set_sources_only", "tables": [survivor]}]
+            confidence = float(parsed.get("confidence", 0.85) or 0.85)
+            resolution = self._build_plan_edit_resolution(
+                edit_goal="rebind",
+                requested_changes=[{"action": "remove_join", "survivor": survivor}],
+                confidence=confidence,
+            )
+            return {
+                "plan_edit_kind": "rebind",
+                "plan_edit_confidence": confidence,
+                "plan_edit_payload": {
+                    "operations": operations,
+                    "excluded_tables": excluded,
+                    "resolution": resolution,
+                },
+                "plan_edit_resolution": resolution,
+                "plan_edit_explanation": f"remove_join → keep {survivor}",
+                "plan_edit_needs_clarification": False,
+                "needs_clarification": False,
+                "clarification_message": "",
+                "excluded_tables": excluded,
+                "graph_iterations": iterations,
+            }
+
+        options = sorted(set(join_tables) or set(current_tables))
+        options_str = " или ".join(f"`{t}`" for t in options) if options else "одной таблицей"
+        return {
+            "plan_edit_kind": "clarify",
+            "plan_edit_confidence": float(parsed.get("confidence", 0.0) or 0.0),
+            "plan_edit_payload": parsed,
+            "plan_edit_resolution": {
+                "edit_goal": "clarify",
+                "clarification_reason": "ambiguous_remove_join_survivor",
+            },
+            "plan_edit_explanation": "remove_join без однозначного survivor",
+            "plan_edit_needs_clarification": True,
+            "needs_clarification": True,
+            "clarification_message": f"Какой источник оставить после удаления JOIN: {options_str}?",
+            "graph_iterations": iterations,
+        }
+
     def _apply_structured_plan_edit_action(
         self,
         state: AgentState,
@@ -1219,14 +1338,13 @@ class PlanEditNodes:
             for item in (parsed.get("tables") or parsed.get("sources") or [])
             if str(item or "").strip()
         ]
+
         if action == "remove_join":
-            for join in parsed.get("joins") or []:
-                if not isinstance(join, dict):
-                    continue
-                for side in ("left", "right"):
-                    table_name = _table_name_from_column_ref(str(join.get(side) or ""))
-                    if table_name:
-                        tables.append(table_name)
+            survivor_update = self._resolve_remove_join_survivor(
+                state, edit_text, parsed, tables, iterations
+            )
+            if survivor_update is not None:
+                return survivor_update
 
         resolved_tables: list[str] = []
         unresolved: list[str] = []
@@ -1742,6 +1860,49 @@ class PlanEditNodes:
                 if _full_table_name(t).lower() not in {item.lower() for item in excluded_tables}
             ]
 
+        must_keep_lower = {
+            _full_table_name(item).lower()
+            for item in (user_hints.get("must_keep_tables") or [])
+            if _full_table_name(item)
+        }
+        excluded_lower = {str(t).lower() for t in excluded_tables if str(t)}
+        conflict = must_keep_lower & excluded_lower
+        if conflict:
+            logger.info("source_rebinder: must_keep ∩ excluded conflict=%s", sorted(conflict))
+            return {
+                "plan_edit_kind": "clarify",
+                "plan_edit_payload": payload,
+                "plan_edit_resolution": {
+                    "edit_goal": "clarify",
+                    "clarification_reason": "must_keep_excluded_conflict",
+                    "conflict_tables": sorted(conflict),
+                },
+                "plan_edit_explanation": "must_keep_tables conflict with excluded_tables",
+                "plan_edit_needs_clarification": True,
+                "plan_edit_applied": False,
+                "needs_clarification": True,
+                "clarification_message": (
+                    "Правка противоречит ранее заданным обязательным источникам: "
+                    + ", ".join(sorted(conflict))
+                    + ". Уточните, оставляем эти таблицы или нет."
+                ),
+                "graph_iterations": iterations,
+            }
+
+        selected_lower = {_full_table_name(t).lower() for t in selected_tables}
+        orphan_must_keep = must_keep_lower - selected_lower
+        if orphan_must_keep:
+            for item in (user_hints.get("must_keep_tables") or []):
+                full = _full_table_name(item)
+                if full and full.lower() in orphan_must_keep:
+                    split = _split_table_name(full)
+                    if split is not None and split not in selected_tables:
+                        selected_tables.append(split)
+            logger.info(
+                "source_rebinder: restored orphan must_keep tables=%s",
+                sorted(orphan_must_keep),
+            )
+
         rebased_state = dict(state)
         rebased_state.update({
             "selected_tables": selected_tables,
@@ -1911,13 +2072,32 @@ class PlanEditNodes:
             for item in (state.get("user_hints") or {}).get("must_keep_tables", [])
             if _full_table_name(item)
         }
+
+        # Explorer signaled an inconsistent state (e.g. must_keep ∩ excluded after
+        # a rebind chain). Surface this BEFORE the generic "missing source" check
+        # so the user gets an actionable message instead of a confusing one.
+        explorer_error = state.get("explorer_error") or {}
+        if explorer_error.get("kind") == "conflict_with_excluded":
+            filtered = explorer_error.get("must_keep_filtered") or []
+            errors.append(
+                "Источник одновременно помечен как обязательный и исключён: "
+                + ", ".join(sorted(str(t) for t in filtered))
+                + ". Уточните, оставить его в плане или нет."
+            )
+        elif explorer_error.get("kind") == "no_eligible_source":
+            sources = explorer_error.get("explicit_sources") or []
+            errors.append(
+                "Не удалось загрузить структуру явных источников: "
+                + ", ".join(sorted(str(t) for t in sources))
+            )
+
         if excluded_tables & present_tables:
             errors.append(
                 "Исключённый источник вернулся в план: "
                 + ", ".join(sorted(excluded_tables & present_tables))
             )
         missing_required = required_tables - present_tables
-        if missing_required:
+        if missing_required and not explorer_error.get("kind"):
             errors.append(
                 "Обязательный источник отсутствует в плане: "
                 + ", ".join(sorted(missing_required))

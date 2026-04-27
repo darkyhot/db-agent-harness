@@ -679,6 +679,77 @@ def test_query_spec_editor_changes_sort_direction_without_losing_metric(syntheti
     ]
 
 
+def test_query_spec_editor_set_sources_only_rebinds_and_excludes_others(synthetic_loader):
+    action = {
+        "action": "set_sources_only",
+        "tables": ["schema_a.dim_y"],
+        "confidence": 0.95,
+    }
+    node = _Node(
+        _DummyLLM([json.dumps(action, ensure_ascii=False)]),
+        _DummyDB(),
+        synthetic_loader,
+        _DummyMemory(),
+        _DummyValidator(),
+        [],
+    )
+    state = _state(
+        plan_edit_text="вообще не надо join, достаточно справочника dim_y",
+        query_spec={
+            "task": "answer_data",
+            "metrics": [{"operation": "count", "target": "tb_id", "distinct_policy": "distinct", "confidence": 0.9}],
+            "dimensions": [],
+            "filters": [],
+            "source_constraints": [],
+            "join_constraints": [],
+            "clarification_needed": False,
+            "confidence": 0.9,
+        },
+        selected_tables=[("schema_a", "fact_x"), ("schema_a", "dim_y")],
+        selected_columns={
+            "schema_a.fact_x": {"select": ["task_code"], "aggregate": ["task_code"]},
+            "schema_a.dim_y": {"select": ["tb_id"], "aggregate": ["tb_id"]},
+        },
+        join_spec=[{"left": "schema_a.fact_x.task_code", "right": "schema_a.dim_y.task_code"}],
+    )
+
+    routed = node.plan_edit_router(state)
+    assert routed["plan_edit_kind"] == "rebind"
+
+    rebased = node.source_rebinder({**state, **routed})
+
+    assert rebased["selected_tables"] == [("schema_a", "dim_y")]
+    assert rebased["allowed_tables"] == ["schema_a.dim_y"]
+    assert "schema_a.fact_x" in rebased["excluded_tables"]
+    assert all("schema_a.fact_x" not in str(item) for item in rebased.get("join_spec", []))
+
+
+def test_plan_edit_validator_rejects_returned_excluded_source(node):
+    result = node.plan_edit_validator(
+        _state(
+            excluded_tables=["schema_a.fact_x"],
+            selected_tables=[("schema_a", "fact_x")],
+        )
+    )
+
+    assert result["plan_edit_applied"] is False
+    assert "Исключённый источник вернулся" in result["clarification_message"]
+
+
+def test_table_explorer_does_not_fallback_when_explicit_sources_are_excluded(node):
+    result = node.table_explorer(
+        _state(
+            selected_tables=[],
+            allowed_tables=["schema_a.fact_x"],
+            excluded_tables=["schema_a.fact_x"],
+            user_input="покажи fact_x",
+        )
+    )
+
+    assert result["table_structures"] == {}
+    assert result["join_analysis_data"] == {}
+
+
 def test_fallback_llm_emits_operations(synthetic_loader):
     llm = _DummyLLM([
         '{"edit_kind":"patch","confidence":0.4,"payload":{}}',

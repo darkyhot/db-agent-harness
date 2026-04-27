@@ -97,6 +97,7 @@ class QueryIRNodes:
             )
         except Exception:  # noqa: BLE001
             semantic_frame = spec.to_semantic_frame()
+        semantic_frame = _apply_query_spec_guardrails(spec, semantic_frame)
 
         return {
             "query_spec": spec.to_dict(),
@@ -322,6 +323,22 @@ def _build_query_interpreter_system_prompt() -> str:
         "- Каждое важное поле снабжай confidence и evidence.\n\n"
         f"JSON Schema:\n{schema}"
     )
+
+
+def _apply_query_spec_guardrails(spec: QuerySpec, semantic_frame: dict[str, Any]) -> dict[str, Any]:
+    """Keep downstream compatibility flags aligned with the LLM QuerySpec."""
+    frame = dict(semantic_frame or {})
+    count_metrics = [
+        metric for metric in spec.metrics
+        if metric.operation == "count" and metric.target
+    ]
+    if len(count_metrics) > 1:
+        frame["requires_single_entity_count"] = False
+        frame["subject"] = None
+    if spec.dimensions:
+        frame["output_dimensions"] = [dim.target for dim in spec.dimensions]
+        frame["requires_single_entity_count"] = False
+    return frame
 
 
 def _build_query_interpreter_user_prompt(

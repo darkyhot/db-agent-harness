@@ -46,6 +46,26 @@ def _table_name_from_column_ref(ref: str) -> str:
     return ""
 
 
+def _state_table_names(state: AgentState) -> list[str]:
+    names: list[str] = []
+
+    def add(name: str) -> None:
+        cleaned = str(name or "").strip()
+        if cleaned and cleaned not in names:
+            names.append(cleaned)
+
+    for item in state.get("selected_tables") or []:
+        add(_full_table_name(item))
+    for table in (state.get("selected_columns") or {}).keys():
+        add(str(table))
+    blueprint = state.get("sql_blueprint") or {}
+    add(str(blueprint.get("main_table") or ""))
+    for join in state.get("join_spec") or []:
+        add(_table_name_from_column_ref(str(join.get("left") or "")))
+        add(_table_name_from_column_ref(str(join.get("right") or "")))
+    return names
+
+
 def _collect_known_columns(selected_columns: dict[str, Any]) -> set[str]:
     result: set[str] = set()
     for roles in (selected_columns or {}).values():
@@ -1076,9 +1096,11 @@ class PlanEditNodes:
             "Получишь текущий QuerySpec, preview/blueprint и текст правки пользователя. "
             "Если пользователь просит убрать источник/JOIN или оставить только часть источников, "
             "верни JSON action по схеме: "
-            '{"action":"remove_source|remove_join|replace_source|clarify",'
+            '{"action":"remove_source|remove_join|replace_source|set_sources_only|clarify",'
             '"tables":["schema.table или table"],"joins":[{"left":"...","right":"..."}],'
             '"replacement_table":"schema.table","question":"...","confidence":0.0}. '
+            "Если пользователь говорит, что достаточно одного справочника/источника, "
+            "используй action=set_sources_only с tables=[...]. "
             "Для остальных смысловых правок верни ПОЛНЫЙ обновлённый QuerySpec JSON по схеме, без markdown. "
             "Не пиши SQL. Не удаляй существующие метрики, фильтры, даты, источники и "
             "измерения, если пользователь явно не попросил удалить или заменить их. "
@@ -1189,10 +1211,14 @@ class PlanEditNodes:
                 "clarification_message": question,
                 "graph_iterations": iterations,
             }
-        if action not in {"remove_source", "remove_join", "replace_source"}:
+        if action not in {"remove_source", "remove_join", "replace_source", "set_sources_only"}:
             return None
 
-        tables = [str(item or "").strip() for item in parsed.get("tables") or [] if str(item or "").strip()]
+        tables = [
+            str(item or "").strip()
+            for item in (parsed.get("tables") or parsed.get("sources") or [])
+            if str(item or "").strip()
+        ]
         if action == "remove_join":
             for join in parsed.get("joins") or []:
                 if not isinstance(join, dict):
@@ -1210,8 +1236,10 @@ class PlanEditNodes:
                 resolved_tables.append(resolved)
             else:
                 unresolved.append(table)
-        if action in {"remove_source", "remove_join"} and not resolved_tables:
+        if action in {"remove_source", "remove_join", "set_sources_only"} and not resolved_tables:
             question = "Какую именно таблицу или JOIN нужно убрать из плана?"
+            if action == "set_sources_only":
+                question = "Какой именно источник нужно оставить единственным?"
             if unresolved:
                 question = f"Не удалось найти таблицу `{unresolved[0]}` в каталоге. Уточните полное имя источника."
             return {
@@ -1228,10 +1256,17 @@ class PlanEditNodes:
 
         operations: list[dict[str, Any]] = []
         excluded = list(state.get("excluded_tables") or (state.get("user_hints") or {}).get("excluded_tables") or [])
-        for table in resolved_tables:
-            operations.append({"op": "drop_table", "table": table, "exclude": True})
-            if table not in excluded:
-                excluded.append(table)
+        if action == "set_sources_only":
+            operations.append({"op": "set_sources_only", "tables": resolved_tables})
+            current_tables = _state_table_names(state)
+            for table in current_tables:
+                if table not in resolved_tables and table not in excluded:
+                    excluded.append(table)
+        else:
+            for table in resolved_tables:
+                operations.append({"op": "drop_table", "table": table, "exclude": True})
+                if table not in excluded:
+                    excluded.append(table)
 
         if action == "replace_source":
             replacement = self._resolve_table_name(str(parsed.get("replacement_table") or ""))
@@ -1247,7 +1282,7 @@ class PlanEditNodes:
                     "clarification_message": "Какую именно таблицу использовать вместо текущей?",
                     "graph_iterations": iterations,
                 }
-            operations.append({"op": "add_table", "table": replacement})
+            operations.append({"op": "replace_main_table", "table": replacement})
 
         resolution = self._build_plan_edit_resolution(
             edit_goal="rebind",
@@ -1638,6 +1673,11 @@ class PlanEditNodes:
         payload = state.get("plan_edit_payload") or {}
         operations = list(payload.get("operations") or [])
         selected_tables = list(state.get("selected_tables") or [])
+        if not selected_tables:
+            selected_tables = [
+                split for table in _state_table_names(state)
+                if (split := _split_table_name(table)) is not None
+            ]
         selected_table_names = [_full_table_name(t) for t in selected_tables]
         user_hints = copy.deepcopy(state.get("user_hints") or {})
         excluded_tables = list(state.get("excluded_tables") or user_hints.get("excluded_tables") or [])
@@ -1653,6 +1693,21 @@ class PlanEditNodes:
                         if _full_table_name(t) != table_name
                     ]
                     user_hints["must_keep_tables"] = [split]
+            elif action == "set_sources_only":
+                keep_tables = [
+                    str(table or "").strip()
+                    for table in op.get("tables") or []
+                    if str(table or "").strip()
+                ]
+                selected_tables = [
+                    split for table in keep_tables
+                    if (split := _split_table_name(table)) is not None
+                ]
+                user_hints["must_keep_tables"] = list(selected_tables)
+                keep_set = {table.lower() for table in keep_tables}
+                for table in _state_table_names(state):
+                    if table and table.lower() not in keep_set and table not in excluded_tables:
+                        excluded_tables.append(table)
             elif action == "add_table":
                 table_name = str(op.get("table") or "")
                 split = _split_table_name(table_name)
@@ -1845,6 +1900,28 @@ class PlanEditNodes:
         aggs = _iter_blueprint_aggregations(blueprint)
         known_columns = _collect_known_columns(selected_columns)
         errors: list[str] = []
+        present_tables = {table.lower() for table in _state_table_names(state)}
+        excluded_tables = {
+            str(item).strip().lower()
+            for item in (state.get("excluded_tables") or (state.get("user_hints") or {}).get("excluded_tables") or [])
+            if str(item).strip()
+        }
+        required_tables = {
+            _full_table_name(item).lower()
+            for item in (state.get("user_hints") or {}).get("must_keep_tables", [])
+            if _full_table_name(item)
+        }
+        if excluded_tables & present_tables:
+            errors.append(
+                "Исключённый источник вернулся в план: "
+                + ", ".join(sorted(excluded_tables & present_tables))
+            )
+        missing_required = required_tables - present_tables
+        if missing_required:
+            errors.append(
+                "Обязательный источник отсутствует в плане: "
+                + ", ".join(sorted(missing_required))
+            )
 
         if main_table:
             split = _split_table_name(main_table)

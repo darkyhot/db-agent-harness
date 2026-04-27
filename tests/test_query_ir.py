@@ -85,6 +85,7 @@ def test_query_spec_projects_multiple_count_metrics_without_loss():
         {"function": "count", "column": "tb_id", "distinct": True},
         {"function": "count", "column": "gosb_id", "distinct": True},
     ]
+    assert spec.to_semantic_frame()["requires_single_entity_count"] is False
 
 
 def test_query_spec_order_by_overrides_blueprint_direction():
@@ -311,7 +312,7 @@ def test_catalog_grounding_keeps_high_fill_fact_dimension_without_helper(tmp_pat
         query_spec=_sum_by_segment_spec(),
         schema_loader=loader,
         user_input="сумма продаж по сегменту",
-        max_sources=1,
+        max_sources=3,
     )
 
     assert result.needs_clarification is False

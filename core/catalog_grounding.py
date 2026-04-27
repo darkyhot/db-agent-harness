@@ -169,6 +169,13 @@ def ground_query_spec(
         schema_loader=schema_loader,
     )
 
+    sources = _prune_sources_to_minimal_covering_table(
+        sources,
+        query_spec=query_spec,
+        schema_loader=schema_loader,
+        user_input=user_input,
+    )
+
     sources = _prune_unrequested_helper_sources(
         sources,
         query_spec=query_spec,
@@ -352,6 +359,8 @@ def _score_catalog_bindings(
 
         table_type = detect_table_type(table, cols)
         score = _score_text(table, description, source_terms, 1.4)
+        if _source_mentioned_in_text(schema, table, user_input):
+            score += 6.0
         metric_score = 0.0
         dimension_score = 0.0
         for _, col in cols.iterrows():
@@ -820,6 +829,135 @@ def _prune_unrequested_helper_sources(
     if not kept:
         return sources[:1]
     return kept
+
+
+def _required_explicit_source_count(query_spec: QuerySpec) -> int:
+    return sum(
+        1 for source in (query_spec.source_constraints or [])
+        if source.required and (source.table or source.schema or source.semantic)
+    )
+
+
+def _prune_sources_to_minimal_covering_table(
+    sources: list[SourceBinding],
+    *,
+    query_spec: QuerySpec,
+    schema_loader,
+    user_input: str = "",
+) -> list[SourceBinding]:
+    """Keep one source when it covers all LLM-requested slots.
+
+    This is a guardrail, not language interpretation: the LLM provides metrics,
+    dimensions, filters, and joins; the deterministic layer only checks whether
+    a single physical table already satisfies that contract.
+    """
+    if len(sources) <= 1:
+        return sources
+    if query_spec.join_constraints or _required_explicit_source_count(query_spec) > 1:
+        return sources
+
+    required_terms = [
+        str(item.target or "").strip()
+        for item in (query_spec.metrics or [])
+        if str(item.target or "").strip() and item.target != "*"
+    ]
+    required_terms.extend(
+        str(item.target or "").strip()
+        for item in (query_spec.dimensions or [])
+        if str(item.target or "").strip()
+    )
+    required_terms.extend(
+        str(item.target or "").strip()
+        for item in (query_spec.filters or [])
+        if str(item.target or "").strip()
+    )
+    required_terms = list(dict.fromkeys(required_terms))
+    if not required_terms:
+        return sources
+
+    candidates: list[tuple[float, SourceBinding]] = []
+    for source in sources:
+        if not _source_covers_query_slots(
+            source,
+            query_spec=query_spec,
+            schema_loader=schema_loader,
+            user_input=user_input,
+        ):
+            continue
+        try:
+            cols = schema_loader.get_table_columns(source.schema, source.table)
+        except Exception:  # noqa: BLE001
+            cols = None
+        table_type = detect_table_type(source.table, cols) if cols is not None and not cols.empty else "unknown"
+        type_bonus = 0.0
+        if _count_id_metrics(query_spec) and table_type in {"dim", "ref", "unknown"}:
+            type_bonus += 1.5
+        mention_bonus = 2.0 if _source_mentioned_in_text(source.schema, source.table, user_input) else 0.0
+        rank = source.confidence + type_bonus + mention_bonus
+        candidates.append((rank, source))
+
+    if not candidates:
+        return sources
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [candidates[0][1]]
+
+
+def _source_covers_query_slots(
+    source: SourceBinding,
+    *,
+    query_spec: QuerySpec,
+    schema_loader,
+    user_input: str = "",
+) -> bool:
+    try:
+        cols = schema_loader.get_table_columns(source.schema, source.table)
+    except Exception:  # noqa: BLE001
+        return False
+    if cols is None or cols.empty:
+        return False
+
+    source_name = source.full_name.lower()
+    source_is_explicit = _source_mentioned_in_text(source.schema, source.table, user_input)
+    for metric in query_spec.metrics or []:
+        target = str(metric.target or "").strip()
+        if not target or target == "*":
+            continue
+        if _best_metric_column_in_table(cols, target) is None:
+            return False
+
+    for dim in query_spec.dimensions or []:
+        target = str(dim.target or "").strip()
+        if not target:
+            continue
+        if dim.source_table and str(dim.source_table).strip().lower() != source_name:
+            return False
+        dim_match = _best_dimension_column(schema_loader, source.schema, source.table, target)
+        if dim_match is None:
+            return False
+        if not source_is_explicit and _float_meta(dim_match.get("not_null_perc")) < 50.0:
+            return False
+
+    for filt in query_spec.filters or []:
+        target = str(filt.target or "").strip()
+        if not target:
+            continue
+        if _best_metric_column_in_table(cols, target) is None:
+            return False
+
+    return True
+
+
+def _source_mentioned_in_text(schema: str, table: str, text: str) -> bool:
+    haystack = str(text or "").lower()
+    table_l = str(table or "").lower()
+    schema_l = str(schema or "").lower()
+    return bool(
+        table_l
+        and (
+            table_l in haystack
+            or (schema_l and f"{schema_l}.{table_l}" in haystack)
+        )
+    )
 
 
 def _prune_count_sources_covered_by_single_dictionary(

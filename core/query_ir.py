@@ -317,6 +317,11 @@ class QuerySpec(StrictModel):
 
     def to_semantic_frame(self) -> dict[str, Any]:
         first_metric = self.metrics[0] if self.metrics else None
+        count_metrics = [
+            metric for metric in self.metrics
+            if metric.operation == "count" and metric.target
+        ]
+        single_count_metric = len(count_metrics) == 1 and not self.dimensions
         filter_intents = []
         for idx, item in enumerate(self.filters):
             filter_intents.append({
@@ -330,13 +335,13 @@ class QuerySpec(StrictModel):
                 "match_source": "query_spec",
             })
         return {
-            "subject": first_metric.target if first_metric and first_metric.operation == "count" else None,
+            "subject": count_metrics[0].target if single_count_metric else None,
             "metric_intent": first_metric.operation if first_metric else None,
             "business_event": self.filters[0].target if self.filters else (first_metric.target if first_metric else None),
             "qualifier": None,
             "output_dimensions": [dim.target for dim in self.dimensions],
             "requires_listing": first_metric.operation == "list" if first_metric else False,
-            "requires_single_entity_count": bool(first_metric and first_metric.operation == "count" and first_metric.target),
+            "requires_single_entity_count": single_count_metric,
             "requested_grain": None,
             "period_kind": "calendar" if self.time_range else None,
             "ambiguities": ["clarification"] if self.clarification_needed else [],

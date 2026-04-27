@@ -175,6 +175,10 @@ class ExplorerNodes:
         # 1. Получаем таблицы из state["selected_tables"]
         selected = state.get("selected_tables", [])
         found_tables: set[tuple[str, str]] = set()
+        explicit_source_guard = bool(
+            state.get("allowed_tables")
+            or (state.get("user_hints") or {}).get("must_keep_tables")
+        )
         excluded_tables = {
             str(item).strip().lower()
             for item in (state.get("excluded_tables") or (state.get("user_hints") or {}).get("excluded_tables") or [])
@@ -187,8 +191,36 @@ class ExplorerNodes:
                     full_name = f"{item[0]}.{item[1]}".lower()
                     if full_name not in excluded_tables:
                         found_tables.add((item[0], item[1]))
+        elif state.get("allowed_tables") or (state.get("user_hints") or {}).get("must_keep_tables"):
+            explicit_sources = list(state.get("allowed_tables") or [])
+            explicit_sources.extend(
+                f"{item[0]}.{item[1]}"
+                for item in (state.get("user_hints") or {}).get("must_keep_tables", [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            )
+            for source in explicit_sources:
+                parts = str(source or "").strip().split(".", 1)
+                if len(parts) != 2:
+                    continue
+                full_name = f"{parts[0]}.{parts[1]}".lower()
+                if full_name not in excluded_tables:
+                    found_tables.add((parts[0], parts[1]))
 
         # 2. Fallback: извлечение schema.table из плана и user_input
+        if not found_tables and explicit_source_guard:
+            logger.info("TableExplorer: explicit source guard active, fallback search disabled")
+            empty_ctx = (
+                "=== РАЗВЕДКА ТАБЛИЦ ===\n\n"
+                "Явные источники заданы, но после фильтрации доступных таблиц не осталось."
+            )
+            return {
+                "tables_context": empty_ctx,
+                "table_structures": {},
+                "table_samples": {},
+                "table_types": {},
+                "join_analysis_data": {},
+            }
+
         if not found_tables:
             plan_text = "\n".join(state.get("plan", []))
             user_input = state.get("user_input", "")

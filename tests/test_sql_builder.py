@@ -592,6 +592,16 @@ class TestCompositeJoin:
         n = norm(sql)
         assert " AND " in n
 
+    def test_composite_join_does_not_add_inserted_dttm_tiebreaker(self):
+        sql = builder.build(
+            "fact_dim_join", self._cols(), self._composite_spec(), self._bp(),
+            {"dm.fact": "fact", "dm.dim": "dim"},
+        )
+        assert sql is not None
+        assert "inserted_dttm" not in sql.lower()
+        assert "DISTINCT ON (old_gosb_id, tb_id)" in sql
+        assert "ORDER BY old_gosb_id, tb_id" in sql
+
     def test_single_key_still_works(self):
         """Одиночный ключ (не составной) по-прежнему работает."""
         single_spec = [{"left": "dm.fact.gosb_id", "right": "dm.dim.old_gosb_id", "safe": False}]

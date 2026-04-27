@@ -169,6 +169,7 @@ class QuerySpec(StrictModel):
     order_by: OrderBySpec | None = None
     limit: int | None = None
     source_constraints: list[SourceConstraint] = Field(default_factory=list)
+    excluded_source_constraints: list[SourceConstraint] = Field(default_factory=list)
     join_constraints: list[JoinConstraint] = Field(default_factory=list)
     clarification_needed: bool = False
     clarification: ClarificationSpec | None = None
@@ -271,6 +272,15 @@ class QuerySpec(StrictModel):
             if schema and table:
                 must_keep.append((schema, table))
 
+        excluded_tables: list[str] = []
+        for source in self.excluded_source_constraints:
+            schema = source.schema
+            table = source.table
+            if table and "." in table and not schema:
+                schema, table = table.split(".", 1)
+            if schema and table:
+                excluded_tables.append(f"{schema}.{table}")
+
         dim_sources: dict[str, dict[str, str]] = {}
         for dim in self.dimensions:
             if dim.source_table:
@@ -280,6 +290,7 @@ class QuerySpec(StrictModel):
 
         return {
             "must_keep_tables": must_keep,
+            "excluded_tables": excluded_tables,
             "join_fields": [j.key for j in self.join_constraints if j.key],
             "dim_sources": dim_sources,
             "having_hints": [

@@ -37,6 +37,15 @@ def _split_table_name(full_name: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
+def _table_name_from_column_ref(ref: str) -> str:
+    parts = str(ref or "").split(".")
+    if len(parts) >= 3:
+        return ".".join(parts[:2])
+    if len(parts) == 2:
+        return ".".join(parts)
+    return ""
+
+
 def _collect_known_columns(selected_columns: dict[str, Any]) -> set[str]:
     result: set[str] = set()
     for roles in (selected_columns or {}).values():
@@ -1065,7 +1074,12 @@ class PlanEditNodes:
         system_prompt = (
             "Ты редактируешь QuerySpec аналитического SQL-агента. "
             "Получишь текущий QuerySpec, preview/blueprint и текст правки пользователя. "
-            "Верни ПОЛНЫЙ обновлённый QuerySpec JSON по схеме, без markdown. "
+            "Если пользователь просит убрать источник/JOIN или оставить только часть источников, "
+            "верни JSON action по схеме: "
+            '{"action":"remove_source|remove_join|replace_source|clarify",'
+            '"tables":["schema.table или table"],"joins":[{"left":"...","right":"..."}],'
+            '"replacement_table":"schema.table","question":"...","confidence":0.0}. '
+            "Для остальных смысловых правок верни ПОЛНЫЙ обновлённый QuerySpec JSON по схеме, без markdown. "
             "Не пиши SQL. Не удаляй существующие метрики, фильтры, даты, источники и "
             "измерения, если пользователь явно не попросил удалить или заменить их. "
             "Для сортировки заполняй order_by.target и order_by.direction. "
@@ -1076,9 +1090,12 @@ class PlanEditNodes:
             f"JSON Schema:\n{json.dumps(query_spec_json_schema(), ensure_ascii=False)}\n\n"
             f"Исходный запрос:\n{state.get('user_input', '')}\n\n"
             f"Текущий QuerySpec:\n{json.dumps(current_spec.to_dict(), ensure_ascii=False, indent=2)}\n\n"
+            f"Выбранные таблицы:\n{json.dumps([_full_table_name(t) for t in state.get('selected_tables') or []], ensure_ascii=False)}\n\n"
+            f"Текущий join_spec:\n{json.dumps(state.get('join_spec') or [], ensure_ascii=False, indent=2)}\n\n"
             f"Текущий SQL blueprint:\n{json.dumps(state.get('sql_blueprint') or {}, ensure_ascii=False, indent=2)}\n\n"
+            f"Текущий preview/diff:\n{state.get('plan_diff_summary') or ''}\n\n"
             f"Правка пользователя:\n{edit_text}\n\n"
-            "Верни полный обновлённый QuerySpec JSON:"
+            "Верни JSON action или полный обновлённый QuerySpec JSON:"
         )
         parsed = self._llm_json_with_retry(
             system_prompt,
@@ -1087,6 +1104,9 @@ class PlanEditNodes:
             failure_tag="query_spec_editor",
             expect="object",
         )
+        action_update = self._apply_structured_plan_edit_action(state, edit_text, parsed or {})
+        if action_update is not None:
+            return action_update
         edited_spec, edit_errors = QuerySpec.from_dict(parsed or {})
         if edited_spec is None:
             return {
@@ -1143,6 +1163,107 @@ class PlanEditNodes:
             ),
             "needs_clarification": bool(edited_spec.clarification_needed),
             "clarification_message": edited_spec.clarification.question if edited_spec.clarification else "",
+            "graph_iterations": iterations,
+        }
+
+    def _apply_structured_plan_edit_action(
+        self,
+        state: AgentState,
+        edit_text: str,
+        parsed: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        action = str(parsed.get("action") or "").strip().lower()
+        if not action:
+            return None
+        iterations = state.get("graph_iterations", 0) + 1
+        if action == "clarify":
+            question = str(parsed.get("question") or "").strip() or "Что именно нужно изменить в плане?"
+            return {
+                "plan_edit_kind": "clarify",
+                "plan_edit_confidence": float(parsed.get("confidence", 0.0) or 0.0),
+                "plan_edit_payload": parsed,
+                "plan_edit_resolution": {"edit_goal": "clarify"},
+                "plan_edit_explanation": "LLM requested clarification for plan edit",
+                "plan_edit_needs_clarification": True,
+                "needs_clarification": True,
+                "clarification_message": question,
+                "graph_iterations": iterations,
+            }
+        if action not in {"remove_source", "remove_join", "replace_source"}:
+            return None
+
+        tables = [str(item or "").strip() for item in parsed.get("tables") or [] if str(item or "").strip()]
+        if action == "remove_join":
+            for join in parsed.get("joins") or []:
+                if not isinstance(join, dict):
+                    continue
+                for side in ("left", "right"):
+                    table_name = _table_name_from_column_ref(str(join.get(side) or ""))
+                    if table_name:
+                        tables.append(table_name)
+
+        resolved_tables: list[str] = []
+        unresolved: list[str] = []
+        for table in dict.fromkeys(tables):
+            resolved = self._resolve_table_name(table)
+            if resolved:
+                resolved_tables.append(resolved)
+            else:
+                unresolved.append(table)
+        if action in {"remove_source", "remove_join"} and not resolved_tables:
+            question = "Какую именно таблицу или JOIN нужно убрать из плана?"
+            if unresolved:
+                question = f"Не удалось найти таблицу `{unresolved[0]}` в каталоге. Уточните полное имя источника."
+            return {
+                "plan_edit_kind": "clarify",
+                "plan_edit_confidence": float(parsed.get("confidence", 0.0) or 0.0),
+                "plan_edit_payload": parsed,
+                "plan_edit_resolution": {"edit_goal": "clarify", "clarification_reason": "unresolved_removed_source"},
+                "plan_edit_explanation": "LLM action referenced an unresolved source",
+                "plan_edit_needs_clarification": True,
+                "needs_clarification": True,
+                "clarification_message": question,
+                "graph_iterations": iterations,
+            }
+
+        operations: list[dict[str, Any]] = []
+        excluded = list(state.get("excluded_tables") or (state.get("user_hints") or {}).get("excluded_tables") or [])
+        for table in resolved_tables:
+            operations.append({"op": "drop_table", "table": table, "exclude": True})
+            if table not in excluded:
+                excluded.append(table)
+
+        if action == "replace_source":
+            replacement = self._resolve_table_name(str(parsed.get("replacement_table") or ""))
+            if not replacement:
+                return {
+                    "plan_edit_kind": "clarify",
+                    "plan_edit_confidence": float(parsed.get("confidence", 0.0) or 0.0),
+                    "plan_edit_payload": parsed,
+                    "plan_edit_resolution": {"edit_goal": "clarify", "clarification_reason": "unresolved_replacement_source"},
+                    "plan_edit_explanation": "LLM action referenced an unresolved replacement source",
+                    "plan_edit_needs_clarification": True,
+                    "needs_clarification": True,
+                    "clarification_message": "Какую именно таблицу использовать вместо текущей?",
+                    "graph_iterations": iterations,
+                }
+            operations.append({"op": "add_table", "table": replacement})
+
+        resolution = self._build_plan_edit_resolution(
+            edit_goal="rebind",
+            requested_changes=[{"action": action, "tables": resolved_tables}],
+            confidence=float(parsed.get("confidence", 0.85) or 0.85),
+        )
+        return {
+            "plan_edit_kind": "rebind",
+            "plan_edit_confidence": float(parsed.get("confidence", 0.85) or 0.85),
+            "plan_edit_payload": {"operations": operations, "excluded_tables": excluded, "resolution": resolution},
+            "plan_edit_resolution": resolution,
+            "plan_edit_explanation": "LLM structured plan edit action",
+            "plan_edit_needs_clarification": False,
+            "needs_clarification": False,
+            "clarification_message": "",
+            "excluded_tables": excluded,
             "graph_iterations": iterations,
         }
 
@@ -1519,6 +1640,7 @@ class PlanEditNodes:
         selected_tables = list(state.get("selected_tables") or [])
         selected_table_names = [_full_table_name(t) for t in selected_tables]
         user_hints = copy.deepcopy(state.get("user_hints") or {})
+        excluded_tables = list(state.get("excluded_tables") or user_hints.get("excluded_tables") or [])
 
         for op in operations:
             action = op.get("op")
@@ -1540,6 +1662,8 @@ class PlanEditNodes:
             elif action == "drop_table":
                 table_name = str(op.get("table") or "")
                 selected_tables = [tuple(t) for t in selected_tables if _full_table_name(t) != table_name]
+                if op.get("exclude") and table_name and table_name not in excluded_tables:
+                    excluded_tables.append(table_name)
             elif action in {"bind_dimension", "replace_dim_source"}:
                 dim = str(op.get("dimension") or "").strip().lower()
                 table_name = str(op.get("table") or "")
@@ -1556,11 +1680,26 @@ class PlanEditNodes:
                     if split is not None and split not in selected_tables:
                         selected_tables.append(split)
 
+        if excluded_tables:
+            user_hints["excluded_tables"] = excluded_tables
+            selected_tables = [
+                tuple(t) for t in selected_tables
+                if _full_table_name(t).lower() not in {item.lower() for item in excluded_tables}
+            ]
+
         rebased_state = dict(state)
         rebased_state.update({
             "selected_tables": selected_tables,
             "allowed_tables": [_full_table_name(t) for t in selected_tables],
             "user_hints": user_hints,
+            "excluded_tables": excluded_tables,
+            "join_spec": [
+                item for item in (state.get("join_spec") or [])
+                if _table_name_from_column_ref(str(item.get("left") or "")).lower()
+                not in {table.lower() for table in excluded_tables}
+                and _table_name_from_column_ref(str(item.get("right") or "")).lower()
+                not in {table.lower() for table in excluded_tables}
+            ],
         })
         rebuilt = self._run_plan_from_selected_tables(rebased_state)
         return {
@@ -1568,6 +1707,7 @@ class PlanEditNodes:
             "selected_tables": selected_tables,
             "allowed_tables": [_full_table_name(t) for t in selected_tables],
             "user_hints": user_hints,
+            "excluded_tables": excluded_tables,
             "previous_sql_blueprint": copy.deepcopy(state.get("sql_blueprint") or {}),
             "plan_edit_applied": True,
             "plan_edit_history": _ensure_history_entry(

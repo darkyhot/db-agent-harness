@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import time
+import hashlib
 from typing import Any
 
 from core.log_safety import summarize_text
@@ -29,7 +30,8 @@ _JOIN_FIX_RULES = (
     "   )\n"
     "   SELECT * FROM cte1 JOIN cte2 ON cte1.join_key = cte2.join_key\n\n"
     "2. ФАКТ + СПРАВОЧНИК → уникальная выборка из справочника:\n"
-    "   JOIN (SELECT DISTINCT ON (key) key, name FROM schema.dim ORDER BY key, date DESC) d ON d.key = f.key\n\n"
+    "   JOIN (SELECT DISTINCT ON (key) key, name FROM schema.dim ORDER BY key) d ON d.key = f.key\n"
+    "   Не добавляй технические tie-breaker колонки вроде inserted_dttm, если они не нужны blueprint.\n\n"
     "3. СПРАВОЧНИК + ФАКТ → агрегация фактов в CTE:\n"
     "   JOIN (SELECT key, SUM(amount) AS total FROM schema.fact GROUP BY key) agg ON agg.key = d.key\n\n"
     "4. СПРАВОЧНИК + СПРАВОЧНИК → уникальные выборки из ОБЕИХ сторон:\n"
@@ -78,6 +80,11 @@ _FIX_HINTS: dict[str, str] = {
         "Используй явное приведение типов: ::text, ::integer, ::date.\n"
         "Проверь типы колонок через get_table_columns."
     ),
+    "ambiguous_column": (
+        "Неоднозначная unqualified-колонка встречается в нескольких таблицах.\n"
+        "Если колонка не требуется SQL blueprint — убери её из SELECT/GROUP BY/ORDER BY.\n"
+        "Если требуется — укажи алиас таблицы явно."
+    ),
     "other": (
         "Проанализируй текст ошибки и исправь SQL.\n"
         "Если причина неясна — вызови get_sample или get_table_columns для диагностики."
@@ -87,6 +94,92 @@ _FIX_HINTS: dict[str, str] = {
 
 class CorrectionNodes:
     """Миксин с узлами error_diagnoser и sql_fixer для GraphNodes."""
+
+    def _extract_ambiguous_columns(self, error: str) -> list[str]:
+        marker = "Найдены неоднозначные unqualified-колонки:"
+        if marker not in error:
+            return []
+        tail = error.split(marker, 1)[1]
+        tail = tail.split(". Укажи алиас", 1)[0]
+        cols: list[str] = []
+        for part in re.split(r"[;\n]", tail):
+            match = re.search(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", part.strip())
+            if match:
+                cols.append(match.group(1))
+        return list(dict.fromkeys(cols))
+
+    def _blueprint_output_columns(self, state: AgentState) -> set[str]:
+        blueprint = state.get("sql_blueprint") or {}
+        selected_columns = state.get("selected_columns") or {}
+        keep: set[str] = set()
+
+        aggregations = []
+        if isinstance(blueprint.get("aggregation"), dict):
+            aggregations.append(blueprint["aggregation"])
+        aggregations.extend(a for a in blueprint.get("aggregations") or [] if isinstance(a, dict))
+        for aggregation in aggregations:
+            for key in ("column", "alias"):
+                value = str(aggregation.get(key) or "").strip()
+                if value and value != "*":
+                    keep.add(value.lower())
+
+        for key in ("group_by", "where_conditions", "having"):
+            for item in blueprint.get(key) or []:
+                for token in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", str(item)):
+                    keep.add(token.lower())
+
+        for token in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", str(blueprint.get("order_by") or "")):
+            keep.add(token.lower())
+
+        for roles in selected_columns.values():
+            for role_name in ("select", "group_by", "aggregate", "filter"):
+                for col in roles.get(role_name, []) or []:
+                    keep.add(str(col).lower())
+        return keep
+
+    def _remove_unneeded_order_by_terms(self, sql: str, columns: list[str]) -> str:
+        drop = {c.lower() for c in columns}
+        if not drop:
+            return sql
+
+        order_pat = re.compile(
+            r"(?is)\bORDER\s+BY\b\s+(.+?)(?=(?:\n\s*(?:LIMIT|GROUP\s+BY|HAVING|WHERE|JOIN|ON|SELECT|FROM)\b)|\)|$)"
+        )
+
+        def repl(match: re.Match) -> str:
+            body = match.group(1)
+            parts: list[str] = []
+            current = ""
+            depth = 0
+            for ch in body:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                if ch == "," and depth == 0:
+                    if current.strip():
+                        parts.append(current.strip())
+                    current = ""
+                    continue
+                current += ch
+            if current.strip():
+                parts.append(current.strip())
+
+            kept: list[str] = []
+            for part in parts:
+                normalized = re.sub(
+                    r"(?i)\s+(ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b",
+                    "",
+                    part,
+                ).strip()
+                bare = normalized.rsplit(".", 1)[-1].strip('"').lower()
+                if bare not in drop:
+                    kept.append(part)
+            return "ORDER BY " + ", ".join(kept) if kept else ""
+
+        fixed = order_pat.sub(repl, sql)
+        fixed = re.sub(r"(?m)^[ \t]*\n", "", fixed)
+        return fixed.strip()
 
     # ------------------------------------------------------------------
     # error_diagnoser
@@ -171,6 +264,66 @@ class CorrectionNodes:
             if isinstance(last_args, dict):
                 last_sql = last_args.get("sql", "")
 
+        seen_fingerprints = list(state.get("correction_error_fingerprints") or [])
+        if last_sql and error:
+            fingerprint = hashlib.sha256(f"{last_sql}\n---\n{error}".encode("utf-8")).hexdigest()
+            if fingerprint in seen_fingerprints:
+                logger.warning("ErrorDiagnoser: повтор той же SQL-ошибки, останавливаю correction-loop")
+                return {
+                    "last_error": None,
+                    "retry_count": retry_count + 1,
+                    "final_answer": (
+                        "Не удалось исправить SQL: повторяется одна и та же ошибка статической проверки. "
+                        f"Последняя ошибка: {error}"
+                    ),
+                    "graph_iterations": iterations,
+                }
+            seen_fingerprints.append(fingerprint)
+
+        ambiguous_cols = self._extract_ambiguous_columns(error or "")
+        if ambiguous_cols and last_sql:
+            required_cols = self._blueprint_output_columns(state)
+            removable = [c for c in ambiguous_cols if c.lower() not in required_cols]
+            fixed_sql = self._remove_unneeded_order_by_terms(last_sql, removable)
+            if removable and fixed_sql != last_sql:
+                diagnosis = {
+                    "error_type": "ambiguous_column",
+                    "root_cause": "Неоднозначная bare-колонка не требуется blueprint и удалена из ORDER BY.",
+                    "fix_strategy": "deterministic_remove_unneeded_order_by",
+                    "columns": removable,
+                }
+                return {
+                    "error_diagnosis": diagnosis,
+                    "retry_count": retry_count + 1,
+                    "last_error": None,
+                    "sql_to_validate": fixed_sql,
+                    "pending_sql_tool_call": {
+                        "tool": "execute_query",
+                        "args": {"sql": fixed_sql},
+                        "step_idx": step_idx,
+                    },
+                    "correction_error_fingerprints": seen_fingerprints,
+                    "graph_iterations": iterations,
+                    "messages": state["messages"] + [
+                        {"role": "assistant", "content": "Диагноз ошибки: ambiguous_column — удалена лишняя неоднозначная колонка"}
+                    ],
+                }
+            return {
+                "error_diagnosis": {
+                    "error_type": "ambiguous_column",
+                    "root_cause": "Неоднозначная unqualified-колонка требует квалификации алиасом.",
+                    "fix_strategy": "fix_syntax",
+                    "columns": ambiguous_cols,
+                },
+                "retry_count": retry_count + 1,
+                "last_error": None,
+                "correction_error_fingerprints": seen_fingerprints,
+                "graph_iterations": iterations,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": "Диагноз ошибки: ambiguous_column — нужна квалификация колонки"}
+                ],
+            }
+
         # --- Автозагрузка метаданных колонок для таблиц из SQL ---
         column_metadata = ""
         tbl_pattern = re.compile(r'\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b')
@@ -206,6 +359,7 @@ class CorrectionNodes:
             "- empty_result: запрос вернул 0 строк\n"
             "- row_explosion: JOIN множит строки\n"
             "- type_mismatch: несовместимые типы данных\n"
+            "- ambiguous_column: unqualified-колонка неоднозначна между несколькими таблицами\n"
             "- other: прочие ошибки\n\n"
             "Формат ответа — строго JSON:\n"
             '{"error_type": "тип_ошибки", "root_cause": "описание причины ошибки",\n'
@@ -280,6 +434,7 @@ class CorrectionNodes:
             "retry_count": retry_count + 1,
             "last_error": None,
             "graph_iterations": iterations,
+            "correction_error_fingerprints": seen_fingerprints,
             "messages": state["messages"] + [
                 {"role": "assistant", "content": f"Диагноз ошибки: {diagnosis.get('error_type', 'unknown')} — {diagnosis.get('root_cause', '')}"}
             ],

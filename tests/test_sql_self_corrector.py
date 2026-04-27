@@ -151,3 +151,17 @@ def test_sql_self_corrector_prompt_requires_answer_data_metrics():
     system_prompt = nodes.llm.calls[0][0]
     assert "task='answer_data'" in system_prompt
     assert "metrics/dimensions" in system_prompt
+
+
+def test_sql_self_corrector_does_not_passthrough_deterministic_sql_after_correction_context():
+    sql = "SELECT region, SUM(amount) AS total_amount FROM dm.sales GROUP BY region"
+    state = _state(sql)
+    state["evidence_trace"] = {"sql_generation": {"mode": "deterministic"}}
+    state["correction_error_fingerprints"] = ["abc"]
+    nodes = _nodes({"verdict": "pass", "issues": [], "rationale": "ok"})
+
+    result = nodes.sql_self_corrector(state)
+
+    assert result["sql_to_validate"] == sql
+    assert result["sql_self_correction"]["verdict"] == "pass"
+    assert nodes.llm.calls

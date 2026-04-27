@@ -441,6 +441,29 @@ class TestUnqualifiedCatalogColumns:
         assert not result.is_valid
         assert any("неоднознач" in e.lower() and "client_id" in e for e in result.errors)
 
+    def test_ambiguous_inserted_dttm_has_stable_diagnostic(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "fact_outflow"): [
+                {"column_name": "report_dt", "dType": "date"},
+                {"column_name": "inserted_dttm", "dType": "timestamp"},
+            ],
+            ("dm", "dim_gosb"): [
+                {"column_name": "new_gosb_name", "dType": "text"},
+                {"column_name": "inserted_dttm", "dType": "timestamp"},
+            ],
+        })
+        sql = (
+            "SELECT f.report_dt, d.new_gosb_name "
+            "FROM dm.fact_outflow f JOIN dm.dim_gosb d ON true "
+            "ORDER BY inserted_dttm DESC"
+        )
+
+        result = check_sql(sql, schema_loader=loader)
+
+        assert not result.is_valid
+        assert any("неоднозначные unqualified-колонки" in e for e in result.errors)
+        assert any("inserted_dttm" in e for e in result.errors)
+
     def test_cte_projection_alias_is_not_flagged_as_missing_column(self):
         loader = _FakeSchemaLoader({
             ("dm", "sales"): [

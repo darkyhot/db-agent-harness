@@ -159,6 +159,7 @@ def _state(**overrides):
         "needs_clarification": False,
         "clarification_message": "",
         "allowed_tables": ["schema_a.fact_x"],
+        "excluded_tables": [],
         "table_structures": {
             "schema_a.fact_x": "task_code | report_dt | task_subtype | task_category",
         },
@@ -417,6 +418,48 @@ def test_source_rebinder_replace_main_table(node):
     result = node.source_rebinder(state)
     assert result["selected_tables"][0] == ("schema_a", "alt_fact")
     assert result["sql_blueprint"]["main_table"] == "schema_a.alt_fact"
+
+
+def test_query_spec_plan_edit_llm_remove_source_persists_exclusion(synthetic_loader):
+    response = {
+        "action": "remove_source",
+        "tables": ["schema_a.dim_y"],
+        "confidence": 0.93,
+    }
+    node = _Node(
+        _DummyLLM([json.dumps(response, ensure_ascii=False)]),
+        _DummyDB(),
+        synthetic_loader,
+        _DummyMemory(),
+        _DummyValidator(),
+        [],
+    )
+    state = _state(
+        plan_edit_text="оставь только fact_x, dim_y не нужна",
+        selected_tables=[("schema_a", "fact_x"), ("schema_a", "dim_y")],
+        allowed_tables=["schema_a.fact_x", "schema_a.dim_y"],
+        join_spec=[{"left": "schema_a.fact_x.task_code", "right": "schema_a.dim_y.task_code", "safe": True}],
+        query_spec={
+            "task": "answer_data",
+            "metrics": [{"operation": "count", "target": "task_code", "distinct_policy": "all", "confidence": 0.9}],
+            "dimensions": [],
+            "filters": [],
+            "source_constraints": [{"schema": "schema_a", "table": "fact_x", "required": True, "confidence": 0.9}],
+            "join_constraints": [],
+            "clarification_needed": False,
+            "confidence": 0.9,
+        },
+    )
+
+    routed = node.plan_edit_router(state)
+    assert routed["plan_edit_kind"] == "rebind"
+    assert routed["excluded_tables"] == ["schema_a.dim_y"]
+
+    rebound = node.source_rebinder({**state, **routed})
+    assert rebound["selected_tables"] == [("schema_a", "fact_x")]
+    assert rebound["allowed_tables"] == ["schema_a.fact_x"]
+    assert rebound["excluded_tables"] == ["schema_a.dim_y"]
+    assert rebound["join_spec"] == []
 
 
 def test_intent_rewriter_fast_path_list(node):

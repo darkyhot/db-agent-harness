@@ -332,6 +332,55 @@ def test_catalog_grounding_does_not_add_unjoinable_high_fill_source(tmp_path):
     assert [source.full_name for source in result.sources] == ["dm.fact_sales"]
 
 
+def test_catalog_grounding_dictionary_cardinality_prefers_single_dict_source(tmp_path):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm"],
+        "table_name": ["uzp_dim_gosb", "uzp_data_epk_consolidation"],
+        "description": ["Справочник ТБ и ГОСБ", "Консолидация ЕПК по ТБ и ГОСБ"],
+        "grain": ["gosb", "epk"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": [
+            "uzp_dim_gosb", "uzp_dim_gosb",
+            "uzp_data_epk_consolidation", "uzp_data_epk_consolidation", "uzp_data_epk_consolidation",
+        ],
+        "column_name": ["tb_id", "old_gosb_id", "epk_id", "tb_id", "gosb_id"],
+        "dType": ["int4", "int4", "int8", "int4", "int4"],
+        "description": ["Идентификатор ТБ", "Идентификатор ГОСБ", "ЕПК", "Идентификатор ТБ", "Идентификатор ГОСБ"],
+        "is_primary_key": [True, True, True, False, False],
+        "unique_perc": [3.0, 95.0, 100.0, 3.0, 80.0],
+        "not_null_perc": [100.0] * 5,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [
+            {"operation": "count", "target": "tb_id", "distinct_policy": "distinct", "confidence": 0.9},
+            {"operation": "count", "target": "gosb_id", "distinct_policy": "distinct", "confidence": 0.9},
+        ],
+        "dimensions": [],
+        "filters": [],
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.9,
+    })
+    assert spec is not None, errors
+
+    result = ground_query_spec(
+        query_spec=spec,
+        schema_loader=loader,
+        user_input="Сколько всего есть тб и госб",
+        max_sources=3,
+    )
+
+    assert result.needs_clarification is False
+    assert [source.full_name for source in result.sources] == ["dm.uzp_dim_gosb"]
+
+
 def test_catalog_grounding_clarifies_when_no_source(tmp_path):
     loader = _loader(tmp_path)
     spec, errors = QuerySpec.from_dict({

@@ -108,11 +108,13 @@ def ground_query_spec(
 
     sources: list[SourceBinding] = []
     warnings: list[str] = []
+    excluded = _excluded_source_names(query_spec, schema_loader)
 
     for constraint in query_spec.source_constraints:
         bound = _bind_explicit_source(constraint, schema_loader)
         if bound is not None:
-            sources.append(bound)
+            if bound.full_name.lower() not in excluded:
+                sources.append(bound)
             continue
         if constraint.required:
             warnings.append(
@@ -133,6 +135,8 @@ def ground_query_spec(
             top_n=max_sources,
             semantic_frame=semantic_frame,
         ):
+            if binding.full_name.lower() in excluded:
+                continue
             if not _has_source(sources, binding):
                 sources.append(binding)
             if len(sources) >= max_sources:
@@ -140,6 +144,8 @@ def ground_query_spec(
 
         for term in search_terms:
             for binding in _search_table_bindings(term, schema_loader, top_n=max_sources):
+                if binding.full_name.lower() in excluded:
+                    continue
                 if not _has_source(sources, binding):
                     sources.append(binding)
                 if len(sources) >= max_sources:
@@ -153,6 +159,14 @@ def ground_query_spec(
         schema_loader=schema_loader,
         user_input=user_input,
         semantic_frame=semantic_frame,
+    )
+    if excluded:
+        sources = [source for source in sources if source.full_name.lower() not in excluded]
+
+    sources = _prune_count_sources_covered_by_single_dictionary(
+        sources,
+        query_spec=query_spec,
+        schema_loader=schema_loader,
     )
 
     sources = _prune_unrequested_helper_sources(
@@ -243,6 +257,22 @@ def _bind_explicit_source(constraint, schema_loader) -> SourceBinding | None:
         confidence=max(0.95, constraint.confidence),
         evidence=constraint.evidence or [Evidence(source="query_spec", text=f"{schema}.{table}", confidence=1.0)],
     )
+
+
+def _excluded_source_names(query_spec: QuerySpec, schema_loader) -> set[str]:
+    excluded: set[str] = set()
+    for constraint in getattr(query_spec, "excluded_source_constraints", []) or []:
+        bound = _bind_explicit_source(constraint, schema_loader)
+        if bound is not None:
+            excluded.add(bound.full_name.lower())
+            continue
+        schema = constraint.schema
+        table = constraint.table
+        if table and "." in table and not schema:
+            schema, table = table.split(".", 1)
+        if schema and table:
+            excluded.add(f"{schema}.{table}".lower())
+    return excluded
 
 
 def _search_table_bindings(term: str, schema_loader, top_n: int) -> list[SourceBinding]:
@@ -790,3 +820,80 @@ def _prune_unrequested_helper_sources(
     if not kept:
         return sources[:1]
     return kept
+
+
+def _prune_count_sources_covered_by_single_dictionary(
+    sources: list[SourceBinding],
+    *,
+    query_spec: QuerySpec,
+    schema_loader,
+) -> list[SourceBinding]:
+    """For dictionary cardinality counts, keep one source that covers all metrics.
+
+    Queries like "сколько всего есть ТБ и ГОСБ" should be answered from the
+    dictionary table containing both entity keys. Joinable fact/helper tables do
+    not add requested information and only create row-count ambiguity.
+    """
+    if len(sources) <= 1 or query_spec.dimensions or query_spec.filters or query_spec.join_constraints:
+        return sources
+    metrics = [
+        metric for metric in (query_spec.metrics or [])
+        if metric.operation == "count" and str(metric.target or "").strip()
+    ]
+    if len(metrics) < 2:
+        return sources
+
+    best: tuple[int, float, SourceBinding] | None = None
+    for source in sources:
+        try:
+            cols = schema_loader.get_table_columns(source.schema, source.table)
+        except Exception:  # noqa: BLE001
+            continue
+        if cols is None or cols.empty:
+            continue
+        table_type = detect_table_type(source.table, cols)
+        if table_type not in {"dim", "ref", "unknown"}:
+            continue
+        covered = 0
+        pk_bonus = 0.0
+        for metric in metrics:
+            match = _best_metric_column_in_table(cols, str(metric.target or ""))
+            if match is None:
+                break
+            covered += 1
+            if bool(match.get("is_primary_key", False)):
+                pk_bonus += 1.0
+        if covered != len(metrics):
+            continue
+        rank = (covered, pk_bonus + source.confidence)
+        candidate = (rank[0], rank[1], source)
+        if best is None or candidate > best:
+            best = candidate
+
+    if best is None:
+        return sources
+    return [best[2]]
+
+
+def _best_metric_column_in_table(cols, target: str):
+    target_norm = _normalize(target)
+    best: tuple[float, Any] | None = None
+    for _, row in cols.iterrows():
+        col_name = str(row.get("column_name") or "")
+        desc = str(row.get("description") or "")
+        score = _score_text(col_name, desc, [target_norm], 1.0)
+        normalized_name = _normalize(col_name)
+        if target_norm == "gosb_id" and normalized_name == "old_gosb_id":
+            score = max(score, 2.0)
+        if target_norm == "gosb" and normalized_name in {"old_gosb_id", "gosb_id"}:
+            score = max(score, 2.0)
+        if target_norm == "tb" and normalized_name == "tb_id":
+            score = max(score, 2.0)
+        if target_norm == "tb_id" and normalized_name == "tb_id":
+            score = max(score, 2.0)
+        if score <= 0:
+            continue
+        candidate = (score, row)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    return best[1] if best else None

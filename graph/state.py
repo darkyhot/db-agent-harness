@@ -125,6 +125,8 @@ class AgentState(TypedDict):
     # При followup-запросах — мёрджится (не перезаписывается).
     # sql_writer и sql_static_checker используют его для проверки.
     allowed_tables: list[str]
+    # Tables forbidden for the current planning/edit cycle, in "schema.table" form.
+    excluded_tables: list[str]
 
     # === Подсказки пользователя (детерминированный экстрактор) ===
     # Заполняется в hint_extractor (между intent_classifier и table_resolver).

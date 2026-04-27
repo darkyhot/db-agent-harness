@@ -134,6 +134,16 @@ class QueryIRNodes:
             schema_loader=self.schema,
             user_input=sanitize_user_input_for_semantics(state.get("user_input", "") or ""),
         )
+        excluded_tables = {
+            str(item).strip().lower()
+            for item in (state.get("excluded_tables") or (state.get("user_hints") or {}).get("excluded_tables") or [])
+            if str(item).strip()
+        }
+        if excluded_tables:
+            result.sources = [source for source in result.sources if source.full_name.lower() not in excluded_tables]
+            if result.plan_ir is not None:
+                result.plan_ir.sources = result.sources
+                result.plan_ir.main_source = result.sources[0] if result.sources else None
         if result.sources and not result.needs_clarification:
             self._review_grounding_with_llm(state, result)
         logger.info(
@@ -182,6 +192,7 @@ class QueryIRNodes:
             update.update({
                 "selected_tables": selected,
                 "allowed_tables": [source.full_name for source in result.sources],
+                "excluded_tables": list(excluded_tables),
                 "plan": [
                     "Ground QuerySpec against catalog: "
                     + ", ".join(source.full_name for source in result.sources)
@@ -307,6 +318,7 @@ def _build_query_interpreter_system_prompt() -> str:
         "верни несколько объектов в metrics, не один.\n"
         "- order_by заполняй для просьб о сортировке; direction должен быть ASC или DESC.\n"
         "- source_constraints заполняй только если источник явно назван или сильно следует из каталога.\n"
+        "- excluded_source_constraints заполняй только при явном запрете источника в правке плана.\n"
         "- Каждое важное поле снабжай confidence и evidence.\n\n"
         f"JSON Schema:\n{schema}"
     )

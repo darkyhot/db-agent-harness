@@ -721,6 +721,45 @@ def _choose_single_entity_count_column(
     return best[1]
 
 
+def _resolve_count_pref_column(cols_df: pd.DataFrame, target: str) -> str | None:
+    target_norm = str(target or "").strip().lower()
+    if not target_norm or cols_df.empty:
+        return None
+    names = [str(col).strip() for col in cols_df.get("column_name", []) if str(col).strip()]
+    by_lower = {name.lower(): name for name in names}
+    if target_norm in by_lower:
+        return by_lower[target_norm]
+    aliases = {
+        "gosb": ["old_gosb_id", "gosb_id"],
+        "госб": ["old_gosb_id", "gosb_id"],
+        "gosb_id": ["old_gosb_id"],
+        "tb": ["tb_id"],
+        "тб": ["tb_id"],
+        "tb_id": ["tb_id"],
+    }
+    for alias in aliases.get(target_norm, []):
+        if alias in by_lower:
+            return by_lower[alias]
+    target_tokens = set(_tokenize(target_norm))
+    best: tuple[float, str] | None = None
+    for _, row in cols_df.iterrows():
+        col_name = str(row.get("column_name") or "").strip()
+        if not col_name:
+            continue
+        desc = str(row.get("description") or "")
+        score = _semantic_match_score(col_name, desc, target_norm)
+        if not score and target_tokens & set(_tokenize(desc)):
+            score = 0.4
+        if score <= 0:
+            continue
+        if bool(row.get("is_primary_key", False)):
+            score += 0.4
+        candidate = (score, col_name)
+        if best is None or candidate > best:
+            best = candidate
+    return best[1] if best else None
+
+
 def _is_scalar_count_request(
     agg_hint: str,
     semantic_output_dimensions: list[str],
@@ -793,9 +832,66 @@ def select_columns(
 
     # Подсказки пользователя: связки «слот → таблица», JOIN-поля, HAVING-хинты.
     user_hints = user_hints or {}
+    excluded_tables = {
+        str(item).strip().lower()
+        for item in (user_hints.get("excluded_tables") or [])
+        if str(item).strip()
+    }
+    if excluded_tables:
+        table_structures = {
+            table: value for table, value in table_structures.items()
+            if table.lower() not in excluded_tables
+        }
+        table_types = {
+            table: value for table, value in table_types.items()
+            if table.lower() not in excluded_tables
+        }
+        join_analysis_data = {
+            key: value
+            for key, value in (join_analysis_data or {}).items()
+            if not any(part.strip().lower() in excluded_tables for part in str(key).split("|"))
+        }
     hint_dim_sources: dict[str, dict[str, str]] = user_hints.get('dim_sources', {}) or {}
     hint_join_fields: list[str] = list(user_hints.get('join_fields', []) or [])
     hint_having: list[dict[str, Any]] = list(user_hints.get('having_hints', []) or [])
+    explicit_count_prefs: list[dict[str, Any]] = [
+        pref for pref in list(user_hints.get("aggregation_preferences_list") or [])
+        if str(pref.get("function") or "").lower() == "count"
+        and str(pref.get("column") or "").strip()
+    ]
+
+    def _table_with_all_count_prefs() -> str | None:
+        if len(explicit_count_prefs) < 2:
+            return None
+        best: tuple[float, str] | None = None
+        for table_key in table_structures:
+            parts = table_key.split(".", 1)
+            if len(parts) != 2:
+                continue
+            cols_df = schema_loader.get_table_columns(parts[0], parts[1])
+            if cols_df.empty:
+                continue
+            matched: list[str] = []
+            score = 0.0
+            for pref in explicit_count_prefs:
+                target = str(pref.get("column") or "").strip()
+                col = _resolve_count_pref_column(cols_df, target)
+                if not col:
+                    break
+                matched.append(col)
+                row = cols_df[cols_df["column_name"].astype(str).str.lower() == col.lower()].iloc[0]
+                score += 2.0 if bool(row.get("is_primary_key", False)) else 1.0
+            if len(matched) != len(explicit_count_prefs):
+                continue
+            t_type = table_types.get(table_key, "unknown")
+            if t_type in ("dim", "ref"):
+                score += 3.0
+            elif t_type == "fact":
+                score -= 2.0
+            candidate = (score, table_key)
+            if best is None or candidate > best:
+                best = candidate
+        return best[1] if best else None
 
     def _slot_dim_source(slot_name: str) -> str | None:
         """Найти dim-источник для слота через user_hints (с учётом синонимов)."""
@@ -824,6 +920,7 @@ def select_columns(
     selected_columns: dict[str, dict] = {}
     per_table_confidence: list[float] = []
     chosen_metric_ref: tuple[str, str] | None = None
+    preferred_count_table = _table_with_all_count_prefs()
 
     for table_key in table_structures:
         parts = table_key.split('.', 1)
@@ -927,6 +1024,15 @@ def select_columns(
         # Это отвечает на «сколько всего X?» вместо генерации GROUP BY + COUNT(*).
         # Признак: agg_hint=count, таблица-справочник, нет явных числовых агрегатов.
         _use_count_distinct = False
+        if agg_hint == "count" and table_key == preferred_count_table and explicit_count_prefs:
+            resolved_pref_cols: list[str] = []
+            for pref in explicit_count_prefs:
+                col = _resolve_count_pref_column(cols_df, str(pref.get("column") or ""))
+                if col and col not in resolved_pref_cols:
+                    resolved_pref_cols.append(col)
+            if resolved_pref_cols:
+                agg_cols = resolved_pref_cols
+                _use_count_distinct = True
         if agg_hint == 'count' and t_type in ('dim', 'ref') and not agg_cols:
             pk_mask = cols_df.get('is_primary_key', pd.Series(dtype=bool)).astype(bool)
             pk_for_count = cols_df.loc[pk_mask, 'column_name'].tolist()
@@ -1149,13 +1255,31 @@ def select_columns(
                 explicit_positions.append((pos, t))
         explicit_positions.sort()
         main_table = explicit_positions[0][1] if explicit_positions else None
+        if preferred_count_table:
+            main_table = preferred_count_table
         if main_table is None:
             main_table = next((t for t, tp in table_types.items() if tp == 'fact'), None)
         if main_table is None:
             main_table = next(iter(table_structures), None)
         if main_table:
             roles = selected_columns.setdefault(main_table, {})
-            if requires_single_entity_count or scalar_count_request:
+            if preferred_count_table and explicit_count_prefs:
+                pref_cols: list[str] = []
+                parts = main_table.split(".", 1)
+                cols_df = schema_loader.get_table_columns(parts[0], parts[1]) if len(parts) == 2 else pd.DataFrame()
+                for pref in explicit_count_prefs:
+                    col = _resolve_count_pref_column(cols_df, str(pref.get("column") or ""))
+                    if col and col not in pref_cols:
+                        pref_cols.append(col)
+                if pref_cols:
+                    roles['aggregate'] = pref_cols
+                    roles['select'] = pref_cols
+                    roles.pop('group_by', None)
+                    logger.info(
+                        "ColumnSelectorDet: explicit count prefs → %s.%s",
+                        main_table, ",".join(pref_cols),
+                    )
+            elif requires_single_entity_count or scalar_count_request:
                 count_col = _choose_single_entity_count_column(
                     main_table,
                     schema_loader,
@@ -1195,7 +1319,7 @@ def select_columns(
                     )
 
     if requires_single_entity_count or scalar_count_request:
-        main_fact = next((t for t, tp in table_types.items() if tp == 'fact'), None)
+        main_fact = preferred_count_table or next((t for t, tp in table_types.items() if tp == 'fact'), None)
         for table_key, roles in list(selected_columns.items()):
             if table_key != main_fact:
                 roles.pop('group_by', None)
@@ -1334,6 +1458,14 @@ def select_columns(
         user_input=user_input,
         hint_join_fields=hint_join_fields,
     )
+    selected_table_names = {table.lower() for table in selected_columns}
+    join_spec = [
+        item for item in join_spec
+        if ".".join(str(item.get("left") or "").split(".")[:2]).lower() in selected_table_names
+        and ".".join(str(item.get("right") or "").split(".")[:2]).lower() in selected_table_names
+        and ".".join(str(item.get("left") or "").split(".")[:2]).lower() not in excluded_tables
+        and ".".join(str(item.get("right") or "").split(".")[:2]).lower() not in excluded_tables
+    ]
 
     # ---- Итоговая confidence ----
     if not selected_columns:

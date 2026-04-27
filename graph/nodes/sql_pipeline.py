@@ -1382,7 +1382,15 @@ class SqlPipelineNodes:
                 ],
             }
 
-        if (evidence_trace.get("sql_generation") or {}).get("mode") == "deterministic":
+        correction_context = bool(
+            state.get("error_diagnosis")
+            or state.get("correction_examples")
+            or state.get("correction_error_fingerprints")
+        )
+        if (
+            (evidence_trace.get("sql_generation") or {}).get("mode") == "deterministic"
+            and not correction_context
+        ):
             correction = {
                 "verdict": "pass",
                 "mode": "deterministic_passthrough",

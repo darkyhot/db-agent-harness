@@ -9,6 +9,7 @@ from core.schema_loader import SchemaLoader
 from core.sql_builder import SqlBuilder
 from core.sql_formatter import format_sql_safe
 from core.sql_planner_deterministic import build_blueprint
+from core.sql_static_checker import check_sql
 
 
 def _ensure_mock_modules():
@@ -47,12 +48,14 @@ def _loader(tmp_path):
 
     pd.DataFrame(
         {
-            "schema_name": ["schema"] * 9,
+            "schema_name": ["schema"] * 11,
             "table_name": [
                 "uzp_dwh_fact_outflow",
                 "uzp_dwh_fact_outflow",
                 "uzp_dwh_fact_outflow",
                 "uzp_dwh_fact_outflow",
+                "uzp_dwh_fact_outflow",
+                "uzp_dim_gosb",
                 "uzp_dim_gosb",
                 "uzp_dim_gosb",
                 "uzp_dim_gosb",
@@ -64,16 +67,24 @@ def _loader(tmp_path):
                 "gosb_id",
                 "tb_id",
                 "outflow_qty",
+                "inserted_dttm",
                 "old_gosb_id",
                 "tb_id",
                 "new_gosb_name",
+                "inserted_dttm",
                 "inn",
                 "segment_name",
             ],
-            "dType": ["date", "int", "int", "numeric", "int", "int", "text", "text", "text"],
-            "description": [""] * 9,
-            "is_primary_key": [False, False, False, False, True, True, False, False, False],
-            "unique_perc": [10.0, 40.0, 5.0, 1.0, 70.0, 10.0, 20.0, 40.0, 10.0],
+            "dType": [
+                "date", "int", "int", "numeric", "timestamp",
+                "int", "int", "text", "timestamp", "text", "text",
+            ],
+            "description": [""] * 11,
+            "is_primary_key": [
+                False, False, False, False, False,
+                True, True, False, False, False, False,
+            ],
+            "unique_perc": [10.0, 40.0, 5.0, 1.0, 100.0, 70.0, 10.0, 20.0, 100.0, 40.0, 10.0],
         }
     ).to_csv(tmp_path / "attr_list.csv", index=False)
 
@@ -142,6 +153,10 @@ def test_outflow_by_date_gosb_name_uses_full_composite_join_and_ignores_unused_j
     assert "gosb_id" in sql_l and "old_gosb_id" in sql_l
     assert "tb_id" in sql_l
     assert " and " in sql_l
+    assert "sum_outflow_qty" in sql_l
+    assert "fact_payee_qty" not in sql_l
+    assert "inserted_dttm" not in sql_l
+    assert check_sql(sql, schema_loader=loader).is_valid
     assert EPK not in {j["left"].rsplit(".", 1)[0] for j in join_spec}
 
 

@@ -508,6 +508,52 @@ def _column_available_for_aggregation(
     return bool((cols_df["column_name"].astype(str).str.lower() == column.lower()).any())
 
 
+def _resolve_available_aggregation_column(
+    column: str,
+    selected_columns: dict[str, dict],
+    *,
+    schema_loader=None,
+    main_table: str = "",
+) -> str | None:
+    raw = str(column or "").strip()
+    if not raw:
+        return None
+    if raw == "*":
+        return "*"
+    selected_cols = {
+        str(col)
+        for roles in selected_columns.values()
+        for col in roles.get("aggregate", []) + roles.get("select", [])
+    }
+    by_lower = {col.lower(): col for col in selected_cols}
+    if raw.lower() in by_lower:
+        return by_lower[raw.lower()]
+    aliases = {
+        "gosb_id": ["old_gosb_id"],
+        "gosb": ["old_gosb_id", "gosb_id"],
+        "госб": ["old_gosb_id", "gosb_id"],
+        "tb": ["tb_id"],
+        "тб": ["tb_id"],
+    }
+    for alias in aliases.get(raw.lower(), []):
+        if alias in by_lower:
+            return by_lower[alias]
+    if schema_loader is None or "." not in main_table:
+        return None
+    schema_name, table_name = main_table.split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return None
+    names = [str(item) for item in cols_df["column_name"].tolist()]
+    by_catalog = {name.lower(): name for name in names}
+    if raw.lower() in by_catalog:
+        return by_catalog[raw.lower()]
+    for alias in aliases.get(raw.lower(), []):
+        if alias in by_catalog:
+            return by_catalog[alias]
+    return None
+
+
 def _build_aggregation_result(
     func: str,
     col: str,
@@ -552,10 +598,13 @@ def _compute_aggregations(
     if hint == "count" and explicit_overrides:
         for override in explicit_overrides:
             override_func = str(override.get("function") or "").strip().lower()
-            col = str(override.get("column") or "").strip()
+            col = _resolve_available_aggregation_column(
+                str(override.get("column") or "").strip(),
+                selected_columns,
+                schema_loader=schema_loader,
+                main_table=main_table,
+            ) or ""
             if override_func not in {"", "count"} or not col:
-                continue
-            if not _column_available_for_aggregation(col, selected_columns, schema_loader=schema_loader, main_table=main_table):
                 continue
             distinct = bool(override.get("distinct")) and col != "*"
             preserve_distinct = preserve_distinct or distinct
@@ -570,7 +619,12 @@ def _compute_aggregations(
                     item.pop("distinct", None)
             return results
 
-    for table_key, roles in selected_columns.items():
+    table_order = list(selected_columns.keys())
+    if main_table in selected_columns:
+        table_order = [main_table] + [t for t in table_order if t != main_table]
+
+    for table_key in table_order:
+        roles = selected_columns.get(table_key, {})
         agg_cols = list(roles.get("aggregate", []) or [])
         if not agg_cols:
             continue
@@ -1025,6 +1079,19 @@ def build_blueprint(
             other_tables = [t for t in selected_columns if t != main_table]
             if other_tables and other_tables[0] in attribute_tables:
                 strategy = "fact_dim_join"
+
+    main_agg_cols = list((selected_columns.get(main_table) or {}).get("aggregate", []) or [])
+    if aggregation and main_agg_cols and aggregation.get("column") not in main_agg_cols:
+        aggregations = _compute_aggregations(
+            intent,
+            selected_columns,
+            user_hints=user_hints,
+            schema_loader=schema_loader,
+            semantic_frame=semantic_frame,
+            strategy=strategy,
+            main_table=main_table,
+        )
+        aggregation = aggregations[0] if aggregations else None
 
     group_by    = _compute_group_by(selected_columns, aggregation)
 

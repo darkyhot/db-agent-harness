@@ -644,6 +644,7 @@ def create_initial_state(
         sql_self_correction=dict(ctx.get("sql_self_correction") or {}),
         # Белый список таблиц (заполняется в table_resolver)
         allowed_tables=list(ctx.get("allowed_tables") or [_full_table_name(t) for t in selected_tables if _full_table_name(t)]),
+        excluded_tables=list(ctx.get("excluded_tables") or []),
         # Explicit mode (задача 2.2)
         explicit_mode=bool(ctx.get("explicit_mode", False)),
         # Plan-preview (задача 2.1)

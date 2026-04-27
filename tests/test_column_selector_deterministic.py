@@ -317,3 +317,62 @@ def test_select_columns_employee_subject_still_avoids_report_dt(tmp_path):
 
     roles = result["selected_columns"]["dm.uzp_dwh_fact_outflow"]
     assert "report_dt" not in roles.get("aggregate", [])
+
+
+def test_select_columns_tb_gosb_cardinality_uses_single_dictionary(tmp_path):
+    from core.column_selector_deterministic import select_columns
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm"],
+        "table_name": ["uzp_dim_gosb", "uzp_data_epk_consolidation"],
+        "description": ["Справочник ТБ и ГОСБ", "Консолидация ЕПК по ТБ и ГОСБ"],
+        "grain": ["gosb", "epk"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": [
+            "uzp_dim_gosb", "uzp_dim_gosb",
+            "uzp_data_epk_consolidation", "uzp_data_epk_consolidation", "uzp_data_epk_consolidation",
+        ],
+        "column_name": ["tb_id", "old_gosb_id", "epk_id", "tb_id", "gosb_id"],
+        "dType": ["int4", "int4", "int8", "int4", "int4"],
+        "description": ["Идентификатор ТБ", "Идентификатор ГОСБ", "ЕПК", "Идентификатор ТБ", "Идентификатор ГОСБ"],
+        "is_primary_key": [True, True, True, False, False],
+        "unique_perc": [3.0, 95.0, 100.0, 3.0, 80.0],
+        "not_null_perc": [100.0] * 5,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    result = select_columns(
+        intent={"aggregation_hint": "count", "entities": ["tb_id", "gosb_id"], "date_filters": {}},
+        table_structures={
+            "dm.uzp_dim_gosb": "Справочник ТБ и ГОСБ",
+            "dm.uzp_data_epk_consolidation": "Консолидация ЕПК",
+        },
+        table_types={"dm.uzp_dim_gosb": "dim", "dm.uzp_data_epk_consolidation": "fact"},
+        join_analysis_data={
+            "dm.uzp_dim_gosb|dm.uzp_data_epk_consolidation": {
+                "text": "JOIN candidates",
+                "table1": "dm.uzp_dim_gosb",
+                "table2": "dm.uzp_data_epk_consolidation",
+            }
+        },
+        schema_loader=loader,
+        user_input="Сколько всего есть тб и госб",
+        user_hints={
+            "aggregation_preferences_list": [
+                {"function": "count", "column": "tb_id", "distinct": True},
+                {"function": "count", "column": "gosb_id", "distinct": True},
+            ]
+        },
+        semantic_frame={"requires_single_entity_count": True, "output_dimensions": []},
+    )
+
+    assert set(result["selected_columns"]) == {"dm.uzp_dim_gosb"}
+    roles = result["selected_columns"]["dm.uzp_dim_gosb"]
+    assert roles["aggregate"] == ["tb_id", "old_gosb_id"]
+    assert "group_by" not in roles
+    assert result["join_spec"] == []

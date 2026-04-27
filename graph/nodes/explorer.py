@@ -175,11 +175,18 @@ class ExplorerNodes:
         # 1. Получаем таблицы из state["selected_tables"]
         selected = state.get("selected_tables", [])
         found_tables: set[tuple[str, str]] = set()
+        excluded_tables = {
+            str(item).strip().lower()
+            for item in (state.get("excluded_tables") or (state.get("user_hints") or {}).get("excluded_tables") or [])
+            if str(item).strip()
+        }
 
         if selected:
             for item in selected:
                 if isinstance(item, (list, tuple)) and len(item) == 2:
-                    found_tables.add((item[0], item[1]))
+                    full_name = f"{item[0]}.{item[1]}".lower()
+                    if full_name not in excluded_tables:
+                        found_tables.add((item[0], item[1]))
 
         # 2. Fallback: извлечение schema.table из плана и user_input
         if not found_tables:
@@ -210,7 +217,9 @@ class ExplorerNodes:
                 )
                 if not df[mask].empty:
                     row = df[mask].iloc[0]
-                    found_tables.add((row["schema_name"], row["table_name"]))
+                    full_name = f"{row['schema_name']}.{row['table_name']}".lower()
+                    if full_name not in excluded_tables:
+                        found_tables.add((row["schema_name"], row["table_name"]))
 
             # Fallback — поиск таблиц по ключевым словам
             if not found_tables:
@@ -228,7 +237,7 @@ class ExplorerNodes:
                             ).head(3).iterrows():
                                 s = row.get("schema_name", "")
                                 t = row.get("table_name", "")
-                                if s and t:
+                                if s and t and f"{s}.{t}".lower() not in excluded_tables:
                                     found_tables.add((s, t))
                             if found_tables:
                                 logger.info(
@@ -428,6 +437,18 @@ class ExplorerNodes:
         table_structures = state.get("table_structures", {})
         table_samples = state.get("table_samples", {})
         join_analysis_data = state.get("join_analysis_data", {})
+        excluded_tables = {
+            str(item).strip().lower()
+            for item in (state.get("excluded_tables") or (state.get("user_hints") or {}).get("excluded_tables") or [])
+            if str(item).strip()
+        }
+        if excluded_tables:
+            table_structures = {k: v for k, v in table_structures.items() if k.lower() not in excluded_tables}
+            table_samples = {k: v for k, v in table_samples.items() if k.lower() not in excluded_tables}
+            join_analysis_data = {
+                k: v for k, v in (join_analysis_data or {}).items()
+                if not any(part.strip().lower() in excluded_tables for part in str(k).split("|"))
+            }
 
         logger.info(
             "ColumnSelector: выбор колонок для %d таблиц", len(table_structures)
@@ -682,6 +703,7 @@ class ExplorerNodes:
         _allowed_raw = state.get("allowed_tables") or []
         if _allowed_raw:
             allowed_tables_set = {t.lower() for t in _allowed_raw}
+            allowed_tables_set -= excluded_tables
             _raw_keys = list(raw_columns.keys())
             for _tk in _raw_keys:
                 if _tk.lower() not in allowed_tables_set:

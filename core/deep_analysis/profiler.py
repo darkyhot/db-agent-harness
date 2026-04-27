@@ -302,6 +302,7 @@ def profile_dataframe(
         dropped_wide_text=list(plan.dropped_wide_text),
         load_strategy=plan.strategy,
         table_description=table_description,
+        where_clause=plan.where_clause,
     )
     return coerced_df, table_profile
 
@@ -316,6 +317,7 @@ def profile_to_brief(profile: TableProfile) -> str:
         f"Описание: {profile.table_description or '(не задано)'}",
         f"Строк всего: {profile.n_rows}, колонок: {profile.n_cols}",
         f"Стратегия загрузки: {profile.load_strategy}",
+        f"Фильтр (WHERE): {profile.where_clause or '—'}",
         f"Откинутые широкие текстовые колонки: {', '.join(profile.dropped_wide_text) or '—'}",
         "",
         "Колонки (имя | роль | уник | null% | доп):",

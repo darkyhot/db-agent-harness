@@ -119,6 +119,60 @@ def _is_no_reply(text: str) -> bool:
     return normalized in {"нет", "no", "n", "неа", "не", "неверно"}
 
 
+def _parse_deep_analysis_args(args: list[str]):
+    """Parse /deep_table_analysis args while preserving free-form SQL/hypothesis text."""
+    from core.deep_analysis import AnalysisMode
+
+    mode = AnalysisMode.FAST
+    table_ref: str | None = None
+    where_clause: str | None = None
+    passthrough_tokens: list[str] = []
+
+    idx = 0
+    while idx < len(args):
+        tok = args[idx]
+        if tok.startswith("--mode="):
+            raw = tok.split("=", 1)[1].lower()
+            if raw not in ("fast", "deep"):
+                raise ValueError("Режим должен быть fast или deep.")
+            mode = AnalysisMode(raw)
+            idx += 1
+            continue
+
+        if tok.startswith("--where=") or tok == "--where":
+            collected: list[str] = []
+            if tok.startswith("--where="):
+                initial = tok.split("=", 1)[1]
+                if initial:
+                    collected.append(initial)
+                idx += 1
+            else:
+                idx += 1
+                if idx >= len(args):
+                    raise ValueError(
+                        "Флаг --where требует значения, например "
+                        "--where=\"report_dt >= '2026-01-01'\"."
+                    )
+
+            while idx < len(args) and not args[idx].startswith("--"):
+                collected.append(args[idx])
+                idx += 1
+            where_clause = " ".join(collected).strip()
+            continue
+
+        passthrough_tokens.append(tok)
+        idx += 1
+
+    for tok in passthrough_tokens:
+        if table_ref is None and "." in tok:
+            table_ref = tok
+            continue
+
+    hypothesis_tokens = [t for t in passthrough_tokens if t != table_ref]
+    hypothesis_text = " ".join(hypothesis_tokens).strip()
+    return mode, table_ref, where_clause, hypothesis_text
+
+
 def _interpret_filter_clarification(
     clarification: str,
     where_resolution: dict,
@@ -221,9 +275,11 @@ HELP_TEXT = """
   /refresh metadata    — пересобрать metadata для всех таблиц из manifest
   /memory              — просмотр и управление долгосрочной памятью
   /metrics             — метрики качества генерации SQL (последние 30 дней)
-  /deep_table_analysis schema.table [--mode=fast|deep] [гипотеза свободным текстом]
+  /deep_table_analysis schema.table [--mode=fast|deep] [--where=<SQL>] [гипотеза свободным текстом]
                        — глубокий поиск закономерностей (сезонность, выбросы, массовые отклонения).
                          Без текста гипотезы — полный автоскан. С текстом — план проверки показывается на аппрув.
+                         --where ограничивает срез таблицы на этапе загрузки, например:
+                           --where="report_dt >= '2026-01-01'" или --where="inn IN ('7707083893','7728168971')".
   /reset               — сбросить контекст текущей сессии
   /clear               — очистить вывод ячейки
   /exit                — завершить работу (сохранить резюме сессии)
@@ -867,34 +923,25 @@ class CLIInterface:
         """Run deep pattern-discovery analysis on a single table.
 
         Usage:
-            /deep_table_analysis schema.table [--mode=fast|deep] [free-form hypothesis]
+            /deep_table_analysis schema.table [--mode=fast|deep]
+                [--where=<SQL>] [free-form hypothesis]
         """
-        from core.deep_analysis import AnalysisMode
+        from core.deep_analysis.loader import _sanitize_where_clause
         from core.deep_analysis.orchestrator import run_deep_analysis
         from core.deep_analysis.user_hypothesis import apply_user_plan_edit, build_user_hypothesis_plan
 
         if not args:
             print(
                 "Использование: /deep_table_analysis schema.table [--mode=fast|deep] "
-                "[текст гипотезы]"
+                "[--where=<SQL>] [текст гипотезы]"
             )
             return
 
-        mode = AnalysisMode.FAST
-        table_ref = None
-        hypothesis_tokens: list[str] = []
-        for tok in args:
-            if tok.startswith("--mode="):
-                raw = tok.split("=", 1)[1].lower()
-                if raw not in ("fast", "deep"):
-                    print("Режим должен быть fast или deep.")
-                    return
-                mode = AnalysisMode(raw)
-                continue
-            if table_ref is None and "." in tok:
-                table_ref = tok
-                continue
-            hypothesis_tokens.append(tok)
+        try:
+            mode, table_ref, where_clause, hypothesis_text = _parse_deep_analysis_args(args)
+        except ValueError as exc:
+            print(str(exc))
+            return
 
         if table_ref is None:
             print("Нужно указать таблицу в формате schema.table.")
@@ -905,7 +952,14 @@ class CLIInterface:
             print("Некорректная ссылка на таблицу. Ожидается schema.table.")
             return
 
-        hypothesis_text = " ".join(hypothesis_tokens).strip()
+        # Validate WHERE before doing any work — we'd rather fail fast than
+        # discover the issue mid-load.
+        if where_clause is not None:
+            try:
+                where_clause = _sanitize_where_clause(where_clause)
+            except ValueError as exc:
+                print(f"Некорректное значение --where: {exc}")
+                return
 
         # If user provided a hypothesis, produce plan preview first.
         user_plan = None
@@ -916,7 +970,11 @@ class CLIInterface:
                 from core.deep_analysis.profiler import profile_dataframe
 
                 loader = SafeLoader(self.db)
-                df, load_plan = loader.plan_and_load(schema_part, table_part, progress_cb=_status_print)
+                df, load_plan = loader.plan_and_load(
+                    schema_part, table_part,
+                    progress_cb=_status_print,
+                    where=where_clause,
+                )
                 _, profile = profile_dataframe(df, load_plan)
             except Exception as exc:
                 _status_print("")
@@ -950,10 +1008,13 @@ class CLIInterface:
             else:
                 print("Достигнут лимит правок, запускаю с последним планом.")
 
-        print(
+        msg = (
             f"\nЗапускаю глубокий анализ {schema_part}.{table_part} "
-            f"в режиме {mode.value}."
+            f"в режиме {mode.value}"
         )
+        if where_clause:
+            msg += f" с фильтром WHERE {where_clause}"
+        print(msg + ".")
         try:
             result = run_deep_analysis(
                 schema_part, table_part,
@@ -961,6 +1022,7 @@ class CLIInterface:
                 schema_loader=self.schema,
                 user_hypothesis=user_plan,
                 progress_cb=_status_print,
+                where=where_clause,
             )
         except Exception as exc:
             _status_print("")

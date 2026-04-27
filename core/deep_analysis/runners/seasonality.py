@@ -23,7 +23,7 @@ import pandas as pd
 from scipy import stats
 
 from core.deep_analysis.logging_setup import get_logger
-from core.deep_analysis.runners._common import severity_from_score, write_entities_csv
+from core.deep_analysis.runners._common import write_entities_csv
 from core.deep_analysis.types import (
     AnalysisContext,
     Finding,
@@ -262,13 +262,20 @@ def _check_all_horizons(
                 "rel_deviation_pct": (rel_dev * 100).values,
             }).sort_values("rel_deviation_pct", key=lambda s: s.abs(), ascending=False)
 
-        if p_value > 0.01 and abs(top_dev) < 0.15:
-            # Neither statistically significant nor large — skip noise.
+        # Severity gates require BOTH statistical significance AND a non-trivial
+        # effect size — at N=5M+ Kruskal-Wallis flags micro-deviations (0.5%)
+        # as p<1e-20, which are noise from a business standpoint.
+        abs_dev = abs(top_dev)
+        if p_value > 0.01 or abs_dev < 0.02:
             continue
-
-        # Approximate z from p-value for severity bucketing.
-        z_equivalent = float(stats.norm.isf(min(max(p_value, 1e-12), 0.5))) if p_value > 0 else 6.0
-        severity = severity_from_score(max(z_equivalent, abs(top_dev) * 5))
+        if abs_dev >= 0.20 and p_value < 1e-10:
+            severity = "critical"
+        elif abs_dev >= 0.10 and p_value < 1e-5:
+            severity = "strong"
+        elif abs_dev >= 0.05 and p_value < 0.01:
+            severity = "notable"
+        else:
+            severity = "info"
 
         csv_rel = write_entities_csv(
             bucket_summary_df,

@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from core.deep_analysis.hypothesis_catalog import generate_catalog_hypotheses
-from core.deep_analysis.loader import LoadPlan
+from core.deep_analysis.loader import LoadPlan, _sanitize_where_clause
 from core.deep_analysis.orchestrator import run_deep_analysis
 from core.deep_analysis.profiler import profile_dataframe
 from core.deep_analysis.progress import ProgressReporter
@@ -309,6 +309,68 @@ def test_integration_end_to_end_with_mock_loader():
         # At least one entity CSV exists on disk.
         csvs = list(result.output_dir.glob("entities_*.csv"))
         assert csvs, f"No entity CSVs written to {result.output_dir}"
+
+
+def test_run_deep_analysis_passes_where_to_loader_and_report():
+    df = pd.DataFrame({
+        "report_dt": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+        "amount": [10, 20],
+    })
+    seen: dict[str, str | None] = {}
+
+    def fake_loader(db, schema, table, progress_cb, *, where=None):
+        seen["where"] = where
+        plan = LoadPlan(
+            schema=schema, table=table, total_rows=len(df),
+            kept_columns=list(df.columns), dropped_wide_text=[],
+            strategy="full", sample_rows=None,
+            est_bytes_per_row=16, est_full_bytes=16 * len(df),
+            where_clause=where,
+        )
+        return df, plan
+
+    def fake_enrich(llm, profile, catalog, semantics):
+        return []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run_deep_analysis(
+            "dm", "sales",
+            mode=AnalysisMode.FAST,
+            db=None, llm=None, schema_loader=None,
+            loader_fn=fake_loader, enrich_fn=fake_enrich,
+            output_root=Path(tmp),
+            where="report_dt >= '2026-01-01'",
+        )
+        report_text = result.report_path.read_text(encoding="utf-8")
+
+    assert seen["where"] == "report_dt >= '2026-01-01'"
+    assert result.profile.where_clause == "report_dt >= '2026-01-01'"
+    assert "Фильтр (WHERE): `report_dt >= '2026-01-01'`" in report_text
+
+
+def test_sanitize_where_clause_allows_select_predicates():
+    assert (
+        _sanitize_where_clause("WHERE report_dt >= '2026-01-01'")
+        == "report_dt >= '2026-01-01'"
+    )
+    assert (
+        _sanitize_where_clause("inn IN ('7707083893','7728168971')")
+        == "inn IN ('7707083893','7728168971')"
+    )
+
+
+def test_sanitize_where_clause_rejects_statement_breakout():
+    for where in [
+        "report_dt >= '2026-01-01'; DROP TABLE dm.sales",
+        "inn = '1' -- comment",
+        "id IN (SELECT id INTO tmp FROM src)",
+        "name = 'broken",
+    ]:
+        try:
+            _sanitize_where_clause(where)
+        except ValueError:
+            continue
+        raise AssertionError(f"WHERE should be rejected: {where}")
 
 
 def test_group_anomalies_handles_small_cohort_like_tb_id():

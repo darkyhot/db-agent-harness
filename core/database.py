@@ -355,26 +355,34 @@ class DatabaseManager:
             plan = "\n".join(row[0] for row in result)
         return plan
 
-    def get_row_count(self, schema: str, table: str) -> int:
+    def get_row_count(
+        self, schema: str, table: str, *, where: str | None = None
+    ) -> int:
         """Получить количество строк в таблице.
 
         Args:
             schema: Имя схемы.
             table: Имя таблицы.
+            where: опциональное SQL-условие (без слова WHERE), применяется к
+                подсчёту. Должно быть предварительно пройдено через
+                ``_sanitize_where_clause``; этот метод не делает повторной
+                проверки и доверяет вызывающей стороне.
 
         Returns:
             Количество строк.
         """
         schema = _validate_identifier(schema, "schema")
         table = _validate_identifier(table, "table")
-        sql = text(
-            f'SELECT COUNT(*) as cnt FROM "{schema}"."{table}"'
-        )
+        sql_str = f'SELECT COUNT(*) as cnt FROM "{schema}"."{table}"'
+        if where:
+            sql_str += f" WHERE {where}"
+        sql = text(sql_str)
         engine = self.get_engine()
         with engine.connect() as conn:
             result = conn.execute(sql)
             count = result.scalar()
-        logger.info("Строк в %s.%s: %d", schema, table, count)
+        logger.info("Строк в %s.%s%s: %d",
+                    schema, table, f" WHERE {where}" if where else "", count)
         return count
 
     def check_key_uniqueness(
@@ -422,13 +430,21 @@ class DatabaseManager:
         )
         return result
 
-    def get_sample(self, schema: str, table: str, n: int = 10) -> pd.DataFrame:
+    def get_sample(
+        self,
+        schema: str,
+        table: str,
+        n: int = 10,
+        *,
+        where: str | None = None,
+    ) -> pd.DataFrame:
         """Получить выборку строк из таблицы.
 
         Args:
             schema: Имя схемы.
             table: Имя таблицы.
             n: Количество строк.
+            where: опциональное SQL-условие (без WHERE).
 
         Returns:
             DataFrame с образцом данных.
@@ -437,7 +453,11 @@ class DatabaseManager:
         table = _validate_identifier(table, "table")
         if not isinstance(n, int) or n < 1:
             raise ValueError(f"Недопустимое значение n: {n}")
-        sql = text(f'SELECT * FROM "{schema}"."{table}" LIMIT :n')
+        sql_str = f'SELECT * FROM "{schema}"."{table}"'
+        if where:
+            sql_str += f" WHERE {where}"
+        sql_str += " LIMIT :n"
+        sql = text(sql_str)
         engine = self.get_engine()
         with engine.connect() as conn:
             df = pd.read_sql(sql, conn, params={"n": n})
@@ -449,6 +469,8 @@ class DatabaseManager:
         table: str,
         n: int = 100_000,
         columns: list[str] | None = None,
+        *,
+        where: str | None = None,
     ) -> pd.DataFrame:
         """Получить random sample строк из таблицы."""
         schema = _validate_identifier(schema, "schema")
@@ -459,9 +481,11 @@ class DatabaseManager:
         if columns:
             safe_columns = [_validate_identifier(col, "column") for col in columns]
             projection = ", ".join(f'"{col}"' for col in safe_columns)
-        sql = text(
-            f'SELECT {projection} FROM "{schema}"."{table}" ORDER BY random() LIMIT :n'
-        )
+        sql_str = f'SELECT {projection} FROM "{schema}"."{table}"'
+        if where:
+            sql_str += f" WHERE {where}"
+        sql_str += " ORDER BY random() LIMIT :n"
+        sql = text(sql_str)
         engine = self.get_engine()
         with engine.connect() as conn:
             df = pd.read_sql(sql, conn, params={"n": n})

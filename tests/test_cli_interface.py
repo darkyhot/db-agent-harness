@@ -1,5 +1,6 @@
-from cli.interface import _build_augmented_clarification_input
+from cli.interface import _build_augmented_clarification_input, _parse_deep_analysis_args
 from cli.interface import CLIInterface
+from core.deep_analysis import AnalysisMode
 
 
 def test_parse_slash_command():
@@ -51,3 +52,45 @@ def test_parse_command_supports_metadata_and_refresh():
         "refresh",
         ["metadata"],
     )
+
+
+def test_parse_deep_analysis_args_collects_where_equals_tokens():
+    mode, table_ref, where_clause, hypothesis_text = _parse_deep_analysis_args([
+        "dm.sales",
+        "--mode=deep",
+        "--where=report_dt",
+        ">=",
+        "'2026-01-01'",
+    ])
+
+    assert mode == AnalysisMode.DEEP
+    assert table_ref == "dm.sales"
+    assert where_clause == "report_dt >= '2026-01-01'"
+    assert hypothesis_text == ""
+
+
+def test_parse_deep_analysis_args_collects_where_space_tokens():
+    mode, table_ref, where_clause, hypothesis_text = _parse_deep_analysis_args([
+        "dm.sales",
+        "--where",
+        "inn",
+        "IN",
+        "('7707083893','7728168971')",
+    ])
+
+    assert mode == AnalysisMode.FAST
+    assert table_ref == "dm.sales"
+    assert where_clause == "inn IN ('7707083893','7728168971')"
+    assert hypothesis_text == ""
+
+
+def test_parse_deep_analysis_args_keeps_hypothesis_without_where():
+    _, table_ref, where_clause, hypothesis_text = _parse_deep_analysis_args([
+        "dm.sales",
+        "проверь",
+        "сезонность",
+    ])
+
+    assert table_ref == "dm.sales"
+    assert where_clause is None
+    assert hypothesis_text == "проверь сезонность"

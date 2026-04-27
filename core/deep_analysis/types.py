@@ -70,6 +70,15 @@ class TableProfile:
     dropped_wide_text: list[str] = field(default_factory=list)
     load_strategy: str = "full"
     table_description: str = ""
+    # If the user constrained the slice with --where, this is the predicate
+    # used at load time. Surfaced in the report so the reader knows the
+    # findings cover only the filtered subset.
+    where_clause: str | None = None
+    # Equivalence: representative column → all functionally identical members
+    # (Cramér's V ≥ 0.99). Populated by orchestrator after profiling.
+    # Columns NOT in any multi-member group still appear here mapped to
+    # themselves, so callers can use this dict as the source of truth.
+    equivalence_groups: dict[str, list[str]] = field(default_factory=dict)
 
     def cols_by_role(self, role: ColumnRole) -> list[str]:
         return [name for name, c in self.columns.items() if c.role == role]
@@ -97,6 +106,39 @@ class TableProfile:
 
     def id_columns(self) -> list[str]:
         return [name for name, c in self.columns.items() if c.role == ColumnRole.ID]
+
+    def representative_of(self, col: str) -> str:
+        """Return the canonical column for `col`'s equivalence class.
+
+        If equivalence groups haven't been populated, every column is its own
+        representative — callers always get a usable result.
+        """
+        if not self.equivalence_groups:
+            return col
+        for rep, members in self.equivalence_groups.items():
+            if col in members:
+                return rep
+        return col
+
+    def is_representative(self, col: str) -> bool:
+        return self.representative_of(col) == col
+
+    def representatives(self, cols: list[str]) -> list[str]:
+        """Filter a column list down to representatives, preserving order."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in cols:
+            rep = self.representative_of(c)
+            if rep in seen:
+                continue
+            seen.add(rep)
+            out.append(c if c == rep else rep)
+        return out
+
+    def equivalent_members(self, col: str) -> list[str]:
+        """All columns in the same equivalence class as `col` (incl. itself)."""
+        rep = self.representative_of(col)
+        return list(self.equivalence_groups.get(rep, [col]))
 
     def entity_candidates(self, min_card: int = 5, max_card: int = 500) -> list[str]:
         """Columns that can serve as cohort/entity keys for group_anomalies.

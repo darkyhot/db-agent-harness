@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 import traceback
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,6 +25,7 @@ from typing import Any
 import pandas as pd
 
 from core.database import DatabaseManager
+from core.deep_analysis.equivalence import compute_equivalence_groups
 from core.deep_analysis.hypothesis_catalog import generate_catalog_hypotheses
 from core.deep_analysis.hypothesis_llm import enrich_hypotheses
 from core.deep_analysis.loader import LoadPlan, SafeLoader
@@ -48,14 +50,22 @@ DEEP_BUDGET_SEC = 3 * 60 * 60  # 3 hours
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent / "workspace" / "deep_analysis"
 
-# Signature: loader_fn(db, schema, table, progress_cb) -> (DataFrame, LoadPlan).
-# Default implementation wraps SafeLoader; tests inject a fake.
-LoaderFn = Callable[[Any, str, str, ProgressCallback | None], tuple[pd.DataFrame, LoadPlan]]
+# Signature: loader_fn(db, schema, table, progress_cb, where=None)
+#   -> (DataFrame, LoadPlan).
+# Default implementation wraps SafeLoader; tests inject a fake. ``where`` is
+# keyword-only with a default of None so existing test loaders that don't
+# accept the kwarg still work via positional arity, but production callers
+# always thread the user-supplied filter through.
+LoaderFn = Callable[..., tuple[pd.DataFrame, LoadPlan]]
 EnrichFn = Callable[[Any, TableProfile, list[HypothesisSpec], str], list[HypothesisSpec]]
 
 
-def _default_loader(db: DatabaseManager, schema: str, table: str, progress_cb):
-    return SafeLoader(db).plan_and_load(schema, table, progress_cb=progress_cb)
+def _default_loader(
+    db: DatabaseManager, schema: str, table: str, progress_cb, *, where: str | None = None
+):
+    return SafeLoader(db).plan_and_load(
+        schema, table, progress_cb=progress_cb, where=where,
+    )
 
 
 @dataclass
@@ -103,6 +113,7 @@ def run_deep_analysis(
     loader_fn: LoaderFn | None = None,
     enrich_fn: EnrichFn | None = None,
     output_root: Path | None = None,
+    where: str | None = None,
 ) -> AnalysisResult:
     started_at = time.time()
     budget_sec = FAST_BUDGET_SEC if mode == AnalysisMode.FAST else DEEP_BUDGET_SEC
@@ -129,12 +140,24 @@ def run_deep_analysis(
         # Stage 1: load
         progress.stage("Загружаю таблицу")
         loader = loader_fn or _default_loader
-        df, plan = loader(db, schema, table, progress.sub)
+        if _loader_accepts_where(loader):
+            df, plan = loader(db, schema, table, progress.sub, where=where)
+        else:
+            # Backward-compat: legacy/test loaders without the `where` kwarg.
+            if where:
+                log.warning(
+                    "Loader %r does not support `where`; ignoring --where=%r",
+                    loader, where,
+                )
+            df, plan = loader(db, schema, table, progress.sub)
 
         # Stage 2: profile
         progress.stage("Профилирую колонки")
         table_desc = _get_table_description(schema_loader, schema, table)
         df, profile = profile_dataframe(df, plan, table_description=table_desc)
+        # Equivalence (post_id ↔ post_name ↔ pos_name etc.) — catalogue/runners
+        # use representatives only so the report doesn't triple-count findings.
+        profile.equivalence_groups = compute_equivalence_groups(df, profile)
         log.info("Profile brief:\n%s", profile_to_brief(profile))
 
         # Stage 3: hypothesis generation
@@ -182,6 +205,17 @@ def run_deep_analysis(
         wall_seconds=wall,
         report_path=report_path,
         run_records=run_records,
+    )
+
+
+def _loader_accepts_where(loader: LoaderFn) -> bool:
+    try:
+        sig = inspect.signature(loader)
+    except (TypeError, ValueError):
+        return True
+    return (
+        "where" in sig.parameters
+        or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
     )
 
 

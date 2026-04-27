@@ -69,7 +69,10 @@ def _tpl_seasonality_counts(p: TableProfile) -> list[HypothesisSpec]:
         est_cost_seconds=10.0,
     ))
     # Category-wise seasonality — e.g. type=отпуск растёт в конце квартала.
-    for cat in p.category_columns(max_cardinality=50)[:3]:
+    # Only iterate over equivalence-class representatives — running the same
+    # seasonality on post_id, post_name, pos_name (all 1:1) triples the noise.
+    cat_reps = p.representatives(p.category_columns(max_cardinality=50))
+    for cat in cat_reps[:3]:
         out.append(HypothesisSpec(
             hypothesis_id=_hid("seasonality_cat", best_date, cat),
             runner="seasonality",
@@ -90,15 +93,19 @@ def _tpl_group_anomalies(p: TableProfile) -> list[HypothesisSpec]:
     larger entity sets (e.g. `employee_id` with thousands) both get checked.
     """
     out: list[HypothesisSpec] = []
-    candidates = p.entity_candidates(min_card=5, max_card=50_000)
+    # Reduce to equivalence-class reps so e.g. saphr_id and a duplicate
+    # pos_id↔post_id pair don't each spawn the full set of group hypotheses.
+    candidates = p.representatives(
+        p.entity_candidates(min_card=5, max_card=50_000)
+    )
     dates = p.date_columns()
     if not candidates:
         return out
 
     best_date = max(dates, key=lambda c: p.columns[c].n_unique) if dates else None
-    num_cols = p.numeric_columns()
-    flag_cols = p.flag_columns()
-    cat_cols = p.category_columns()
+    num_cols = p.representatives(p.numeric_columns())
+    flag_cols = p.representatives(p.flag_columns())
+    cat_cols = p.representatives(p.category_columns())
 
     # Pick up to 3 distinct granularity levels. Sort descending and take both
     # ends to capture finest + coarsest cohorts.
@@ -229,6 +236,9 @@ def _tpl_dependencies(p: TableProfile) -> list[HypothesisSpec]:
     )
     # Drop obvious id columns — they have unique values and give no signal.
     candidates = [c for c in candidates if p.columns[c].role != ColumnRole.ID]
+    # Drop members of equivalence classes — only keep the representative so
+    # we don't enumerate trivially-1:1 pairs (post_id ↔ post_name).
+    candidates = p.representatives(candidates)
     if len(candidates) < 2:
         return []
     return [HypothesisSpec(

@@ -10,10 +10,15 @@ Strategy:
    aggressively or fall back to random sampling with an explicit note in the
    profile (the pipeline documents the downsample in the final report).
 4. Execute the actual full-load SELECT with the allowed projection.
+
+When the caller supplies a `where` clause, every read operation (row count,
+profile sample, final SELECT) applies the same predicate so the analysis
+stays consistent with the user-requested slice (e.g. one year, one ИНН set).
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import pandas as pd
@@ -28,6 +33,63 @@ PROFILE_SAMPLE_ROWS = 10_000
 SAFE_MAX_DF_BYTES = 60 * 1024 ** 3  # ~60 GB hard cap for one DataFrame
 MIN_RAM_HEADROOM_BYTES = 8 * 1024 ** 3  # leave at least 8 GB free
 
+# Tokens that must never appear in a user-supplied WHERE clause. We're inlining
+# the predicate into raw SQL (parameter binding can't represent the structure
+# of a free-form filter), so the safe-list approach is to reject anything that
+# could mutate state, terminate the statement, or open a comment.
+_WHERE_FORBIDDEN_TOKENS = (
+    ";", "--", "/*", "*/",
+)
+_WHERE_FORBIDDEN_KEYWORDS = (
+    "drop", "delete", "update", "insert", "alter", "create", "truncate",
+    "grant", "revoke", "merge", "call", "execute", "exec", "copy",
+    "vacuum", "attach", "detach", "into",
+)
+_WHERE_KEYWORD_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(" + "|".join(_WHERE_FORBIDDEN_KEYWORDS) + r")(?![A-Za-z0-9_])",
+    flags=re.IGNORECASE,
+)
+_WHERE_MAX_LEN = 1000
+
+
+def _sanitize_where_clause(where: str | None) -> str | None:
+    """Validate a free-form WHERE predicate and return a normalised form.
+
+    None / empty string → returns None (no filter). Anything that would
+    terminate the surrounding SELECT, open a SQL comment, or invoke a
+    state-changing statement is rejected with a descriptive ValueError.
+
+    The check is intentionally conservative — false positives are easier to
+    explain to the user than a smuggled DELETE.
+    """
+    if where is None:
+        return None
+    cleaned = where.strip()
+    if not cleaned:
+        return None
+    if cleaned.lower().startswith("where "):
+        cleaned = cleaned[6:].lstrip()
+    if not cleaned:
+        return None
+    if len(cleaned) > _WHERE_MAX_LEN:
+        raise ValueError(
+            f"WHERE-условие слишком длинное (>{_WHERE_MAX_LEN} символов)."
+        )
+    for tok in _WHERE_FORBIDDEN_TOKENS:
+        if tok in cleaned:
+            raise ValueError(
+                f"WHERE-условие содержит запрещённую последовательность '{tok}'."
+            )
+    match = _WHERE_KEYWORD_RE.search(cleaned)
+    if match:
+        raise ValueError(
+            f"WHERE-условие содержит запрещённое ключевое слово "
+            f"'{match.group(1)}' — допускаются только предикаты SELECT."
+        )
+    if cleaned.count("'") % 2 != 0:
+        raise ValueError("WHERE-условие имеет непарную кавычку — проверьте строки.")
+    return cleaned
+
 
 @dataclass
 class LoadPlan:
@@ -40,6 +102,7 @@ class LoadPlan:
     sample_rows: int | None       # populated when strategy == "sample"
     est_bytes_per_row: float
     est_full_bytes: float
+    where_clause: str | None = None  # echoes the user's --where for reporting
 
 
 class SafeLoader:
@@ -61,17 +124,26 @@ class SafeLoader:
         table: str,
         *,
         progress_cb=None,
+        where: str | None = None,
     ) -> tuple[pd.DataFrame, LoadPlan]:
         schema = _validate_identifier(schema, "schema")
         table = _validate_identifier(table, "table")
+        where_clause = _sanitize_where_clause(where)
+        if where_clause:
+            self._log.info("Loading slice with WHERE: %s", where_clause)
 
         if progress_cb:
-            progress_cb("Считаю количество строк в таблице...")
-        total_rows = self._db.get_row_count(schema, table)
+            if where_clause:
+                progress_cb(f"Считаю количество строк (WHERE {where_clause})...")
+            else:
+                progress_cb("Считаю количество строк в таблице...")
+        total_rows = self._db.get_row_count(schema, table, where=where_clause)
 
         if progress_cb:
             progress_cb("Профилирую первые 10 000 строк для подбора колонок...")
-        sample = self._db.get_sample(schema, table, n=PROFILE_SAMPLE_ROWS)
+        sample = self._db.get_sample(
+            schema, table, n=PROFILE_SAMPLE_ROWS, where=where_clause
+        )
 
         kept, dropped, str_widths = self._select_columns(sample)
         est_row_bytes = self._estimate_row_bytes(sample[kept])
@@ -95,12 +167,15 @@ class SafeLoader:
                     f"Загружаю таблицу полностью "
                     f"({total_rows} строк, ~{est_full_bytes / 1024**3:.1f} ГБ)..."
                 )
-            df = self._load_projection(schema, table, kept, limit=None)
+            df = self._load_projection(
+                schema, table, kept, limit=None, where=where_clause
+            )
             plan = LoadPlan(
                 schema=schema, table=table, total_rows=total_rows,
                 kept_columns=kept, dropped_wide_text=dropped,
                 strategy="full", sample_rows=None,
                 est_bytes_per_row=est_row_bytes, est_full_bytes=est_full_bytes,
+                where_clause=where_clause,
             )
             return df, plan
 
@@ -116,12 +191,15 @@ class SafeLoader:
             progress_cb(
                 f"Таблица слишком большая, беру случайную выборку {sample_rows} строк..."
             )
-        df = self._db.get_random_sample(schema, table, n=sample_rows, columns=kept)
+        df = self._db.get_random_sample(
+            schema, table, n=sample_rows, columns=kept, where=where_clause
+        )
         plan = LoadPlan(
             schema=schema, table=table, total_rows=total_rows,
             kept_columns=kept, dropped_wide_text=dropped,
             strategy="sample", sample_rows=sample_rows,
             est_bytes_per_row=est_row_bytes, est_full_bytes=est_full_bytes,
+            where_clause=where_clause,
         )
         return df, plan
 
@@ -167,10 +245,13 @@ class SafeLoader:
         columns: list[str],
         *,
         limit: int | None,
+        where: str | None = None,
     ) -> pd.DataFrame:
         safe_cols = [_validate_identifier(c, "column") for c in columns]
         projection = ", ".join(f'"{c}"' for c in safe_cols) if safe_cols else "*"
         sql = f'SELECT {projection} FROM "{schema}"."{table}"'
+        if where:
+            sql += f" WHERE {where}"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         self._log.info("Executing load SQL: %s", sql[:300])

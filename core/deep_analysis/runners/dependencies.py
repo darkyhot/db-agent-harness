@@ -43,6 +43,62 @@ _CRAMER_V_STRONG = 0.25             # effect thresholds for inclusion
 _SPEARMAN_STRONG = 0.4
 _ETA_SQ_STRONG = 0.1
 
+# Suffixes that mark a column as one face of a reference-table pair
+# (post_id / post_name / post_code etc.). Pairs that share a stem and differ
+# only by such a suffix are skipped — by definition V≈1 and not a discovery.
+_REFERENCE_SUFFIXES = (
+    "_id", "_name", "_nm", "_code", "_cd", "_key", "_desc", "_descr", "_text",
+)
+
+
+def _strip_reference_suffix(name: str) -> str | None:
+    low = name.lower()
+    for s in _REFERENCE_SUFFIXES:
+        if low.endswith(s) and len(low) > len(s):
+            return low[: -len(s)]
+    return None
+
+
+def _is_reference_pair(a: str, b: str) -> bool:
+    """True when a/b look like two faces of the same dictionary entry.
+
+    Two columns are a reference pair when:
+
+    1. Both share an exact stem after stripping a known role suffix
+       (`post_id` ↔ `post_name`, `tb_code` ↔ `tb_id`).
+    2. One stem is a single-token extension of the other (`manager_lvl_1`
+       vs `manager_lvl_1_post`) — covers nested `*_post_id` ↔ `*_name`
+       patterns we see in flattened SAP/Сбер extracts.
+    3. One side is bare and the other is `bare + role_suffix`
+       (`post` ↔ `post_id`).
+    """
+    al, bl = a.lower(), b.lower()
+    if al == bl:
+        return False
+    sa = _strip_reference_suffix(al)
+    sb = _strip_reference_suffix(bl)
+
+    if sa is None and sb is None:
+        return False
+
+    if sa is None:
+        # `post` ↔ `post_id`
+        return sb == al
+    if sb is None:
+        return sa == bl
+
+    if sa == sb:
+        return True
+
+    short, long_ = (sa, sb) if len(sa) < len(sb) else (sb, sa)
+    if long_.startswith(short + "_"):
+        remainder = long_[len(short) + 1:]
+        # Single-token tail only (e.g. `_post`); refuse multi-token to avoid
+        # folding `region` with `region_capital_market_share`.
+        if remainder and "_" not in remainder:
+            return True
+    return False
+
 
 def run_dependencies(
     df: pd.DataFrame,
@@ -63,6 +119,10 @@ def run_dependencies(
     max_pairs = int(spec.params.get("max_pairs", 80))
 
     pairs = list(combinations(cols, 2))
+    # Drop reference-table siblings (post_id ↔ post_name and so on) — by
+    # definition V≈1 and no analytical value. Catches the ~14 trivial
+    # findings we used to emit per run on Сбер-style flat extracts.
+    pairs = [(a, b) for a, b in pairs if not _is_reference_pair(a, b)]
     # Bias toward pairs whose names don't share a common prefix — those are
     # the "non-obvious" ones worth surfacing. Obvious pairs (client_id,
     # client_name) still get checked but ranked last.

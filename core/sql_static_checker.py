@@ -28,6 +28,23 @@ _AGGREGATE_FUNCS = frozenset({
     "string_agg", "array_agg", "json_agg", "bool_and", "bool_or",
 })
 
+_SQL_KEYWORDS = frozenset({
+    "add", "all", "alter", "and", "any", "as", "asc", "between", "by",
+    "case", "cast", "cross", "current", "current_date", "current_timestamp",
+    "date", "delete", "desc", "distinct", "else", "end", "except", "exists", "false",
+    "following", "from", "full", "group", "having", "in", "inner", "insert",
+    "intersect", "into", "is", "join", "left", "like", "limit", "not", "now",
+    "null", "on", "or", "order", "outer", "over", "partition", "preceding",
+    "range", "right", "rows", "select", "set", "then", "timestamp", "true",
+    "unbounded", "union", "update", "when", "where", "with",
+})
+
+_BUILTIN_FUNCTIONS = _AGGREGATE_FUNCS | frozenset({
+    "abs", "ceil", "coalesce", "date_trunc", "extract", "floor", "lower",
+    "nullif", "round", "to_char", "to_date", "to_number", "to_timestamp",
+    "trim", "upper",
+})
+
 
 @dataclass
 class StaticCheckResult:
@@ -354,14 +371,176 @@ def _build_source_alias_map(sql: str) -> dict[str, str]:
     alias_map: dict[str, str] = {}
     source_pat = re.compile(
         r'(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_\.]*)'
-        r'(?:\s+AS)?\s+([a-zA-Z_][a-zA-Z0-9_]*)',
+        r'(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?',
         re.IGNORECASE,
     )
     for match in source_pat.finditer(sql):
         source = match.group(1).lower()
-        alias = match.group(2).lower()
+        alias = (match.group(2) or source.rsplit(".", 1)[-1]).lower()
+        if alias in _SQL_KEYWORDS:
+            alias = source.rsplit(".", 1)[-1]
         alias_map[alias] = source
+    subquery_alias_pat = re.compile(
+        r"\)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:ON|WHERE|GROUP|ORDER|JOIN|LEFT|RIGHT|INNER|FULL|CROSS|$)",
+        re.IGNORECASE,
+    )
+    for match in subquery_alias_pat.finditer(sql):
+        alias = match.group(1).lower()
+        if alias not in _SQL_KEYWORDS:
+            alias_map[alias] = "<subquery>"
     return alias_map
+
+
+def _strip_literals_and_comments(sql: str) -> str:
+    """Убрать литералы и комментарии, сохранив SQL-форму для regex-проверок."""
+    no_block_comments = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    no_line_comments = re.sub(r"--[^\n]*", " ", no_block_comments)
+    no_strings = re.sub(r"'(?:''|[^'])*'", "''", no_line_comments)
+    no_quoted_identifiers = re.sub(r'"[^"]*"', '""', no_strings)
+    return no_quoted_identifiers
+
+
+def _remove_parenthesized_selects(sql: str) -> str:
+    """Remove nested SELECT bodies from an outer-query scan."""
+    out: list[str] = []
+    i = 0
+    while i < len(sql):
+        if sql[i] != "(":
+            out.append(sql[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < len(sql) and sql[j].isspace():
+            j += 1
+        if not sql[j:j + 6].lower() == "select":
+            out.append(sql[i])
+            i += 1
+            continue
+        depth = 1
+        j += 6
+        while j < len(sql) and depth > 0:
+            if sql[j] == "(":
+                depth += 1
+            elif sql[j] == ")":
+                depth -= 1
+            j += 1
+        out.append("(__subquery__)")
+        i = j
+    return "".join(out)
+
+
+def _extract_simple_projection_aliases(sql: str) -> set[str]:
+    return {
+        m.group(1).lower()
+        for m in re.finditer(r"\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", sql, re.IGNORECASE)
+    }
+
+
+def _extract_contextual_unqualified_identifiers(sql: str) -> set[str]:
+    """Собрать голые имена колонок из SQL-контекстов, где они реально читаются.
+
+    Проверка намеренно консервативная: она не пытается валидировать каждое слово
+    в запросе, а берёт только места, где галлюцинированная колонка ломает SQL:
+    аргументы функций, SELECT-проекции, WHERE/HAVING/GROUP/ORDER выражения.
+    """
+    clean = _remove_parenthesized_selects(_strip_literals_and_comments(_strip_ctes(sql)))
+    identifiers: set[str] = set()
+
+    # COUNT(DISTINCT col), SUM(col), COALESCE(col, 0) и т.п.
+    func_pat = re.compile(
+        r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*(?:DISTINCT\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b",
+        re.IGNORECASE,
+    )
+    for match in func_pat.finditer(clean):
+        func = match.group(1).lower()
+        name = match.group(2).lower()
+        if clean[match.end():].lstrip().startswith("."):
+            continue
+        if func in _BUILTIN_FUNCTIONS and name not in _SQL_KEYWORDS:
+            identifiers.add(name)
+
+    clause_pats = [
+        r"\bSELECT\b(.+?)\bFROM\b",
+        r"\bWHERE\b(.+?)(?:\bGROUP\s+BY\b|\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|;|$)",
+        r"\bGROUP\s+BY\b(.+?)(?:\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|;|$)",
+        r"\bHAVING\b(.+?)(?:\bORDER\s+BY\b|\bLIMIT\b|;|$)",
+        r"\bORDER\s+BY\b(.+?)(?:\bLIMIT\b|;|$)",
+    ]
+    token_pat = re.compile(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b")
+    for pat in clause_pats:
+        for clause_match in re.finditer(pat, clean, re.IGNORECASE | re.DOTALL):
+            clause = clause_match.group(1)
+            # Удаляем qualified refs, чтобы не проверять правую часть повторно как bare.
+            clause = re.sub(
+                r"\b[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\b",
+                " ",
+                clause,
+            )
+            for token_match in token_pat.finditer(clause):
+                name = token_match.group(0).lower()
+                end = token_match.end()
+                if name in _SQL_KEYWORDS or name in _BUILTIN_FUNCTIONS:
+                    continue
+                if clause[end:].lstrip().startswith("("):
+                    continue
+                identifiers.add(name)
+    return identifiers
+
+
+def _validate_unqualified_columns(
+    *,
+    identifiers: set[str],
+    real_tables: dict[tuple[str, str], set[str]],
+    cte_columns: dict[str, set[str]],
+    skip_identifiers: set[str] | None = None,
+    result: StaticCheckResult,
+) -> None:
+    if not identifiers:
+        return
+
+    projection_aliases = set()
+    for cols in cte_columns.values():
+        projection_aliases.update(cols)
+    skip = set(skip_identifiers or set()) | projection_aliases
+
+    missing: list[str] = []
+    ambiguous: list[str] = []
+    table_labels = {
+        key: f"{key[0]}.{key[1]}"
+        for key in real_tables
+    }
+    for name in sorted(identifiers):
+        if name in skip:
+            continue
+        matches = [key for key, cols in real_tables.items() if name in cols]
+        if not matches:
+            missing.append(name)
+        elif len(matches) > 1:
+            ambiguous.append(
+                f"{name} ({', '.join(table_labels[key] for key in matches[:4])})"
+            )
+
+    if missing:
+        available_hint = ""
+        if len(real_tables) == 1:
+            only_key = next(iter(real_tables))
+            available_hint = (
+                f" В таблице {table_labels[only_key]} доступны, например: "
+                + ", ".join(sorted(real_tables[only_key])[:12])
+                + "."
+            )
+        result.add_error(
+            "Найдены unqualified-колонки, отсутствующие в каталоге: "
+            + ", ".join(missing[:8])
+            + "."
+            + available_hint
+        )
+    if ambiguous:
+        result.add_error(
+            "Найдены неоднозначные unqualified-колонки: "
+            + "; ".join(ambiguous[:5])
+            + ". Укажи алиас таблицы для каждой такой колонки."
+        )
 
 
 def _check_columns_against_catalog(
@@ -455,6 +634,20 @@ def _check_columns_against_catalog(
             f"{', '.join(unique_suspicious[:5])}. "
             "Проверь названия колонок через get_table_columns."
         )
+
+    bare_identifiers = _extract_contextual_unqualified_identifiers(sql)
+    bare_identifiers -= _extract_simple_projection_aliases(sql)
+    bare_identifiers -= set(cte_columns.keys())
+    bare_identifiers -= set(source_alias_map.keys())
+    bare_identifiers -= all_schema_names
+    bare_identifiers -= all_table_names
+    _validate_unqualified_columns(
+        identifiers=bare_identifiers,
+        real_tables=real_tables,
+        cte_columns=cte_columns,
+        skip_identifiers=set(source_alias_map.keys()) | all_schema_names | all_table_names,
+        result=result,
+    )
 
 
 def _extract_select_columns(sql: str) -> list[str]:

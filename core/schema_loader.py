@@ -108,6 +108,7 @@ class SchemaLoader:
             data_dir: Директория с CSV-файлами. По умолчанию — data_for_agent/.
         """
         self._data_dir = data_dir or DATA_DIR
+        self._data_dir.mkdir(parents=True, exist_ok=True)
         self._tables_df: pd.DataFrame | None = None
         self._attrs_df: pd.DataFrame | None = None
         # TF-IDF индекс (строится лениво при первом поиске)
@@ -119,6 +120,8 @@ class SchemaLoader:
         self._table_semantics: dict[str, dict[str, Any]] | None = None
         self._semantic_lexicon: dict[str, Any] | None = None
         self._rule_registry: dict[str, Any] | None = None
+        # Семантический индекс (GigaChat Embeddings) — опциональный, инжектируется извне
+        self.semantic_index: Any | None = None
 
     @staticmethod
     def _load_json_artifact(path: Path) -> dict[str, Any] | None:
@@ -374,17 +377,107 @@ class SchemaLoader:
         )
         return result.reset_index(drop=True)
 
+    def semantic_search_tables(
+        self, query: str, top_k: int = 10
+    ) -> list[tuple[str, str, float]]:
+        """Семантический поиск таблиц через GigaChat Embeddings.
+
+        Дополнительный сигнал рядом с keyword-поиском (search_tables).
+        Если semantic_index недоступен — возвращает пустой список без ошибок.
+
+        Args:
+            query: Текстовый запрос пользователя.
+            top_k: Максимальное количество результатов.
+
+        Returns:
+            Список (schema, table, score) отсортированный по убыванию score.
+            Дедуплицированный по (schema, table).
+        """
+        if self.semantic_index is None:
+            return []
+        try:
+            hits = self.semantic_index.semantic_search(query, top_k=top_k * 3)
+        except Exception as e:
+            logger.warning("semantic_search_tables: ошибка поиска: %s", e)
+            return []
+        if not hits:
+            return []
+
+        seen: set[tuple[str, str]] = set()
+        result: list[tuple[str, str, float]] = []
+        for key, score in hits:
+            parts = key.split(".")
+            if len(parts) < 2:
+                continue
+            schema, table = parts[0], parts[1]
+            pair = (schema, table)
+            if pair not in seen:
+                seen.add(pair)
+                result.append((schema, table, score))
+            if len(result) >= top_k:
+                break
+
+        logger.debug(
+            "semantic_search_tables('%s'): найдено %d уникальных таблиц",
+            query, len(result),
+        )
+        return result
+
     def _persist_tables_df(self, df: pd.DataFrame) -> None:
         """Сохранить tables_list.csv и обновить кеш/индексы."""
         for col in _TABLE_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
         path = self._data_dir / _TABLES_CSV
+        path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(path, index=False, encoding="utf-8")
         self._tables_df = df.copy()
         self._tfidf_vectorizer = None
         self._tfidf_matrix = None
         self._tfidf_index = []
+
+    def _persist_attrs_df(self, df: pd.DataFrame) -> None:
+        """Сохранить attr_list.csv и обновить кеш."""
+        for col in _ATTR_COLUMNS:
+            if col not in df.columns:
+                default = False if col == "partition_key" else ""
+                df[col] = default
+        path = self._data_dir / "attr_list.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False, encoding="utf-8")
+        self._attrs_df = df.copy()
+
+    def invalidate_metadata_cache(self, *, remove_artifacts: bool = False) -> None:
+        """Сбросить in-memory cache и при необходимости удалить JSON-артефакты."""
+        self._tables_df = None
+        self._attrs_df = None
+        self._tfidf_vectorizer = None
+        self._tfidf_matrix = None
+        self._tfidf_index = []
+        self._value_profiles = None
+        self._column_semantics = None
+        self._table_semantics = None
+        self._semantic_lexicon = None
+        self._rule_registry = None
+
+        if remove_artifacts:
+            for path in (
+                self._value_profiles_path(),
+                self._column_semantics_path(),
+                self._table_semantics_path(),
+                self._semantic_lexicon_path(),
+                self._rule_registry_path(),
+            ):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Не удалось удалить артефакт %s", path)
+
+    def replace_catalog(self, tables_df: pd.DataFrame, attrs_df: pd.DataFrame) -> None:
+        """Полностью заменить CSV-каталог и сбросить производные артефакты."""
+        self._persist_tables_df(tables_df.copy())
+        self._persist_attrs_df(attrs_df.copy())
+        self.invalidate_metadata_cache(remove_artifacts=True)
 
     @staticmethod
     def _profile_key(schema: str, table: str, column: str) -> str:
@@ -440,7 +533,11 @@ class SchemaLoader:
         self._table_semantics = dict(generated)
         path.write_text(json.dumps(self._table_semantics, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def ensure_value_profiles(self, db_manager: Any | None = None) -> None:
+    def ensure_value_profiles(
+        self,
+        db_manager: Any | None = None,
+        sample_cache: dict[tuple[str, str], pd.DataFrame] | None = None,
+    ) -> None:
         """Построить и закешировать value profiles для фильтровых колонок."""
         if self._value_profiles is not None and db_manager is None:
             return
@@ -473,16 +570,23 @@ class SchemaLoader:
                 metadata_profile = build_metadata_profile(row, semantics)
                 metadata_profiles[column] = metadata_profile
                 sample_columns.append(column)
-            table_sample = (
-                fetch_table_profile_sample(
-                    db_manager,
-                    schema=schema,
-                    table=table,
-                    columns=sample_columns,
+            table_sample = None
+            if sample_cache is not None:
+                table_sample = sample_cache.get((schema, table))
+                if table_sample is not None and sample_columns:
+                    available = [col for col in sample_columns if col in table_sample.columns]
+                    table_sample = table_sample[available].copy() if available else pd.DataFrame()
+            if table_sample is None:
+                table_sample = (
+                    fetch_table_profile_sample(
+                        db_manager,
+                        schema=schema,
+                        table=table,
+                        columns=sample_columns,
+                    )
+                    if db_manager is not None and sample_columns
+                    else None
                 )
-                if db_manager is not None and sample_columns
-                else None
-            )
             for row in table_rows:
                 column = str(row.get("column_name", "") or "")
                 key = self._profile_key(schema, table, column)

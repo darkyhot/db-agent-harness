@@ -47,6 +47,7 @@ def evaluate_filter_confidence(
     intent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     where_resolution = where_resolution or {}
+    reasoning = [str(item) for item in (where_resolution.get("reasoning", []) or [])]
     qualifier = str((semantic_frame or {}).get("qualifier") or "")
     explicit_filters = list((intent or {}).get("filter_conditions") or [])
     filter_candidates = where_resolution.get("filter_candidates", {}) or {}
@@ -65,6 +66,13 @@ def evaluate_filter_confidence(
             "score": 0.95,
             "level": "high",
             "evidence": ["no_extra_filters_requested"],
+        }
+
+    if "table_context_covers_business_event" in reasoning:
+        return {
+            "score": 0.95,
+            "level": "high",
+            "evidence": ["table_context_covers_business_event"],
         }
 
     candidate_scores: list[float] = []
@@ -149,13 +157,35 @@ def build_planning_confidence(
     table_confidence: dict[str, Any] | None,
     filter_confidence: dict[str, Any] | None,
     join_confidence: dict[str, Any] | None,
+    user_hints: dict[str, Any] | None = None,
+    explicit_mode: bool = False,
 ) -> dict[str, Any]:
     components = {
         "table_confidence": table_confidence or {"score": 0.25, "level": "low", "evidence": ["missing"]},
         "filter_confidence": filter_confidence or {"score": 0.95, "level": "high", "evidence": ["default"]},
         "join_confidence": join_confidence or {"score": 0.95, "level": "high", "evidence": ["default"]},
     }
-    score = min(float(components["table_confidence"]["score"]), float(components["filter_confidence"]["score"]), float(components["join_confidence"]["score"]))
+    table_score = float(components["table_confidence"]["score"])
+    filter_score = float(components["filter_confidence"]["score"])
+    join_score = float(components["join_confidence"]["score"])
+
+    # Hint-boost: явные хинты пользователя повышают соответствующие компоненты.
+    # В explicit_mode (≥2 явных хинта) применяется строже: max(score, 0.95) вместо 0.9/0.8.
+    hints = user_hints or {}
+    _boost_table = 0.95 if explicit_mode else 0.9
+    _boost_filter = 0.95 if explicit_mode else 0.8
+    _boost_join = 0.95 if explicit_mode else 0.9
+
+    if hints.get("must_keep_tables"):
+        table_score = max(table_score, _boost_table)
+    if hints.get("group_by_hints") or hints.get("aggregate_hints"):
+        filter_score = max(filter_score, _boost_filter)
+    if hints.get("join_fields"):
+        join_score = max(join_score, _boost_join)
+
+    # Взвешенная сумма (table доминирует, т.к. выбор таблиц — критический шаг)
+    score = 0.4 * table_score + 0.3 * filter_score + 0.3 * join_score
+
     level = _level(score)
     action = "execute" if level == "high" else ("clarify" if level == "medium" else "stop")
     return {
@@ -185,35 +215,30 @@ def build_fallback_policy(
         }
 
     if not has_template_sql:
+        allow_reviewed_llm = level != "low" and action != "stop"
         return {
-            "allow_llm_fallback": level == "high",
-            "action": "llm_fallback" if level == "high" else action,
+            "allow_llm_fallback": allow_reviewed_llm,
+            "action": "llm_fallback" if allow_reviewed_llm else action,
             "reason": "no_deterministic_template",
+            "guard": "sql_self_corrector",
             "message": (
-                "" if level == "high"
+                "" if allow_reviewed_llm
                 else "Не хватает уверенности, чтобы безопасно строить SQL через LLM без детерминированной основы."
             ),
         }
 
-    if level == "high":
+    if level in {"high", "medium"} and action != "stop":
         return {
             "allow_llm_fallback": True,
             "action": "llm_fallback",
-            "reason": "deterministic_failed_but_plan_high_confidence",
+            "reason": "deterministic_failed_but_plan_reviewable",
+            "guard": "sql_self_corrector",
             "message": "",
-        }
-
-    if level == "medium":
-        return {
-            "allow_llm_fallback": False,
-            "action": "clarify",
-            "reason": "medium_confidence_requires_clarification",
-            "message": "Есть несколько правдоподобных интерпретаций запроса. Нужна короткая уточняющая деталь перед генерацией SQL.",
         }
 
     return {
         "allow_llm_fallback": False,
-        "action": "stop",
+        "action": action if action == "stop" else "stop",
         "reason": "low_confidence_blocks_llm_fallback",
         "message": "Недостаточно уверенности в выборе источника или фильтров, поэтому генерация SQL остановлена до уточнения.",
     }

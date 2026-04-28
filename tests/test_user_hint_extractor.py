@@ -34,34 +34,34 @@ def synthetic_loader(tmp_path):
     tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
 
     attrs_df = pd.DataFrame({
-        "schema_name": ["schema_a"] * 8,
+        "schema_name": ["schema_a"] * 10,
         "table_name": [
-            "fact_x", "fact_x", "fact_x",
+            "fact_x", "fact_x", "fact_x", "fact_x", "fact_x",
             "dim_y", "dim_y", "dim_y",
             "ref_segments_table", "ref_segments_table",
         ],
         "column_name": [
-            "event_id", "inn", "amount",
+            "event_id", "inn", "amount", "tb_id", "gosb_id",
             "client_id", "inn", "segment_name",
             "segment_id", "segment_name",
         ],
         "dType": [
-            "bigint", "varchar", "numeric",
+            "bigint", "varchar", "numeric", "varchar", "varchar",
             "bigint", "varchar", "varchar",
             "bigint", "varchar",
         ],
         "description": [
-            "PK события", "ИНН клиента", "Сумма",
+            "PK события", "ИНН клиента", "Сумма", "ТБ", "ГОСБ",
             "PK клиента", "ИНН клиента", "Сегмент",
             "PK сегмента", "Название сегмента",
         ],
         "is_primary_key": [
-            True, False, False,
+            True, False, False, False, False,
             True, False, False,
             True, False,
         ],
-        "unique_perc": [100.0, 50.0, 1.0, 100.0, 80.0, 5.0, 100.0, 100.0],
-        "not_null_perc": [100.0, 80.0, 99.0, 100.0, 95.0, 50.0, 100.0, 100.0],
+        "unique_perc": [100.0, 50.0, 1.0, 30.0, 20.0, 100.0, 80.0, 5.0, 100.0, 100.0],
+        "not_null_perc": [100.0, 80.0, 99.0, 100.0, 100.0, 100.0, 95.0, 50.0, 100.0, 100.0],
     })
     attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
 
@@ -194,9 +194,197 @@ class TestExtractUserHintsContract:
         assert hints["join_fields"] == []
         assert hints["dim_sources"] == {}
         assert hints["having_hints"] == []
+        assert hints["group_by_hints"] == []
+        assert hints["aggregate_hints"] == []
+        assert hints["aggregation_preferences"] == {}
+        assert hints["time_granularity"] is None
+        assert hints["negative_filters"] == []
 
     def test_none_loader_safe(self):
         """Не падает при отсутствии loader."""
         hints = extract_user_hints("посчитай отток по сегменту", None)
         # Возвращает пустую структуру вместо исключения
         assert hints["must_keep_tables"] == []
+
+
+class TestGroupByHints:
+    def test_sgruppiruй_po_column(self, synthetic_loader):
+        """«сгруппируй по segment_name» → group_by_hints содержит segment_name."""
+        hints = extract_user_hints(
+            "сгруппируй по segment_name", synthetic_loader,
+        )
+        assert "segment_name" in hints["group_by_hints"]
+
+    def test_po_column_no_join_context(self, synthetic_loader):
+        """«по segment_name» без JOIN-контекста → group_by_hints."""
+        hints = extract_user_hints(
+            "посчитай задачи. По segment_name", synthetic_loader,
+        )
+        assert "segment_name" in hints["group_by_hints"]
+
+    def test_po_column_with_join_context_not_group(self, synthetic_loader):
+        """«соедини по inn» — JOIN-контекст, значит в join_fields, не в group_by."""
+        hints = extract_user_hints(
+            "соедини fact_x и dim_y по inn", synthetic_loader,
+        )
+        assert "inn" in hints["join_fields"]
+        assert "inn" not in hints["group_by_hints"]
+
+    def test_unknown_column_ignored(self, synthetic_loader):
+        """Колонка не из каталога → игнорируется."""
+        hints = extract_user_hints(
+            "сгруппируй по nonexistent_column", synthetic_loader,
+        )
+        assert "nonexistent_column" not in hints["group_by_hints"]
+
+    def test_group_by_english(self, synthetic_loader):
+        """«group by segment_name» → group_by_hints."""
+        hints = extract_user_hints(
+            "group by segment_name", synthetic_loader,
+        )
+        assert "segment_name" in hints["group_by_hints"]
+
+
+class TestAggregateHints:
+    def test_poschitay_noun(self, synthetic_loader):
+        """«посчитай amount» → aggregate_hints содержит ("count", "amount")."""
+        hints = extract_user_hints(
+            "посчитай amount за февраль", synthetic_loader,
+        )
+        agg_funcs = [a[0] for a in hints["aggregate_hints"]]
+        assert "count" in agg_funcs
+
+    def test_summa_po_noun(self, synthetic_loader):
+        """«сумма по amount» → ("sum", "amount")."""
+        hints = extract_user_hints(
+            "сумма по amount", synthetic_loader,
+        )
+        assert any(a[0] == "sum" for a in hints["aggregate_hints"])
+
+    def test_count_english(self, synthetic_loader):
+        """«count of amount» → ("count", "amount")."""
+        hints = extract_user_hints(
+            "count of amount", synthetic_loader,
+        )
+        assert any(a[0] == "count" for a in hints["aggregate_hints"])
+
+    def test_acceptance_count_task_code(self, synthetic_loader):
+        """Acceptance: посчитай задачи по task_code → aggregate_hints count + group_by."""
+        # event_id есть в каталоге, segment_name есть в каталоге
+        hints = extract_user_hints(
+            "посчитай event_id. По segment_name", synthetic_loader,
+        )
+        agg_funcs = [a[0] for a in hints["aggregate_hints"]]
+        assert "count" in agg_funcs
+        assert "segment_name" in hints["group_by_hints"]
+
+    def test_count_distinct_preference(self, synthetic_loader):
+        """count(distinct event_id) → aggregation_preferences.distinct=True."""
+        hints = extract_user_hints(
+            "возьми count(distinct event_id)", synthetic_loader,
+        )
+        assert hints["aggregation_preferences"] == {
+            "function": "count",
+            "column": "event_id",
+            "distinct": True,
+        }
+
+    def test_extract_force_count_star_for_prosto_stroki(self, synthetic_loader):
+        hints = extract_user_hints(
+            "посчитай просто количество строк", synthetic_loader,
+        )
+        assert hints["aggregation_preferences"] == {
+            "function": "count",
+            "column": "*",
+            "distinct": False,
+            "force_count_star": True,
+        }
+
+    def test_extract_no_distinct_phrase(self, synthetic_loader):
+        hints = extract_user_hints(
+            "не надо считать по уникальной дате", synthetic_loader,
+        )
+        assert hints["aggregation_preferences"] == {
+            "function": "count",
+            "distinct": False,
+        }
+
+    def test_extract_multiple_distinct_count_targets(self, synthetic_loader):
+        hints = extract_user_hints(
+            "сколько всего есть уникальных тб и госб", synthetic_loader,
+        )
+        assert hints["aggregation_preferences_list"] == [
+            {"function": "count", "column": "tb_id", "distinct": True},
+            {"function": "count", "column": "gosb_id", "distinct": True},
+        ]
+
+
+class TestTimeGranularity:
+    def test_pomesyachno(self, synthetic_loader):
+        """«помесячно» → time_granularity == "month"."""
+        hints = extract_user_hints("посчитай помесячно", synthetic_loader)
+        assert hints["time_granularity"] == "month"
+
+    def test_po_kvartalам(self, synthetic_loader):
+        """«по кварталам» → time_granularity == "quarter"."""
+        hints = extract_user_hints("отток по кварталам", synthetic_loader)
+        assert hints["time_granularity"] == "quarter"
+
+    def test_monthly_english(self, synthetic_loader):
+        """«monthly» → time_granularity == "month"."""
+        hints = extract_user_hints("show monthly stats", synthetic_loader)
+        assert hints["time_granularity"] == "month"
+
+    def test_yearly(self, synthetic_loader):
+        """«ежегодно» → time_granularity == "year"."""
+        hints = extract_user_hints("покажи ежегодно", synthetic_loader)
+        assert hints["time_granularity"] == "year"
+
+    def test_daily(self, synthetic_loader):
+        """«ежедневно» → time_granularity == "day"."""
+        hints = extract_user_hints("ежедневно отчёт", synthetic_loader)
+        assert hints["time_granularity"] == "day"
+
+    def test_no_granularity(self, synthetic_loader):
+        """Без временной гранулярности → None."""
+        hints = extract_user_hints("покажи сумму по клиентам", synthetic_loader)
+        assert hints["time_granularity"] is None
+
+    def test_acceptance_vozmi_fact_pomesyachno(self, synthetic_loader):
+        """Acceptance: «возьми schema_a.fact_x, посчитай помесячно» → time_granularity=month + must_keep."""
+        hints = extract_user_hints(
+            "возьми schema_a.fact_x, посчитай помесячно", synthetic_loader,
+        )
+        assert hints["time_granularity"] == "month"
+        assert ("schema_a", "fact_x") in hints["must_keep_tables"]
+
+
+class TestNegativeFilters:
+    def test_ne_uchityvay(self, synthetic_loader):
+        """«не учитывай канцелярию» → negative_filters содержит "канцелярию"."""
+        hints = extract_user_hints(
+            "покажи всех клиентов, не учитывай канцелярию", synthetic_loader,
+        )
+        assert len(hints["negative_filters"]) >= 1
+        assert any("канцеляр" in v for v in hints["negative_filters"])
+
+    def test_isklyuchi(self, synthetic_loader):
+        """«исключи тест» → negative_filters."""
+        hints = extract_user_hints("исключи тест из выборки", synthetic_loader)
+        assert len(hints["negative_filters"]) >= 1
+
+    def test_krome(self, synthetic_loader):
+        """«кроме X» → negative_filters."""
+        hints = extract_user_hints("покажи всё кроме архива", synthetic_loader)
+        assert len(hints["negative_filters"]) >= 1
+        assert any("архив" in v for v in hints["negative_filters"])
+
+    def test_exclude_english(self, synthetic_loader):
+        """«excluding test» → negative_filters."""
+        hints = extract_user_hints("show all excluding test data", synthetic_loader)
+        assert len(hints["negative_filters"]) >= 1
+
+    def test_no_negative_filter(self, synthetic_loader):
+        """Без исключений → пустой список."""
+        hints = extract_user_hints("посчитай отток по клиентам", synthetic_loader)
+        assert hints["negative_filters"] == []

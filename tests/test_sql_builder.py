@@ -429,6 +429,36 @@ class TestCountDistinct:
         assert "COUNT(DISTINCT" in sql.upper(), f"Ожидали COUNT(DISTINCT ...), получили: {sql}"
         assert "LIMIT" not in sql.upper(), "LIMIT не должен появляться при limit=None"
 
+    def test_multiple_distinct_counts_in_simple_select(self):
+        cols = {
+            "dm.gosb": {
+                "select": ["gosb_id", "tb_id"],
+                "filter": [],
+                "aggregate": ["gosb_id", "tb_id"],
+                "group_by": [],
+            }
+        }
+        bp = {
+            "strategy": "simple_select",
+            "main_table": "dm.gosb",
+            "aggregation": {"function": "COUNT", "column": "tb_id", "alias": "count_tb_id", "distinct": True},
+            "aggregations": [
+                {"function": "COUNT", "column": "tb_id", "alias": "count_tb_id", "distinct": True},
+                {"function": "COUNT", "column": "gosb_id", "alias": "count_gosb_id", "distinct": True},
+            ],
+            "group_by": [],
+            "where_conditions": [],
+            "order_by": None,
+            "limit": None,
+        }
+        sql = builder.build("simple_select", cols, [], bp, {"dm.gosb": "dim"})
+        assert sql is not None
+        n = norm(sql)
+        assert "COUNT(DISTINCT" in n
+        assert "GOSB_ID) AS COUNT_GOSB_ID" in n
+        assert "TB_ID) AS COUNT_TB_ID" in n
+        assert "GROUP BY" not in n
+
     def test_legacy_count_distinct_function_is_normalized(self):
         cols = {
             "dm.gosb": {
@@ -561,6 +591,16 @@ class TestCompositeJoin:
         assert sql is not None
         n = norm(sql)
         assert " AND " in n
+
+    def test_composite_join_does_not_add_inserted_dttm_tiebreaker(self):
+        sql = builder.build(
+            "fact_dim_join", self._cols(), self._composite_spec(), self._bp(),
+            {"dm.fact": "fact", "dm.dim": "dim"},
+        )
+        assert sql is not None
+        assert "inserted_dttm" not in sql.lower()
+        assert "DISTINCT ON (old_gosb_id, tb_id)" in sql
+        assert "ORDER BY old_gosb_id, tb_id" in sql
 
     def test_single_key_still_works(self):
         """Одиночный ключ (не составной) по-прежнему работает."""

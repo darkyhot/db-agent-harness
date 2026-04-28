@@ -14,8 +14,11 @@ from typing import Any
 from core.join_analysis import detect_table_type, format_join_analysis
 from core.column_selector_deterministic import (
     select_columns as _det_select_columns,
-    _complete_composite_join,
+    normalize_join_spec,
+    _derive_requested_slots,
+    _semantic_match_score,
 )
+from core.llm_column_verifier import verify_column_selection
 from graph.state import AgentState
 
 # Минимальная confidence для использования детерминированного результата без LLM.
@@ -32,17 +35,43 @@ def _apply_explicit_join_override(
     join_spec: list[dict[str, Any]],
     selected_columns: dict[str, Any],
     intent: dict[str, Any],
+    user_hints: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Применить explicit_join из интента как override join_spec.
+    """Применить explicit_join из интента / user_hints как override join_spec.
 
     Когда пользователь явно указал ключ JOIN ("по инн", "по дате") — он имеет
     абсолютный приоритет. Ищем колонку по col_hint семантически в selected_columns,
     подставляем в join_spec вместо auto-detected пары.
 
+    Источники (оба опциональны, обрабатываются в порядке приоритета):
+    - user_hints.join_fields — свежий результат LLM/regex-экстрактора, primary.
+    - intent.explicit_join — результат intent_classifier, secondary.
+
+    Конфликт разрешается так: ключи из user_hints применяются первыми;
+    ключи из intent.explicit_join — только для col_hint-ов, которые не
+    были покрыты user_hints.
+
     Returns:
-        Обновлённый join_spec (исходный если explicit_join пуст или не нашли совпадений).
+        Обновлённый join_spec (исходный если оба источника пусты / не нашли совпадений).
     """
-    explicit_joins = intent.get("explicit_join") or []
+    explicit_joins: list[dict[str, Any]] = []
+    covered_hints: set[str] = set()
+
+    for field in (user_hints or {}).get("join_fields") or []:
+        col = str(field).lower().strip()
+        if col and col not in covered_hints:
+            explicit_joins.append({"column_hint": col, "table_hint": ""})
+            covered_hints.add(col)
+
+    for ej in intent.get("explicit_join") or []:
+        if not isinstance(ej, dict):
+            continue
+        col = str(ej.get("column_hint") or "").lower().strip()
+        if not col or col in covered_hints:
+            continue
+        explicit_joins.append(ej)
+        covered_hints.add(col)
+
     if not explicit_joins:
         return join_spec
 
@@ -149,13 +178,80 @@ class ExplorerNodes:
         # 1. Получаем таблицы из state["selected_tables"]
         selected = state.get("selected_tables", [])
         found_tables: set[tuple[str, str]] = set()
+        explicit_source_guard = bool(
+            state.get("allowed_tables")
+            or (state.get("user_hints") or {}).get("must_keep_tables")
+        )
+        excluded_tables = {
+            str(item).strip().lower()
+            for item in (state.get("excluded_tables") or (state.get("user_hints") or {}).get("excluded_tables") or [])
+            if str(item).strip()
+        }
 
         if selected:
             for item in selected:
                 if isinstance(item, (list, tuple)) and len(item) == 2:
-                    found_tables.add((item[0], item[1]))
+                    full_name = f"{item[0]}.{item[1]}".lower()
+                    if full_name not in excluded_tables:
+                        found_tables.add((item[0], item[1]))
+        elif state.get("allowed_tables") or (state.get("user_hints") or {}).get("must_keep_tables"):
+            explicit_sources = list(state.get("allowed_tables") or [])
+            explicit_sources.extend(
+                f"{item[0]}.{item[1]}"
+                for item in (state.get("user_hints") or {}).get("must_keep_tables", [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            )
+            for source in explicit_sources:
+                parts = str(source or "").strip().split(".", 1)
+                if len(parts) != 2:
+                    continue
+                full_name = f"{parts[0]}.{parts[1]}".lower()
+                if full_name not in excluded_tables:
+                    found_tables.add((parts[0], parts[1]))
 
         # 2. Fallback: извлечение schema.table из плана и user_input
+        if not found_tables and explicit_source_guard:
+            must_keep_full = [
+                f"{item[0]}.{item[1]}"
+                for item in (state.get("user_hints") or {}).get("must_keep_tables", [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            ]
+            allowed_full = list(state.get("allowed_tables") or [])
+            explicit_full = list(dict.fromkeys(must_keep_full + allowed_full))
+            filtered_by_excluded = [
+                t for t in explicit_full if t.lower() in excluded_tables
+            ]
+            err_kind = (
+                "conflict_with_excluded" if filtered_by_excluded else "no_eligible_source"
+            )
+            logger.warning(
+                "TableExplorer: explicit source guard active (kind=%s, must_keep=%s, "
+                "allowed=%s, excluded=%s, filtered=%s, selected=%s)",
+                err_kind,
+                must_keep_full,
+                allowed_full,
+                sorted(excluded_tables),
+                filtered_by_excluded,
+                selected,
+            )
+            empty_ctx = (
+                "=== РАЗВЕДКА ТАБЛИЦ ===\n\n"
+                "Явные источники заданы, но после фильтрации доступных таблиц не осталось."
+            )
+            return {
+                "tables_context": empty_ctx,
+                "table_structures": {},
+                "table_samples": {},
+                "table_types": {},
+                "join_analysis_data": {},
+                "explorer_error": {
+                    "kind": err_kind,
+                    "must_keep_filtered": filtered_by_excluded,
+                    "explicit_sources": explicit_full,
+                    "excluded_tables": sorted(excluded_tables),
+                },
+            }
+
         if not found_tables:
             plan_text = "\n".join(state.get("plan", []))
             user_input = state.get("user_input", "")
@@ -170,6 +266,7 @@ class ExplorerNodes:
                     "table_samples": {},
                     "table_types": {},
                     "join_analysis_data": {},
+                    "explorer_error": {},
                 }
 
             pattern = re.compile(
@@ -184,7 +281,9 @@ class ExplorerNodes:
                 )
                 if not df[mask].empty:
                     row = df[mask].iloc[0]
-                    found_tables.add((row["schema_name"], row["table_name"]))
+                    full_name = f"{row['schema_name']}.{row['table_name']}".lower()
+                    if full_name not in excluded_tables:
+                        found_tables.add((row["schema_name"], row["table_name"]))
 
             # Fallback — поиск таблиц по ключевым словам
             if not found_tables:
@@ -202,7 +301,7 @@ class ExplorerNodes:
                             ).head(3).iterrows():
                                 s = row.get("schema_name", "")
                                 t = row.get("table_name", "")
-                                if s and t:
+                                if s and t and f"{s}.{t}".lower() not in excluded_tables:
                                     found_tables.add((s, t))
                             if found_tables:
                                 logger.info(
@@ -228,6 +327,7 @@ class ExplorerNodes:
                 "table_samples": {},
                 "table_types": {},
                 "join_analysis_data": {},
+                "explorer_error": {},
             }
 
         logger.info(
@@ -370,6 +470,7 @@ class ExplorerNodes:
             "table_samples": table_samples,
             "table_types": table_types,
             "join_analysis_data": join_analysis_data,
+            "explorer_error": {},
             "messages": state["messages"] + [
                 {
                     "role": "assistant",
@@ -402,6 +503,18 @@ class ExplorerNodes:
         table_structures = state.get("table_structures", {})
         table_samples = state.get("table_samples", {})
         join_analysis_data = state.get("join_analysis_data", {})
+        excluded_tables = {
+            str(item).strip().lower()
+            for item in (state.get("excluded_tables") or (state.get("user_hints") or {}).get("excluded_tables") or [])
+            if str(item).strip()
+        }
+        if excluded_tables:
+            table_structures = {k: v for k, v in table_structures.items() if k.lower() not in excluded_tables}
+            table_samples = {k: v for k, v in table_samples.items() if k.lower() not in excluded_tables}
+            join_analysis_data = {
+                k: v for k, v in (join_analysis_data or {}).items()
+                if not any(part.strip().lower() in excluded_tables for part in str(k).split("|"))
+            }
 
         logger.info(
             "ColumnSelector: выбор колонок для %d таблиц", len(table_structures)
@@ -436,8 +549,47 @@ class ExplorerNodes:
             _det_result.get("reason", ""),
         )
 
-        if _det_conf >= _DET_CONFIDENCE_THRESHOLD and not state.get("column_selector_hint", ""):
-            # Достаточная уверенность — пропускаем LLM
+        # B.3: LLM-верификатор детерминированного выбора превратился в дев-инструмент.
+        # Раньше он сбрасывал confidence до 0.40 на critical issues и форсил
+        # LLM-fallback, но это давало ложные срабатывания на non-deterministic LLM.
+        # Теперь — только лог. Реальные правки делает plan_verifier (см. узел
+        # plan_verifier между sql_pipeline и plan_preview).
+        verifier_hint_from_critic = ""
+        if (
+            getattr(self, "llm_verifier_enabled", False)
+            and _det_conf >= _DET_CONFIDENCE_THRESHOLD
+            and _det_result.get("selected_columns")
+        ):
+            try:
+                _requested = _derive_requested_slots(user_input, intent)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("LLMColumnVerifier: не смогли вычислить slots: %s", exc)
+                _requested = {}
+            if _requested:
+                verdict = verify_column_selection(
+                    user_input=user_input,
+                    requested_slots=_requested,
+                    selected_columns=_det_result["selected_columns"],
+                    schema_loader=self.schema,
+                    llm_invoker=self,
+                    semantic_scorer=_semantic_match_score,
+                )
+                if verdict.get("hint"):
+                    logger.info(
+                        "ColumnSelector/verifier (passive): %s",
+                        verdict["hint"],
+                    )
+
+        _hints = state.get("user_hints", {}) or {}
+        # Только group_by_hints (явная ось группировки) требует пересмотра колонок через LLM.
+        # aggregate_hints не меняет набор колонок — только способ агрегации.
+        _has_explicit_group = bool(_hints.get("group_by_hints"))
+        if (
+            _det_conf >= _DET_CONFIDENCE_THRESHOLD
+            and not state.get("column_selector_hint", "")
+            and not _has_explicit_group
+        ):
+            # Достаточная уверенность и нет явных group_by-хинтов → пропускаем LLM
             logger.info(
                 "ColumnSelector: confidence=%.2f >= %.2f → используем детерминированный результат",
                 _det_conf,
@@ -448,6 +600,12 @@ class ExplorerNodes:
                 _det_result["join_spec"],
                 _det_result["selected_columns"],
                 intent,
+                user_hints=state.get("user_hints"),
+            )
+            _det_join_spec = normalize_join_spec(
+                _det_join_spec,
+                self.schema,
+                state.get("table_types", {}) or {},
             )
             self.memory.add_message(
                 "assistant",
@@ -471,10 +629,20 @@ class ExplorerNodes:
                 "graph_iterations": state.get("graph_iterations", 0) + 1,
             }
 
+        _fallback_reasons: list[str] = []
+        if _det_conf < _DET_CONFIDENCE_THRESHOLD:
+            _fallback_reasons.append(
+                f"confidence {_det_conf:.2f} < {_DET_CONFIDENCE_THRESHOLD:.2f}"
+            )
+        if state.get("column_selector_hint", ""):
+            _fallback_reasons.append("corrective_hint")
+        if verifier_hint_from_critic:
+            _fallback_reasons.append("verifier_critical")
+        if _has_explicit_group:
+            _fallback_reasons.append("explicit_group_by_hints")
         logger.info(
-            "ColumnSelector: confidence=%.2f < %.2f → запускаем LLM",
-            _det_conf,
-            _DET_CONFIDENCE_THRESHOLD,
+            "ColumnSelector: запускаем LLM (%s)",
+            ", ".join(_fallback_reasons) or "fallback_reason=unknown",
         )
 
         # --- Системный промпт ---
@@ -572,9 +740,13 @@ class ExplorerNodes:
 
         # Если sql_planner обнаружил пропущенную таблицу — добавляем корректирующую подсказку
         hint = state.get("column_selector_hint", "")
+        # B.3: верификатор детерминированного результата мог сгенерировать собственную
+        # критику — присоединяем её к существующей подсказке.
+        if verifier_hint_from_critic:
+            hint = (hint + "\n" + verifier_hint_from_critic).strip() if hint else verifier_hint_from_critic
         if hint:
             user_prompt += f"\n\n=== КОРРЕКТИРУЮЩАЯ ИНСТРУКЦИЯ ===\n{hint}"
-            logger.info("ColumnSelector: применяю корректирующую подсказку от sql_planner")
+            logger.info("ColumnSelector: применяю корректирующую подсказку")
 
         # Известные ошибки из памяти — передаём чтобы агент не повторял их
         correction_examples: list[str] = state.get("correction_examples", [])
@@ -634,6 +806,7 @@ class ExplorerNodes:
         _allowed_raw = state.get("allowed_tables") or []
         if _allowed_raw:
             allowed_tables_set = {t.lower() for t in _allowed_raw}
+            allowed_tables_set -= excluded_tables
             _raw_keys = list(raw_columns.keys())
             for _tk in _raw_keys:
                 if _tk.lower() not in allowed_tables_set:
@@ -697,74 +870,25 @@ class ExplorerNodes:
                     "strategy": str(jk.get("strategy", "direct")),
                 }
 
-                # Post-validation: проверяем уникальность правой стороны по схеме.
-                # Если колонка не уникальна — корректируем safe=False и добавляем risk.
-                # Это информационная коррекция, не блокирующая — sql_writer учтёт её.
-                right_parts = entry["right"].rsplit(".", 2)
-                if len(right_parts) == 3:
-                    r_schema, r_table, r_col = right_parts
-                    try:
-                        uniq = self.schema.check_key_uniqueness(r_schema, r_table, [r_col])
-                        if uniq.get("is_unique") is False:
-                            if entry["safe"]:
-                                entry["safe"] = False
-                                entry["risk"] = (
-                                    f"{r_col} не уникален в {r_schema}.{r_table} "
-                                    f"(~{uniq.get('duplicate_pct', '?')}% дублей)"
-                                )
-                                logger.warning(
-                                    "ColumnSelector post-validation: %s.%s.%s "
-                                    "помечен safe=True, но не уникален — исправляем на safe=False",
-                                    r_schema, r_table, r_col,
-                                )
-                        elif uniq.get("is_unique") is True:
-                            # Подтверждаем safe=True данными схемы
-                            if not entry["safe"]:
-                                entry["safe"] = True
-                                logger.info(
-                                    "ColumnSelector post-validation: %s.%s.%s "
-                                    "уникален по схеме — исправляем на safe=True",
-                                    r_schema, r_table, r_col,
-                                )
-                    except Exception as e:
-                        logger.debug(
-                            "ColumnSelector post-validation: ошибка проверки %s — %s",
-                            entry["right"], e,
-                        )
-
                 join_spec.append(entry)
 
         # --- Блок B: explicit_join override (LLM путь) ---
-        join_spec = _apply_explicit_join_override(join_spec, selected_columns, intent)
+        join_spec = _apply_explicit_join_override(
+            join_spec, selected_columns, intent,
+            user_hints=state.get("user_hints"),
+        )
 
-        # Hardening: дополнить LLM join_spec составными парами PK, которые LLM мог пропустить.
-        # Если dim-таблица имеет составной PK, но LLM вернул только одну пару — добавляем остальные.
-        _table_types_for_composite = state.get("table_types", {})
-        if join_spec and _table_types_for_composite:
-            _extra: list[dict[str, Any]] = []
-            for _entry in list(join_spec):
-                try:
-                    _extra_pairs = _complete_composite_join(
-                        _entry,
-                        ".".join(_entry["left"].split(".")[:2]),
-                        ".".join(_entry["right"].split(".")[:2]),
-                        _table_types_for_composite,
-                        self.schema,
-                    )
-                    for _ep in _extra_pairs:
-                        # Не добавляем дубли (проверяем по left+right)
-                        if not any(
-                            x["left"] == _ep["left"] and x["right"] == _ep["right"]
-                            for x in join_spec + _extra
-                        ):
-                            _extra.append(_ep)
-                except Exception as _ce:
-                    logger.debug("ColumnSelector composite hardening: %s", _ce)
-            if _extra:
-                join_spec.extend(_extra)
-                logger.info(
-                    "ColumnSelector: дополнено %d составных join-пар после LLM", len(_extra)
-                )
+        before_normalize = len(join_spec)
+        join_spec = normalize_join_spec(
+            join_spec,
+            self.schema,
+            state.get("table_types", {}) or {},
+        )
+        if len(join_spec) > before_normalize:
+            logger.info(
+                "ColumnSelector: дополнено %d составных join-пар после LLM/override",
+                len(join_spec) - before_normalize,
+            )
 
         logger.info(
             "ColumnSelector: выбрано колонок для %d таблиц, %d join-ключей",

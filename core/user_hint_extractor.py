@@ -10,8 +10,12 @@
   column_selector, какую колонку и из какой таблицы брать для измерения.
 - having_hints: постагрегатные фильтры «от N человек», «более N клиентов» →
   HAVING COUNT(DISTINCT <unit_col>) >= N в sql_planner/sql_builder.
+- group_by_hints: явные оси группировки ("по task_code", "сгруппируй по региону").
+- aggregate_hints: явные агрегаты ("посчитай задачи", "сумма по выручке").
+- time_granularity: гранулярность времени ("помесячно" → "month", "по кварталам" → "quarter").
+- negative_filters: значения для исключения ("не учитывай X", "исключи Y").
 
-Все сущности валидируются против реального каталога (schema_loader), чтобы
+Все сущности-идентификаторы валидируются против реального каталога (schema_loader), чтобы
 ни одна "мусорная" подсказка не попала в state.
 """
 
@@ -85,6 +89,157 @@ _HAVING_PATTERNS: list[re.Pattern[str]] = [
     ),
 ]
 
+# Явные маркеры группировки: "сгруппируй по X", "группировка по X", "group by X"
+_GROUP_BY_EXPLICIT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"сгруппир[уоыёе]\w*\s+по\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"группиров\w+\s+по\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bgroup\s+by\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+        re.IGNORECASE,
+    ),
+    # "по X" в начале предложения или после знаков препинания — почти всегда группировка
+    re.compile(
+        r"(?:^|[.!?,;]\s*)[Пп]о\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+    ),
+]
+
+# Паттерны агрегатов (русский + английский)
+_AGGREGATE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # count: "посчитай X", "подсчитай X", "количество X", "число X", "count X"
+    (re.compile(
+        r"(?:посчита[йи]\w*|подсчита[йи]\w*|количество|число)\s+"
+        r"([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
+        re.IGNORECASE,
+    ), "count"),
+    (re.compile(
+        r"\bcount\s+(?:of\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
+        re.IGNORECASE,
+    ), "count"),
+    # sum: "сумма X", "суммируй X", "сумму по X", "sum of X", "sum X"
+    (re.compile(
+        r"(?:сумм[аыуе]\w*|суммиру\w+)\s+(?:по\s+)?([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
+        re.IGNORECASE,
+    ), "sum"),
+    (re.compile(
+        r"\bsum\s+(?:of\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
+        re.IGNORECASE,
+    ), "sum"),
+    # avg: "среднее X", "средний X", "средняя X", "avg X", "average X"
+    (re.compile(
+        r"средн[еийяяёая]\w*\s+(?:по\s+)?([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_]*)",
+        re.IGNORECASE,
+    ), "avg"),
+    (re.compile(
+        r"\b(?:avg|average)\s+(?:of\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
+        re.IGNORECASE,
+    ), "avg"),
+]
+
+_COUNT_DISTINCT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\bcount\s*\(\s*distinct\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bcount\s+distinct\s+([a-zA-Z_][a-zA-Z0-9_]*)\b",
+        re.IGNORECASE,
+    ),
+]
+_COUNT_STAR_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"(?:count\s*\(\s*\*\s*\)|count\s+all|count\s+rows|count\s+of\s+rows)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:count\s+по\s+всем\s+строкам|посчита[йи]\w*\s+просто\s+количеств\w*\s+строк|"
+        r"прост\w*\s+количеств\w*\s+строк|все\s+строк[аи]\s+посчита[йи]\w*)",
+        re.IGNORECASE,
+    ),
+]
+_COUNT_NO_DISTINCT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"(?:без\s+distinct|не\s+надо\s+count\s+distinct|не\s+надо\s+distinct|"
+        r"не\s+надо\s+счита\w*\s+по\s+уникальн\w+|не\s+счита\w*\s+по\s+уникальн\w+|не\s+по\s+уникальн\w+)",
+        re.IGNORECASE,
+    ),
+]
+_MULTI_COUNT_DISTINCT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"(?:сколько|число|количество)\s+(?:всего\s+)?(?:есть\s+)?уникальн\w*\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_\s,]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bcount\s+distinct\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_\s,]+)",
+        re.IGNORECASE,
+    ),
+]
+
+# Нормализация гранулярности времени.
+# Ключ — каноническое значение; список — паттерны (подстроки/regex).
+_TIME_GRANULARITY_MAP: dict[str, list[str]] = {
+    "day":     [
+        r"ежедневн\w*", r"по\s+дням", r"\bdaily\b", r"по\s+дню",
+        r"\bby\s+day\b", r"подённо\w*",
+    ],
+    "week":    [
+        r"еженедельн\w*", r"по\s+неделям", r"\bweekly\b", r"по\s+неделе",
+        r"\bby\s+week\b", r"понедельн\w*",
+    ],
+    "month":   [
+        r"помесячн\w*", r"по\s+месяц\w+", r"\bmonthly\b",
+        r"ежемесячн\w*", r"\bby\s+month\b",
+    ],
+    "quarter": [
+        r"поквартальн\w*", r"по\s+квартал\w+", r"\bquarterly\b",
+        r"\bby\s+quarter\b",
+    ],
+    "year":    [
+        r"ежегодн\w*", r"по\s+год\w+", r"\byearly\b", r"\bannually\b",
+        r"\bby\s+year\b",
+    ],
+}
+
+# Компилированные паттерны для гранулярности (строится один раз из _TIME_GRANULARITY_MAP)
+_TIME_GRANULARITY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(pat, re.IGNORECASE), granularity)
+    for granularity, patterns in _TIME_GRANULARITY_MAP.items()
+    for pat in patterns
+]
+
+# Паттерны негативных фильтров
+_NEGATIVE_FILTER_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"не\s+учитыва[йи]\w*\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_\s]*?)(?:[,;.!?]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"исключ[иите]\w*\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_\s]*?)(?:[,;.!?]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"без\s+учёта\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_\s]*?)(?:[,;.!?]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"кроме\s+([a-zA-Zа-яА-ЯёЁ_][a-zA-Zа-яА-ЯёЁ0-9_\s]*?)(?:[,;.!?]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bexclud(?:e|ing)\s+([a-zA-Z_][a-zA-Z0-9_\s]*?)(?:[,;.!?]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bexcept\s+(?:for\s+)?([a-zA-Z_][a-zA-Z0-9_\s]*?)(?:[,;.!?]|$)",
+        re.IGNORECASE,
+    ),
+]
+
 # "<концепт> возьми (в|из) <таблица> (по <поле>)?"
 _DIM_SOURCE_PATTERN = re.compile(
     r"([a-zA-Zа-яА-ЯёЁ_]{3,})\s+возьм[иите]+\s+(?:из|в)\s+"
@@ -133,6 +288,8 @@ _KEY_SYNONYMS: dict[str, list[str]] = {
     "дата": ["date", "dt", "report_dt"],
     "сотрудник": ["employee", "emp", "staff"],
     "клиент": ["client", "customer"],
+    "тб": ["tb_id", "tb"],
+    "госб": ["gosb_id", "gosb", "old_gosb_id"],
 }
 
 
@@ -258,6 +415,40 @@ def _resolve_join_field(
 # Публичная функция
 # ---------------------------------------------------------------------------
 
+def _column_exists_in_catalog(column: str, schema_loader: Any) -> bool:
+    """Проверить, есть ли колонка с таким именем хотя бы в одной таблице каталога."""
+    if schema_loader is None:
+        return False
+    attrs_df = schema_loader.attrs_df
+    if attrs_df.empty:
+        return False
+    return bool((attrs_df["column_name"].str.lower() == column.lower()).any())
+
+
+def _resolve_aggregate_targets(text: str, schema_loader: Any) -> list[str]:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return []
+    raw = re.sub(r"\b(?:всего|есть|уникальн\w*|distinct|count)\b", " ", raw, flags=re.IGNORECASE)
+    tokens = [
+        tok.strip()
+        for tok in re.split(r"\s+и\s+|,|/|;", raw)
+        if tok.strip()
+    ]
+    resolved: list[str] = []
+    for token in tokens:
+        cols = _resolve_join_field(token, schema_loader)
+        if cols:
+            for col in cols:
+                if col not in resolved:
+                    resolved.append(col)
+            continue
+        token_norm = _normalize_slot_key(token)
+        if _column_exists_in_catalog(token_norm, schema_loader) and token_norm not in resolved:
+            resolved.append(token_norm)
+    return resolved
+
+
 def extract_user_hints(
     user_input: str,
     schema_loader: Any,
@@ -274,6 +465,12 @@ def extract_user_hints(
             "join_fields": ["inn", "customer_id", ...],
             "dim_sources": {"segment": {"table": "schema.t", "join_col": "inn"}},
             "having_hints": [{"op": ">=", "value": 3, "unit_hint": "человек"}],
+            "group_by_hints": ["task_code", "region", ...],
+            "aggregate_hints": [("count", "task"), ("sum", "revenue"), ...],
+            "aggregation_preferences": {"function": "count", "column": "task_code", "distinct": True},
+            "aggregation_preferences_list": [{"function": "count", "column": "task_code", "distinct": True}],
+            "time_granularity": "month" | "quarter" | "year" | "day" | "week" | None,
+            "negative_filters": ["канцелярия", ...],
         }
     """
     result: dict[str, Any] = {
@@ -281,6 +478,12 @@ def extract_user_hints(
         "join_fields": [],
         "dim_sources": {},
         "having_hints": [],
+        "group_by_hints": [],
+        "aggregate_hints": [],
+        "aggregation_preferences": {},
+        "aggregation_preferences_list": [],
+        "time_granularity": None,
+        "negative_filters": [],
     }
 
     if not user_input or schema_loader is None:
@@ -371,13 +574,114 @@ def extract_user_hints(
             })
     result["having_hints"] = having_hints
 
+    # 6. Explicit group-by markers: "сгруппируй по X", "group by X", "По X" (после точки)
+    group_by_hints: list[str] = []
+    for pattern in _GROUP_BY_EXPLICIT_PATTERNS:
+        for m in pattern.finditer(user_input):
+            token = m.group(1).lower().strip()
+            if token in _STOP_WORDS:
+                continue
+            if not _column_exists_in_catalog(token, schema_loader):
+                logger.debug("group_by_hints: колонка '%s' не найдена в каталоге, пропускаем", token)
+                continue
+            if token not in group_by_hints:
+                group_by_hints.append(token)
+
+    result["group_by_hints"] = group_by_hints
+
+    # 7. Aggregate hints: "посчитай X", "сумма по X", etc.
+    aggregate_hints: list[tuple[str, str]] = []
+    for pattern, agg_func in _AGGREGATE_PATTERNS:
+        for m in pattern.finditer(user_input):
+            unit = m.group(1).strip().lower()
+            if not unit or unit in _STOP_WORDS:
+                continue
+            pair = (agg_func, unit)
+            if pair not in aggregate_hints:
+                aggregate_hints.append(pair)
+    result["aggregate_hints"] = aggregate_hints
+
+    aggregation_preferences: dict[str, Any] = {}
+    for pattern in _COUNT_STAR_PATTERNS:
+        if pattern.search(user_input):
+            aggregation_preferences = {
+                "function": "count",
+                "column": "*",
+                "distinct": False,
+                "force_count_star": True,
+            }
+            break
+    if not aggregation_preferences:
+        for pattern in _COUNT_DISTINCT_PATTERNS:
+            match = pattern.search(user_input)
+            if not match:
+                continue
+            column = match.group(1).strip().lower()
+            if not column:
+                continue
+            aggregation_preferences = {
+                "function": "count",
+                "column": column,
+                "distinct": True,
+            }
+            break
+    if not aggregation_preferences and any(pattern.search(user_input) for pattern in _COUNT_NO_DISTINCT_PATTERNS):
+        aggregation_preferences = {
+            "function": "count",
+            "distinct": False,
+        }
+    elif aggregation_preferences and any(pattern.search(user_input) for pattern in _COUNT_NO_DISTINCT_PATTERNS):
+        aggregation_preferences["distinct"] = False
+    result["aggregation_preferences"] = aggregation_preferences
+    aggregation_preferences_list: list[dict[str, Any]] = []
+    for pattern in _MULTI_COUNT_DISTINCT_PATTERNS:
+        match = pattern.search(user_input)
+        if not match:
+            continue
+        for col in _resolve_aggregate_targets(match.group(1), schema_loader):
+            aggregation_preferences_list.append({
+                "function": "count",
+                "column": col,
+                "distinct": True,
+            })
+        if aggregation_preferences_list:
+            break
+    if aggregation_preferences:
+        base_entry = dict(aggregation_preferences)
+        if base_entry not in aggregation_preferences_list:
+            aggregation_preferences_list.insert(0, base_entry)
+    result["aggregation_preferences_list"] = aggregation_preferences_list
+
+    # 8. Time granularity: "помесячно" → "month", "по кварталам" → "quarter"
+    time_granularity: str | None = None
+    for pattern, granularity in _TIME_GRANULARITY_PATTERNS:
+        if pattern.search(user_input):
+            time_granularity = granularity
+            break
+    result["time_granularity"] = time_granularity
+
+    # 9. Negative filters: "не учитывай X", "исключи Y"
+    negative_filters: list[str] = []
+    for pattern in _NEGATIVE_FILTER_PATTERNS:
+        for m in pattern.finditer(user_input):
+            value = m.group(1).strip().lower()
+            value = re.sub(r"\s+", " ", value).strip()
+            if value and value not in negative_filters:
+                negative_filters.append(value)
+    result["negative_filters"] = negative_filters
+
     logger.info(
         "UserHintExtractor: must_keep=%d, join_fields=%d, dim_sources=%s, "
-        "having_hints=%d",
+        "having_hints=%d, group_by=%d, aggregate=%d, time_granularity=%s, "
+        "negative_filters=%d",
         len(must_keep),
         len(join_fields),
         summarize_dict_keys(dim_sources, label="dim_sources"),
         len(having_hints),
+        len(group_by_hints),
+        len(aggregate_hints),
+        time_granularity,
+        len(negative_filters),
     )
 
     return result

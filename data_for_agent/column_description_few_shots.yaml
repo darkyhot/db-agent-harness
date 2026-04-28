@@ -1,0 +1,86 @@
+columns:
+- column_name: report_dt
+  description: Отчетная дата
+- column_name: tb_id
+  description: Идентификатор ТБ
+- column_name: gosb_id
+  description: Идентификатор ГОСБ
+- column_name: inn
+  description: ИНН
+- column_name: segment_name
+  description: Наименование сегмента
+- column_name: is_force
+  description: Признак силовой организации
+- column_name: tb_short_name
+  description: Краткое наименование ТБ
+- column_name: tb_full_name
+  description: Полное наименование ТБ
+- column_name: old_gosb_name
+  description: Старое наименование ГОСБ
+- column_name: old_gosb_id
+  description: Старый номер ГОСБ
+- column_name: new_gosb_name
+  description: Новое наименование ГОСБ
+- column_name: new_gosb_id
+  description: Новый номер ГОСБ
+- column_name: tb_name
+  description: Наименование ТБ
+- column_name: gosb_name
+  description: Наименование ГОСБ
+- column_name: department_manager_saphr_id
+  description: Табельный номер начальника отдела
+- column_name: department_manager_saphr_fio
+  description: ФИО начальника отдела
+- column_name: task_manager_saphr_id
+  description: Табельный номер руководителя направления
+- column_name: task_manager_saphr_fio
+  description: ФИО руководителя направления
+- column_name: acc_num
+  description: Номер счета
+- column_name: acc_open_dt
+  description: Дата открытия счета
+- column_name: acc_subtype
+  description: Подтип кода счета
+- column_name: acc_type
+  description: Тип агрегирования по периодам SUM->сумма/AVG->средневзешенное/LAST->последний
+    период
+- column_name: actual_client_tid
+  description: Актуальный идентификатор клиента
+- column_name: amt
+  description: Сумма транзакции
+- column_name: epk_id
+  description: Идентификатор ЕПК
+- column_name: saphr_id
+  description: Табельный номер сотрудника
+- column_name: post_id
+  description: Идентификатор должности сотрудника
+- column_name: pos_id
+  description: Идентификатор позиции сотрудника
+- column_name: role_id
+  description: Идентификатор закрепленной роли
+- column_name: start_dttm
+  description: Дата и время начала закрепления
+- column_name: epk_create_dttm
+  description: Дата создания карточки ЕПК
+- column_name: client_type_id
+  description: Идентификатор типа клиента
+- column_name: client_type_name
+  description: Наименование типа клиента
+- column_name: industry_id
+  description: Идентификатор отрасли
+- column_name: industry_name
+  description: Наименование отрасли
+- column_name: kpp
+  description: КПП
+- column_name: fio
+  description: ФИО
+- column_name: post_name
+  description: Наименование эталонной должности
+- column_name: pos_name
+  description: Наименование штатной должности
+- column_name: tb_code
+  description: Код ТБ
+- column_name: gosb_code
+  description: Код ГОСБ
+- column_name: sap_gosb_code
+  description: Исходный код ГОСБ из SAP

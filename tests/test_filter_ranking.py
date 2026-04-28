@@ -1,6 +1,6 @@
 import pandas as pd
 
-from core.filter_ranking import rank_filter_candidates
+from core.filter_ranking import _column_looks_like_subject_flag, _subject_alias_stems, rank_filter_candidates
 from core.schema_loader import SchemaLoader
 from core.semantic_frame import derive_semantic_frame
 
@@ -266,3 +266,104 @@ def test_filter_ranking_records_example_values_for_fallback_label(tmp_path):
     )
     top = next(c for c in next(iter(ranked.values())) if c["column"] == "task_subtype")
     assert top["example_values"][:2] == ["фактический отток", "новый"]
+
+
+def test_filter_ranking_adds_implicit_subject_flag_for_task_rows(tmp_path):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["outflow_snapshot"],
+        "description": ["Снимок событий оттока"],
+        "grain": ["snapshot"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["outflow_snapshot"] * 3,
+        "column_name": ["report_dt", "inn", "is_task"],
+        "dType": ["date", "text", "boolean"],
+        "description": ["Отчетная дата", "ИНН клиента", "Признак выставленной задачи"],
+        "is_primary_key": [False, False, False],
+        "unique_perc": [0.5, 90.0, 0.02],
+        "not_null_perc": [100.0, 100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+
+    frame = derive_semantic_frame("Сколько задач", schema_loader=loader)
+    ranked = rank_filter_candidates(
+        user_input="Сколько задач",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.outflow_snapshot"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+
+    assert "implicit_subject_flag:dm.outflow_snapshot.is_task" in ranked
+    top = ranked["implicit_subject_flag:dm.outflow_snapshot.is_task"][0]
+    assert top["column"] == "is_task"
+    assert top["condition"] == "is_task = true"
+
+
+def test_implicit_flag_found_when_subject_misclassified_to_outflow(tmp_path):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["outflow_snapshot"],
+        "description": ["Снимок событий оттока"],
+        "grain": ["snapshot"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["outflow_snapshot"] * 3,
+        "column_name": ["report_dt", "inn", "is_task"],
+        "dType": ["date", "text", "boolean"],
+        "description": ["Отчетная дата", "ИНН клиента", "Признак выставленной задачи"],
+        "is_primary_key": [False, False, False],
+        "unique_perc": [0.5, 90.0, 0.02],
+        "not_null_perc": [100.0, 100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+
+    ranked = rank_filter_candidates(
+        user_input="Сколько задач по оттоку",
+        intent={"filter_conditions": []},
+        selected_tables=["dm.outflow_snapshot"],
+        schema_loader=loader,
+        semantic_frame={"subject": "outflow", "filter_intents": []},
+    )
+
+    assert "implicit_subject_flag:dm.outflow_snapshot.is_task" in ranked
+    top = ranked["implicit_subject_flag:dm.outflow_snapshot.is_task"][0]
+    assert top["column"] == "is_task"
+
+
+def test_column_looks_like_subject_flag_handles_english_plural():
+    assert _column_looks_like_subject_flag("is_tasks", {"task"})
+
+
+def test_subject_alias_stems_falls_back_to_builtin_map(tmp_path):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["snapshot_x"],
+        "description": ["Снимок"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["snapshot_x"],
+        "column_name": ["report_dt"],
+        "dType": ["date"],
+        "description": ["Дата"],
+        "is_primary_key": [False],
+        "unique_perc": [0.0],
+        "not_null_perc": [100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader._semantic_lexicon = {"subjects": {}}
+
+    stems = _subject_alias_stems("task", loader)
+    assert "задач" in stems or "task" in stems

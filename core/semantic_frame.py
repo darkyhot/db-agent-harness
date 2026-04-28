@@ -5,7 +5,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from core.semantic_registry import find_best_subject, find_matching_dimensions, find_matching_rules
+from core.semantic_registry import (
+    builtin_subject_aliases,
+    find_best_subject,
+    find_matching_dimensions,
+    find_matching_rules,
+)
 
 
 _RU_MONTH_STEMS = (
@@ -28,6 +33,16 @@ def sanitize_user_input_for_semantics(user_input: str) -> str:
     """Убрать служебные CLI-аннотации, не относящиеся к бизнес-смыслу запроса."""
     text = str(user_input or "")
     text = _SERVICE_SUFFIX_RE.sub("", text)
+    # Clarification question text is UI/service context. Keeping it in semantic
+    # extraction makes phrases like "к февралю 26" look like real filters or
+    # dimensions. The user's answer is kept because it can carry useful values
+    # such as a year.
+    lines = []
+    for line in text.splitlines():
+        if re.match(r"^\s*Вопрос\s+уточнения\s*:", line, flags=re.IGNORECASE):
+            continue
+        lines.append(line)
+    text = "\n".join(lines)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -37,27 +52,11 @@ def _collect_text(user_input: str, intent: dict[str, Any] | None) -> str:
     return " ".join([user_input or ""] + entities + required).lower()
 
 
-def _normalize_text(text: str) -> str:
-    text = str(text or "").lower().replace("ё", "е")
-    text = re.sub(r"[^0-9a-zа-я_ ]+", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _tokenize(text: str) -> list[str]:
-    return [tok for tok in _normalize_text(text).split() if len(tok) >= 2]
-
-
-def _stem(token: str) -> str:
-    token = _normalize_text(token)
-    for suffix in (
-        "ыми", "ими", "ого", "его", "ому", "ему", "ая", "яя", "ое", "ее",
-        "ые", "ие", "ый", "ий", "ой", "ом", "ем", "ым", "им", "ах", "ях",
-        "ов", "ев", "ей", "ам", "ям", "у", "ю", "а", "я", "ы", "и", "е", "о",
-    ):
-        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
-            return token[: -len(suffix)]
-    return token
+from core.text_normalize import (  # noqa: E402
+    normalize_text as _normalize_text,
+    stem as _stem,
+    tokenize as _tokenize,
+)
 
 
 def _metric_intent(intent: dict[str, Any] | None, haystack: str) -> str | None:
@@ -224,6 +223,36 @@ def _has_explicit_grouping_request(
     return bool(_extract_output_dimension_hints(user_input))
 
 
+def _looks_like_aggregate_metric_filter(
+    item: dict[str, Any],
+    user_input: str,
+    metric_intent: str | None,
+) -> bool:
+    """Отсечь value-candidate фильтр, если слово является метрикой агрегации.
+
+    Пример: в `сумма оттока` слово `отток` задаёт измеряемую величину, а не
+    фильтр по enum-значению вроде `task_subtype = 'Фактический отток'`.
+    """
+    if metric_intent not in {"sum", "avg", "min", "max"}:
+        return False
+
+    normalized_input = _normalize_text(user_input)
+    event_pattern = r"(?:отток\w*|outflow|churn|attrition)"
+    aggregate_pattern = (
+        r"(?:сумм\w*|sum|средн\w*|avg|average|min|max|миним\w*|максим\w*)"
+        rf"(?:\s+\w+){{0,2}}\s+{event_pattern}"
+    )
+    if not re.search(aggregate_pattern, normalized_input):
+        return False
+
+    phrase = " ".join(
+        str(item.get(key) or "")
+        for key in ("query_text", "matched_phrase", "column_key", "request_id")
+    )
+    phrase_norm = _normalize_text(phrase)
+    return bool(re.search(event_pattern, phrase_norm))
+
+
 def _derive_filter_intents(
     *,
     user_input: str,
@@ -317,22 +346,30 @@ def derive_semantic_frame(
     user_input: str,
     intent: dict[str, Any] | None = None,
     schema_loader=None,
+    user_hints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build semantic frame using metadata-driven lexicon when available."""
+    """Build semantic frame using metadata-driven lexicon when available.
+
+    Args:
+        user_input: Текст запроса пользователя.
+        intent: Результат intent_classifier (опционально).
+        schema_loader: SchemaLoader с каталогом (опционально).
+        user_hints: Финальные user_hints (после merge в hint_extractor). Если заданы,
+            используются как приоритетный источник для metric_intent,
+            output_dimensions и period_kind — регекс-эвристики вокруг
+            `haystack`/дат ничего не перезаписывают.
+    """
     clean_input = sanitize_user_input_for_semantics(user_input)
     haystack = _collect_text(clean_input, intent)
     lexicon = schema_loader.get_semantic_lexicon() if schema_loader is not None else {}
+    user_hints = user_hints or {}
 
     subject = find_best_subject(haystack, lexicon) if lexicon else None
     if subject is None:
-        if any(token in haystack for token in ("task", "ticket", "issue", "задач", "воронка")):
-            subject = "task"
-        elif any(token in haystack for token in ("client", "customer", "клиент")):
-            subject = "client"
-        elif any(token in haystack for token in ("employee", "staff", "сотрудник")):
-            subject = "employee"
-        elif any(token in haystack for token in ("organization", "org", "branch", "госб", "тб")):
-            subject = "organization"
+        for candidate, aliases in builtin_subject_aliases().items():
+            if any(token in haystack for token in aliases):
+                subject = candidate
+                break
 
     raw_filter_intents = _derive_filter_intents(user_input=clean_input, intent=intent, schema_loader=schema_loader)
 
@@ -340,19 +377,38 @@ def derive_semantic_frame(
     period_kind = None
     if re.search(r"\b(20\d{2}|\d{2})\b", haystack) or any(stem in haystack for stem in _RU_MONTH_STEMS):
         period_kind = "calendar"
+    if user_hints.get("time_granularity"):
+        # LLM/regex извлёк явную гранулярность → календарный period.
+        period_kind = "calendar"
 
     metric_intent = _metric_intent(intent, haystack)
+    hint_aggs = user_hints.get("aggregate_hints") or []
+    if hint_aggs and isinstance(hint_aggs[0], dict):
+        hint_fn = hint_aggs[0].get("function")
+        if hint_fn in {"count", "sum", "avg", "min", "max", "list"}:
+            metric_intent = hint_fn
+
     output_dimensions = (
         find_matching_dimensions(haystack, lexicon) if lexicon else []
     )
     output_dimensions = list(dict.fromkeys(output_dimensions + _extract_output_dimension_hints(clean_input)))
     required_output = [str(v).strip().lower() for v in ((intent or {}).get("required_output") or []) if str(v).strip()]
     output_dimensions = list(dict.fromkeys(required_output + output_dimensions))
+    hint_group_by = [
+        str(v).strip().lower()
+        for v in (user_hints.get("group_by_hints") or [])
+        if str(v).strip()
+    ]
+    if hint_group_by:
+        output_dimensions = list(dict.fromkeys(hint_group_by + output_dimensions))
     qualifier = None
     business_event = None
     ambiguities: list[str] = []
 
-    filter_intents = raw_filter_intents
+    filter_intents = [
+        item for item in raw_filter_intents
+        if not _looks_like_aggregate_metric_filter(item, clean_input, metric_intent)
+    ]
     filter_intents = [
         item for item in filter_intents
         if not _looks_like_output_dimension_filter(item, output_dimensions)

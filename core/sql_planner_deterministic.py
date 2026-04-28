@@ -159,6 +159,72 @@ def _compute_group_by(
 
 
 # ---------------------------------------------------------------------------
+# 2a-ext. TIME GRANULARITY — DATE_TRUNC wrap для group_by
+# ---------------------------------------------------------------------------
+
+_DATE_LIKE_DTYPES: frozenset[str] = frozenset({
+    "date", "timestamp", "timestamptz",
+    "timestamp with time zone", "timestamp without time zone",
+})
+
+
+def _apply_time_granularity(
+    group_by: list[str],
+    selected_columns: dict[str, dict],
+    time_granularity: str | None,
+    schema_loader,
+) -> list[str]:
+    """Обернуть date/timestamp-колонки в DATE_TRUNC если задана гранулярность.
+
+    Если колонка уже в group_by — заменяет её на DATE_TRUNC(gran, col).
+    Если date-колонка есть в select/filter, но не в group_by — добавляет DATE_TRUNC в группировку.
+    Если date-колонок нет — возвращает group_by без изменений.
+    """
+    if not time_granularity or schema_loader is None:
+        return group_by
+
+    date_cols: set[str] = set()
+    for table_key, roles in selected_columns.items():
+        parts = table_key.split(".", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            cols_df = schema_loader.get_table_columns(parts[0], parts[1])
+        except Exception:
+            continue
+        for _, row in cols_df.iterrows():
+            dtype_raw = str(row.get("dType") or row.get("dtype") or "").lower().strip()
+            if any(d in dtype_raw for d in _DATE_LIKE_DTYPES):
+                col_name = str(row.get("column_name", "")).strip()
+                if col_name:
+                    date_cols.add(col_name.lower())
+
+    if not date_cols:
+        return group_by
+
+    result: list[str] = []
+    wrapped: set[str] = set()
+    for col in group_by:
+        if col.lower() in date_cols:
+            expr = f"DATE_TRUNC('{time_granularity}', {col})"
+            result.append(expr)
+            wrapped.add(col.lower())
+        else:
+            result.append(col)
+
+    # Добавляем date-колонки из select/filter, которых нет в group_by
+    all_in_gb = {c.lower() for c in group_by}
+    for table_key, roles in selected_columns.items():
+        for role in ("select", "filter"):
+            for col in roles.get(role, []):
+                if col.lower() in date_cols and col.lower() not in all_in_gb:
+                    result.append(f"DATE_TRUNC('{time_granularity}', {col})")
+                    all_in_gb.add(col.lower())
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 2b. HAVING (постагрегатные фильтры из user_hints)
 # ---------------------------------------------------------------------------
 
@@ -243,9 +309,12 @@ def _count_column_should_be_distinct(
     column: str,
     schema_loader=None,
     semantic_frame: dict | None = None,
+    strategy: str = "",
 ) -> bool:
     """Определить, нужно ли считать COUNT по колонке как DISTINCT."""
     if not column or column == "*":
+        return False
+    if strategy == "simple_select":
         return False
     if (semantic_frame or {}).get("requires_single_entity_count"):
         return True
@@ -274,9 +343,29 @@ def _count_column_should_be_distinct(
     return False
 
 
+def _list_pk_candidates(main_table: str, schema_loader) -> list[str]:
+    """Список PK-колонок таблицы (для LLM-резолвера при составном PK)."""
+    if not main_table or schema_loader is None or "." not in main_table:
+        return []
+    schema_name, table_name = main_table.split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return []
+    pks: list[str] = []
+    for _, row in cols_df.iterrows():
+        if not bool(row.get("is_primary_key", False)):
+            continue
+        name = str(row.get("column_name", "") or "").strip()
+        if name:
+            pks.append(name)
+    return pks
+
+
 def _choose_count_identifier_column(
     main_table: str,
     schema_loader,
+    semantic_frame: dict | None = None,
+    user_input: str = "",
 ) -> str | None:
     """Подобрать identifier/PK-колонку для COUNT(DISTINCT ...) safety net."""
     if not main_table or schema_loader is None or "." not in main_table:
@@ -285,6 +374,17 @@ def _choose_count_identifier_column(
     cols_df = schema_loader.get_table_columns(schema_name, table_name)
     if cols_df.empty:
         return None
+    try:
+        from core.filter_ranking import _stem_set, _subject_alias_stems, _text_score
+    except Exception:  # noqa: BLE001
+        _stem_set = None
+        _subject_alias_stems = None
+        _text_score = None
+
+    subject = str((semantic_frame or {}).get("subject") or "").strip().lower()
+    subject_stems = _subject_alias_stems(subject, schema_loader) if _subject_alias_stems and subject else set()
+    query_stems = _stem_set(user_input) if _stem_set else set()
+    grain = str(schema_loader.get_table_semantics(schema_name, table_name).get("grain") or "").strip().lower()
 
     best: tuple[float, str] | None = None
     for _, row in cols_df.iterrows():
@@ -302,60 +402,260 @@ def _choose_count_identifier_column(
         if sem_class == "identifier":
             score += 60.0
         lower_name = col_name.lower()
+        col_stems = _stem_set(col_name.replace("_", " ")) if _stem_set else set()
+        if col_stems & (subject_stems | query_stems):
+            score += 90.0
+        if _text_score is not None:
+            score += min(_text_score(subject or user_input, col_name, str(row.get("description", "") or "")), 14.0)
         if lower_name.endswith("_code"):
             score += 20.0
         if lower_name.endswith("_id"):
             score += 10.0
+        is_date_axis = lower_name.endswith(_DATE_AXIS_SUFFIXES) or sem_class in {"date", "datetime", "timestamp"}
+        if is_date_axis:
+            score -= 80.0
+            if grain == "snapshot" and unique_perc >= 95.0:
+                score -= 40.0
         candidate = (score, col_name)
         if best is None or candidate > best:
             best = candidate
-    if best is None or best[0] < 50.0:
+    if best is None or best[0] < 40.0:
         return None
     return best[1]
+
+
+def _is_time_axis_count_column(
+    main_table: str,
+    column: str,
+    schema_loader=None,
+) -> bool:
+    """True если count-колонка похожа на дату/ось времени и опасна для COUNT."""
+    lower_col = str(column or "").strip().lower()
+    if not lower_col or lower_col == "*":
+        return False
+    if lower_col.endswith(_DATE_AXIS_SUFFIXES):
+        return True
+    if schema_loader is None or "." not in str(main_table or ""):
+        return "date" in lower_col or "dttm" in lower_col or "timestamp" in lower_col
+
+    schema_name, table_name = str(main_table).split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return "date" in lower_col or "dttm" in lower_col or "timestamp" in lower_col
+    matched = cols_df[cols_df["column_name"].astype(str).str.lower() == lower_col]
+    if matched.empty:
+        return "date" in lower_col or "dttm" in lower_col or "timestamp" in lower_col
+    row = matched.iloc[0]
+    dtype = str(row.get("dType", "") or "").lower().strip()
+    semantics = schema_loader.get_column_semantics(schema_name, table_name, lower_col)
+    sem_class = str(semantics.get("semantic_class", "") or "").lower().strip()
+    return (
+        dtype.startswith("date")
+        or dtype.startswith("timestamp")
+        or sem_class in {"date", "datetime", "timestamp", "system_timestamp"}
+    )
 
 
 def _compute_aggregation(
     intent: dict,
     selected_columns: dict[str, dict],
     *,
+    user_hints: dict | None = None,
     schema_loader=None,
     semantic_frame: dict | None = None,
+    strategy: str = "",
+    main_table: str = "",
 ) -> dict | None:
-    """Вычислить агрегацию из intent.aggregation_hint + aggregate-роли колонок."""
+    """Backward-compatible shim: вернуть первую агрегацию из canonical aggregations."""
+    aggregations = _compute_aggregations(
+        intent,
+        selected_columns,
+        user_hints=user_hints,
+        schema_loader=schema_loader,
+        semantic_frame=semantic_frame,
+        strategy=strategy,
+        main_table=main_table,
+    )
+    if not aggregations:
+        return None
+    first = dict(aggregations[0])
+    first.pop("source_table", None)
+    return first
+
+
+def _column_available_for_aggregation(
+    column: str,
+    selected_columns: dict[str, dict],
+    schema_loader=None,
+    main_table: str = "",
+) -> bool:
+    if column == "*":
+        return True
+    selected_cols = {
+        c
+        for roles in selected_columns.values()
+        for role_name in ("aggregate", "select", "group_by", "filter")
+        for c in (roles.get(role_name, []) or [])
+    }
+    if column in selected_cols:
+        return True
+    if schema_loader is None or "." not in main_table:
+        return False
+    schema_name, table_name = main_table.split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return False
+    return bool((cols_df["column_name"].astype(str).str.lower() == column.lower()).any())
+
+
+def _resolve_available_aggregation_column(
+    column: str,
+    selected_columns: dict[str, dict],
+    *,
+    schema_loader=None,
+    main_table: str = "",
+) -> str | None:
+    raw = str(column or "").strip()
+    if not raw:
+        return None
+    if raw == "*":
+        return "*"
+    selected_cols = {
+        str(col)
+        for roles in selected_columns.values()
+        for col in roles.get("aggregate", []) + roles.get("select", [])
+    }
+    by_lower = {col.lower(): col for col in selected_cols}
+    if raw.lower() in by_lower:
+        return by_lower[raw.lower()]
+    aliases = {
+        "gosb_id": ["old_gosb_id"],
+        "gosb": ["old_gosb_id", "gosb_id"],
+        "госб": ["old_gosb_id", "gosb_id"],
+        "tb": ["tb_id"],
+        "тб": ["tb_id"],
+    }
+    for alias in aliases.get(raw.lower(), []):
+        if alias in by_lower:
+            return by_lower[alias]
+    if schema_loader is None or "." not in main_table:
+        return None
+    schema_name, table_name = main_table.split(".", 1)
+    cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    if cols_df.empty:
+        return None
+    names = [str(item) for item in cols_df["column_name"].tolist()]
+    by_catalog = {name.lower(): name for name in names}
+    if raw.lower() in by_catalog:
+        return by_catalog[raw.lower()]
+    for alias in aliases.get(raw.lower(), []):
+        if alias in by_catalog:
+            return by_catalog[alias]
+    return None
+
+
+def _build_aggregation_result(
+    func: str,
+    col: str,
+    *,
+    distinct: bool = False,
+    source_table: str = "",
+) -> dict[str, str | bool]:
+    alias = "count_all" if func == "COUNT" and col == "*" else f"{func.lower()}_{col}"
+    result: dict[str, str | bool] = {"function": func, "column": col, "alias": alias}
+    if distinct and col != "*":
+        result["distinct"] = True
+    if source_table:
+        result["source_table"] = source_table
+    return result
+
+
+def _compute_aggregations(
+    intent: dict,
+    selected_columns: dict[str, dict],
+    *,
+    user_hints: dict | None = None,
+    schema_loader=None,
+    semantic_frame: dict | None = None,
+    strategy: str = "",
+    main_table: str = "",
+) -> list[dict]:
     hint = (intent.get("aggregation_hint") or "").lower().strip()
     func = _HINT_TO_FUNC.get(hint)
-
     if not func:
-        # Нет агрегации или «list» — просто выборка без агрегата
-        return None
+        return []
 
-    # Находим первую колонку с ролью aggregate
-    for _table, roles in selected_columns.items():
-        agg_cols = roles.get("aggregate", [])
-        if agg_cols:
-            col = agg_cols[0]
-            alias = "count_all" if hint == "count" and col == "*" else f"{func.lower()}_{col}"
-            distinct = False
-            if hint == "count" and (
-                col.lower().endswith("_count_distinct")
-                or _count_column_should_be_distinct(
-                    selected_columns,
-                    col,
-                    schema_loader=schema_loader,
-                    semantic_frame=semantic_frame,
-                )
-            ):
-                distinct = True
-            result: dict = {"function": func, "column": col, "alias": alias}
-            if distinct:
-                result["distinct"] = True
-            return result
+    user_hints = user_hints or {}
+    explicit_overrides = list(user_hints.get("aggregation_preferences_list") or [])
+    legacy_override = (user_hints.get("aggregation_preferences") or {}) if isinstance(user_hints, dict) else {}
+    if legacy_override and legacy_override not in explicit_overrides:
+        explicit_overrides.insert(0, legacy_override)
 
-    # Нет явной aggregate-роли — COUNT(*) как fallback для count
-    if hint == "count":
-        return {"function": "COUNT", "column": "*", "alias": "count_all"}
+    results: list[dict] = []
+    seen: set[tuple[str, str, bool]] = set()
+    preserve_distinct = False
 
-    return None
+    if hint == "count" and explicit_overrides:
+        for override in explicit_overrides:
+            override_func = str(override.get("function") or "").strip().lower()
+            col = _resolve_available_aggregation_column(
+                str(override.get("column") or "").strip(),
+                selected_columns,
+                schema_loader=schema_loader,
+                main_table=main_table,
+            ) or ""
+            if override_func not in {"", "count"} or not col:
+                continue
+            distinct = bool(override.get("distinct")) and col != "*"
+            preserve_distinct = preserve_distinct or distinct
+            key = ("COUNT", col, distinct)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(_build_aggregation_result("COUNT", col, distinct=distinct, source_table=main_table))
+        if results:
+            if strategy == "simple_select" and not preserve_distinct:
+                for item in results:
+                    item.pop("distinct", None)
+            return results
+
+    table_order = list(selected_columns.keys())
+    if main_table in selected_columns:
+        table_order = [main_table] + [t for t in table_order if t != main_table]
+
+    for table_key in table_order:
+        roles = selected_columns.get(table_key, {})
+        agg_cols = list(roles.get("aggregate", []) or [])
+        if not agg_cols:
+            continue
+        col = agg_cols[0]
+        distinct = False
+        if hint == "count" and (
+            col.lower().endswith("_count_distinct")
+            or _count_column_should_be_distinct(
+                selected_columns,
+                col,
+                schema_loader=schema_loader,
+                semantic_frame=semantic_frame,
+                strategy=strategy,
+            )
+        ):
+            distinct = True
+        key = (func, col, distinct)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(_build_aggregation_result(func, col, distinct=distinct, source_table=table_key))
+        break
+
+    if not results and hint == "count":
+        results.append(_build_aggregation_result("COUNT", "*", distinct=False, source_table=main_table))
+
+    if strategy == "simple_select" and func == "COUNT" and not preserve_distinct:
+        for item in results:
+            item.pop("distinct", None)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -396,10 +696,68 @@ def _quote_value(value: str, operator: str) -> str:
     return f"'{safe_val}'"
 
 
+_BOOL_DTYPES = ("bool", "boolean")
+_INT_DTYPES = ("int", "smallint", "integer", "bigint", "int2", "int4", "int8", "numeric", "decimal", "float", "double", "real")
+_DATE_DTYPES = ("date", "timestamp", "datetime", "time")
+
+
+def _value_compatible_with_dtype(value: str, operator: str, dtype: str) -> tuple[bool, str]:
+    """Проверить совместимость литерала с dtype колонки.
+
+    Returns (compatible, reason). Если dtype неизвестен — возвращает True.
+    """
+    dtype_l = (dtype or "").lower().strip()
+    if not dtype_l:
+        return True, "unknown_dtype"
+
+    val = (value or "").strip().strip("'\"").lower()
+    is_date_literal = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", val))
+    is_bool_literal = val in {"true", "false", "0", "1", "t", "f"}
+    is_numeric_literal = bool(re.fullmatch(r"-?\d+(?:\.\d+)?", val))
+
+    is_bool_col = any(b in dtype_l for b in _BOOL_DTYPES)
+    is_date_col = any(d in dtype_l for d in _DATE_DTYPES)
+    is_numeric_col = (not is_bool_col) and any(
+        d == dtype_l or dtype_l.startswith(d) for d in _INT_DTYPES
+    )
+
+    if is_bool_col and is_date_literal:
+        return False, f"date literal {value!r} incompatible with bool column"
+    if is_numeric_col and is_date_literal:
+        return False, f"date literal {value!r} incompatible with numeric column dtype={dtype_l}"
+    if is_date_col and is_bool_literal and not is_numeric_literal:
+        # 'true'/'false' on date column is always wrong
+        if val in {"true", "false", "t", "f"}:
+            return False, f"bool literal {value!r} incompatible with date column"
+    return True, "ok"
+
+
+def _lookup_column_dtype(
+    schema_loader,
+    selected_columns: dict[str, dict],
+    column: str,
+) -> str:
+    """Найти dtype колонки в любой из selected-таблиц. Пустая строка, если не нашли."""
+    if schema_loader is None:
+        return ""
+    for table_key in selected_columns:
+        if "." not in table_key:
+            continue
+        schema, table = table_key.split(".", 1)
+        try:
+            dtype = schema_loader.get_column_dtype(schema, table, column)
+        except Exception:  # noqa: BLE001
+            continue
+        if dtype:
+            return dtype
+    return ""
+
+
 def _compute_where_from_intent(
     intent: dict,
     selected_columns: dict[str, dict],
     user_input: str = "",
+    schema_loader=None,
 ) -> list[str]:
     """Сформировать WHERE-условия из структурированных данных в intent.
 
@@ -447,6 +805,22 @@ def _compute_where_from_intent(
 
             if not hint or not value:
                 continue
+            if (
+                (date_from or date_to)
+                and operator.strip().upper() in {"=", "=="}
+                and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+                and (
+                    any(token in hint for token in ("date", "dt", "dttm", "timestamp"))
+                    or hint.endswith(("_ts",))
+                )
+            ):
+                logger.debug(
+                    "DeterministicPlanner: literal date filter %s=%s пропущен, "
+                    "так как уже есть календарный диапазон",
+                    hint,
+                    value,
+                )
+                continue
 
             # Проверяем оператор на допустимость
             if not _OPERATOR_RE.match(operator):
@@ -469,12 +843,21 @@ def _compute_where_from_intent(
                         break
 
             if matched_col:
-                quoted = _quote_value(value, operator)
                 op_upper = operator.strip().upper()
+                dtype = _lookup_column_dtype(schema_loader, selected_columns, matched_col)
+                compatible, reason = _value_compatible_with_dtype(value, op_upper, dtype)
+                if not compatible:
+                    logger.warning(
+                        "DeterministicPlanner: dropping filter %s %s %r — %s",
+                        matched_col, op_upper, value, reason,
+                    )
+                    continue
+                quoted = _quote_value(value, operator)
                 conditions.append(f"{matched_col} {op_upper} {quoted}")
                 logger.debug(
-                    "DeterministicPlanner: filter_condition %s %s %s → %s",
-                    matched_col, op_upper, quoted, f"{matched_col} {op_upper} {quoted}",
+                    "DeterministicPlanner: filter_condition %s %s %s (dtype=%s) → %s",
+                    matched_col, op_upper, quoted, dtype or "?",
+                    f"{matched_col} {op_upper} {quoted}",
                 )
             else:
                 logger.debug(
@@ -531,23 +914,68 @@ def _derive_date_filters_from_text(user_input: str) -> dict[str, str | None]:
     }
 
 
-def _find_date_column(selected_columns: dict[str, dict]) -> str | None:
-    """Найти первую колонку с date/timestamp-семантикой в filter-ролях."""
-    _date_suffixes = ("_dt", "_date", "_dttm", "_timestamp", "_ts", "date", "dttm")
+_DATE_COLUMN_SUFFIXES = ("_dt", "_date", "_dttm", "_timestamp", "_ts", "date", "dttm")
+_DATE_COLUMN_DEPRIO_PREFIXES = ("inserted_", "updated_", "modified_", "created_", "load_", "etl_")
 
+
+def _date_column_priority(col_name: str) -> int:
+    """Меньше — лучше. report_dt → 0, *_dt/_date → 1, *_dttm → 2, inserted_*/updated_* → 4."""
+    name = col_name.lower()
+    if name == "report_dt" or name == "report_date":
+        return 0
+    if name.startswith(_DATE_COLUMN_DEPRIO_PREFIXES):
+        return 4
+    if name.endswith(("_dt", "_date")) or name == "date":
+        return 1
+    if name.endswith(("_dttm", "dttm")):
+        return 2
+    if name.endswith(("_ts", "_timestamp")) or "timestamp" in name:
+        return 3
+    return 5
+
+
+def _rank_date_columns(selected_columns: dict[str, dict]) -> list[str]:
+    """Вернуть все date-колонки из filter-ролей, отсортированные по приоритету."""
+    seen: set[str] = set()
+    ranked: list[tuple[int, str]] = []
     for _table, roles in selected_columns.items():
         for col in roles.get("filter", []):
             col_lower = col.lower()
-            if any(col_lower.endswith(suf) for suf in _date_suffixes):
-                return col
-            if "date" in col_lower or "dttm" in col_lower or "timestamp" in col_lower:
-                return col
+            is_date = any(col_lower.endswith(suf) for suf in _DATE_COLUMN_SUFFIXES) or any(
+                tok in col_lower for tok in ("date", "dttm", "timestamp")
+            )
+            if is_date and col not in seen:
+                seen.add(col)
+                ranked.append((_date_column_priority(col), col))
+    ranked.sort(key=lambda x: x[0])
+    return [col for _, col in ranked]
+
+
+def _find_date_column(selected_columns: dict[str, dict]) -> str | None:
+    """Выбрать наиболее подходящую date-колонку из filter-ролей.
+
+    Приоритет: report_dt > *_dt/_date > *_dttm > *_ts > inserted_/updated_/modified_/created_.
+    Логирует выбранную колонку и альтернативы. Возвращает None, если ничего не найдено
+    (тогда пробует select-роли как fallback, как раньше).
+    """
+    ranked = _rank_date_columns(selected_columns)
+    if ranked:
+        chosen = ranked[0]
+        if len(ranked) > 1:
+            logger.info(
+                "DeterministicPlanner: date_col=%s chosen from %d candidates: %s",
+                chosen, len(ranked), ranked,
+            )
+        else:
+            logger.debug("DeterministicPlanner: date_col=%s (single candidate)", chosen)
+        return chosen
 
     # Fallback: ищем среди select-колонок
     for _table, roles in selected_columns.items():
         for col in roles.get("select", []):
             col_lower = col.lower()
-            if any(col_lower.endswith(suf) for suf in _date_suffixes):
+            if any(col_lower.endswith(suf) for suf in _DATE_COLUMN_SUFFIXES):
+                logger.debug("DeterministicPlanner: date_col=%s (fallback from select)", col)
                 return col
 
     return None
@@ -598,6 +1026,10 @@ def build_blueprint(
     semantic_frame: dict | None = None,
     user_filter_choices: dict[str, str] | None = None,
     rejected_filter_choices: dict[str, list[str]] | None = None,
+    count_identifier_resolver=None,
+    filter_tiebreaker=None,
+    filter_specs: list[dict] | None = None,
+    time_range: dict | None = None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -610,17 +1042,31 @@ def build_blueprint(
         user_input: Текст запроса (для derive date filters).
         user_hints: Подсказки из hint_extractor (having_hints используются здесь).
         schema_loader: SchemaLoader для подбора unit_col в HAVING.
+        count_identifier_resolver: Опциональный callable(main_table, pk_candidates, user_input) -> str | None,
+            который спрашивает LLM, какая колонка — identifier сущности для
+            COUNT(DISTINCT). Срабатывает ТОЛЬКО при составном PK (≥2 кандидатов)
+            в safety-net пути. При None/невалидном ответе — fallback на
+            детерминированный `_choose_count_identifier_column`.
 
     Returns:
         dict совместимый с форматом sql_blueprint из AgentState.
     """
-    aggregation = _compute_aggregation(
+    effective_table_types = {
+        table: table_types.get(table, "unknown")
+        for table in selected_columns
+    }
+    table_types = effective_table_types
+    strategy, main_table = _determine_strategy(effective_table_types, join_spec)
+    aggregations = _compute_aggregations(
         intent,
         selected_columns,
+        user_hints=user_hints,
         schema_loader=schema_loader,
         semantic_frame=semantic_frame,
+        strategy=strategy,
+        main_table=main_table,
     )
-    strategy, main_table = _determine_strategy(table_types, join_spec)
+    aggregation = aggregations[0] if aggregations else None
 
     # --- Блок C: date-aligned JOIN (axis-join по дате) ---
     # Если join_spec указывает на date-колонки — это "аналитический JOIN по оси времени":
@@ -645,24 +1091,88 @@ def build_blueprint(
     if (
         str((intent or {}).get("aggregation_hint") or "").lower().strip() == "count"
         and (semantic_frame or {}).get("requires_single_entity_count")
+        and not list((semantic_frame or {}).get("output_dimensions") or [])
         and schema_loader is not None
         and main_table
+        and not ((user_hints or {}).get("aggregation_preferences") or {}).get("force_count_star")
     ):
         main_roles = selected_columns.setdefault(main_table, {})
         suspicious_group_by = list(main_roles.get("group_by", []) or [])
+        current_agg_cols = list(main_roles.get("aggregate", []) or [])
+        suspicious_agg_col = next(
+            (
+                col for col in current_agg_cols
+                if _is_time_axis_count_column(main_table, col, schema_loader=schema_loader)
+            ),
+            None,
+        )
         fallback_col = None
-        if main_roles.get("aggregate") == ["*"] or suspicious_group_by:
-            fallback_col = _choose_count_identifier_column(main_table, schema_loader)
-        if fallback_col:
+        force_count_star = strategy == "simple_select" and (
+            main_roles.get("aggregate") == ["*"] or suspicious_agg_col is not None
+        )
+        if (main_roles.get("aggregate") == ["*"] or suspicious_group_by or suspicious_agg_col) and not force_count_star:
+            # 1. LLM-резолвер при составном PK — срабатывает только если
+            #    предоставлен callback И в таблице ≥2 PK-кандидата.
+            if count_identifier_resolver is not None:
+                pk_candidates = _list_pk_candidates(main_table, schema_loader)
+                if len(pk_candidates) >= 2:
+                    try:
+                        llm_choice = count_identifier_resolver(
+                            main_table=main_table,
+                            pk_candidates=pk_candidates,
+                            user_input=user_input,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "count_identifier_resolver упал: %s — fallback на detreministic",
+                            exc,
+                        )
+                        llm_choice = None
+                    if llm_choice and llm_choice in pk_candidates:
+                        fallback_col = llm_choice
+                        logger.info(
+                            "DeterministicPlanner: COUNT identifier выбран LLM → %s.%s",
+                            main_table, fallback_col,
+                        )
+            # 2. Fallback на детерминистику.
+            if fallback_col is None:
+                fallback_col = _choose_count_identifier_column(
+                    main_table,
+                    schema_loader,
+                    semantic_frame=semantic_frame,
+                    user_input=user_input,
+                )
+        if force_count_star:
+            main_roles["aggregate"] = ["*"]
+            main_roles.pop("group_by", None)
+            aggregations = _compute_aggregations(
+                intent,
+                selected_columns,
+                user_hints=user_hints,
+                schema_loader=schema_loader,
+                semantic_frame=semantic_frame,
+                strategy=strategy,
+                main_table=main_table,
+            )
+            aggregation = aggregations[0] if aggregations else None
+            logger.info(
+                "DeterministicPlanner: single-entity safety net → %s.COUNT(*)",
+                main_table,
+            )
+        elif fallback_col:
             main_roles["aggregate"] = [fallback_col]
             main_roles["select"] = [fallback_col]
             main_roles.pop("group_by", None)
-            aggregation = _compute_aggregation(
+            aggregations = _compute_aggregations(
                 intent,
                 selected_columns,
+                user_hints=user_hints,
                 schema_loader=schema_loader,
                 semantic_frame=semantic_frame,
+                strategy=strategy,
+                main_table=main_table,
             )
+            aggregation = aggregations[0] if aggregations else None
             logger.info(
                 "DeterministicPlanner: single-entity safety net → %s.%s",
                 main_table, fallback_col,
@@ -682,8 +1192,30 @@ def build_blueprint(
             if other_tables and other_tables[0] in attribute_tables:
                 strategy = "fact_dim_join"
 
+    main_agg_cols = list((selected_columns.get(main_table) or {}).get("aggregate", []) or [])
+    if aggregation and main_agg_cols and aggregation.get("column") not in main_agg_cols:
+        aggregations = _compute_aggregations(
+            intent,
+            selected_columns,
+            user_hints=user_hints,
+            schema_loader=schema_loader,
+            semantic_frame=semantic_frame,
+            strategy=strategy,
+            main_table=main_table,
+        )
+        aggregation = aggregations[0] if aggregations else None
+
     group_by    = _compute_group_by(selected_columns, aggregation)
-    base_where_conditions = _compute_where_from_intent(intent, selected_columns, user_input=user_input)
+
+    # Применяем DATE_TRUNC из time_granularity (если задана)
+    _time_gran = (user_hints or {}).get("time_granularity")
+    if _time_gran:
+        group_by = _apply_time_granularity(group_by, selected_columns, _time_gran, schema_loader)
+        logger.info("DeterministicPlanner: time_granularity='%s' → group_by=%s", _time_gran, group_by)
+
+    base_where_conditions = _compute_where_from_intent(
+        intent, selected_columns, user_input=user_input, schema_loader=schema_loader,
+    )
     where_resolution = resolve_where(
         user_input=user_input,
         intent=intent,
@@ -694,6 +1226,9 @@ def build_blueprint(
         base_conditions=base_where_conditions,
         user_filter_choices=user_filter_choices,
         rejected_filter_choices=rejected_filter_choices,
+        filter_tiebreaker=filter_tiebreaker,
+        filter_specs=filter_specs,
+        time_range=time_range,
     )
     where_conditions = where_resolution.get("conditions", base_where_conditions)
 
@@ -794,13 +1329,18 @@ def build_blueprint(
         main_table=main_table,
     )
 
+    legacy_aggregation = dict(aggregation) if aggregation else None
+    if legacy_aggregation:
+        legacy_aggregation.pop("source_table", None)
+
     blueprint = {
         "strategy": strategy,
         "main_table": main_table,
         "cte_needed": cte_needed,
         "subquery_for": subquery_for,
         "where_conditions": where_conditions,
-        "aggregation": aggregation,
+        "aggregation": legacy_aggregation,
+        "aggregations": aggregations,
         "group_by": group_by,
         "having": having_clauses,
         "order_by": order_by,
@@ -809,7 +1349,7 @@ def build_blueprint(
         "axis_column": axis_column,
         "required_output": required_output,
         "where_resolution": where_resolution,
-        "notes": f"[deterministic] strategy={strategy}, tables={list(table_types.keys())}",
+        "notes": f"[deterministic] strategy={strategy}, tables={list(effective_table_types.keys())}",
     }
 
     logger.info(

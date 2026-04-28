@@ -17,6 +17,18 @@ from tools.path_safety import resolve_workspace_path
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+DEFAULT_CONFIG: dict[str, Any] = {
+    "user_id": "",
+    "host": "",
+    "port": 5432,
+    "database": "prom",
+    "llm_model": "GigaChat-2-Max",
+    "debug_prompt": False,
+    "show_plan": False,
+    "llm_verifier_enabled": False,
+}
+CONNECTION_CONFIG_KEYS = ("user_id", "host", "port", "database")
+RUNTIME_CONFIG_KEYS = ("llm_model", "debug_prompt", "show_plan", "llm_verifier_enabled")
 
 # Regex для валидации идентификаторов (схема, таблица, колонка)
 _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
@@ -74,23 +86,44 @@ class DatabaseManager:
         """
         self._config_path = config_path or CONFIG_PATH
         self._engine: Engine | None = None
-        self._config: dict[str, Any] = {}
+        self._config: dict[str, Any] = dict(DEFAULT_CONFIG)
+        self._loaded_keys: set[str] = set()
+        self._config_file_exists = False
         self._load_config()
 
     def _load_config(self) -> None:
         """Загрузка конфигурации из JSON-файла."""
         try:
             with open(self._config_path, encoding="utf-8") as f:
-                self._config = json.load(f)
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise ValueError("config.json должен содержать JSON-объект")
+            self._config = {**DEFAULT_CONFIG, **loaded}
+            self._loaded_keys = set(loaded.keys())
+            self._config_file_exists = True
             logger.info("Конфигурация загружена из %s", self._config_path)
         except FileNotFoundError:
             logger.warning("Файл конфигурации не найден: %s", self._config_path)
-            self._config = {}
+            self._config = dict(DEFAULT_CONFIG)
+            self._loaded_keys = set()
+            self._config_file_exists = False
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("Некорректный файл конфигурации %s: %s", self._config_path, e)
+            self._config = dict(DEFAULT_CONFIG)
+            self._loaded_keys = set()
+            self._config_file_exists = False
+
+    def _write_config(self) -> None:
+        """Записать текущую конфигурацию на диск."""
+        with open(self._config_path, "w", encoding="utf-8") as f:
+            json.dump(self._config, f, indent=4, ensure_ascii=False)
+        self._loaded_keys = set(self._config.keys())
+        self._config_file_exists = True
 
     def save_config(
         self, user_id: str, host: str, port: int = 5432, database: str = "prom"
     ) -> None:
-        """Сохранить конфигурацию подключения в config.json.
+        """Совместимость: сохранить connection-конфигурацию в config.json.
 
         Args:
             user_id: Имя пользователя БД.
@@ -98,17 +131,48 @@ class DatabaseManager:
             port: Порт подключения.
             database: Имя базы данных.
         """
-        self._config = {
+        self.save_connection_config(user_id, host, port, database)
+
+    def save_connection_config(
+        self, user_id: str, host: str, port: int = 5432, database: str = "prom"
+    ) -> None:
+        """Сохранить только параметры подключения, не трогая runtime-флаги."""
+        self._config.update({
             "user_id": user_id,
             "host": host,
             "port": port,
             "database": database,
-            "debug_prompt": self._config.get("debug_prompt", False),
-        }
-        with open(self._config_path, "w", encoding="utf-8") as f:
-            json.dump(self._config, f, indent=4, ensure_ascii=False)
+        })
+        self._write_config()
         self._engine = None
         logger.info("Конфигурация сохранена: %s@%s:%d/%s", user_id, host, port, database)
+
+    def save_runtime_params(
+        self,
+        *,
+        debug_prompt: bool,
+        show_plan: bool,
+        llm_model: str | None = None,
+        llm_verifier_enabled: bool | None = None,
+    ) -> None:
+        """Сохранить runtime-параметры CLI/графа в config.json."""
+        self._config.update({
+            "debug_prompt": bool(debug_prompt),
+            "show_plan": bool(show_plan),
+        })
+        if llm_model is not None:
+            self._config["llm_model"] = str(llm_model).strip() or DEFAULT_CONFIG["llm_model"]
+        if llm_verifier_enabled is not None:
+            self._config["llm_verifier_enabled"] = bool(llm_verifier_enabled)
+        self._write_config()
+        logger.info(
+            "Runtime-параметры сохранены: llm_model=%s, debug_prompt=%s, "
+            "show_plan=%s, llm_verifier_enabled=%s",
+            self._config.get("llm_model"),
+            bool(debug_prompt),
+            bool(show_plan),
+            self._config.get("llm_verifier_enabled"),
+        )
 
     @property
     def runtime_config(self) -> dict[str, Any]:
@@ -120,9 +184,43 @@ class DatabaseManager:
         self._config["debug_prompt"] = bool(enabled)
 
     @property
+    def config_file_exists(self) -> bool:
+        """Существует ли корректно прочитанный config.json."""
+        return self._config_file_exists
+
+    def missing_connection_fields(self) -> list[str]:
+        """Список отсутствующих полей connection-секции."""
+        missing: list[str] = []
+        for key in CONNECTION_CONFIG_KEYS:
+            value = self._config.get(key)
+            if key not in self._loaded_keys:
+                missing.append(key)
+            elif isinstance(value, str) and not value.strip():
+                missing.append(key)
+        return missing
+
+    def missing_runtime_fields(self) -> list[str]:
+        """Список отсутствующих полей runtime-секции."""
+        missing: list[str] = []
+        for key in RUNTIME_CONFIG_KEYS:
+            if key not in self._loaded_keys:
+                missing.append(key)
+        return missing
+
+    @property
     def is_configured(self) -> bool:
         """Проверка наличия минимальной конфигурации."""
-        return bool(self._config.get("user_id") and self._config.get("host"))
+        return not self.missing_connection_fields()
+
+    @property
+    def has_runtime_params(self) -> bool:
+        """Заполнены ли runtime-параметры в конфиге."""
+        return not self.missing_runtime_fields()
+
+    @property
+    def has_complete_config(self) -> bool:
+        """Полностью ли заполнен конфиг (connection + runtime)."""
+        return self.is_configured and self.has_runtime_params
 
     @property
     def config_summary(self) -> str:
@@ -273,26 +371,34 @@ class DatabaseManager:
             plan = "\n".join(row[0] for row in result)
         return plan
 
-    def get_row_count(self, schema: str, table: str) -> int:
+    def get_row_count(
+        self, schema: str, table: str, *, where: str | None = None
+    ) -> int:
         """Получить количество строк в таблице.
 
         Args:
             schema: Имя схемы.
             table: Имя таблицы.
+            where: опциональное SQL-условие (без слова WHERE), применяется к
+                подсчёту. Должно быть предварительно пройдено через
+                ``_sanitize_where_clause``; этот метод не делает повторной
+                проверки и доверяет вызывающей стороне.
 
         Returns:
             Количество строк.
         """
         schema = _validate_identifier(schema, "schema")
         table = _validate_identifier(table, "table")
-        sql = text(
-            f'SELECT COUNT(*) as cnt FROM "{schema}"."{table}"'
-        )
+        sql_str = f'SELECT COUNT(*) as cnt FROM "{schema}"."{table}"'
+        if where:
+            sql_str += f" WHERE {where}"
+        sql = text(sql_str)
         engine = self.get_engine()
         with engine.connect() as conn:
             result = conn.execute(sql)
             count = result.scalar()
-        logger.info("Строк в %s.%s: %d", schema, table, count)
+        logger.info("Строк в %s.%s%s: %d",
+                    schema, table, f" WHERE {where}" if where else "", count)
         return count
 
     def check_key_uniqueness(
@@ -340,13 +446,21 @@ class DatabaseManager:
         )
         return result
 
-    def get_sample(self, schema: str, table: str, n: int = 10) -> pd.DataFrame:
+    def get_sample(
+        self,
+        schema: str,
+        table: str,
+        n: int = 10,
+        *,
+        where: str | None = None,
+    ) -> pd.DataFrame:
         """Получить выборку строк из таблицы.
 
         Args:
             schema: Имя схемы.
             table: Имя таблицы.
             n: Количество строк.
+            where: опциональное SQL-условие (без WHERE).
 
         Returns:
             DataFrame с образцом данных.
@@ -355,7 +469,39 @@ class DatabaseManager:
         table = _validate_identifier(table, "table")
         if not isinstance(n, int) or n < 1:
             raise ValueError(f"Недопустимое значение n: {n}")
-        sql = text(f'SELECT * FROM "{schema}"."{table}" LIMIT :n')
+        sql_str = f'SELECT * FROM "{schema}"."{table}"'
+        if where:
+            sql_str += f" WHERE {where}"
+        sql_str += " LIMIT :n"
+        sql = text(sql_str)
+        engine = self.get_engine()
+        with engine.connect() as conn:
+            df = pd.read_sql(sql, conn, params={"n": n})
+        return df
+
+    def get_random_sample(
+        self,
+        schema: str,
+        table: str,
+        n: int = 100_000,
+        columns: list[str] | None = None,
+        *,
+        where: str | None = None,
+    ) -> pd.DataFrame:
+        """Получить random sample строк из таблицы."""
+        schema = _validate_identifier(schema, "schema")
+        table = _validate_identifier(table, "table")
+        if not isinstance(n, int) or n < 1:
+            raise ValueError(f"Недопустимое значение n: {n}")
+        projection = "*"
+        if columns:
+            safe_columns = [_validate_identifier(col, "column") for col in columns]
+            projection = ", ".join(f'"{col}"' for col in safe_columns)
+        sql_str = f'SELECT {projection} FROM "{schema}"."{table}"'
+        if where:
+            sql_str += f" WHERE {where}"
+        sql_str += " ORDER BY random() LIMIT :n"
+        sql = text(sql_str)
         engine = self.get_engine()
         with engine.connect() as conn:
             df = pd.read_sql(sql, conn, params={"n": n})

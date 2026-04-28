@@ -6,38 +6,21 @@ import re
 from difflib import SequenceMatcher
 from typing import Any
 
+from core.semantic_registry import builtin_subject_aliases
+from core.text_normalize import (
+    normalize_text as _normalize_text,
+    stem as _stem,
+    stem_set as _stem_set,
+    tokenize as _tokenize,
+)
+
 # Порог Левенштейна-подобного ratio для «нечёткого» сравнения стемов.
 # 0.85 покрывает опечатки вида замены/вставки/пропуска одной буквы на словах
 # длины 5+, но не срабатывает на разных словах («факт»/«акт»).
 _FUZZY_STEM_RATIO = 0.85
 _FUZZY_STEM_MIN_LEN = 5
-
-
-def _normalize_text(text: str) -> str:
-    text = str(text or "").lower().replace("ё", "е")
-    text = re.sub(r"[^0-9a-zа-я_ ]+", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _tokenize(text: str) -> list[str]:
-    return [tok for tok in _normalize_text(text).split() if len(tok) >= 2]
-
-
-def _stem(token: str) -> str:
-    token = _normalize_text(token)
-    for suffix in (
-        "ыми", "ими", "ого", "его", "ому", "ему", "ая", "яя", "ое", "ее",
-        "ые", "ие", "ый", "ий", "ой", "ом", "ем", "ым", "им", "ах", "ях",
-        "ов", "ев", "ей", "ам", "ям", "у", "ю", "а", "я", "ы", "и", "е", "о",
-    ):
-        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
-            return token[: -len(suffix)]
-    return token
-
-
-def _stem_set(text: str) -> set[str]:
-    return {_stem(tok) for tok in _tokenize(text)}
+_FLAG_PREFIXES = {"is", "has", "flag", "flg", "bool", "boolean", "priznak", "признак"}
+_FLAG_SUFFIXES = {"flag", "flg", "ind", "indicator", "bool", "boolean", "priznak", "признак"}
 
 
 def _fuzzy_stem_match(stem: str, candidates: set[str]) -> bool:
@@ -62,6 +45,54 @@ def _fuzzy_stem_match(stem: str, candidates: set[str]) -> bool:
 def _fuzzy_overlap_count(value_stems: set[str], query_stems: set[str]) -> int:
     """Сколько value_stems имеют exact- или fuzzy-матч в query_stems."""
     return sum(1 for vs in value_stems if _fuzzy_stem_match(vs, query_stems))
+
+
+def _subject_alias_stems(subject: str, schema_loader) -> set[str]:
+    subject = _normalize_text(subject)
+    if not subject:
+        return set()
+    aliases = [subject]
+    try:
+        lexicon = schema_loader.get_semantic_lexicon()
+    except Exception:  # noqa: BLE001
+        lexicon = {}
+    meta = ((lexicon or {}).get("subjects") or {}).get(subject) or {}
+    aliases.extend(str(v) for v in (meta.get("aliases") or []) if str(v).strip())
+    aliases.extend(builtin_subject_aliases().get(subject, []))
+    stems: set[str] = set()
+    for alias in aliases:
+        stems.update(_stem_set(alias))
+    return stems
+
+
+def _column_looks_like_subject_flag(column: str, subject_stems: set[str]) -> bool:
+    """Определить, что flag-колонка кодирует принадлежность строки к subject.
+
+    Правило умышленно строгое: после снятия типичных boolean-prefix/suffix имя
+    должно схлопываться к одному subject-токену. Это даёт универсальный механизм
+    для is_task / client_flag / has_employee и не задевает более узкие признаки
+    вроде is_task_leader.
+    """
+    tokens = _tokenize(str(column or "").replace("_", " "))
+    if not tokens:
+        return False
+    while tokens and tokens[0] in _FLAG_PREFIXES:
+        tokens = tokens[1:]
+    while tokens and tokens[-1] in _FLAG_SUFFIXES:
+        tokens = tokens[:-1]
+    if len(tokens) != 1:
+        return False
+    token_stem = _stem(tokens[0])
+    if token_stem in subject_stems:
+        return True
+    singular_stem = _stem(re.sub(r"(es|s)$", "", tokens[0], flags=re.IGNORECASE))
+    if singular_stem and singular_stem in subject_stems:
+        return True
+    if len(token_stem) >= 4:
+        for cand in subject_stems:
+            if len(cand) >= 4 and SequenceMatcher(None, token_stem, cand).ratio() >= 0.8:
+                return True
+    return _fuzzy_stem_match(token_stem, subject_stems)
 
 
 def _text_score(query_text: str, column: str, description: str) -> float:
@@ -141,14 +172,37 @@ def _phrase_in_known_terms(profile: dict[str, Any], query_text: str) -> tuple[st
     return best_value, best_len
 
 
-def _column_reference_score(user_input: str, column: str, description: str) -> float:
-    """Высокий бонус, если пользователь явно назвал колонку или её описание."""
+def _column_reference_score(
+    user_input: str,
+    column: str,
+    description: str,
+    *,
+    semantic_index: Any = None,
+    column_key: str = "",
+) -> float:
+    """Высокий бонус, если пользователь явно назвал колонку или её описание.
+
+    Опциональный semantic_index добавляет бонус (до +20) на основе косинусного
+    сходства между запросом и эмбеддингом колонки.
+    """
     normalized = _normalize_text(user_input)
     column_norm = _normalize_text(column)
     if column_norm and column_norm in normalized:
-        return 120.0
-    desc_score = _text_score(user_input, "", description)
-    return 35.0 if desc_score >= 14.0 else 0.0
+        base = 120.0
+    else:
+        desc_score = _text_score(user_input, "", description)
+        base = 35.0 if desc_score >= 14.0 else 0.0
+
+    if semantic_index is not None and column_key:
+        try:
+            sem_scores = semantic_index.similarity(user_input, [column_key])
+            sem_score = sem_scores.get(column_key, 0.0)
+        except Exception:
+            sem_score = 0.0
+        bonus = 20.0 if sem_score >= 0.8 else (10.0 if sem_score >= 0.6 else 0.0)
+        return base + bonus
+
+    return base
 
 
 def _escape_sql_literal(value: str) -> str:
@@ -162,16 +216,17 @@ def _build_condition(column: str, operator: str, value: Any, profile: dict[str, 
     dtype = str(profile.get("dType", "") or "").lower()
 
     if semantic_class == "flag" or value_mode == "boolean_like":
-        if value is True:
-            if "bool" in dtype:
-                return f"{column} = true"
+        # Унифицированное представление булева флага: true/false без строкового
+        # литерала. Раньше при не-bool dtype возвращался '"True"', что давало
+        # одновременно is_task = true и is_task = 'True' для одного запроса.
+        if isinstance(value, bool) or str(value).strip().lower() in {"true", "false"}:
+            normalized_true = (
+                value is True
+                or (isinstance(value, str) and value.strip().lower() == "true")
+            )
             if any(token in dtype for token in ("int", "numeric", "decimal", "number")):
-                return f"{column} = 1"
-        if value is False:
-            if "bool" in dtype:
-                return f"{column} = false"
-            if any(token in dtype for token in ("int", "numeric", "decimal", "number")):
-                return f"{column} = 0"
+                return f"{column} = {1 if normalized_true else 0}"
+            return f"{column} = {'true' if normalized_true else 'false'}"
         return f"{column} = '{_escape_sql_literal(str(value))}'"
 
     if op == "ILIKE":
@@ -206,6 +261,78 @@ def _collect_requests(intent: dict[str, Any], semantic_frame: dict[str, Any] | N
     return requests
 
 
+def _collect_implicit_subject_flag_requests(
+    *,
+    selected_tables: list[str],
+    schema_loader,
+    semantic_frame: dict[str, Any] | None,
+    existing_requests: list[dict[str, Any]],
+    query_stems: set[str] = frozenset(),
+) -> list[dict[str, Any]]:
+    subject = str((semantic_frame or {}).get("subject") or "").strip().lower()
+    subject_stems = _subject_alias_stems(subject, schema_loader)
+    relevant_stems = set(subject_stems) | set(query_stems)
+    for aliases in builtin_subject_aliases().values():
+        alias_stems: set[str] = set()
+        for alias in aliases:
+            alias_stems.update(_stem_set(alias))
+        if alias_stems & relevant_stems:
+            relevant_stems.update(alias_stems)
+    if not relevant_stems:
+        return []
+
+    existing_keys = {
+        str(req.get("column_key") or "").strip().lower()
+        for req in existing_requests
+        if str(req.get("column_key") or "").strip()
+    }
+    implicit_requests: list[dict[str, Any]] = []
+
+    for table_key in selected_tables:
+        if "." not in table_key:
+            continue
+        schema, table = table_key.split(".", 1)
+        cols_df = schema_loader.get_table_columns(schema, table)
+        if cols_df.empty:
+            continue
+
+        best_match: tuple[float, str] | None = None
+        for _, row in cols_df.iterrows():
+            column = str(row.get("column_name", "") or "").strip()
+            if not column:
+                continue
+            column_key = f"{schema}.{table}.{column}".lower()
+            if column_key in existing_keys:
+                continue
+
+            semantics = schema_loader.get_column_semantics(schema, table, column)
+            semantic_class = str(semantics.get("semantic_class", "") or "")
+            profile = schema_loader.get_value_profile(schema, table, column)
+            value_mode = str(profile.get("value_mode", "") or "")
+            dtype = str(row.get("dType") or row.get("dtype") or "").lower()
+            if semantic_class != "flag" and value_mode != "boolean_like" and "bool" not in dtype and not column.lower().startswith(("is_", "has_")):
+                continue
+            if not _column_looks_like_subject_flag(column, relevant_stems):
+                continue
+
+            score = 100.0 + _text_score(subject or " ".join(sorted(query_stems)), column, str(row.get("description", "") or ""))
+            candidate = (score, column_key)
+            if best_match is None or candidate > best_match:
+                best_match = candidate
+
+        if best_match is None:
+            continue
+        implicit_requests.append({
+            "request_id": f"implicit_subject_flag:{best_match[1]}",
+            "kind": "boolean_true",
+            "query_text": subject,
+            "column_key": best_match[1],
+            "match_source": "implicit_subject_flag",
+        })
+
+    return implicit_requests
+
+
 def rank_filter_candidates(
     *,
     user_input: str,
@@ -216,6 +343,16 @@ def rank_filter_candidates(
 ) -> dict[str, list[dict[str, Any]]]:
     """Rank filter candidates for metadata-driven filter intents."""
     requests = _collect_requests(intent, semantic_frame)
+    query_stems = _stem_set(user_input)
+    requests.extend(
+        _collect_implicit_subject_flag_requests(
+            selected_tables=selected_tables,
+            schema_loader=schema_loader,
+            semantic_frame=semantic_frame,
+            existing_requests=requests,
+            query_stems=query_stems,
+        )
+    )
     ranked: dict[str, list[dict[str, Any]]] = {str(req.get("request_id")): [] for req in requests}
     if not requests:
         return ranked
@@ -264,7 +401,12 @@ def rank_filter_candidates(
                         score += 16.0
                     if request.get("column_hint"):
                         score += _text_score(str(request.get("column_hint") or ""), column, description)
-                    score += _column_reference_score(user_input, column, description)
+                    _sem_idx = getattr(schema_loader, "semantic_index", None)
+                    score += _column_reference_score(
+                        user_input, column, description,
+                        semantic_index=_sem_idx,
+                        column_key=key,
+                    )
                     matched_value, value_score = _profile_value_match(profile, query_text)
                     score += value_score
                     if matched_value and _stem(request.get("query_text") or "") in _stem(matched_value):
@@ -275,7 +417,8 @@ def rank_filter_candidates(
                         candidate_value = query_text
 
                 elif kind == "boolean_true":
-                    if semantic_class == "flag":
+                    dtype = str(row.get("dType") or row.get("dtype") or "").lower()
+                    if semantic_class == "flag" or str(profile.get("value_mode") or "") == "boolean_like" or "bool" in dtype:
                         score += 44.0
                         candidate_value = True
                         operator = "="
@@ -284,6 +427,16 @@ def rank_filter_candidates(
                         score -= 20.0
 
                 else:
+                    exact_value_binding = (
+                        bool(request_column_key)
+                        and key == request_column_key
+                        and str(request.get("match_source") or "") == "value_candidate"
+                    )
+                    if exact_value_binding:
+                        score += 72.0
+                        if candidate_value is None:
+                            candidate_value = query_text
+                        evidence.append("semantic_frame_value_candidate")
                     if semantic_class in {"enum_like", "label", "free_text"}:
                         score += 20.0
                         if kind == "phrase_filter":

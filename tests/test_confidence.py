@@ -22,13 +22,15 @@ def test_filter_confidence_low_when_clarification_needed():
 
 
 def test_planning_confidence_uses_worst_component():
+    # Weighted formula: 0.4*0.9 + 0.3*0.52 + 0.3*0.86 = 0.36 + 0.156 + 0.258 = 0.774 → high
+    # Поведение изменилось: взвешенная сумма, а не min — medium filter больше не блокирует
     planning = build_planning_confidence(
         table_confidence={"score": 0.9, "level": "high", "evidence": []},
         filter_confidence={"score": 0.52, "level": "medium", "evidence": []},
         join_confidence={"score": 0.86, "level": "high", "evidence": []},
     )
-    assert planning["level"] == "medium"
-    assert planning["action"] == "clarify"
+    assert planning["level"] == "high"
+    assert planning["action"] == "execute"
 
 
 def test_fallback_policy_allows_llm_only_for_high_confidence():
@@ -46,7 +48,7 @@ def test_fallback_policy_allows_llm_only_for_high_confidence():
     assert policy["action"] == "llm_fallback"
 
 
-def test_fallback_policy_blocks_medium_confidence():
+def test_fallback_policy_allows_medium_confidence_with_self_correction_guard():
     planning = {
         "score": 0.55,
         "level": "medium",
@@ -57,8 +59,24 @@ def test_fallback_policy_blocks_medium_confidence():
         deterministic_sql_valid=False,
         has_template_sql=True,
     )
+    assert policy["allow_llm_fallback"] is True
+    assert policy["action"] == "llm_fallback"
+    assert policy["guard"] == "sql_self_corrector"
+
+
+def test_fallback_policy_still_blocks_low_confidence():
+    planning = {
+        "score": 0.25,
+        "level": "low",
+        "action": "stop",
+    }
+    policy = build_fallback_policy(
+        planning_confidence=planning,
+        deterministic_sql_valid=False,
+        has_template_sql=False,
+    )
     assert policy["allow_llm_fallback"] is False
-    assert policy["action"] == "clarify"
+    assert policy["action"] == "stop"
 
 
 def test_filter_confidence_treats_user_choices_as_resolved():
@@ -93,6 +111,56 @@ def test_filter_confidence_treats_user_choices_as_resolved():
     assert all("user_choice" in ev for ev in result["evidence"])
 
 
+# ---------------------------------------------------------------------------
+# Task 1.3: Weighted confidence with hint-boost
+# ---------------------------------------------------------------------------
+
+def test_hint_boost_must_keep_tables_elevates_low_table_score():
+    """must_keep_tables → table_score boosted to 0.9 → overall high."""
+    planning = build_planning_confidence(
+        table_confidence={"score": 0.5, "level": "medium", "evidence": []},
+        filter_confidence={"score": 0.9, "level": "high", "evidence": []},
+        join_confidence={"score": 0.9, "level": "high", "evidence": []},
+        user_hints={"must_keep_tables": [("dm", "fact_churn")]},
+    )
+    # 0.4*0.9 + 0.3*0.9 + 0.3*0.9 = 0.9 → high
+    assert planning["level"] == "high"
+
+
+def test_hint_boost_group_by_hints_elevates_filter_score():
+    """group_by_hints → filter_score boosted to 0.8."""
+    planning = build_planning_confidence(
+        table_confidence={"score": 0.9, "level": "high", "evidence": []},
+        filter_confidence={"score": 0.3, "level": "low", "evidence": []},
+        join_confidence={"score": 0.9, "level": "high", "evidence": []},
+        user_hints={"group_by_hints": ["task_code"]},
+    )
+    # filter_score = max(0.3, 0.8) = 0.8
+    # 0.4*0.9 + 0.3*0.8 + 0.3*0.9 = 0.36 + 0.24 + 0.27 = 0.87 → high
+    assert planning["level"] == "high"
+
+
+def test_no_hints_low_table_score_remains_low():
+    """Без hints, table=0.3 и все компоненты низкие → level == 'low'."""
+    planning = build_planning_confidence(
+        table_confidence={"score": 0.3, "level": "low", "evidence": []},
+        filter_confidence={"score": 0.3, "level": "low", "evidence": []},
+        join_confidence={"score": 0.3, "level": "low", "evidence": []},
+    )
+    assert planning["level"] == "low"
+    assert planning["action"] == "stop"
+
+
+def test_all_high_scores_remain_high():
+    """Все компоненты высокие → high."""
+    planning = build_planning_confidence(
+        table_confidence={"score": 0.9, "level": "high", "evidence": []},
+        filter_confidence={"score": 0.9, "level": "high", "evidence": []},
+        join_confidence={"score": 0.9, "level": "high", "evidence": []},
+    )
+    assert planning["level"] == "high"
+
+
 def test_filter_confidence_treats_semantic_exact_match_as_high():
     where_resolution = {
         "needs_clarification": False,
@@ -117,3 +185,33 @@ def test_filter_confidence_treats_semantic_exact_match_as_high():
     assert result["level"] == "high"
     assert result["score"] >= 0.95
     assert any("semantic_exact" in ev for ev in result["evidence"])
+
+
+def test_filter_confidence_treats_table_context_business_event_as_high():
+    where_resolution = {
+        "needs_clarification": False,
+        "applied_rules": [],
+        "reasoning": ["table_context_covers_business_event"],
+        "filter_candidates": {
+            "text:dm.sale_funnel.task_subtype": [
+                {
+                    "column": "task_subtype",
+                    "score": 61.0,
+                    "confidence": "medium",
+                },
+                {
+                    "column": "task_category",
+                    "score": 60.0,
+                    "confidence": "medium",
+                },
+            ],
+        },
+    }
+    result = evaluate_filter_confidence(
+        where_resolution,
+        semantic_frame={"qualifier": "factual_outflow"},
+        intent={"filter_conditions": []},
+    )
+    assert result["level"] == "high"
+    assert result["score"] >= 0.95
+    assert result["evidence"] == ["table_context_covers_business_event"]

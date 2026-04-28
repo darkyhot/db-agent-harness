@@ -198,6 +198,7 @@ class BaseNodeMixin:
         "column_selector": 80_000,   # нужен полный контекст всех таблиц
         "sql_planner": 40_000,
         "sql_writer": 60_000,
+        "sql_self_corrector": 50_000,
         "sql_static_checker": 20_000,
         "error_diagnoser": 30_000,
         "sql_fixer": 50_000,
@@ -228,6 +229,8 @@ class BaseNodeMixin:
         sql_validator: SQLValidator,
         tools: list,
         debug_prompt: bool = False,
+        show_plan: bool = False,
+        llm_verifier_enabled: bool = False,
     ) -> None:
         self.llm = llm
         self.db = db_manager
@@ -236,6 +239,8 @@ class BaseNodeMixin:
         self.validator = sql_validator
         self.tools = tools
         self.debug_prompt = debug_prompt
+        self.show_plan = show_plan
+        self.llm_verifier_enabled = llm_verifier_enabled
         self.tool_map: dict[str, Any] = {t.name: t for t in tools}
         self.few_shot = FewShotRetriever(memory)
         self._sample_cache: dict[tuple[str, str], tuple[float, str]] = {}
@@ -616,6 +621,144 @@ class BaseNodeMixin:
             )
 
         return {"tool": "none", "result": original_response}
+
+    def _llm_json_with_retry(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float = 0.0,
+        failure_tag: str = "unknown",
+        expect: str = "object",
+    ) -> Any:
+        """Вызвать LLM и распарсить JSON-ответ с одним retry при невалидном ответе.
+
+        На второй провал пишет запись в memory['json_parse_failures'] и
+        возвращает None — вызывающая сторона применяет свой fallback
+        (regex / детерминистика).
+
+        Args:
+            system_prompt: Системный промпт с описанием схемы ответа.
+            user_prompt: Пользовательский промпт.
+            temperature: Температура (по умолчанию 0.0 — детерминированный JSON).
+            failure_tag: Идентификатор места вызова (hint_extractor, count_identifier, ...)
+                — пишется в лог, чтобы потом было понятно, какой промпт подправить.
+            expect: "object" (dict) или "array" (list) — какой тип ожидается.
+
+        Returns:
+            Распарсенный dict / list, либо None при провале после retry.
+        """
+        primary = str(self.llm.invoke_with_system(
+            system_prompt, user_prompt, temperature=temperature,
+        ))
+        parsed = self._try_parse_json(primary, expect=expect)
+        if parsed is not None:
+            return parsed
+
+        retry_system = (
+            "Верни ТОЛЬКО один валидный JSON-" + expect + ", без markdown, "
+            "без пояснений, без текста до/после. "
+            "Соблюдай схему, описанную ниже.\n\n" + system_prompt
+        )
+        retry_user = (
+            "Предыдущий ответ не распарсился как JSON. "
+            "Верни строго валидный JSON-" + expect + ".\n\n"
+            + user_prompt
+        )
+        secondary = str(self.llm.invoke_with_system(
+            retry_system, retry_user, temperature=0.0,
+        ))
+        parsed = self._try_parse_json(secondary, expect=expect)
+        if parsed is not None:
+            return parsed
+
+        self._log_json_failure(failure_tag, primary, secondary, user_prompt)
+        return None
+
+    @staticmethod
+    def _try_parse_json(raw: str, *, expect: str = "object") -> Any:
+        """Попытаться распарсить JSON из ответа LLM.
+
+        Пробует: напрямую → через _clean_llm_json + _extract_json_objects →
+        через json_repair. Возвращает None, если ничего не подошло или
+        тип не совпал с expect.
+        """
+        want_dict = expect == "object"
+        cleaned = BaseNodeMixin._clean_llm_json(raw)
+
+        try:
+            value = json.loads(cleaned)
+            if want_dict and isinstance(value, dict):
+                return value
+            if not want_dict and isinstance(value, list):
+                return value
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        for candidate in BaseNodeMixin._extract_json_objects(cleaned):
+            try:
+                value = json.loads(candidate)
+                if want_dict and isinstance(value, dict):
+                    return value
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+        if not want_dict:
+            arr_start = cleaned.find("[")
+            arr_end = cleaned.rfind("]")
+            if arr_start != -1 and arr_end > arr_start:
+                try:
+                    value = json.loads(cleaned[arr_start:arr_end + 1])
+                    if isinstance(value, list):
+                        return value
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        if repair_json is not None:
+            try:
+                repaired = repair_json(cleaned)
+                value = json.loads(repaired)
+                if want_dict and isinstance(value, dict):
+                    logger.info("json_repair recovered %s", expect)
+                    return value
+                if not want_dict and isinstance(value, list):
+                    logger.info("json_repair recovered %s", expect)
+                    return value
+            except (json.JSONDecodeError, ValueError, Exception):
+                pass
+
+        return None
+
+    def _log_json_failure(
+        self, tag: str, primary: str, secondary: str, user_prompt: str,
+    ) -> None:
+        """Залоггировать failed-кейс в memory['json_parse_failures']."""
+        from datetime import datetime, timezone
+        entry = {
+            "tag": tag,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "user_prompt": user_prompt[:500],
+            "primary": primary[:800],
+            "secondary": secondary[:800],
+        }
+        try:
+            existing = self.memory.get_memory("json_parse_failures")
+            log: list[dict[str, Any]]
+            if existing:
+                try:
+                    log = json.loads(existing)
+                    if not isinstance(log, list):
+                        log = []
+                except (json.JSONDecodeError, ValueError):
+                    log = []
+            else:
+                log = []
+            log.append(entry)
+            log = log[-50:]
+            self.memory.set_memory("json_parse_failures", json.dumps(log, ensure_ascii=False))
+        except Exception as exc:
+            logger.warning("Не удалось записать json_parse_failures: %s", exc)
+        logger.warning("JSON-парсинг провалился после retry: tag=%s", tag)
 
     @staticmethod
     def _extract_json_objects(text: str) -> list[str]:

@@ -52,6 +52,18 @@ class AgentState(TypedDict):
 
     # === Структурированные данные (результаты экстракции каждого узла) ===
 
+    # query_interpreter → единый семантический IR запроса.
+    # Primary semantic contract. Старые intent/user_hints/semantic_frame ниже
+    # остаются compatibility projection до полного удаления legacy pipeline.
+    query_spec: dict[str, Any]
+    query_spec_validation_errors: list[str]
+    use_legacy_interpreter: bool
+
+    # catalog_grounder → физическое связывание QuerySpec с каталогом.
+    query_grounding: dict[str, Any]
+    plan_ir: dict[str, Any]
+    clarification_spec: dict[str, Any]
+
     # intent_classifier → структурированный интент
     intent: dict[str, Any]
     # Пример: {"intent": "analytics", "entities": [...], "date_filters": {...},
@@ -100,6 +112,7 @@ class AgentState(TypedDict):
     # Устанавливается когда dim-таблица пропущена в selected_columns.
     # Сбрасывается в "" после того как column_selector её использует.
     column_selector_hint: str
+    column_selector_retry_count: int
 
     # Multi-turn context: предыдущий успешный SQL и краткое резюме результата
     # Передаётся из CLIInterface при follow-up запросах ("а теперь по регионам")
@@ -112,6 +125,8 @@ class AgentState(TypedDict):
     # При followup-запросах — мёрджится (не перезаписывается).
     # sql_writer и sql_static_checker используют его для проверки.
     allowed_tables: list[str]
+    # Tables forbidden for the current planning/edit cycle, in "schema.table" form.
+    excluded_tables: list[str]
 
     # === Подсказки пользователя (детерминированный экстрактор) ===
     # Заполняется в hint_extractor (между intent_classifier и table_resolver).
@@ -122,10 +137,22 @@ class AgentState(TypedDict):
     #     "join_fields": ["inn", "customer_id", ...],
     #     "dim_sources": {"segment": {"table": "schema.t", "join_col": "inn"}},
     #     "having_hints": [{"op": ">=", "value": 3, "unit_hint": "человек"}],
+    #     "group_by_hints": ["task_code", "region", ...],
+    #     "aggregate_hints": [("count", "task"), ("sum", "revenue"), ...],
+    #     "aggregation_preferences": {"function": "count", "column": "task_code", "distinct": True},
+    #     "time_granularity": "month" | "quarter" | "year" | "day" | "week" | None,
+    #     "negative_filters": ["канцелярия", ...],
     #   }
     # Используется в table_resolver (hard-lock must_keep_tables),
-    # column_selector (dim_sources/join_fields), sql_planner (HAVING).
+    # column_selector (dim_sources/join_fields/group_by_hints),
+    # sql_planner (HAVING, GROUP BY, DATE_TRUNC).
     user_hints: dict[str, Any]
+    # Промежуточный результат LLM-извлечения подсказок (перед merge с regex-ами).
+    # Заполняется hint_extractor_llm; merge-слой в hint_extractor сводит его с
+    # regex-результатом в финальное user_hints.
+    user_hints_llm: dict[str, Any]
+    # "llm" | "regex" | "merged" — источник финального user_hints для логирования.
+    hints_source: str
 
     # semantic frame запроса и результат where_resolver
     semantic_frame: dict[str, Any]
@@ -134,3 +161,52 @@ class AgentState(TypedDict):
     planning_confidence: dict[str, Any]
     evidence_trace: dict[str, Any]
     fallback_policy: dict[str, Any]
+    # sql_self_corrector → LLM review of generated/fixed SQL against user intent.
+    # Stores verdict/issues/correction source for audit and debugging.
+    sql_self_correction: dict[str, Any]
+
+    # === Explicit mode (Задача 2.2) ===
+    # Устанавливается explicit_mode_dispatcher если пользователь явно задал ≥2 параметра
+    # (таблица + JOIN-поле, таблица + гранулярность, etc.). При True — план показывается
+    # принудительно и хинты применяются строже.
+    explicit_mode: bool
+
+    # === Plan-preview (Задача 2.1) ===
+    # plan_preview_pending: plan_preview выставил True — ждём подтверждения пользователя.
+    # plan_preview_approved: CLI выставляет True при повторном запуске после "ок".
+    # plan_preview_iteration: счётчик правок (максимум 3 итерации).
+    plan_preview_pending: bool
+    plan_preview_approved: bool
+    plan_preview_iteration: int
+
+    # === Plan-verifier (LLM-валидация плана перед preview) ===
+    # plan_verifier_done: True после первого прохода verifier — защита от
+    #   зацикливания. После пересборки blueprint узел не выполняется повторно.
+    # plan_verifier_applied: True если хотя бы одна правка применилась
+    #   (state.selected_columns/sql_blueprint обновлены) — после этого
+    #   маршрутизация уйдёт обратно в sql_planner для пересборки.
+    # plan_verdict: dump последнего PlanVerdict для логов и UI.
+    plan_verifier_done: bool
+    plan_verifier_applied: bool
+    plan_verdict: dict[str, Any]
+
+    # === Plan-edit cycle ===
+    plan_edit_text: str
+    plan_edit_kind: str
+    plan_edit_confidence: float
+    plan_edit_payload: dict[str, Any]
+    plan_edit_resolution: dict[str, Any]
+    plan_edit_explanation: str
+    plan_edit_needs_clarification: bool
+    plan_edit_applied: bool
+    plan_edit_history: list[dict[str, Any]]
+    previous_sql_blueprint: dict[str, Any]
+    plan_diff: dict[str, Any]
+    plan_diff_summary: str
+
+    # Set by table_explorer when explicit_source_guard fires and no explicit
+    # source survives filtering. Lets plan_edit_validator surface a precise
+    # diagnostic instead of the misleading "missing required source" error.
+    # Keys: "kind" ("conflict_with_excluded" | "no_eligible_source"),
+    #       "must_keep_filtered" (list[str]), "excluded_tables" (list[str]).
+    explorer_error: dict[str, Any]

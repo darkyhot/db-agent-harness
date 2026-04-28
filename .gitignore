@@ -17,3 +17,6 @@ workspace/*
 # Data — ignore CSV/JSON data files, keep directory
 # data_for_agent/*
 # !data_for_agent/.gitkeep
+
+# Embeddings cache (строится автоматически, не коммитится)
+data_for_agent/embeddings.npz

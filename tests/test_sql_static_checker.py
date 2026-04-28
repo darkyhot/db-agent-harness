@@ -385,3 +385,100 @@ class TestTypeCompatibility:
         sql = "SELECT c.id FROM dm.clients c WHERE c.id = 42"
         result = check_sql(sql, schema_loader=loader, check_columns=False)
         assert not any("Несовместимые" in e for e in result.errors)
+
+
+class TestUnqualifiedCatalogColumns:
+    def test_missing_unqualified_column_in_count_distinct_errors(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "gosb_dim"): [
+                {"column_name": "tb_id", "dType": "int4"},
+                {"column_name": "old_gosb_id", "dType": "int4"},
+            ]
+        })
+        sql = "SELECT COUNT(DISTINCT gosb_id) AS total_gosb FROM dm.gosb_dim"
+
+        result = check_sql(sql, schema_loader=loader)
+
+        assert not result.is_valid
+        assert any("gosb_id" in e for e in result.errors)
+
+    def test_valid_unqualified_column_in_single_table_passes(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "gosb_dim"): [
+                {"column_name": "tb_id", "dType": "int4"},
+                {"column_name": "old_gosb_id", "dType": "int4"},
+            ]
+        })
+        sql = (
+            "SELECT COUNT(DISTINCT old_gosb_id) AS total_gosb, "
+            "COUNT(DISTINCT tb_id) AS total_tb FROM dm.gosb_dim"
+        )
+
+        result = check_sql(sql, schema_loader=loader)
+
+        assert result.is_valid
+        assert not result.errors
+
+    def test_ambiguous_unqualified_column_across_tables_errors(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "sales"): [
+                {"column_name": "client_id", "dType": "int8"},
+                {"column_name": "amount", "dType": "numeric"},
+            ],
+            ("dm", "clients"): [
+                {"column_name": "client_id", "dType": "int8"},
+                {"column_name": "name", "dType": "text"},
+            ],
+        })
+        sql = (
+            "SELECT client_id, SUM(amount) AS total_amount "
+            "FROM dm.sales s JOIN dm.clients c ON c.client_id = s.client_id "
+            "GROUP BY client_id"
+        )
+
+        result = check_sql(sql, schema_loader=loader)
+
+        assert not result.is_valid
+        assert any("неоднознач" in e.lower() and "client_id" in e for e in result.errors)
+
+    def test_ambiguous_inserted_dttm_has_stable_diagnostic(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "fact_outflow"): [
+                {"column_name": "report_dt", "dType": "date"},
+                {"column_name": "inserted_dttm", "dType": "timestamp"},
+            ],
+            ("dm", "dim_gosb"): [
+                {"column_name": "new_gosb_name", "dType": "text"},
+                {"column_name": "inserted_dttm", "dType": "timestamp"},
+            ],
+        })
+        sql = (
+            "SELECT f.report_dt, d.new_gosb_name "
+            "FROM dm.fact_outflow f JOIN dm.dim_gosb d ON true "
+            "ORDER BY inserted_dttm DESC"
+        )
+
+        result = check_sql(sql, schema_loader=loader)
+
+        assert not result.is_valid
+        assert any("неоднозначные unqualified-колонки" in e for e in result.errors)
+        assert any("inserted_dttm" in e for e in result.errors)
+
+    def test_cte_projection_alias_is_not_flagged_as_missing_column(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "sales"): [
+                {"column_name": "client_id", "dType": "int8"},
+                {"column_name": "amount", "dType": "numeric"},
+            ]
+        })
+        sql = (
+            "WITH agg AS ("
+            "SELECT client_id, SUM(amount) AS total_amount "
+            "FROM dm.sales GROUP BY client_id"
+            ") SELECT client_id, total_amount FROM agg ORDER BY total_amount DESC"
+        )
+
+        result = check_sql(sql, schema_loader=loader)
+
+        assert result.is_valid
+        assert not result.errors

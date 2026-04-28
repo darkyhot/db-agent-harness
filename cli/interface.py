@@ -151,7 +151,7 @@ def _parse_deep_analysis_args(args: list[str]):
                 if idx >= len(args):
                     raise ValueError(
                         "Флаг --where требует значения, например "
-                        "--where=\"report_dt >= '2026-01-01'\"."
+                        "--where=report_dt >= '2026-01-01'."
                     )
 
             while idx < len(args) and not args[idx].startswith("--"):
@@ -279,7 +279,7 @@ HELP_TEXT = """
                        — глубокий поиск закономерностей (сезонность, выбросы, массовые отклонения).
                          Без текста гипотезы — полный автоскан. С текстом — план проверки показывается на аппрув.
                          --where ограничивает срез таблицы на этапе загрузки, например:
-                           --where="report_dt >= '2026-01-01'" или --where="inn IN ('7707083893','7728168971')".
+                           --where=report_dt >= '2026-01-01' или --where=inn IN ('7707083893','7728168971').
   /reset               — сбросить контекст текущей сессии
   /clear               — очистить вывод ячейки
   /exit                — завершить работу (сохранить резюме сессии)
@@ -290,7 +290,7 @@ HELP_TEXT = """
 CONFIG_HELP_TEXT = """
 Доступные варианты `/config`:
   /config connection   — изменить подключение к БД: user_id, host, port, database
-  /config params       — изменить параметры агента: debug_prompt, show_plan
+  /config params       — изменить параметры агента: llm_model, debug_prompt, show_plan
 
 Когда что использовать:
   /config connection   — если меняется база, хост, порт или пользователь
@@ -470,6 +470,7 @@ class CLIInterface:
 ╚══════════════════════════════════════════╝
 
 Текущая конфигурация: {config_str}
+Модель LLM: {self.db.runtime_config.get("llm_model", "GigaChat-2-Max")} (llm_model в config.json)
 Загружено таблиц: {tables_count} | Загружено атрибутов: {attrs_count}
 Память: загружено {sessions} предыдущих сессий
 Отладка промптов: {"ВКЛ" if self.debug_prompt else "ВЫКЛ"} (debug_prompt в config.json)
@@ -622,8 +623,12 @@ class CLIInterface:
         """Интерактивно настроить только runtime-параметры агента."""
         runtime = self.db.runtime_config
         print("\n--- Настройка параметров агента ---")
-        print("Подсказка: `debug_prompt` включает печать внутренних промптов, "
+        print("Подсказка: `llm_model` — имя модели GigaChat (например, GigaChat-2-Max, "
+              "GigaChat-3-Ultra); `debug_prompt` включает печать внутренних промптов; "
               "`show_plan` показывает план запроса перед выполнением.")
+        current_model = runtime.get("llm_model", "GigaChat-2-Max") or "GigaChat-2-Max"
+        raw_model = input(f"llm_model [{current_model}]: ").strip()
+        llm_model = raw_model or current_model
         debug_prompt = self._prompt_bool(
             "debug_prompt",
             current=runtime.get("debug_prompt", False),
@@ -632,8 +637,13 @@ class CLIInterface:
             "show_plan",
             current=runtime.get("show_plan", False),
         )
-        self.db.save_runtime_params(debug_prompt=debug_prompt, show_plan=show_plan)
+        self.db.save_runtime_params(
+            debug_prompt=debug_prompt,
+            show_plan=show_plan,
+            llm_model=llm_model,
+        )
         print("\n✓ Параметры сохранены:")
+        print(f"  llm_model: {llm_model}")
         print(f"  debug_prompt: {debug_prompt}")
         print(f"  show_plan: {show_plan}")
 

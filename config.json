@@ -3,6 +3,7 @@
     "host": "",
     "port": 5432,
     "database": "prom",
+    "llm_model": "GigaChat-2-Max",
     "debug_prompt": false,
     "show_plan": false
 }

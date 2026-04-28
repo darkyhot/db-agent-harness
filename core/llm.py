@@ -1,16 +1,37 @@
 """GigaChat клиент с rate-limit и retry логикой."""
 
+import json
 import os
 import time
 import logging
 import threading
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 from langchain_gigachat.chat_models import GigaChat
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MODEL = "GigaChat-2-Max"
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+
+
+def _resolve_model() -> str:
+    """Определить модель GigaChat: env GIGACHAT_MODEL → config.json → default."""
+    env_model = os.getenv("GIGACHAT_MODEL")
+    if env_model:
+        return env_model
+    try:
+        with open(_CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+        model = cfg.get("llm_model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return DEFAULT_MODEL
 
 
 class RateLimitedLLM:
@@ -35,7 +56,7 @@ class RateLimitedLLM:
         """Инициализация GigaChat клиента из переменных окружения."""
         self._base_url = os.getenv("GIGACHAT_API_URL")
         self._access_token = os.getenv("JPY_API_TOKEN")
-        self._model = "GigaChat-2-Max"
+        self._model = _resolve_model()
         self._llm = GigaChat(
             base_url=self._base_url,
             access_token=self._access_token,

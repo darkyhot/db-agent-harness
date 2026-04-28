@@ -22,11 +22,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "host": "",
     "port": 5432,
     "database": "prom",
+    "llm_model": "GigaChat-2-Max",
     "debug_prompt": False,
     "show_plan": False,
 }
 CONNECTION_CONFIG_KEYS = ("user_id", "host", "port", "database")
-RUNTIME_CONFIG_KEYS = ("debug_prompt", "show_plan")
+RUNTIME_CONFIG_KEYS = ("llm_model", "debug_prompt", "show_plan")
 
 # Regex для валидации идентификаторов (схема, таблица, колонка)
 _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
@@ -145,15 +146,24 @@ class DatabaseManager:
         self._engine = None
         logger.info("Конфигурация сохранена: %s@%s:%d/%s", user_id, host, port, database)
 
-    def save_runtime_params(self, *, debug_prompt: bool, show_plan: bool) -> None:
+    def save_runtime_params(
+        self,
+        *,
+        debug_prompt: bool,
+        show_plan: bool,
+        llm_model: str | None = None,
+    ) -> None:
         """Сохранить runtime-параметры CLI/графа в config.json."""
         self._config.update({
             "debug_prompt": bool(debug_prompt),
             "show_plan": bool(show_plan),
         })
+        if llm_model is not None:
+            self._config["llm_model"] = str(llm_model).strip() or DEFAULT_CONFIG["llm_model"]
         self._write_config()
         logger.info(
-            "Runtime-параметры сохранены: debug_prompt=%s, show_plan=%s",
+            "Runtime-параметры сохранены: llm_model=%s, debug_prompt=%s, show_plan=%s",
+            self._config.get("llm_model"),
             bool(debug_prompt),
             bool(show_plan),
         )

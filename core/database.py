@@ -153,6 +153,7 @@ class DatabaseManager:
         debug_prompt: bool,
         show_plan: bool,
         llm_model: str | None = None,
+        llm_verifier_enabled: bool | None = None,
     ) -> None:
         """Сохранить runtime-параметры CLI/графа в config.json."""
         self._config.update({
@@ -161,12 +162,16 @@ class DatabaseManager:
         })
         if llm_model is not None:
             self._config["llm_model"] = str(llm_model).strip() or DEFAULT_CONFIG["llm_model"]
+        if llm_verifier_enabled is not None:
+            self._config["llm_verifier_enabled"] = bool(llm_verifier_enabled)
         self._write_config()
         logger.info(
-            "Runtime-параметры сохранены: llm_model=%s, debug_prompt=%s, show_plan=%s",
+            "Runtime-параметры сохранены: llm_model=%s, debug_prompt=%s, "
+            "show_plan=%s, llm_verifier_enabled=%s",
             self._config.get("llm_model"),
             bool(debug_prompt),
             bool(show_plan),
+            self._config.get("llm_verifier_enabled"),
         )
 
     @property

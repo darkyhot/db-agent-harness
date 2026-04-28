@@ -89,3 +89,17 @@ def test_save_connection_and_runtime_params_preserve_full_config(tmp_path):
         "llm_verifier_enabled": False,
     }
     assert db.has_complete_config is True
+
+
+def test_save_runtime_params_updates_llm_verifier_flag(tmp_path):
+    config_path = tmp_path / "config.json"
+    db = DatabaseManager(config_path=config_path)
+
+    db.save_runtime_params(
+        debug_prompt=False,
+        show_plan=True,
+        llm_verifier_enabled=True,
+    )
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["llm_verifier_enabled"] is True

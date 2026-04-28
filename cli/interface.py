@@ -290,7 +290,7 @@ HELP_TEXT = """
 CONFIG_HELP_TEXT = """
 Доступные варианты `/config`:
   /config connection   — изменить подключение к БД: user_id, host, port, database
-  /config params       — изменить параметры агента: llm_model, debug_prompt, show_plan
+  /config params       — изменить параметры агента: llm_model, debug_prompt, show_plan, llm_verifier_enabled
 
 Когда что использовать:
   /config connection   — если меняется база, хост, порт или пользователь
@@ -477,6 +477,7 @@ class CLIInterface:
 Память: загружено {sessions} предыдущих сессий
 Отладка промптов: {"ВКЛ" if self.debug_prompt else "ВЫКЛ"} (debug_prompt в config.json)
 Показ плана: {"ВКЛ" if self.show_plan else "ВЫКЛ"} (show_plan в config.json)
+LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"} (llm_verifier_enabled в config.json)
 
 Введите запрос или slash-команду. /help — список команд.
 """
@@ -629,7 +630,8 @@ class CLIInterface:
         print("\n--- Настройка параметров агента ---")
         print("Подсказка: `llm_model` — имя модели GigaChat (например, GigaChat-2-Max, "
               "GigaChat-3-Ultra); `debug_prompt` включает печать внутренних промптов; "
-              "`show_plan` показывает план запроса перед выполнением.")
+              "`show_plan` показывает план запроса перед выполнением; "
+              "`llm_verifier_enabled` включает LLM-проверку SQL.")
         current_model = runtime.get("llm_model", "GigaChat-2-Max") or "GigaChat-2-Max"
         raw_model = input(f"llm_model [{current_model}]: ").strip()
         llm_model = raw_model or current_model
@@ -641,15 +643,21 @@ class CLIInterface:
             "show_plan",
             current=runtime.get("show_plan", False),
         )
+        llm_verifier_enabled = self._prompt_bool(
+            "llm_verifier_enabled",
+            current=runtime.get("llm_verifier_enabled", False),
+        )
         self.db.save_runtime_params(
             debug_prompt=debug_prompt,
             show_plan=show_plan,
             llm_model=llm_model,
+            llm_verifier_enabled=llm_verifier_enabled,
         )
         print("\n✓ Параметры сохранены:")
         print(f"  llm_model: {llm_model}")
         print(f"  debug_prompt: {debug_prompt}")
         print(f"  show_plan: {show_plan}")
+        print(f"  llm_verifier_enabled: {llm_verifier_enabled}")
 
     def _run_full_config_setup(self) -> None:
         """Полная первичная настройка config: connection + params."""

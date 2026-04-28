@@ -1106,7 +1106,12 @@ class PlanEditNodes:
             "измерения, если пользователь явно не попросил удалить или заменить их. "
             "Для сортировки заполняй order_by.target и order_by.direction. "
             "Для просьб вроде 'а где ТБ?' добавляй недостающую metric/dimension, "
-            "а не заменяй существующую."
+            "а не заменяй существующую. "
+            "ВАЖНО: если возвращаешь полный QuerySpec, ОБЯЗАТЕЛЬНО заполни "
+            "source_constraints актуальным набором источников (после правки). "
+            "Пустой source_constraints приведёт к потере связи с каталогом и "
+            "ошибке выполнения. Если правка не меняет источники — просто "
+            "перенеси их из текущего QuerySpec без изменений."
         )
         user_prompt = (
             f"JSON Schema:\n{json.dumps(query_spec_json_schema(), ensure_ascii=False)}\n\n"
@@ -1126,8 +1131,19 @@ class PlanEditNodes:
             failure_tag="query_spec_editor",
             expect="object",
         )
+        _parsed_keys = sorted((parsed or {}).keys())
+        _parsed_action = (parsed or {}).get("action")
+        _parsed_sources = (parsed or {}).get("source_constraints") or []
+        logger.info(
+            "_edit_query_spec: LLM ответ — action=%s, top_keys=%s, source_constraints=%d",
+            _parsed_action, _parsed_keys, len(_parsed_sources) if isinstance(_parsed_sources, list) else -1,
+        )
         action_update = self._apply_structured_plan_edit_action(state, edit_text, parsed or {})
         if action_update is not None:
+            logger.info(
+                "_edit_query_spec: применено action='%s' → kind=%s",
+                _parsed_action, action_update.get("plan_edit_kind"),
+            )
             return action_update
         edited_spec, edit_errors = QuerySpec.from_dict(parsed or {})
         if edited_spec is None:
@@ -1142,9 +1158,34 @@ class PlanEditNodes:
                 "graph_iterations": iterations,
             }
 
+        # Fallback: если LLM вернул полный QuerySpec без source_constraints —
+        # наследуем источники из текущего QuerySpec, чтобы не терять связь с
+        # каталогом (см. фикс #4 разбора).
+        if not edited_spec.source_constraints and current_spec.source_constraints:
+            logger.info(
+                "_edit_query_spec: LLM не указал source_constraints — наследую %d источника(ов) из текущего QuerySpec",
+                len(current_spec.source_constraints),
+            )
+            edited_spec.source_constraints = list(current_spec.source_constraints)
+
         legacy_intent = edited_spec.to_legacy_intent()
         legacy_hints = edited_spec.to_legacy_user_hints()
         semantic_frame = edited_spec.to_semantic_frame()
+        # allowed_tables: восстанавливаем из must_keep_tables, чтобы explorer
+        # имел явные источники даже до отработки catalog_grounder.
+        inherited_allowed = [
+            f"{schema}.{table}"
+            for schema, table in legacy_hints.get("must_keep_tables", []) or []
+            if schema and table
+        ]
+        logger.info(
+            "_edit_query_spec: после правки source_constraints=%d, must_keep_tables=%s, "
+            "allowed_tables=%s, excluded_tables=%s, обнуляю selected_tables/selected_columns/sql_blueprint",
+            len(edited_spec.source_constraints),
+            legacy_hints.get("must_keep_tables") or [],
+            inherited_allowed,
+            legacy_hints.get("excluded_tables") or [],
+        )
         return {
             "query_spec": edited_spec.to_dict(),
             "query_spec_validation_errors": [],
@@ -1156,7 +1197,7 @@ class PlanEditNodes:
             "query_grounding": {},
             "plan_ir": {},
             "selected_tables": [],
-            "allowed_tables": [],
+            "allowed_tables": inherited_allowed,
             "table_structures": {},
             "table_samples": {},
             "table_types": {},
@@ -2098,6 +2139,17 @@ class PlanEditNodes:
             )
         missing_required = required_tables - present_tables
         if missing_required and not explorer_error.get("kind"):
+            logger.warning(
+                "plan_edit_validator: missing_required=%s, present=%s, required=%s, "
+                "excluded=%s, main_table=%r, selected_columns_keys=%s, explorer_error=%s",
+                sorted(missing_required),
+                sorted(present_tables),
+                sorted(required_tables),
+                sorted(excluded_tables),
+                main_table,
+                list(selected_columns.keys()),
+                explorer_error,
+            )
             errors.append(
                 "Обязательный источник отсутствует в плане: "
                 + ", ".join(sorted(missing_required))

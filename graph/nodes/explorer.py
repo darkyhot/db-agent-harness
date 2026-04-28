@@ -221,10 +221,15 @@ class ExplorerNodes:
             err_kind = (
                 "conflict_with_excluded" if filtered_by_excluded else "no_eligible_source"
             )
-            logger.info(
-                "TableExplorer: explicit source guard active (kind=%s, filtered=%s)",
+            logger.warning(
+                "TableExplorer: explicit source guard active (kind=%s, must_keep=%s, "
+                "allowed=%s, excluded=%s, filtered=%s, selected=%s)",
                 err_kind,
+                must_keep_full,
+                allowed_full,
+                sorted(excluded_tables),
                 filtered_by_excluded,
+                selected,
             )
             empty_ctx = (
                 "=== РАЗВЕДКА ТАБЛИЦ ===\n\n"

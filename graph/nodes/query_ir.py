@@ -130,6 +130,14 @@ class QueryIRNodes:
                 "graph_iterations": iterations,
             }
 
+        logger.info(
+            "CatalogGrounder: input source_constraints=%s, excluded_in_spec=%s, "
+            "state.must_keep=%s, state.allowed=%s",
+            [(s.schema, s.table) for s in spec.source_constraints],
+            [(s.schema, s.table) for s in spec.excluded_source_constraints],
+            (state.get("user_hints") or {}).get("must_keep_tables") or [],
+            state.get("allowed_tables") or [],
+        )
         result = ground_query_spec(
             query_spec=spec,
             schema_loader=self.schema,
@@ -141,7 +149,14 @@ class QueryIRNodes:
             if str(item).strip()
         }
         if excluded_tables:
+            _before = [s.full_name for s in result.sources]
             result.sources = [source for source in result.sources if source.full_name.lower() not in excluded_tables]
+            _after = [s.full_name for s in result.sources]
+            if _before != _after:
+                logger.info(
+                    "CatalogGrounder: excluded filter %s → %s (excluded=%s)",
+                    _before, _after, sorted(excluded_tables),
+                )
             if result.plan_ir is not None:
                 result.plan_ir.sources = result.sources
                 result.plan_ir.main_source = result.sources[0] if result.sources else None

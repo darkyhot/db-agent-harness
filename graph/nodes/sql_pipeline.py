@@ -897,11 +897,23 @@ class SqlPipelineNodes:
                 "missing_required_tables": required_missing_from_columns,
             }
 
+        # Если стратегия не использует join — очищаем join_spec в state, чтобы
+        # downstream-узлы (plan_preview, валидаторы) не работали с устаревшим
+        # набором, оставшимся от column_selector при ≥2 таблицах-кандидатах.
+        effective_join_spec = join_spec
+        if blueprint.get("strategy") == "simple_select" and join_spec:
+            logger.info(
+                "SqlPlanner: strategy=simple_select → очищаю join_spec (было %d пар)",
+                len(join_spec),
+            )
+            effective_join_spec = []
+
         return {
             "sql_blueprint": blueprint,
             "where_resolution": where_resolution,
             "planning_confidence": planning_confidence,
             "evidence_trace": evidence_trace,
+            "join_spec": effective_join_spec,
             "column_selector_hint": new_hint,
             "column_selector_retry_count": (
                 int(state.get("column_selector_retry_count", 0) or 0) + 1

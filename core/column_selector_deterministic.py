@@ -1466,6 +1466,12 @@ def select_columns(
         and ".".join(str(item.get("left") or "").split(".")[:2]).lower() not in excluded_tables
         and ".".join(str(item.get("right") or "").split(".")[:2]).lower() not in excluded_tables
     ]
+    if len(selected_columns) >= 2 and join_spec:
+        logger.info(
+            "ColumnSelectorDet: построен join_spec из %d пар для %d таблиц "
+            "(финальная стратегия определяется в sql_planner; для simple_select join_spec будет очищен)",
+            len(join_spec), len(selected_columns),
+        )
 
     # ---- Итоговая confidence ----
     if not selected_columns:

@@ -53,8 +53,11 @@ def _render_plan(
     if strategy:
         lines.append(f"- **Стратегия:** {strategy}")
 
-    # JOIN
-    if join_spec:
+    # JOIN — показываем только когда стратегия реально использует join.
+    # Иначе пользователь видит ложный JOIN (column_selector строит join_spec
+    # для любых ≥2 таблиц, даже если стратегия simple_select).
+    join_strategies = {"fact_dim_join", "dim_fact_join", "fact_fact_join", "dim_dim_join"}
+    if join_spec and strategy in join_strategies:
         join_parts = []
         for j in join_spec:
             left = j.get("left") or ""

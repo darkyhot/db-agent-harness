@@ -38,6 +38,23 @@ logger = logging.getLogger(__name__)
 # Префиксы PK-нормализации: old_gosb_id → gosb_id
 _PK_NORM_RE = re.compile(r"^(old|new|prev|cur|current|actual|base|src|tgt)_", re.I)
 
+# Карта алиасов измерений: пользовательский слот → реальное имя колонки.
+# Используется как в COUNT preference (`_resolve_count_pref_column`), так и
+# в общем выборе колонок (`_choose_best_column`), чтобы для слота "тб" гарантированно
+# выбрать tb_id, а не isu_branch_id, чьё описание формально матчится по фаззи.
+_DIMENSION_ALIAS_MAP: dict[str, list[str]] = {
+    "gosb": ["gosb_id", "old_gosb_id"],
+    "госб": ["gosb_id", "old_gosb_id"],
+    "gosb_id": ["gosb_id", "old_gosb_id"],
+    "tb": ["tb_id"],
+    "тб": ["tb_id"],
+    "tb_id": ["tb_id"],
+}
+
+# Суффиксы id-подобных колонок — используются для штрафа в label-слотах
+# (когда пользователь спросил "название X", а кандидат — *_id).
+_ID_LIKE_SUFFIXES = ("_id", "_code", "_num", "_no")
+
 
 # ---------------------------------------------------------------------------
 # Sanitize (Direction 5.2): корректирует галлюцинированные колонки от LLM
@@ -473,6 +490,13 @@ def _semantic_match_score(col_name: str, desc: str, slot: str) -> float:
             score += 0.8
         if lower.startswith(('old_', 'prev_')):
             score -= 0.8
+        # Жёсткий штраф: id-подобная колонка в label-слоте без явного name/label токена
+        # в имени — описание совпало по «наименованию», но колонка всё равно идентификатор.
+        if (
+            lower.endswith(_ID_LIKE_SUFFIXES)
+            and not any(t in col_tokens for t in ('name', 'label', 'title', 'naimenovanie', 'nazvanie'))
+        ):
+            score -= 0.6
 
     if slot == 'date':
         if any(t in col_tokens for t in _DATE_HINTS):
@@ -522,6 +546,11 @@ def _choose_best_column(
             allowed_tables = {dim_source_table}
 
     is_dimension_slot = _is_dimension_slot(slot)
+    slot_aliases = set(_DIMENSION_ALIAS_MAP.get((slot or "").lower(), []))
+    candidates_log: list[tuple[float, str, str, float, str]] = []  # (score, table, col, semantic, tags)
+    dropped_label_filter: list[str] = []
+    dropped_id_for_label: list[str] = []
+    alias_hit_col: str | None = None
 
     for table_key in table_structures:
         if allowed_tables and table_key not in allowed_tables:
@@ -545,6 +574,13 @@ def _choose_best_column(
 
             desc = str(row.get('description', '') or '')
             semantic = _semantic_match_score(col_name, desc, slot)
+            # A.2: алиас-хит → пол semantic'а к 0.85 (ниже 1.0, чтобы description-only
+            # совпадение могло перебить алиас если оно выраженно сильнее).
+            lower_for_alias = col_name.lower()
+            is_alias_hit = bool(slot_aliases) and lower_for_alias in slot_aliases
+            if is_alias_hit:
+                semantic = max(semantic, 0.85)
+                alias_hit_col = f"{table_key}.{col_name}"
             if semantic <= 0 and require_numeric and _is_numeric(dtype) and not is_pk:
                 # Fallback для англоязычных metric-name колонок, когда
                 # описание не повторяет термин сущности из пользовательского запроса.
@@ -555,11 +591,20 @@ def _choose_best_column(
                 continue
             col_tokens = set(_tokenize(col_name))
             desc_tokens = set(_tokenize(desc))
-            if _is_label_slot(slot) and not (
-                {'name', 'label', 'title'} & col_tokens
-                or {'naimenovanie', 'nazvanie', 'name'} & desc_tokens
-            ):
-                continue
+            if _is_label_slot(slot):
+                name_has_label = bool({'name', 'label', 'title'} & col_tokens)
+                desc_has_label = bool({'naimenovanie', 'nazvanie', 'name'} & desc_tokens)
+                lower_name_for_filter = col_name.lower()
+                name_is_id_like = lower_name_for_filter.endswith(_ID_LIKE_SUFFIXES)
+                # NAME содержит label-токен → пропускаем; иначе только если
+                # DESC матчится И NAME не id-подобный (description как мягкий сигнал
+                # не должен пропускать *_id для слотов "название X").
+                if not name_has_label and (not desc_has_label or name_is_id_like):
+                    if name_is_id_like:
+                        dropped_id_for_label.append(f"{table_key}.{col_name}")
+                    else:
+                        dropped_label_filter.append(f"{table_key}.{col_name}")
+                    continue
 
             not_null = float(row.get('not_null_perc', 0) or 0)
             unique = float(row.get('unique_perc', 0) or 0)
@@ -595,8 +640,34 @@ def _choose_best_column(
                 score -= 200
 
             candidate = (score, table_key, col_name)
+            tags: list[str] = []
+            if is_alias_hit:
+                tags.append("alias")
+            if (agg_hint or '').lower():
+                tags.append(f"agg={agg_hint}")
+            candidates_log.append((score, table_key, col_name, semantic, ",".join(tags)))
             if best is None or candidate > best:
                 best = candidate
+
+    if candidates_log:
+        top3 = sorted(candidates_log, key=lambda x: x[0], reverse=True)[:3]
+        logger.debug(
+            "ChooseBest[slot=%s]: top3=%s",
+            slot,
+            [(c[1] + "." + c[2], round(c[0], 1), round(c[3], 3), c[4]) for c in top3],
+        )
+    if dropped_id_for_label:
+        logger.debug(
+            "ChooseBest[slot=%s]: dropped id-like cols (label slot): %s",
+            slot, dropped_id_for_label,
+        )
+    if dropped_label_filter:
+        logger.debug(
+            "ChooseBest[slot=%s]: dropped non-label cols (label slot): %s",
+            slot, dropped_label_filter,
+        )
+    if alias_hit_col and best and f"{best[1]}.{best[2]}" == alias_hit_col:
+        logger.info("ChooseBest[slot=%s]: alias hit → %s", slot, alias_hit_col)
 
     if best is None:
         return None
@@ -729,15 +800,16 @@ def _resolve_count_pref_column(cols_df: pd.DataFrame, target: str) -> str | None
     by_lower = {name.lower(): name for name in names}
     if target_norm in by_lower:
         return by_lower[target_norm]
-    aliases = {
+    # Используем общий module-level _DIMENSION_ALIAS_MAP, но в COUNT-контексте
+    # для gosb_id предпочитаем old_gosb_id (исторически выше cardinality), поэтому
+    # переопределяем для этих ключей.
+    count_aliases = {
         "gosb": ["old_gosb_id", "gosb_id"],
         "госб": ["old_gosb_id", "gosb_id"],
         "gosb_id": ["old_gosb_id"],
-        "tb": ["tb_id"],
-        "тб": ["tb_id"],
-        "tb_id": ["tb_id"],
     }
-    for alias in aliases.get(target_norm, []):
+    aliases = count_aliases.get(target_norm) or _DIMENSION_ALIAS_MAP.get(target_norm, [])
+    for alias in aliases:
         if alias in by_lower:
             return by_lower[alias]
     target_tokens = set(_tokenize(target_norm))
@@ -937,6 +1009,9 @@ def select_columns(
         agg_candidates: list[tuple[str, float]] = []   # (col, score)
         gb_candidates: list[tuple[str, float]] = []
         filter_candidates: list[tuple[str, float]] = []
+        # Семантическая оценка победителя по каждой роли (для confidence-формулы A.1).
+        # Ключи: ('agg', metric), ('gb', slot), ('flt', 'date').
+        per_col_sem: dict[tuple[str, str], dict[str, float]] = {}
 
         for _, row in cols_df.iterrows():
             col_name = str(row.get('column_name', '')).strip()
@@ -951,10 +1026,15 @@ def select_columns(
             # ---- aggregate score ----
             if wants_aggregation and t_type in ('fact', 'unknown') and not is_pk:
                 if _is_numeric(dtype):
+                    metric_slot = requested['metric'] or ''
+                    sem_for_metric = (
+                        _semantic_match_score(col_name, desc, metric_slot) if metric_slot else 0.0
+                    )
                     s = 0.4 + _metric_score(col_name, entities) * 0.6
-                    if requested['metric']:
-                        s = max(s, _semantic_match_score(col_name, desc, requested['metric']))
+                    if metric_slot:
+                        s = max(s, sem_for_metric)
                     agg_candidates.append((col_name, round(s, 3)))
+                    per_col_sem.setdefault(('agg', metric_slot or '*'), {})[col_name] = sem_for_metric
 
             # ---- group_by score ----
             # Не кладём PK и числовые метрики в group_by если они не упомянуты в entities
@@ -964,10 +1044,13 @@ def select_columns(
                     gb_s = 0.0
                 else:
                     entity_hit = _entity_score(col_name, desc, entities)
-                    slot_hit = max(
-                        [_semantic_match_score(col_name, desc, slot) for slot in requested['dimensions']],
-                        default=0.0,
-                    )
+                    per_slot_sem = {
+                        slot: _semantic_match_score(col_name, desc, slot)
+                        for slot in requested['dimensions']
+                    }
+                    slot_hit = max(per_slot_sem.values(), default=0.0)
+                    for _slot_name, _sem in per_slot_sem.items():
+                        per_col_sem.setdefault(('gb', _slot_name), {})[col_name] = _sem
                     if _is_categorical(dtype):
                         gb_s += 0.25
                     if (entity_hit > 0 or slot_hit > 0) and unique_perc > 0 and unique_perc < 30:
@@ -999,7 +1082,9 @@ def select_columns(
             flt_s = 0.0
             if _is_date(dtype) and has_date_filter:
                 flt_s = 0.90
-                if _semantic_match_score(col_name, desc, 'date') >= 0.8:
+                date_sem = _semantic_match_score(col_name, desc, 'date')
+                per_col_sem.setdefault(('flt', 'date'), {})[col_name] = date_sem
+                if date_sem >= 0.8:
                     flt_s = 0.98
             for fc in filter_conditions:
                 hint = str(fc.get('column_hint', '') or '').lower()
@@ -1062,20 +1147,51 @@ def select_columns(
                 seen[c] = None
         select_cols = list(seen.keys())
 
-        # ---- confidence для этой таблицы ----
-        t_conf = 0.50
-        if select_cols:
-            t_conf += 0.15
-        if wants_aggregation and agg_hint != 'count' and agg_cols:
-            t_conf += 0.20
-        elif agg_hint == 'count':
-            t_conf += 0.15
-        elif wants_aggregation and not agg_cols and t_type not in ('dim', 'ref'):
-            t_conf -= 0.20   # хотим агрегацию, но не нашли числовых колонок (не применяется к справочникам)
-        if entities and not group_by_cols and agg_hint not in ('count', ''):
-            t_conf -= 0.10   # есть entities, но GROUP BY пустой — подозрительно
+        # ---- confidence для этой таблицы (A.1: семантическая база вместо рig-flat 0.50) ----
+        sem_components: list[float] = []
+        if agg_cols:
+            metric_key = ('agg', requested['metric'] or '*')
+            metric_sems = per_col_sem.get(metric_key, {})
+            for c in agg_cols:
+                sem_components.append(metric_sems.get(c, 0.0))
+        for c in group_by_cols:
+            # Берём максимум по всем dimension-слотам — group_by-колонка считается
+            # «семантически совпавшей», если она матчится хотя бы с одним из слотов.
+            best_for_col = 0.0
+            for slot_name in requested['dimensions']:
+                best_for_col = max(best_for_col, per_col_sem.get(('gb', slot_name), {}).get(c, 0.0))
+            sem_components.append(best_for_col)
+        if has_date_filter and filter_cols:
+            date_sems = per_col_sem.get(('flt', 'date'), {})
+            for c in filter_cols:
+                if c in date_sems:
+                    sem_components.append(date_sems[c])
+                    break
 
-        per_table_confidence.append(max(0.0, min(1.0, t_conf)))
+        sem_avg = (sum(sem_components) / len(sem_components)) if sem_components else 0.0
+
+        components: dict[str, float] = {
+            "base": 0.30,
+            "sem_avg": round(0.40 * sem_avg, 3),
+        }
+        if select_cols:
+            components["select"] = 0.10
+        if wants_aggregation and agg_hint != 'count' and agg_cols:
+            components["agg_found"] = 0.15
+        elif agg_hint == 'count':
+            components["count_agg"] = 0.10
+        elif wants_aggregation and not agg_cols and t_type not in ('dim', 'ref'):
+            components["agg_missing"] = -0.20
+        if entities and not group_by_cols and agg_hint not in ('count', ''):
+            components["entities_no_gb"] = -0.10
+
+        t_conf = sum(components.values())
+        t_conf = max(0.0, min(1.0, t_conf))
+        logger.debug(
+            "ColumnSelectorDet[%s] confidence=%.3f components=%s sem_components=%s",
+            table_key, t_conf, components, [round(s, 3) for s in sem_components],
+        )
+        per_table_confidence.append(t_conf)
 
         # ---- Собираем роли ----
         roles: dict[str, list[str]] = {}
@@ -1488,6 +1604,23 @@ def select_columns(
             roles.get('aggregate') for roles in selected_columns.values()
         ):
             overall += 0.10
+        # A.4: множественные date-колонки в filter-роли → детерминизм гадает,
+        # на какую ось накладывать дату. Штраф провоцирует LLM-fallback.
+        date_filter_cols: list[str] = []
+        for roles in selected_columns.values():
+            for c in roles.get('filter', []):
+                lc = c.lower()
+                if (
+                    lc.endswith(('_dt', '_date', '_dttm', '_ts', '_timestamp'))
+                    or 'date' in lc or 'dttm' in lc or 'timestamp' in lc
+                ):
+                    date_filter_cols.append(c)
+        if len(date_filter_cols) > 1:
+            overall -= 0.15
+            logger.info(
+                "ColumnSelectorDet: ambiguous date filter columns %s → confidence -= 0.15",
+                date_filter_cols,
+            )
         # Штраф: мультитабличный запрос без JOIN-ключей
         if len(selected_columns) > 1 and not join_spec:
             overall *= 0.55
@@ -1501,7 +1634,7 @@ def select_columns(
                 f'join-ключей: {len(join_spec)}, '
                 f'avg col confidence: {overall:.2f}'
             )
-        overall = min(overall, 0.99)
+        overall = max(0.0, min(overall, 0.99))
 
     logger.info('ColumnSelectorDet: %s', reason)
     logger.info('ColumnSelectorDet: selected_columns=%s', selected_columns)

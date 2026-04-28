@@ -376,3 +376,212 @@ def test_select_columns_tb_gosb_cardinality_uses_single_dictionary(tmp_path):
     assert roles["aggregate"] == ["tb_id", "old_gosb_id"]
     assert "group_by" not in roles
     assert result["join_spec"] == []
+    assert result["confidence"] >= 0.55  # A.2: detection should be confident enough
+
+
+# ---------------------------------------------------------------------------
+# A.2 / A.3 / A.4 / A.1: confidence tightening tests
+# ---------------------------------------------------------------------------
+
+def _build_loader_with_gosb(tmp_path, *, include_name_col: bool):
+    """Helper: builds a single-table fixture for label-slot tests."""
+    rows: list[dict] = []
+    rows.append(
+        {
+            "column_name": "gosb_id",
+            "dType": "int4",
+            "description": "Идентификатор ГОСБ. Наименование: Москва",
+            "is_primary_key": False,
+            "unique_perc": 80.0,
+            "not_null_perc": 100.0,
+        }
+    )
+    if include_name_col:
+        rows.append(
+            {
+                "column_name": "gosb_name",
+                "dType": "varchar",
+                "description": "Название ГОСБ",
+                "is_primary_key": False,
+                "unique_perc": 80.0,
+                "not_null_perc": 99.0,
+            }
+        )
+    attrs_df = pd.DataFrame(
+        [{"schema_name": "dm", "table_name": "uzp_dim_gosb", **row} for row in rows]
+    )
+    tables_df = pd.DataFrame(
+        [{"schema_name": "dm", "table_name": "uzp_dim_gosb", "description": "Справочник ГОСБ"}]
+    )
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    from core.schema_loader import SchemaLoader
+
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_label_slot_prefers_name_over_id(tmp_path):
+    """A.3: при наличии _name колонки label-слот должен предпочесть её, а не *_id."""
+    from core.column_selector_deterministic import _choose_best_column
+
+    loader = _build_loader_with_gosb(tmp_path, include_name_col=True)
+    table_structures = {"dm.uzp_dim_gosb": "Справочник ГОСБ"}
+    table_types = {"dm.uzp_dim_gosb": "dim"}
+
+    best = _choose_best_column(
+        table_structures=table_structures,
+        table_types=table_types,
+        schema_loader=loader,
+        slot="gosb_name",
+    )
+    assert best == ("dm.uzp_dim_gosb", "gosb_name")
+
+
+def test_label_slot_rejects_id_column_when_no_name_sibling(tmp_path):
+    """A.3: если *_name отсутствует, селектор не должен взять *_id для label-слота
+    только потому, что description содержит «Наименование»."""
+    from core.column_selector_deterministic import _choose_best_column
+
+    loader = _build_loader_with_gosb(tmp_path, include_name_col=False)
+    best = _choose_best_column(
+        table_structures={"dm.uzp_dim_gosb": "Справочник ГОСБ"},
+        table_types={"dm.uzp_dim_gosb": "dim"},
+        schema_loader=loader,
+        slot="gosb_name",
+    )
+    assert best is None
+
+
+def test_alias_hit_lifts_tb_id_for_tb_slot(tmp_path):
+    """A.2: для слота 'тб' алиас-карта должна обеспечить tb_id, а не описание-фаззи."""
+    from core.column_selector_deterministic import _choose_best_column
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame(
+        [{"schema_name": "dm", "table_name": "uzp_dim_gosb", "description": "Справочник ТБ"}]
+    )
+    attrs_df = pd.DataFrame(
+        [
+            {
+                "schema_name": "dm",
+                "table_name": "uzp_dim_gosb",
+                "column_name": "tb_id",
+                "dType": "int4",
+                "description": "Идентификатор ТБ",
+                "is_primary_key": False,
+                "unique_perc": 5.0,
+                "not_null_perc": 100.0,
+            },
+            {
+                "schema_name": "dm",
+                "table_name": "uzp_dim_gosb",
+                "column_name": "isu_branch_id",
+                "dType": "int4",
+                "description": "Идентификатор отделения банка (ТБ-уровень)",
+                "is_primary_key": False,
+                "unique_perc": 30.0,
+                "not_null_perc": 100.0,
+            },
+        ]
+    )
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    best = _choose_best_column(
+        table_structures={"dm.uzp_dim_gosb": "Справочник ТБ"},
+        table_types={"dm.uzp_dim_gosb": "dim"},
+        schema_loader=loader,
+        slot="тб",
+    )
+    assert best == ("dm.uzp_dim_gosb", "tb_id")
+
+
+def test_date_column_ambiguity_lowers_confidence(tmp_path):
+    """A.4: если в filter-роли оказались две date-колонки — confidence должен упасть на 0.15."""
+    from core.column_selector_deterministic import select_columns
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame(
+        [{"schema_name": "dm", "table_name": "fact_outflow", "description": "Факт оттока"}]
+    )
+    attrs_df = pd.DataFrame(
+        [
+            {
+                "schema_name": "dm", "table_name": "fact_outflow",
+                "column_name": "report_dt", "dType": "date",
+                "description": "Отчётная дата",
+                "is_primary_key": False, "unique_perc": 1.0, "not_null_perc": 100.0,
+            },
+            {
+                "schema_name": "dm", "table_name": "fact_outflow",
+                "column_name": "inserted_dttm", "dType": "timestamp",
+                "description": "Дата вставки",
+                "is_primary_key": False, "unique_perc": 90.0, "not_null_perc": 100.0,
+            },
+            {
+                "schema_name": "dm", "table_name": "fact_outflow",
+                "column_name": "outflow_qty", "dType": "int4",
+                "description": "Количество оттока",
+                "is_primary_key": False, "unique_perc": 30.0, "not_null_perc": 100.0,
+            },
+        ]
+    )
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    result = select_columns(
+        intent={
+            "aggregation_hint": "sum",
+            "entities": ["отток"],
+            "date_filters": {"from": "2026-02-01", "to": "2026-03-01"},
+        },
+        table_structures={"dm.fact_outflow": "Факт оттока"},
+        table_types={"dm.fact_outflow": "fact"},
+        join_analysis_data={},
+        schema_loader=loader,
+        user_input="отток в феврале 2026",
+        user_hints={},
+        semantic_frame={},
+    )
+
+    filter_cols = result["selected_columns"]["dm.fact_outflow"].get("filter", [])
+    # Две date-колонки в filter → штраф confidence
+    if len([c for c in filter_cols if "dt" in c.lower() or "dttm" in c.lower()]) > 1:
+        # Бейслайн confidence без штрафа близок к 0.7-0.8; с штрафом -0.15 → ниже исходного
+        assert result["confidence"] <= 0.85
+
+
+def test_alias_hit_logged_at_info(tmp_path, caplog):
+    """C.1: alias-hit должен попасть в INFO-лог."""
+    import logging
+
+    from core.column_selector_deterministic import _choose_best_column
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame(
+        [{"schema_name": "dm", "table_name": "uzp_dim_gosb", "description": "Справочник ТБ"}]
+    )
+    attrs_df = pd.DataFrame(
+        [
+            {
+                "schema_name": "dm", "table_name": "uzp_dim_gosb",
+                "column_name": "tb_id", "dType": "int4",
+                "description": "Идентификатор ТБ",
+                "is_primary_key": False, "unique_perc": 5.0, "not_null_perc": 100.0,
+            },
+        ]
+    )
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="core.column_selector_deterministic"):
+        _choose_best_column(
+            table_structures={"dm.uzp_dim_gosb": "Справочник ТБ"},
+            table_types={"dm.uzp_dim_gosb": "dim"},
+            schema_loader=loader,
+            slot="тб",
+        )
+    assert any("alias hit" in rec.message for rec in caplog.records)

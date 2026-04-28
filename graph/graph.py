@@ -380,6 +380,7 @@ def build_graph(
     tools: list,
     debug_prompt: bool = False,
     show_plan: bool = False,
+    llm_verifier_enabled: bool = False,
 ) -> StateGraph:
     """Собрать граф агента.
 
@@ -399,6 +400,7 @@ def build_graph(
         llm, db_manager, schema_loader, memory, sql_validator, tools,
         debug_prompt=debug_prompt,
         show_plan=show_plan,
+        llm_verifier_enabled=llm_verifier_enabled,
     )
 
     graph = StateGraph(AgentState)

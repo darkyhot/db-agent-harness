@@ -328,12 +328,14 @@ class CLIInterface:
         # Флаги из конфига
         self.debug_prompt = self.db.runtime_config.get("debug_prompt", False)
         self.show_plan = self.db.runtime_config.get("show_plan", False)
+        self.llm_verifier_enabled = self.db.runtime_config.get("llm_verifier_enabled", False)
 
         # Сборка графа
         self.graph = build_graph(
             self.llm, self.db, self.schema, self.memory, self.validator, all_tools,
             debug_prompt=self.debug_prompt,
             show_plan=self.show_plan,
+            llm_verifier_enabled=self.llm_verifier_enabled,
         )
 
         # Периодическая очистка старых сессий (старше 90 дней)
@@ -503,6 +505,7 @@ class CLIInterface:
         runtime = self.db.runtime_config
         self.debug_prompt = runtime.get("debug_prompt", False)
         self.show_plan = runtime.get("show_plan", False)
+        self.llm_verifier_enabled = runtime.get("llm_verifier_enabled", False)
 
     def _rebuild_graph(self) -> None:
         """Пересобрать graph и tool bindings после смены конфига."""
@@ -515,6 +518,7 @@ class CLIInterface:
             self.llm, self.db, self.schema, self.memory, self.validator, all_tools,
             debug_prompt=self.debug_prompt,
             show_plan=self.show_plan,
+            llm_verifier_enabled=self.llm_verifier_enabled,
         )
 
     def _prompt_text(

@@ -61,7 +61,12 @@ def test_missing_fields_detect_incomplete_config(tmp_path):
     db = DatabaseManager(config_path=config_path)
 
     assert db.missing_connection_fields() == ["host", "port", "database"]
-    assert db.missing_runtime_fields() == ["debug_prompt", "show_plan"]
+    assert db.missing_runtime_fields() == [
+        "llm_model",
+        "debug_prompt",
+        "show_plan",
+        "llm_verifier_enabled",
+    ]
     assert db.has_complete_config is False
 
 
@@ -78,7 +83,9 @@ def test_save_connection_and_runtime_params_preserve_full_config(tmp_path):
         "host": "db.local",
         "port": 5433,
         "database": "analytics",
+        "llm_model": "GigaChat-2-Max",
         "debug_prompt": True,
         "show_plan": False,
+        "llm_verifier_enabled": False,
     }
     assert db.has_complete_config is True

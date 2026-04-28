@@ -9,10 +9,13 @@ QuerySpec creation, not to this module.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import re
 from typing import Any
 
 from core.join_analysis import detect_table_type
+
+logger = logging.getLogger(__name__)
 from core.filter_ranking import rank_filter_candidates
 from core.query_ir import (
     ClarificationSpec,
@@ -825,8 +828,21 @@ def _prune_unrequested_helper_sources(
         )
         if score >= 0.5:
             kept.append(source)
+            logger.debug(
+                "PruneHelper: keep %s (score=%.2f >= 0.5)",
+                source.full_name, score,
+            )
+        else:
+            logger.info(
+                "PruneHelper: drop %s (frame_support_score=%.2f < 0.5)",
+                source.full_name, score,
+            )
 
     if not kept:
+        logger.info(
+            "PruneHelper: all candidates dropped, falling back to first source %s",
+            sources[0].full_name if sources else "<none>",
+        )
         return sources[:1]
     return kept
 
@@ -899,7 +915,14 @@ def _prune_sources_to_minimal_covering_table(
     if not candidates:
         return sources
     candidates.sort(key=lambda item: item[0], reverse=True)
-    return [candidates[0][1]]
+    chosen = candidates[0][1]
+    if len(sources) > 1:
+        dropped = [src.full_name for src in sources if src.full_name != chosen.full_name]
+        logger.info(
+            "PruneMinimalCovering: keep %s (rank=%.2f), drop %s — single table covers all slots",
+            chosen.full_name, candidates[0][0], dropped,
+        )
+    return [chosen]
 
 
 def _source_covers_query_slots(
@@ -1010,7 +1033,14 @@ def _prune_count_sources_covered_by_single_dictionary(
 
     if best is None:
         return sources
-    return [best[2]]
+    chosen = best[2]
+    if len(sources) > 1:
+        dropped = [src.full_name for src in sources if src.full_name != chosen.full_name]
+        logger.info(
+            "PruneCountSingleDictionary: keep %s (covered=%d, rank=%.2f), drop %s",
+            chosen.full_name, best[0], best[1], dropped,
+        )
+    return [chosen]
 
 
 def _best_metric_column_in_table(cols, target: str):

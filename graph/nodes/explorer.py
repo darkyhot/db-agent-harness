@@ -15,7 +15,10 @@ from core.join_analysis import detect_table_type, format_join_analysis
 from core.column_selector_deterministic import (
     select_columns as _det_select_columns,
     normalize_join_spec,
+    _derive_requested_slots,
+    _semantic_match_score,
 )
+from core.llm_column_verifier import verify_column_selection
 from graph.state import AgentState
 
 # Минимальная confidence для использования детерминированного результата без LLM.
@@ -546,6 +549,40 @@ class ExplorerNodes:
             _det_result.get("reason", ""),
         )
 
+        # B.3: LLM-верификатор детерминированного выбора (только в high-confidence-полосе).
+        # Ниже порога LLM column_selector и так запустится — верификатор не нужен.
+        verifier_hint_from_critic = ""
+        if (
+            getattr(self, "llm_verifier_enabled", False)
+            and _det_conf >= _DET_CONFIDENCE_THRESHOLD
+            and _det_result.get("selected_columns")
+        ):
+            try:
+                _requested = _derive_requested_slots(user_input, intent)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("LLMColumnVerifier: не смогли вычислить slots: %s", exc)
+                _requested = {}
+            verdict = verify_column_selection(
+                user_input=user_input,
+                requested_slots=_requested,
+                selected_columns=_det_result["selected_columns"],
+                schema_loader=self.schema,
+                llm_invoker=self,
+                semantic_scorer=_semantic_match_score,
+            )
+            if verdict.get("should_force_fallback"):
+                logger.info(
+                    "ColumnSelector/verifier: critical issues=%d → принудительный LLM fallback",
+                    len(verdict.get("issues", [])),
+                )
+                _det_conf = 0.40
+                verifier_hint_from_critic = verdict.get("hint") or ""
+            elif verdict.get("hint"):
+                logger.info(
+                    "ColumnSelector/verifier: warnings (без fallback): %s",
+                    verdict["hint"],
+                )
+
         _hints = state.get("user_hints", {}) or {}
         # Только group_by_hints (явная ось группировки) требует пересмотра колонок через LLM.
         # aggregate_hints не меняет набор колонок — только способ агрегации.
@@ -602,6 +639,8 @@ class ExplorerNodes:
             )
         if state.get("column_selector_hint", ""):
             _fallback_reasons.append("corrective_hint")
+        if verifier_hint_from_critic:
+            _fallback_reasons.append("verifier_critical")
         if _has_explicit_group:
             _fallback_reasons.append("explicit_group_by_hints")
         logger.info(
@@ -704,9 +743,13 @@ class ExplorerNodes:
 
         # Если sql_planner обнаружил пропущенную таблицу — добавляем корректирующую подсказку
         hint = state.get("column_selector_hint", "")
+        # B.3: верификатор детерминированного результата мог сгенерировать собственную
+        # критику — присоединяем её к существующей подсказке.
+        if verifier_hint_from_critic:
+            hint = (hint + "\n" + verifier_hint_from_critic).strip() if hint else verifier_hint_from_critic
         if hint:
             user_prompt += f"\n\n=== КОРРЕКТИРУЮЩАЯ ИНСТРУКЦИЯ ===\n{hint}"
-            logger.info("ColumnSelector: применяю корректирующую подсказку от sql_planner")
+            logger.info("ColumnSelector: применяю корректирующую подсказку")
 
         # Известные ошибки из памяти — передаём чтобы агент не повторял их
         correction_examples: list[str] = state.get("correction_examples", [])

@@ -696,10 +696,68 @@ def _quote_value(value: str, operator: str) -> str:
     return f"'{safe_val}'"
 
 
+_BOOL_DTYPES = ("bool", "boolean")
+_INT_DTYPES = ("int", "smallint", "integer", "bigint", "int2", "int4", "int8", "numeric", "decimal", "float", "double", "real")
+_DATE_DTYPES = ("date", "timestamp", "datetime", "time")
+
+
+def _value_compatible_with_dtype(value: str, operator: str, dtype: str) -> tuple[bool, str]:
+    """Проверить совместимость литерала с dtype колонки.
+
+    Returns (compatible, reason). Если dtype неизвестен — возвращает True.
+    """
+    dtype_l = (dtype or "").lower().strip()
+    if not dtype_l:
+        return True, "unknown_dtype"
+
+    val = (value or "").strip().strip("'\"").lower()
+    is_date_literal = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", val))
+    is_bool_literal = val in {"true", "false", "0", "1", "t", "f"}
+    is_numeric_literal = bool(re.fullmatch(r"-?\d+(?:\.\d+)?", val))
+
+    is_bool_col = any(b in dtype_l for b in _BOOL_DTYPES)
+    is_date_col = any(d in dtype_l for d in _DATE_DTYPES)
+    is_numeric_col = (not is_bool_col) and any(
+        d == dtype_l or dtype_l.startswith(d) for d in _INT_DTYPES
+    )
+
+    if is_bool_col and is_date_literal:
+        return False, f"date literal {value!r} incompatible with bool column"
+    if is_numeric_col and is_date_literal:
+        return False, f"date literal {value!r} incompatible with numeric column dtype={dtype_l}"
+    if is_date_col and is_bool_literal and not is_numeric_literal:
+        # 'true'/'false' on date column is always wrong
+        if val in {"true", "false", "t", "f"}:
+            return False, f"bool literal {value!r} incompatible with date column"
+    return True, "ok"
+
+
+def _lookup_column_dtype(
+    schema_loader,
+    selected_columns: dict[str, dict],
+    column: str,
+) -> str:
+    """Найти dtype колонки в любой из selected-таблиц. Пустая строка, если не нашли."""
+    if schema_loader is None:
+        return ""
+    for table_key in selected_columns:
+        if "." not in table_key:
+            continue
+        schema, table = table_key.split(".", 1)
+        try:
+            dtype = schema_loader.get_column_dtype(schema, table, column)
+        except Exception:  # noqa: BLE001
+            continue
+        if dtype:
+            return dtype
+    return ""
+
+
 def _compute_where_from_intent(
     intent: dict,
     selected_columns: dict[str, dict],
     user_input: str = "",
+    schema_loader=None,
 ) -> list[str]:
     """Сформировать WHERE-условия из структурированных данных в intent.
 
@@ -785,12 +843,21 @@ def _compute_where_from_intent(
                         break
 
             if matched_col:
-                quoted = _quote_value(value, operator)
                 op_upper = operator.strip().upper()
+                dtype = _lookup_column_dtype(schema_loader, selected_columns, matched_col)
+                compatible, reason = _value_compatible_with_dtype(value, op_upper, dtype)
+                if not compatible:
+                    logger.warning(
+                        "DeterministicPlanner: dropping filter %s %s %r — %s",
+                        matched_col, op_upper, value, reason,
+                    )
+                    continue
+                quoted = _quote_value(value, operator)
                 conditions.append(f"{matched_col} {op_upper} {quoted}")
                 logger.debug(
-                    "DeterministicPlanner: filter_condition %s %s %s → %s",
-                    matched_col, op_upper, quoted, f"{matched_col} {op_upper} {quoted}",
+                    "DeterministicPlanner: filter_condition %s %s %s (dtype=%s) → %s",
+                    matched_col, op_upper, quoted, dtype or "?",
+                    f"{matched_col} {op_upper} {quoted}",
                 )
             else:
                 logger.debug(
@@ -847,23 +914,68 @@ def _derive_date_filters_from_text(user_input: str) -> dict[str, str | None]:
     }
 
 
-def _find_date_column(selected_columns: dict[str, dict]) -> str | None:
-    """Найти первую колонку с date/timestamp-семантикой в filter-ролях."""
-    _date_suffixes = ("_dt", "_date", "_dttm", "_timestamp", "_ts", "date", "dttm")
+_DATE_COLUMN_SUFFIXES = ("_dt", "_date", "_dttm", "_timestamp", "_ts", "date", "dttm")
+_DATE_COLUMN_DEPRIO_PREFIXES = ("inserted_", "updated_", "modified_", "created_", "load_", "etl_")
 
+
+def _date_column_priority(col_name: str) -> int:
+    """Меньше — лучше. report_dt → 0, *_dt/_date → 1, *_dttm → 2, inserted_*/updated_* → 4."""
+    name = col_name.lower()
+    if name == "report_dt" or name == "report_date":
+        return 0
+    if name.startswith(_DATE_COLUMN_DEPRIO_PREFIXES):
+        return 4
+    if name.endswith(("_dt", "_date")) or name == "date":
+        return 1
+    if name.endswith(("_dttm", "dttm")):
+        return 2
+    if name.endswith(("_ts", "_timestamp")) or "timestamp" in name:
+        return 3
+    return 5
+
+
+def _rank_date_columns(selected_columns: dict[str, dict]) -> list[str]:
+    """Вернуть все date-колонки из filter-ролей, отсортированные по приоритету."""
+    seen: set[str] = set()
+    ranked: list[tuple[int, str]] = []
     for _table, roles in selected_columns.items():
         for col in roles.get("filter", []):
             col_lower = col.lower()
-            if any(col_lower.endswith(suf) for suf in _date_suffixes):
-                return col
-            if "date" in col_lower or "dttm" in col_lower or "timestamp" in col_lower:
-                return col
+            is_date = any(col_lower.endswith(suf) for suf in _DATE_COLUMN_SUFFIXES) or any(
+                tok in col_lower for tok in ("date", "dttm", "timestamp")
+            )
+            if is_date and col not in seen:
+                seen.add(col)
+                ranked.append((_date_column_priority(col), col))
+    ranked.sort(key=lambda x: x[0])
+    return [col for _, col in ranked]
+
+
+def _find_date_column(selected_columns: dict[str, dict]) -> str | None:
+    """Выбрать наиболее подходящую date-колонку из filter-ролей.
+
+    Приоритет: report_dt > *_dt/_date > *_dttm > *_ts > inserted_/updated_/modified_/created_.
+    Логирует выбранную колонку и альтернативы. Возвращает None, если ничего не найдено
+    (тогда пробует select-роли как fallback, как раньше).
+    """
+    ranked = _rank_date_columns(selected_columns)
+    if ranked:
+        chosen = ranked[0]
+        if len(ranked) > 1:
+            logger.info(
+                "DeterministicPlanner: date_col=%s chosen from %d candidates: %s",
+                chosen, len(ranked), ranked,
+            )
+        else:
+            logger.debug("DeterministicPlanner: date_col=%s (single candidate)", chosen)
+        return chosen
 
     # Fallback: ищем среди select-колонок
     for _table, roles in selected_columns.items():
         for col in roles.get("select", []):
             col_lower = col.lower()
-            if any(col_lower.endswith(suf) for suf in _date_suffixes):
+            if any(col_lower.endswith(suf) for suf in _DATE_COLUMN_SUFFIXES):
+                logger.debug("DeterministicPlanner: date_col=%s (fallback from select)", col)
                 return col
 
     return None
@@ -1101,7 +1213,9 @@ def build_blueprint(
         group_by = _apply_time_granularity(group_by, selected_columns, _time_gran, schema_loader)
         logger.info("DeterministicPlanner: time_granularity='%s' → group_by=%s", _time_gran, group_by)
 
-    base_where_conditions = _compute_where_from_intent(intent, selected_columns, user_input=user_input)
+    base_where_conditions = _compute_where_from_intent(
+        intent, selected_columns, user_input=user_input, schema_loader=schema_loader,
+    )
     where_resolution = resolve_where(
         user_input=user_input,
         intent=intent,

@@ -462,7 +462,27 @@ def test_query_spec_plan_edit_llm_remove_source_persists_exclusion(synthetic_loa
     assert rebound["join_spec"] == []
 
 
-def test_intent_rewriter_fast_path_list(node):
+def test_intent_rewriter_fast_path_list(synthetic_loader):
+    response = {
+        "columns": {
+            "schema_a.fact_x": {
+                "select": ["task_code"],
+                "filter": ["report_dt", "task_subtype", "task_category"],
+                "aggregate": [],
+                "group_by": [],
+            }
+        },
+        "join_keys": [],
+        "null_warnings": [],
+    }
+    node = _Node(
+        _DummyLLM([json.dumps(response, ensure_ascii=False)]),
+        _DummyDB(),
+        synthetic_loader,
+        _DummyMemory(),
+        _DummyValidator(),
+        [],
+    )
     state = _state(plan_edit_text="не считаем, покажи список", plan_edit_payload={
         "intent_changes": {"aggregation_hint": "list"},
     })

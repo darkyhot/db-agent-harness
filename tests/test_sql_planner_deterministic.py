@@ -1121,3 +1121,111 @@ def test_build_blueprint_employee_subject_still_rewrites_report_dt_count(tmp_pat
     )
 
     assert bp["aggregation"] == {"function": "COUNT", "column": "*", "alias": "count_all"}
+
+
+# ---------------------------------------------------------------------------
+# A.4 / C.3: _find_date_column priority + alternatives
+# ---------------------------------------------------------------------------
+
+class TestFindDateColumnPriority:
+    def test_prefers_report_dt_over_inserted_dttm(self):
+        cols = {
+            "dm.t": {
+                "select": [],
+                "filter": ["inserted_dttm", "report_dt"],
+                "aggregate": [],
+                "group_by": [],
+            }
+        }
+        assert _find_date_column(cols) == "report_dt"
+
+    def test_prefers_dt_suffix_over_inserted(self):
+        cols = {
+            "dm.t": {
+                "filter": ["inserted_dttm", "event_dt"], "select": [], "aggregate": [], "group_by": [],
+            }
+        }
+        assert _find_date_column(cols) == "event_dt"
+
+    def test_only_inserted_picks_inserted(self):
+        cols = {
+            "dm.t": {
+                "filter": ["inserted_dttm"], "select": [], "aggregate": [], "group_by": [],
+            }
+        }
+        assert _find_date_column(cols) == "inserted_dttm"
+
+
+# ---------------------------------------------------------------------------
+# C.4: type validation in _compute_where_from_intent
+# ---------------------------------------------------------------------------
+
+def _build_loader_with_bool_and_date(tmp_path):
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame(
+        [{"schema_name": "dm", "table_name": "fact", "description": "t"}]
+    )
+    attrs_df = pd.DataFrame(
+        [
+            {
+                "schema_name": "dm", "table_name": "fact",
+                "column_name": "is_task", "dType": "bool",
+                "description": "Признак задачи",
+                "is_primary_key": False, "unique_perc": 50.0, "not_null_perc": 100.0,
+            },
+            {
+                "schema_name": "dm", "table_name": "fact",
+                "column_name": "report_dt", "dType": "date",
+                "description": "Отчётная дата",
+                "is_primary_key": False, "unique_perc": 1.0, "not_null_perc": 100.0,
+            },
+        ]
+    )
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_compute_where_drops_date_literal_for_bool_column(tmp_path):
+    """C.4: дата-литерал не должен попадать в WHERE для bool-колонки."""
+    loader = _build_loader_with_bool_and_date(tmp_path)
+    selected_columns = {
+        "dm.fact": {
+            "select": [], "filter": ["is_task", "report_dt"],
+            "aggregate": [], "group_by": [],
+        }
+    }
+    intent = {
+        "filter_conditions": [
+            {"column_hint": "is_task", "operator": "=", "value": "2026-03-01"},
+        ],
+        "date_filters": {"from": None, "to": None},
+    }
+    where = _compute_where_from_intent(
+        intent, selected_columns, user_input="", schema_loader=loader,
+    )
+    joined = " | ".join(where)
+    assert "is_task = '2026-03-01'" not in joined
+    assert "is_task = \"2026-03-01\"" not in joined
+
+
+def test_compute_where_keeps_compatible_filter(tmp_path):
+    """C.4: совместимый литерал — сохраняется."""
+    loader = _build_loader_with_bool_and_date(tmp_path)
+    selected_columns = {
+        "dm.fact": {
+            "select": [], "filter": ["is_task"],
+            "aggregate": [], "group_by": [],
+        }
+    }
+    intent = {
+        "filter_conditions": [
+            {"column_hint": "is_task", "operator": "=", "value": "true"},
+        ],
+        "date_filters": {"from": None, "to": None},
+    }
+    where = _compute_where_from_intent(
+        intent, selected_columns, user_input="", schema_loader=loader,
+    )
+    assert any("is_task" in c for c in where)

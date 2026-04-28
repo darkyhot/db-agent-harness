@@ -25,9 +25,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "llm_model": "GigaChat-2-Max",
     "debug_prompt": False,
     "show_plan": False,
+    "llm_verifier_enabled": False,
 }
 CONNECTION_CONFIG_KEYS = ("user_id", "host", "port", "database")
-RUNTIME_CONFIG_KEYS = ("llm_model", "debug_prompt", "show_plan")
+RUNTIME_CONFIG_KEYS = ("llm_model", "debug_prompt", "show_plan", "llm_verifier_enabled")
 
 # Regex для валидации идентификаторов (схема, таблица, колонка)
 _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')

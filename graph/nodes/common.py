@@ -230,6 +230,7 @@ class BaseNodeMixin:
         tools: list,
         debug_prompt: bool = False,
         show_plan: bool = False,
+        llm_verifier_enabled: bool = False,
     ) -> None:
         self.llm = llm
         self.db = db_manager
@@ -239,6 +240,7 @@ class BaseNodeMixin:
         self.tools = tools
         self.debug_prompt = debug_prompt
         self.show_plan = show_plan
+        self.llm_verifier_enabled = llm_verifier_enabled
         self.tool_map: dict[str, Any] = {t.name: t for t in tools}
         self.few_shot = FewShotRetriever(memory)
         self._sample_cache: dict[tuple[str, str], tuple[float, str]] = {}

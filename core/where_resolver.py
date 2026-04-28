@@ -144,9 +144,51 @@ def _business_event_is_aggregate_metric(
     return False
 
 
+_CONDITION_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*(>=|<=|!=|<>|=|<|>|ILIKE|LIKE|IN|NOT IN|IS NOT|IS)\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_condition(condition: str) -> tuple[str, str, str] | None:
+    """Грубо разобрать condition вида `col op value` → (col, op_norm, value_norm)."""
+    match = _CONDITION_RE.match(str(condition or "").strip())
+    if not match:
+        return None
+    column = match.group(1).strip().lower()
+    op = match.group(2).strip().upper()
+    if op == "<>":
+        op = "!="
+    raw_value = match.group(3).strip()
+    # Нормализуем значение: убираем кавычки, ::date и пробелы;
+    # 'True'/true/1 для bool сводим к одному виду.
+    value_norm = raw_value.replace("::date", "").replace("::timestamp", "").strip()
+    if value_norm.startswith("'") and value_norm.endswith("'") and len(value_norm) >= 2:
+        value_norm = value_norm[1:-1]
+    low = value_norm.lower()
+    if low in {"true", "1"}:
+        value_norm = "true"
+    elif low in {"false", "0"}:
+        value_norm = "false"
+    return column, op, value_norm
+
+
 def _add_unique(conditions: list[str], condition: str) -> None:
-    if condition not in conditions:
-        conditions.append(condition)
+    """Добавить condition с дедупом по точной строке И по `(column, op, value_norm)`.
+
+    Раньше дедуп шёл только по точной строке — что приводило к парам
+    `is_task = true` и `is_task = 'True'` в одном WHERE. Расширяем ключ:
+    нормализованная тройка (column, operator, value).
+    """
+    if condition in conditions:
+        return
+    parsed = _parse_condition(condition)
+    if parsed is not None:
+        for existing in conditions:
+            existing_parsed = _parse_condition(existing)
+            if existing_parsed == parsed:
+                return
+    conditions.append(condition)
 
 
 def _explicit_column_choice(user_input: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -467,6 +509,9 @@ def resolve_where(
             "WhereResolver: suppress clarification — business_event покрыт aggregate-метрикой"
         )
 
+    conditions = _drop_system_timestamp_when_time_axis_present(
+        conditions, selected_columns, schema_loader=schema_loader,
+    )
     logger.info(
         "WhereResolver: filter_intents=%d, applied_rules=%s, conditions=%d, candidates=%s",
         len(filter_intents),
@@ -682,6 +727,80 @@ def _apply_exact_filter_specs(
             _add_unique(conditions, condition)
             applied.append(f"query_spec:{idx}")
     return applied
+
+
+def _drop_system_timestamp_when_time_axis_present(
+    conditions: list[str],
+    selected_columns: dict[str, dict[str, Any]],
+    *,
+    schema_loader=None,
+) -> list[str]:
+    """Удалить условия на system_timestamp-колонки, если есть эквивалентные
+    условия на time_axis-колонках (semantic_class='date').
+
+    Это устраняет дубль `inserted_dttm >= '2026-02-01'` и `report_dt >= '2026-02-01'`,
+    когда LLM сгенерировал филтры по обеим осям. Базис истины — column_semantics:
+    semantic_class='system_timestamp' проигрывает любой date-колонке с тем же
+    оператором и значением.
+    """
+    if schema_loader is None or not conditions:
+        return conditions
+
+    column_to_table: dict[str, tuple[str, str]] = {}
+    for table_key, roles in (selected_columns or {}).items():
+        if "." not in table_key:
+            continue
+        schema, table = table_key.split(".", 1)
+        for role in ("filter", "select", "group_by", "aggregate"):
+            for col in roles.get(role, []) or []:
+                col_str = str(col or "").strip()
+                if col_str and col_str != "*":
+                    column_to_table.setdefault(col_str.lower(), (schema, table))
+
+    parsed_per_cond: list[tuple[str, str, str] | None] = [
+        _parse_condition(cond) for cond in conditions
+    ]
+
+    def _semantic_class(column: str) -> str:
+        binding = column_to_table.get(column.lower())
+        if not binding:
+            return ""
+        schema, table = binding
+        try:
+            sem = schema_loader.get_column_semantics(schema, table, column) or {}
+        except Exception:  # noqa: BLE001
+            sem = {}
+        return str(sem.get("semantic_class") or "").lower()
+
+    # Группируем по (op, value_norm) и помечаем колонки в группе.
+    groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
+    for idx, parsed in enumerate(parsed_per_cond):
+        if parsed is None:
+            continue
+        col, op, value = parsed
+        groups.setdefault((op, value), []).append((idx, col))
+
+    drop_indices: set[int] = set()
+    for (_, _), members in groups.items():
+        if len(members) < 2:
+            continue
+        date_axis_present = any(
+            _semantic_class(col) == "date" for _, col in members
+        )
+        if not date_axis_present:
+            continue
+        for idx, col in members:
+            if _semantic_class(col) == "system_timestamp":
+                drop_indices.add(idx)
+                logger.info(
+                    "WhereResolver: drop system_timestamp condition #%d on %s "
+                    "— покрыто time_axis колонкой",
+                    idx, col,
+                )
+
+    if not drop_indices:
+        return conditions
+    return [cond for idx, cond in enumerate(conditions) if idx not in drop_indices]
 
 
 def _should_skip_exact_calendar_date_filter(

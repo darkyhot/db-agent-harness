@@ -71,6 +71,7 @@ class DimensionSpec(StrictModel):
     role: str = "group_by"
     source_table: str | None = None
     join_key: str | None = None
+    label: str | None = None
     evidence: list[Evidence] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     alternatives: list[Alternative] = Field(default_factory=list)

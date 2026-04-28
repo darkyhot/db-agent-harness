@@ -255,7 +255,8 @@ def _route_after_sql_planner(state: AgentState) -> str:
     """Маршрутизация после sql_planner.
 
     Если column_selector пропустил dim-таблицу, возвращаемся в column_selector
-    с корректирующей подсказкой. Иначе — через plan_preview к sql_writer.
+    с корректирующей подсказкой. Иначе — в plan_verifier (если включён) или
+    сразу в plan_preview.
     """
     limit = _check_limits(state)
     if limit:
@@ -266,6 +267,26 @@ def _route_after_sql_planner(state: AgentState) -> str:
 
     if state.get("needs_clarification"):
         return END
+
+    if state.get("plan_verifier_done"):
+        return "plan_preview"
+
+    return "plan_verifier"
+
+
+def _route_after_plan_verifier(state: AgentState) -> str:
+    """После plan_verifier: если применились правки — обратно в sql_planner
+    для пересборки blueprint, иначе — в plan_preview.
+    """
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    if state.get("needs_clarification"):
+        return END
+
+    if state.get("plan_verifier_applied"):
+        return "sql_planner"
 
     return "plan_preview"
 
@@ -416,6 +437,7 @@ def build_graph(
     graph.add_node("table_explorer", nodes.table_explorer)
     graph.add_node("column_selector", nodes.column_selector)
     graph.add_node("sql_planner", nodes.sql_planner)
+    graph.add_node("plan_verifier", nodes.plan_verifier)
     graph.add_node("plan_preview", nodes.plan_preview)
     graph.add_node("plan_edit_router", nodes.plan_edit_router)
     graph.add_node("plan_patcher", nodes.plan_patcher)
@@ -469,10 +491,20 @@ def build_graph(
     graph.add_edge("column_selector", "sql_planner")
 
     # sql_planner → conditional routing:
-    # если dim-таблица пропущена → column_selector, иначе → plan_preview
+    # column_selector (если пропущена dim-таблица) или plan_verifier (LLM-валидация плана)
+    # или plan_preview (если verifier уже отработал на этой итерации).
     graph.add_conditional_edges("sql_planner", _route_after_sql_planner, {
         END: END,
         "column_selector": "column_selector",
+        "plan_verifier": "plan_verifier",
+        "plan_preview": "plan_preview",
+        "summarizer": "summarizer",
+    })
+
+    # plan_verifier → sql_planner (если применились правки) или plan_preview.
+    graph.add_conditional_edges("plan_verifier", _route_after_plan_verifier, {
+        END: END,
+        "sql_planner": "sql_planner",
         "plan_preview": "plan_preview",
         "summarizer": "summarizer",
     })
@@ -653,6 +685,10 @@ def create_initial_state(
         plan_preview_pending=False,
         plan_preview_approved=plan_preview_approved,
         plan_preview_iteration=plan_preview_iteration,
+        # Plan-verifier (LLM-валидация плана перед preview)
+        plan_verifier_done=False,
+        plan_verifier_applied=False,
+        plan_verdict={},
         # Plan-edit cycle
         plan_edit_text=plan_edit_text,
         plan_edit_kind="",

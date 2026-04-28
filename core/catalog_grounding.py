@@ -925,6 +925,66 @@ def _prune_sources_to_minimal_covering_table(
     return [chosen]
 
 
+_LABEL_TARGET_TOKENS = (
+    "name", "label", "title",
+    "название", "наименование", "имя",
+)
+
+
+def _target_is_label_slot(target: str) -> bool:
+    """True если dimension target явно просит человеко-читаемое имя сущности."""
+    t = str(target or "").lower()
+    if not t:
+        return False
+    if t.endswith(("_name", "_label", "_title")):
+        return True
+    return any(token in t for token in _LABEL_TARGET_TOKENS)
+
+
+def _source_has_label_column_for_term(
+    schema_loader,
+    schema: str,
+    table: str,
+    term: str,
+) -> bool:
+    """Проверить, есть ли в таблице колонка с semantic_class='label', связанная с термином.
+
+    Используется как guard для label-слотов: fact-таблица с одним лишь `gosb_id`
+    не должна считаться покрывающей слот «название ГОСБ» — для этого нужен
+    реальный label-атрибут (gosb_name/old_gosb_name/etc.).
+
+    Связь термина с колонкой проверяется через `_column_match_score` — он
+    учитывает и имя, и описание, что важно для случая «ГОСБ» (кириллица) →
+    `gosb_name` (латиница): термин совпадает с описанием «Название ГОСБ».
+    """
+    try:
+        cols = schema_loader.get_table_columns(schema, table)
+    except Exception:  # noqa: BLE001
+        return False
+    if cols is None or cols.empty:
+        return False
+    for _, row in cols.iterrows():
+        col_name = str(row.get("column_name") or "").strip()
+        if not col_name:
+            continue
+        try:
+            sem = schema_loader.get_column_semantics(schema, table, col_name) or {}
+        except Exception:  # noqa: BLE001
+            sem = {}
+        sem_class = str(sem.get("semantic_class") or "").lower()
+        col_lower = col_name.lower()
+        is_label_col = (
+            sem_class == "label"
+            or any(col_lower.endswith(suffix) for suffix in ("_name", "_label", "_title"))
+        )
+        if not is_label_col:
+            continue
+        desc = str(row.get("description") or "")
+        if _column_match_score(col_name, desc, term) > 0:
+            return True
+    return False
+
+
 def _source_covers_query_slots(
     source: SourceBinding,
     *,
@@ -954,6 +1014,11 @@ def _source_covers_query_slots(
             continue
         if dim.source_table and str(dim.source_table).strip().lower() != source_name:
             return False
+        if _target_is_label_slot(target):
+            if not _source_has_label_column_for_term(
+                schema_loader, source.schema, source.table, target
+            ):
+                return False
         dim_match = _best_dimension_column(schema_loader, source.schema, source.table, target)
         if dim_match is None:
             return False

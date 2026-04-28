@@ -216,16 +216,17 @@ def _build_condition(column: str, operator: str, value: Any, profile: dict[str, 
     dtype = str(profile.get("dType", "") or "").lower()
 
     if semantic_class == "flag" or value_mode == "boolean_like":
-        if value is True:
-            if "bool" in dtype:
-                return f"{column} = true"
+        # Унифицированное представление булева флага: true/false без строкового
+        # литерала. Раньше при не-bool dtype возвращался '"True"', что давало
+        # одновременно is_task = true и is_task = 'True' для одного запроса.
+        if isinstance(value, bool) or str(value).strip().lower() in {"true", "false"}:
+            normalized_true = (
+                value is True
+                or (isinstance(value, str) and value.strip().lower() == "true")
+            )
             if any(token in dtype for token in ("int", "numeric", "decimal", "number")):
-                return f"{column} = 1"
-        if value is False:
-            if "bool" in dtype:
-                return f"{column} = false"
-            if any(token in dtype for token in ("int", "numeric", "decimal", "number")):
-                return f"{column} = 0"
+                return f"{column} = {1 if normalized_true else 0}"
+            return f"{column} = {'true' if normalized_true else 'false'}"
         return f"{column} = '{_escape_sql_literal(str(value))}'"
 
     if op == "ILIKE":

@@ -549,8 +549,11 @@ class ExplorerNodes:
             _det_result.get("reason", ""),
         )
 
-        # B.3: LLM-верификатор детерминированного выбора (только в high-confidence-полосе).
-        # Ниже порога LLM column_selector и так запустится — верификатор не нужен.
+        # B.3: LLM-верификатор детерминированного выбора превратился в дев-инструмент.
+        # Раньше он сбрасывал confidence до 0.40 на critical issues и форсил
+        # LLM-fallback, но это давало ложные срабатывания на non-deterministic LLM.
+        # Теперь — только лог. Реальные правки делает plan_verifier (см. узел
+        # plan_verifier между sql_pipeline и plan_preview).
         verifier_hint_from_critic = ""
         if (
             getattr(self, "llm_verifier_enabled", False)
@@ -562,26 +565,20 @@ class ExplorerNodes:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLMColumnVerifier: не смогли вычислить slots: %s", exc)
                 _requested = {}
-            verdict = verify_column_selection(
-                user_input=user_input,
-                requested_slots=_requested,
-                selected_columns=_det_result["selected_columns"],
-                schema_loader=self.schema,
-                llm_invoker=self,
-                semantic_scorer=_semantic_match_score,
-            )
-            if verdict.get("should_force_fallback"):
-                logger.info(
-                    "ColumnSelector/verifier: critical issues=%d → принудительный LLM fallback",
-                    len(verdict.get("issues", [])),
+            if _requested:
+                verdict = verify_column_selection(
+                    user_input=user_input,
+                    requested_slots=_requested,
+                    selected_columns=_det_result["selected_columns"],
+                    schema_loader=self.schema,
+                    llm_invoker=self,
+                    semantic_scorer=_semantic_match_score,
                 )
-                _det_conf = 0.40
-                verifier_hint_from_critic = verdict.get("hint") or ""
-            elif verdict.get("hint"):
-                logger.info(
-                    "ColumnSelector/verifier: warnings (без fallback): %s",
-                    verdict["hint"],
-                )
+                if verdict.get("hint"):
+                    logger.info(
+                        "ColumnSelector/verifier (passive): %s",
+                        verdict["hint"],
+                    )
 
         _hints = state.get("user_hints", {}) or {}
         # Только group_by_hints (явная ось группировки) требует пересмотра колонок через LLM.

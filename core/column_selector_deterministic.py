@@ -550,6 +550,7 @@ def _choose_best_column(
     candidates_log: list[tuple[float, str, str, float, str]] = []  # (score, table, col, semantic, tags)
     dropped_label_filter: list[str] = []
     dropped_id_for_label: list[str] = []
+    saw_any_candidate_for_label = False
     alias_hit_col: str | None = None
 
     for table_key in table_structures:
@@ -592,6 +593,7 @@ def _choose_best_column(
             col_tokens = set(_tokenize(col_name))
             desc_tokens = set(_tokenize(desc))
             if _is_label_slot(slot):
+                saw_any_candidate_for_label = True
                 name_has_label = bool({'name', 'label', 'title'} & col_tokens)
                 desc_has_label = bool({'naimenovanie', 'nazvanie', 'name'} & desc_tokens)
                 lower_name_for_filter = col_name.lower()
@@ -614,6 +616,15 @@ def _choose_best_column(
                 score -= 180
             elif lower_name.startswith(('fact_', 'avg_')):
                 score -= 40
+            # Legacy-id штраф: old_/legacy_ для слотов-id ниже канонического PK.
+            if lower_name.startswith(('old_', 'legacy_')) and (
+                slot.lower() in ('gosb', 'gosb_id', 'госб', 'tb', 'tb_id', 'тб')
+                or _is_dimension_slot(slot)
+            ):
+                score -= 100
+            # ISU-префикс — историческое наследие; для слота tb предпочитаем tb_id.
+            if lower_name.startswith('isu_') and slot.lower() in ('tb', 'tb_id', 'тб', 'branch'):
+                score -= 120
 
             if _is_label_slot(slot):
                 if t_type in ('dim', 'ref', 'unknown'):
@@ -670,6 +681,14 @@ def _choose_best_column(
         logger.info("ChooseBest[slot=%s]: alias hit → %s", slot, alias_hit_col)
 
     if best is None:
+        if _is_label_slot(slot) and saw_any_candidate_for_label and (
+            dropped_id_for_label or dropped_label_filter
+        ):
+            logger.warning(
+                "ChooseBest[slot=%s]: label slot unresolved — все кандидаты отброшены "
+                "(нет колонки name/label/title); dropped_id=%s, dropped_other=%s",
+                slot, dropped_id_for_label, dropped_label_filter,
+            )
         return None
     return best[1], best[2]
 
@@ -772,6 +791,14 @@ def _choose_single_entity_count_column(
             score += 35.0
         if lower_name.endswith("_id"):
             score += 15.0
+        # Штраф для legacy-id и устаревших ИСУ-префиксов: предпочитаем
+        # текущий канонический id (gosb_id над old_gosb_id, tb_id над isu_branch_id).
+        if lower_name.startswith(("old_", "legacy_", "prev_")):
+            score -= 60.0
+        if lower_name.startswith("isu_") and any(
+            tok in (subject, *query_entities) for tok in ("tb", "тб", "branch", "bank")
+        ):
+            score -= 80.0
         if subject == "task" and "task" in lower_name:
             score += 25.0
         if subject == "client" and any(tok in lower_name for tok in ("client", "cust", "inn")):
@@ -800,13 +827,17 @@ def _resolve_count_pref_column(cols_df: pd.DataFrame, target: str) -> str | None
     by_lower = {name.lower(): name for name in names}
     if target_norm in by_lower:
         return by_lower[target_norm]
-    # Используем общий module-level _DIMENSION_ALIAS_MAP, но в COUNT-контексте
-    # для gosb_id предпочитаем old_gosb_id (исторически выше cardinality), поэтому
-    # переопределяем для этих ключей.
+    # COUNT-контекст: для gosb/госб/gosb_id предпочитаем канонический gosb_id,
+    # а old_gosb_id — fallback (раньше было наоборот, но это давало семантически
+    # неверный ответ на «сколько всего ГОСБ» — пользователь имеет в виду
+    # текущие ГОСБ, не исторический срез). Для tb — строго tb_id.
     count_aliases = {
-        "gosb": ["old_gosb_id", "gosb_id"],
-        "госб": ["old_gosb_id", "gosb_id"],
-        "gosb_id": ["old_gosb_id"],
+        "gosb": ["gosb_id", "old_gosb_id"],
+        "госб": ["gosb_id", "old_gosb_id"],
+        "gosb_id": ["gosb_id", "old_gosb_id"],
+        "tb": ["tb_id"],
+        "тб": ["tb_id"],
+        "tb_id": ["tb_id"],
     }
     aliases = count_aliases.get(target_norm) or _DIMENSION_ALIAS_MAP.get(target_norm, [])
     for alias in aliases:
@@ -826,6 +857,13 @@ def _resolve_count_pref_column(cols_df: pd.DataFrame, target: str) -> str | None
             continue
         if bool(row.get("is_primary_key", False)):
             score += 0.4
+        lower_name = col_name.lower()
+        # Штраф legacy-префиксов: old_/prev_/legacy_/isu_ — это исторические
+        # суррогаты, текущий PK обычно идёт без префикса.
+        if lower_name.startswith(("old_", "prev_", "legacy_")):
+            score -= 0.4
+        if lower_name.startswith("isu_") and target_norm in {"tb", "тб", "tb_id", "branch", "bank"}:
+            score -= 0.5
         candidate = (score, col_name)
         if best is None or candidate > best:
             best = candidate
@@ -1620,6 +1658,41 @@ def select_columns(
             logger.info(
                 "ColumnSelectorDet: ambiguous date filter columns %s → confidence -= 0.15",
                 date_filter_cols,
+            )
+        # A.5: label-слоты в requested['dimensions'], для которых не нашлось
+        # ни одной *_name/*_label/*_title-колонки в выбранных таблицах →
+        # значит, ни одна группировка не отражает то, что просил пользователь
+        # ("название X"). Снижаем confidence, чтобы запустился LLM-fallback
+        # либо чтобы plan-verifier потом мог потребовать dim-таблицу.
+        unresolved_label_slots = []
+        for dim_slot in requested.get('dimensions', []) or []:
+            if not _is_label_slot(dim_slot):
+                continue
+            has_label_col = False
+            for table_key, roles in selected_columns.items():
+                for c in roles.get('group_by', []) or roles.get('select', []) or []:
+                    lc = c.lower()
+                    if lc.endswith(_LABEL_SUFFIXES):
+                        has_label_col = True
+                        break
+                    parts = table_key.split('.', 1)
+                    if len(parts) == 2:
+                        try:
+                            sem = schema_loader.get_column_semantics(parts[0], parts[1], c) or {}
+                        except Exception:  # noqa: BLE001
+                            sem = {}
+                        if str(sem.get('semantic_class') or '').lower() == 'label':
+                            has_label_col = True
+                            break
+                if has_label_col:
+                    break
+            if not has_label_col:
+                unresolved_label_slots.append(dim_slot)
+        if unresolved_label_slots:
+            overall -= 0.20
+            logger.info(
+                "ColumnSelectorDet: unresolved label slots %s → confidence -= 0.20",
+                unresolved_label_slots,
             )
         # Штраф: мультитабличный запрос без JOIN-ключей
         if len(selected_columns) > 1 and not join_spec:

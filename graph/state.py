@@ -179,6 +179,17 @@ class AgentState(TypedDict):
     plan_preview_approved: bool
     plan_preview_iteration: int
 
+    # === Plan-verifier (LLM-валидация плана перед preview) ===
+    # plan_verifier_done: True после первого прохода verifier — защита от
+    #   зацикливания. После пересборки blueprint узел не выполняется повторно.
+    # plan_verifier_applied: True если хотя бы одна правка применилась
+    #   (state.selected_columns/sql_blueprint обновлены) — после этого
+    #   маршрутизация уйдёт обратно в sql_planner для пересборки.
+    # plan_verdict: dump последнего PlanVerdict для логов и UI.
+    plan_verifier_done: bool
+    plan_verifier_applied: bool
+    plan_verdict: dict[str, Any]
+
     # === Plan-edit cycle ===
     plan_edit_text: str
     plan_edit_kind: str

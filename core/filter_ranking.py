@@ -6,7 +6,6 @@ import re
 from difflib import SequenceMatcher
 from typing import Any
 
-from core.semantic_registry import builtin_subject_aliases
 from core.text_normalize import (
     normalize_text as _normalize_text,
     stem as _stem,
@@ -58,7 +57,8 @@ def _subject_alias_stems(subject: str, schema_loader) -> set[str]:
         lexicon = {}
     meta = ((lexicon or {}).get("subjects") or {}).get(subject) or {}
     aliases.extend(str(v) for v in (meta.get("aliases") or []) if str(v).strip())
-    aliases.extend(builtin_subject_aliases().get(subject, []))
+    flag_meta = ((lexicon or {}).get("flag_subjects") or {}).get(subject) or {}
+    aliases.extend(str(v) for v in (flag_meta.get("aliases") or []) if str(v).strip())
     stems: set[str] = set()
     for alias in aliases:
         stems.update(_stem_set(alias))

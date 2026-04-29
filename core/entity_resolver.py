@@ -105,6 +105,12 @@ def _truncate_desc(text: str) -> str:
     return s if len(s) <= _MAX_DESC_LEN else s[: _MAX_DESC_LEN - 1] + "…"
 
 
+def _metadata_text(row: Any) -> str:
+    description = str(row.get("description") or "").strip()
+    synonyms = str(row.get("synonyms") or "").replace(",", " ").strip()
+    return f"{description} {synonyms}".strip()
+
+
 def _is_numeric_dtype(dtype: str) -> bool:
     return bool(_NUMERIC_DTYPE_RE.match(str(dtype or "").strip()))
 
@@ -203,7 +209,7 @@ def _collect_candidates(
                 ref=f"{schema}.{table}.{col}",
                 column=col,
                 table_key=f"{schema}.{table}",
-                description=str(row.get("description") or "").strip(),
+                description=_metadata_text(row),
                 dtype=str(row.get("dType") or "").strip(),
                 is_primary_key=bool(row.get("is_primary_key", False)),
                 unique_perc=_safe_float(row.get("unique_perc")),

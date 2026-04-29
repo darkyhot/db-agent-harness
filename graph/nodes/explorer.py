@@ -540,13 +540,23 @@ class ExplorerNodes:
                 "confidence": 0.5,
             }
         spec, spec_errors = QuerySpec.from_dict(raw_query_spec)
-        bound_result = None if spec is None else bind_columns(
-            query_spec=spec,
-            table_structures=table_structures,
-            table_types=state.get("table_types", {}) or {},
-            schema_loader=self.schema,
-            llm_invoker=self,
+        # QuerySpec is a semantic contract. For ordinary aggregate/list queries
+        # column and join binding must stay with the join-aware selector below.
+        bound_result = None
+        scalar_count_spec = bool(
+            spec is not None
+            and not spec.dimensions
+            and spec.metrics
+            and all(metric.operation == "count" for metric in spec.metrics)
         )
+        if spec is not None and (spec.strategy == "count_attributes" or scalar_count_spec):
+            bound_result = bind_columns(
+                query_spec=spec,
+                table_structures=table_structures,
+                table_types=state.get("table_types", {}) or {},
+                schema_loader=self.schema,
+                llm_invoker=self,
+            )
         if bound_result and bound_result.get("selected_columns"):
             logger.info(
                 "ColumnSelector: QuerySpec binding confidence=%.2f (%s)",

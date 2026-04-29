@@ -260,6 +260,13 @@ def _looks_like_explicit_column(token: str) -> bool:
     return "_" in lower or lower.endswith(_METRIC_SUFFIXES + _LABEL_SUFFIXES + ('_id', '_code'))
 
 
+def _metadata_text(row: Any) -> str:
+    """Column description enriched with catalog-maintained semantic synonyms."""
+    description = str(row.get('description', '') or '')
+    synonyms = str(row.get('synonyms', '') or '').replace(',', ' ')
+    return f"{description} {synonyms}".strip()
+
+
 def _looks_like_table_artifact(token: str) -> bool:
     lower = str(token or '').lower().strip()
     if not lower or '.' in lower:
@@ -585,7 +592,7 @@ def _choose_best_column(
             if require_numeric and not _is_numeric(dtype):
                 continue
 
-            desc = str(row.get('description', '') or '')
+            desc = _metadata_text(row)
             semantic = _semantic_match_score(col_name, desc, slot)
             if semantic <= 0 and require_numeric and _is_numeric(dtype) and not is_pk:
                 # Fallback для англоязычных metric-name колонок, когда
@@ -754,7 +761,7 @@ def _choose_single_entity_count_column(
         col_name = str(row.get("column_name", "") or "").strip()
         if not col_name:
             continue
-        desc = str(row.get("description", "") or "")
+        desc = _metadata_text(row)
         is_pk = bool(row.get("is_primary_key", False))
         dtype = str(row.get("dType", "") or "").lower().strip()
         unique_perc = float(row.get("unique_perc", 0) or 0)
@@ -835,7 +842,7 @@ def _resolve_count_pref_column(cols_df: pd.DataFrame, target: str) -> str | None
         col_name = str(row.get("column_name") or "").strip()
         if not col_name:
             continue
-        desc = str(row.get("description") or "")
+        desc = _metadata_text(row)
         score = _semantic_match_score(col_name, desc, target_norm)
         if not score and target_tokens & set(_tokenize(desc)):
             score = 0.4
@@ -1041,7 +1048,7 @@ def select_columns(
             dtype = str(row.get('dType', '') or '').lower().strip()
             is_pk = bool(row.get('is_primary_key', False))
             unique_perc = float(row.get('unique_perc', 0) or 0)
-            desc = str(row.get('description', '') or '')
+            desc = _metadata_text(row)
 
             # ---- aggregate score ----
             if wants_aggregation and t_type in ('fact', 'unknown') and not is_pk:

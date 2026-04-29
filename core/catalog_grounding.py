@@ -369,7 +369,7 @@ def _score_catalog_bindings(
         dimension_score = 0.0
         for _, col in cols.iterrows():
             col_name = str(col.get("column_name") or "")
-            col_desc = str(col.get("description") or "")
+            col_desc = _row_text(col)
             metric_score += _score_text(col_name, col_desc, metric_terms, 3.0)
             for term in entity_terms:
                 if _best_attribute_column_score(col, term) > 0:
@@ -466,7 +466,7 @@ def _best_attribute_column_score(row: Any, term: str) -> float:
     col_name = str(row.get("column_name") or "").strip()
     if not col_name:
         return 0.0
-    desc = str(row.get("description") or "")
+    desc = _row_text(row)
     score = _score_text(col_name, desc, [term], 1.0)
     if score <= 0:
         return 0.0
@@ -501,6 +501,12 @@ def _score_text(name: str, description: str, terms: list[str], weight: float) ->
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^0-9a-zа-яё_]+", " ", str(text).lower())).strip()
+
+
+def _row_text(row: Any) -> str:
+    description = str(row.get("description") or "")
+    synonyms = str(row.get("synonyms") or "").replace(",", " ")
+    return f"{description} {synonyms}".strip()
 
 
 def _column_match_score(column_name: str, description: str, term: str) -> float:
@@ -553,7 +559,7 @@ def _best_dimension_column(
         col_name = str(row.get("column_name") or "").strip()
         if not col_name:
             continue
-        desc = str(row.get("description") or "")
+        desc = _row_text(row)
         score = _column_match_score(col_name, desc, term)
         if score <= 0:
             continue
@@ -986,6 +992,13 @@ def _target_is_label_slot(target: str) -> bool:
     return any(token in t for token in _LABEL_TARGET_TOKENS)
 
 
+def _dimension_requests_label(dim: Any) -> bool:
+    return (
+        _target_is_label_slot(getattr(dim, "target", ""))
+        or _target_is_label_slot(getattr(dim, "label", ""))
+    )
+
+
 def _source_has_label_column_for_term(
     schema_loader,
     schema: str,
@@ -1024,7 +1037,7 @@ def _source_has_label_column_for_term(
         )
         if not is_label_col:
             continue
-        desc = str(row.get("description") or "")
+        desc = _row_text(row)
         if _column_match_score(col_name, desc, term) > 0:
             return True
     return False
@@ -1059,7 +1072,7 @@ def _source_covers_query_slots(
             continue
         if dim.source_table and str(dim.source_table).strip().lower() != source_name:
             return False
-        if _target_is_label_slot(target):
+        if _dimension_requests_label(dim):
             if not _source_has_label_column_for_term(
                 schema_loader, source.schema, source.table, target
             ):
@@ -1166,7 +1179,7 @@ def _best_metric_column_in_table(cols, target: str):
     best: tuple[float, Any] | None = None
     for _, row in cols.iterrows():
         col_name = str(row.get("column_name") or "")
-        desc = str(row.get("description") or "")
+        desc = _row_text(row)
         score = _score_text(col_name, desc, [target_norm], 1.0)
         if score <= 0:
             continue

@@ -10,12 +10,13 @@ def classify_column(row: dict[str, Any]) -> dict[str, Any]:
     column = str(row.get("column_name", "") or "")
     dtype = str(row.get("dType", "") or "").lower()
     description = str(row.get("description", "") or "").lower()
+    synonyms = str(row.get("synonyms", "") or "").lower()
     is_pk = bool(row.get("is_primary_key", False))
     unique_pct = float(row.get("unique_perc", 0.0) or 0.0)
     not_null_pct = float(row.get("not_null_perc", 0.0) or 0.0)
 
     lower = column.lower()
-    text = f"{lower} {description}"
+    text = f"{lower} {description} {synonyms}"
     tags: set[str] = set()
 
     if any(token in dtype for token in ("timestamp", "datetime")) or lower.endswith("_dttm"):

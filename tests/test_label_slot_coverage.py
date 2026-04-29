@@ -61,6 +61,17 @@ def test_fact_table_does_not_cover_label_slot(tmp_path):
     )
 
 
+def test_fact_table_does_not_cover_label_from_dimension_label(tmp_path):
+    loader = _two_tables_loader(tmp_path)
+    fact_source = SourceBinding(schema="dm", table="fact_outflow", confidence=0.9)
+    spec = QuerySpec(
+        dimensions=[DimensionSpec(target="ГОСБ", label="Название ГОСБ")],
+    )
+    assert not _source_covers_query_slots(
+        fact_source, query_spec=spec, schema_loader=loader,
+    )
+
+
 def test_dim_table_covers_label_slot(tmp_path):
     loader = _two_tables_loader(tmp_path)
     dim_source = SourceBinding(schema="dm", table="dim_gosb", confidence=0.9)

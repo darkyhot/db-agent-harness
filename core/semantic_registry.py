@@ -122,17 +122,6 @@ def _is_overly_generic_match_phrase(column: str, phrase: str) -> bool:
     return False
 
 
-def builtin_subject_aliases() -> dict[str, list[str]]:
-    """Заглушка для обратной совместимости.
-
-    Раньше возвращала захардкоженный словарь "task"/"client"/"organization" → русско-
-    английские варианты. Теперь aliases собираются из метаданных каталога (table
-    descriptions, primary_subjects) на этапе `build_semantic_lexicon` — никаких
-    встроенных знаний о домене.
-    """
-    return {}
-
-
 def build_semantic_lexicon(
     tables_df,
     attrs_df,
@@ -195,7 +184,8 @@ def build_semantic_lexicon(
             semantics = column_semantics.get(key, {})
             sem_class = str(semantics.get("semantic_class", "") or "")
             description = str(row.get("description", "") or "")
-            aliases = _collect_aliases(column.replace("_", " "), description)
+            synonyms = str(row.get("synonyms", "") or "")
+            aliases = _collect_aliases(column.replace("_", " "), description, synonyms)
             # Flag-колонки `is_X`/`has_X` маркируют принадлежность строки к subject=X.
             # Сохраняем их в отдельной секции `flag_subjects`, чтобы:
             #  1) filter_ranking мог найти aliases при поиске implicit subject flag;
@@ -206,7 +196,7 @@ def build_semantic_lexicon(
             if flag_subject_match and sem_class in {"flag", "enum_like"}:
                 subject_token = flag_subject_match.group(1).strip()
                 if subject_token and subject_token not in _STOPWORDS:
-                    subject_aliases = _collect_aliases(subject_token, description)
+                    subject_aliases = _collect_aliases(subject_token, description, synonyms)
                     if subject_aliases:
                         flag_subjects = lexicon.setdefault("flag_subjects", {})
                         entry = flag_subjects.setdefault(
@@ -326,6 +316,15 @@ def find_best_subject(query: str, lexicon: dict[str, Any]) -> str | None:
     best_subject = None
     best_score = 0
     for subject, meta in (lexicon.get("subjects") or {}).items():
+        aliases = meta.get("aliases", []) or []
+        score = 0
+        for alias in aliases:
+            alias_tokens = set(_stem_tokens(_tokenize(alias)))
+            score = max(score, len(query_tokens & alias_tokens))
+        if score > best_score:
+            best_score = score
+            best_subject = subject
+    for subject, meta in (lexicon.get("flag_subjects") or {}).items():
         aliases = meta.get("aliases", []) or []
         score = 0
         for alias in aliases:

@@ -158,6 +158,43 @@ def _compute_group_by(
     return group_by
 
 
+def _drop_join_only_select_columns(
+    selected_columns: dict[str, dict],
+    join_spec: list[dict],
+    aggregation: dict | None,
+) -> None:
+    """Remove technical join keys from SELECT roles for aggregate joins."""
+    if not aggregation or not join_spec:
+        return
+    join_cols_by_table: dict[str, set[str]] = {}
+    for item in join_spec:
+        for side in ("left", "right"):
+            ref = str(item.get(side) or "")
+            parts = ref.rsplit(".", 1)
+            if len(parts) != 2:
+                continue
+            table_key, col_name = parts
+            join_cols_by_table.setdefault(table_key, set()).add(col_name)
+
+    for table_key, roles in selected_columns.items():
+        join_cols = join_cols_by_table.get(table_key)
+        if not join_cols:
+            continue
+        protected = set(roles.get("group_by", [])) | set(roles.get("aggregate", [])) | set(roles.get("filter", []))
+        select_cols = list(roles.get("select", []) or [])
+        cleaned = [
+            col for col in select_cols
+            if col not in join_cols or col in protected
+        ]
+        if cleaned != select_cols:
+            roles["select"] = cleaned
+            logger.info(
+                "DeterministicPlanner: removed join-only select columns from %s: %s",
+                table_key,
+                [col for col in select_cols if col not in cleaned],
+            )
+
+
 # ---------------------------------------------------------------------------
 # 2a-ext. TIME GRANULARITY — DATE_TRUNC wrap для group_by
 # ---------------------------------------------------------------------------
@@ -1229,6 +1266,7 @@ def build_blueprint(
         )
         aggregation = aggregations[0] if aggregations else None
 
+    _drop_join_only_select_columns(selected_columns, join_spec, aggregation)
     group_by    = _compute_group_by(selected_columns, aggregation)
 
     # Применяем DATE_TRUNC из time_granularity (если задана)

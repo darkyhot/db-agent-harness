@@ -79,6 +79,8 @@ class QueryIRNodes:
                 "graph_iterations": iterations,
             }
 
+        _strip_unstated_physical_hints(spec, user_input)
+
         logger.info(
             "QueryInterpreter: QuerySpec=%s",
             summarize_dict_keys(spec.to_dict(), label="query_spec"),
@@ -228,20 +230,8 @@ class QueryIRNodes:
             grain = str(row.get("grain") or "")
             if not schema or not table:
                 continue
-            col_bits: list[str] = []
-            try:
-                cols = self.schema.get_table_columns(schema, table).head(12)
-                for _, col in cols.iterrows():
-                    name = str(col.get("column_name") or "")
-                    dtype = str(col.get("dType") or "")
-                    col_desc = str(col.get("description") or "")
-                    if name:
-                        col_bits.append(f"{name}:{dtype}:{col_desc[:60]}")
-            except Exception:  # noqa: BLE001
-                col_bits = []
             lines.append(
-                f"- {schema}.{table}; grain={grain or 'unknown'}; desc={desc[:160]}; "
-                f"cols={'; '.join(col_bits)}"
+                f"- {schema}.{table}; grain={grain or 'unknown'}; desc={desc[:220]}"
             )
         return "\n".join(lines)
 
@@ -335,9 +325,46 @@ def _build_query_interpreter_system_prompt() -> str:
         "- source_constraints заполняй только если источник явно назван пользователем; "
         "не угадывай таблицу на этапе QuerySpec.\n"
         "- excluded_source_constraints заполняй только при явном запрете источника в правке плана.\n"
+        "- target_column_hint, dimensions[*].source_table и dimensions[*].join_key "
+        "заполняй ТОЛЬКО если пользователь явно написал физическое имя колонки/таблицы "
+        "(например outflow_qty или schema.table). Не выбирай колонки по каталогу: "
+        "физическую привязку выполнит downstream catalog/column resolver.\n"
         "- Каждое важное поле снабжай confidence и evidence.\n\n"
         f"JSON Schema:\n{schema}"
     )
+
+
+def _strip_unstated_physical_hints(spec: QuerySpec, user_input: str) -> None:
+    """Drop physical hints that were inferred from catalog instead of user text."""
+    haystack = str(user_input or "").lower()
+
+    def _mentioned(value: str | None) -> bool:
+        item = str(value or "").strip().lower()
+        return bool(item and item in haystack)
+
+    for entity in spec.entities:
+        if entity.target_column_hint and not _mentioned(entity.target_column_hint):
+            logger.info(
+                "QueryInterpreter: drop inferred target_column_hint=%s for entity=%s",
+                entity.target_column_hint,
+                entity.name,
+            )
+            entity.target_column_hint = None
+    for dim in spec.dimensions:
+        if dim.source_table and not _mentioned(dim.source_table):
+            logger.info(
+                "QueryInterpreter: drop inferred dimension source_table=%s for target=%s",
+                dim.source_table,
+                dim.target,
+            )
+            dim.source_table = None
+        if dim.join_key and not _mentioned(dim.join_key):
+            logger.info(
+                "QueryInterpreter: drop inferred dimension join_key=%s for target=%s",
+                dim.join_key,
+                dim.target,
+            )
+            dim.join_key = None
 
 
 def _apply_query_spec_guardrails(spec: QuerySpec, semantic_frame: dict[str, Any]) -> dict[str, Any]:

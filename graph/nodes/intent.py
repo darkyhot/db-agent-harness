@@ -678,12 +678,14 @@ class IntentNodes:
             table_name: str,
             slot: str,
             metric_entities: list[str] | None = None,
+            metric_role: bool = False,
         ) -> float:
             cols = _get_cols(schema_name, table_name)
             if cols.empty:
                 return -1.0
             t_type = _table_type(schema_name, table_name)
             is_dimension_slot = _is_dimension_slot(slot)
+            is_metric_role = metric_role or _is_metric_slot(slot)
             best = -1.0
             for _, row in cols.iterrows():
                 col_name = str(row.get("column_name", "") or "")
@@ -705,7 +707,7 @@ class IntentNodes:
                         score += 25
                     if t_type == "fact":
                         score -= 20
-                elif _is_metric_slot(slot):
+                elif is_metric_role:
                     if t_type == "fact":
                         score += 35
                     else:
@@ -901,6 +903,7 @@ class IntentNodes:
             if metric_slot:
                 metric_score = _score_table_for_slot(
                     st[0], st[1], metric_slot, metric_entities=metric_entities,
+                    metric_role=True,
                 )
                 if metric_score > 0:
                     score += metric_score
@@ -932,8 +935,8 @@ class IntentNodes:
             metric_main_candidates.sort(
                 key=lambda item: (
                     bool(item.get("is_dim_source")),
-                    -float(item.get("metric_score", 0.0) or 0.0),
                     -float(item.get("score", 0.0) or 0.0),
+                    -float(item.get("metric_score", 0.0) or 0.0),
                 )
             )
             main_table = metric_main_candidates[0]["table"]
@@ -1120,6 +1123,7 @@ class IntentNodes:
             if metric_slot:
                 slot_scores[table_key][str(metric_slot)] = _score_table_for_slot(
                     st[0], st[1], str(metric_slot), metric_entities=metric_entities,
+                    metric_role=True,
                 )
             for slot in dimension_slots:
                 slot_scores[table_key][str(slot)] = _score_table_for_slot(

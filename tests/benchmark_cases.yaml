@@ -12,7 +12,7 @@
     period_kind: null
 - query: "Покажи список клиентов по региону"
   expected:
-    subject: "client"
+    subject: null
     requires_listing: true
 - query: "Сколько сотрудников с подтвержденным оттоком"
   expected:

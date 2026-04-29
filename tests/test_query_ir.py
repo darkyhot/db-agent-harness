@@ -4,6 +4,7 @@ from core.catalog_grounding import ground_query_spec
 from core.query_ir import FilterSpec, QuerySpec, query_spec_json_schema
 from core.schema_loader import SchemaLoader
 from core.where_resolver import resolve_where
+from graph.nodes.query_ir import _strip_unstated_physical_hints
 from graph.nodes.sql_pipeline import _apply_query_spec_blueprint_overrides
 
 
@@ -56,6 +57,54 @@ def test_query_spec_accepts_valid_payload():
     assert spec is not None
     assert spec.to_legacy_intent()["aggregation_hint"] == "sum"
     assert spec.to_legacy_user_hints()["group_by_hints"] == ["order_dt"]
+
+
+def test_query_interpreter_strips_unstated_physical_hints():
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "sum", "target": "отток", "confidence": 0.9}],
+        "entities": [{"name": "отток", "target_column_hint": "fact_payee_qty"}],
+        "dimensions": [
+            {
+                "target": "ГОСБ",
+                "label": "Название ГОСБ",
+                "source_table": "dm.dim_gosb",
+                "join_key": "gosb_id",
+                "confidence": 0.9,
+            }
+        ],
+        "filters": [],
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.9,
+    })
+    assert spec is not None, errors
+
+    _strip_unstated_physical_hints(spec, "Посчитай сумму оттока по дате и названию ГОСБ")
+
+    assert spec.entities[0].target_column_hint is None
+    assert spec.dimensions[0].source_table is None
+    assert spec.dimensions[0].join_key is None
+
+
+def test_query_interpreter_keeps_explicit_physical_hints():
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "sum", "target": "outflow_qty", "confidence": 0.9}],
+        "entities": [{"name": "outflow_qty", "target_column_hint": "outflow_qty"}],
+        "dimensions": [],
+        "filters": [],
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.9,
+    })
+    assert spec is not None, errors
+
+    _strip_unstated_physical_hints(spec, "Покажи сумму outflow_qty")
+
+    assert spec.entities[0].target_column_hint == "outflow_qty"
 
 
 def test_query_spec_projects_multiple_count_metrics_without_loss():

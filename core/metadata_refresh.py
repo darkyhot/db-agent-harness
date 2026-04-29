@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import math
 import re
 from itertools import combinations
@@ -421,6 +422,117 @@ class MetadataRefreshService:
         )
         return (system_prompt, user_prompt)
 
+    def _build_synonym_prompt(
+        self,
+        schema: str,
+        table: str,
+        rows: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        payload = [
+            {
+                "column": str(row.get("column_name") or ""),
+                "dtype": str(row.get("dType") or ""),
+                "description": str(row.get("description") or ""),
+            }
+            for row in rows
+            if str(row.get("column_name") or "").strip()
+        ]
+        system_prompt = (
+            "Ты senior аналитик DWH. Сгенерируй поисковые синонимы для колонок каталога.\n"
+            "Синонимы нужны для сопоставления пользовательских вопросов с физическими "
+            "полями, а не для SQL.\n"
+            "Правила:\n"
+            "- Верни ТОЛЬКО JSON-объект вида {\"column_name\": [\"синоним\", ...]}.\n"
+            "- Для каждой колонки дай 0-6 коротких синонимов на русском и/или английском.\n"
+            "- Используй имя колонки, описание, dtype и устойчивые бизнес-термины.\n"
+            "- Не добавляй sample-значения, SQL-функции, названия таблиц и слишком общие "
+            "слова вроде дата/код/id без уточнения.\n"
+            "- Если полезных синонимов нет, верни пустой список для этой колонки."
+        )
+        user_prompt = (
+            f"Схема: {schema}\n"
+            f"Таблица: {table}\n"
+            "Колонки:\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+            "JSON:"
+        )
+        return (system_prompt, user_prompt)
+
+    @staticmethod
+    def _normalize_synonym_list(values: Any) -> str:
+        if isinstance(values, str):
+            raw_values = re.split(r"[,;|\n]+", values)
+        elif isinstance(values, list):
+            raw_values = values
+        else:
+            raw_values = []
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_values:
+            item = re.sub(r"\s+", " ", str(raw or "").strip())
+            if not item:
+                continue
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+            if len(result) >= 6:
+                break
+        return ",".join(result)
+
+    def _parse_synonym_response(
+        self,
+        response: str,
+        column_names: list[str],
+    ) -> dict[str, str]:
+        by_lower = {name.lower(): name for name in column_names}
+        parsed: Any
+        try:
+            parsed = json.loads(str(response))
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", str(response), flags=re.DOTALL)
+            if not match:
+                return {}
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return {}
+        if not isinstance(parsed, dict):
+            return {}
+        result: dict[str, str] = {}
+        for raw_key, raw_values in parsed.items():
+            key = by_lower.get(str(raw_key or "").strip().lower())
+            if not key:
+                continue
+            synonyms = self._normalize_synonym_list(raw_values)
+            if synonyms:
+                result[key] = synonyms
+        return result
+
+    def _generate_column_synonyms(
+        self,
+        schema: str,
+        table: str,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        if self.llm is None or not rows:
+            return {}
+        column_names = [
+            str(row.get("column_name") or "").strip()
+            for row in rows
+            if str(row.get("column_name") or "").strip()
+        ]
+        if not column_names:
+            return {}
+        system_prompt, user_prompt = self._build_synonym_prompt(schema, table, rows)
+        try:
+            response = self.llm.invoke_with_system(system_prompt, user_prompt, temperature=0.1)
+        except Exception:  # noqa: BLE001
+            logger.warning("LLM не смог сгенерировать synonyms для %s.%s", schema, table)
+            return {}
+        return self._parse_synonym_response(str(response), column_names)
+
     def _generate_column_descriptions(
         self,
         schema: str,
@@ -579,6 +691,13 @@ class MetadataRefreshService:
                 "partition_key": False,
                 "synonyms": "",
             })
+
+        if allow_generation and self.llm is not None:
+            generated_synonyms = self._generate_column_synonyms(schema, table, rows)
+            for row in rows:
+                col_name = str(row.get("column_name") or "")
+                if not str(row.get("synonyms") or "").strip():
+                    row["synonyms"] = generated_synonyms.get(col_name, "")
 
         table_description = str(table_comment or "").strip()
         if schema == SN_T_UZP_SCHEMA and not table_description and allow_generation:

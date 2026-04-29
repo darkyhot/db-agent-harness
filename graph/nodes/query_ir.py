@@ -9,7 +9,6 @@ from typing import Any
 from core.catalog_grounding import ground_query_spec
 from core.log_safety import summarize_dict_keys, summarize_text
 from core.query_ir import QuerySpec, query_spec_json_schema
-from core.semantic_frame import derive_semantic_frame, sanitize_user_input_for_semantics
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -34,13 +33,12 @@ class QueryIRNodes:
             return {"graph_iterations": iterations}
 
         user_input = state.get("user_input", "") or ""
-        semantic_user_input = sanitize_user_input_for_semantics(user_input)
         logger.info("QueryInterpreter: запрос: %s", summarize_text(user_input, label="user_input"))
 
         system_prompt = _build_query_interpreter_system_prompt()
         user_prompt = _build_query_interpreter_user_prompt(
             user_input=user_input,
-            catalog_context=self._get_query_ir_catalog_context(semantic_user_input),
+            catalog_context=self._get_query_ir_catalog_context(user_input),
             prev_sql=state.get("prev_sql", ""),
             prev_summary=state.get("prev_result_summary", ""),
         )
@@ -88,16 +86,6 @@ class QueryIRNodes:
 
         legacy_intent = spec.to_legacy_intent()
         legacy_hints = spec.to_legacy_user_hints()
-        try:
-            semantic_frame = derive_semantic_frame(
-                semantic_user_input,
-                legacy_intent,
-                schema_loader=self.schema,
-                user_hints=legacy_hints,
-            )
-        except Exception:  # noqa: BLE001
-            semantic_frame = spec.to_semantic_frame()
-        semantic_frame = _apply_query_spec_guardrails(spec, semantic_frame)
 
         return {
             "query_spec": spec.to_dict(),
@@ -106,7 +94,7 @@ class QueryIRNodes:
             "user_hints_llm": legacy_hints,
             "user_hints": legacy_hints,
             "hints_source": "query_spec",
-            "semantic_frame": semantic_frame,
+            "semantic_frame": {},
             "needs_clarification": bool(spec.clarification_needed),
             "clarification_message": spec.clarification.question if spec.clarification else "",
             "messages": state["messages"] + [
@@ -141,7 +129,7 @@ class QueryIRNodes:
         result = ground_query_spec(
             query_spec=spec,
             schema_loader=self.schema,
-            user_input=sanitize_user_input_for_semantics(state.get("user_input", "") or ""),
+            user_input=state.get("user_input", "") or "",
         )
         excluded_tables = {
             str(item).strip().lower()
@@ -329,14 +317,23 @@ def _build_query_interpreter_system_prompt() -> str:
         "- Верни ТОЛЬКО JSON-объект без markdown.\n"
         "- task='answer_data' для расчётов/выборок; 'inspect_schema' для вопросов о каталоге; "
         "'edit_plan' для правки прошлого плана; 'clarify' для неоднозначности.\n"
+        "- strategy выбирай явно: 'count_attributes' для вопросов вида "
+        "'сколько есть X и Y' / 'сколько всего X и Y', где нужно посчитать "
+        "кардинальности нескольких атрибутов; 'aggregate' для обычных агрегатов; "
+        "'list' для перечислений.\n"
+        "- Для strategy='count_attributes' заполняй entities смысловыми именами "
+        "из запроса, например entities=[{'name':'ТБ'}, {'name':'госб'}]. "
+        "Не маппь их на физические колонки и не выбирай таблицу, если пользователь "
+        "явно не назвал источник.\n"
         "- filters описывают бизнес-смысл, не SQL.\n"
-        "- Если пользователь просит несколько показателей (например ТБ и ГОСБ), "
-        "верни несколько объектов в metrics, не один.\n"
+        "- Если пользователь просит несколько обычных показателей, верни несколько "
+        "objects в metrics, не один.\n"
         "- В dimensions[*].label можно положить опциональное человеко-читаемое имя оси "
         "(напр. 'Дата отчёта'); поле описательное, downstream его не использует. "
         "Других полей у dimension нет — не добавляй ничего, кроме перечисленных в JSON Schema.\n"
         "- order_by заполняй для просьб о сортировке; direction должен быть ASC или DESC.\n"
-        "- source_constraints заполняй только если источник явно назван или сильно следует из каталога.\n"
+        "- source_constraints заполняй только если источник явно назван пользователем; "
+        "не угадывай таблицу на этапе QuerySpec.\n"
         "- excluded_source_constraints заполняй только при явном запрете источника в правке плана.\n"
         "- Каждое важное поле снабжай confidence и evidence.\n\n"
         f"JSON Schema:\n{schema}"

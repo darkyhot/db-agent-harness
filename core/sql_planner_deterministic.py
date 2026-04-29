@@ -251,12 +251,6 @@ def _compute_having(
     if not main_table or not schema_loader:
         return []
 
-    # Импорт здесь, чтобы избежать кругов и зависеть только при наличии хинтов.
-    try:
-        from core.user_hint_extractor import match_unit_column
-    except Exception:  # noqa: BLE001
-        return []
-
     parts = main_table.split(".", 1)
     if len(parts) != 2:
         return []
@@ -271,7 +265,7 @@ def _compute_having(
         if value is None:
             continue
         unit = hint.get("unit_hint", "") or ""
-        col = match_unit_column(unit, main_table, schema_loader) if unit else None
+        col = _match_unit_column_from_catalog(unit, main_cols) if unit else None
         if not col and not main_cols.empty:
             try:
                 pk_mask = main_cols.get(
@@ -298,6 +292,36 @@ def _compute_having(
             f"COUNT(DISTINCT {col})", op, value, unit,
         )
     return result
+
+
+def _match_unit_column_from_catalog(unit: str, cols_df) -> str | None:
+    """Resolve HAVING unit to a column using only structured hint text and catalog columns."""
+    normalized = str(unit or "").strip().lower()
+    if not normalized or cols_df is None or cols_df.empty:
+        return None
+    best: tuple[float, str] | None = None
+    for _, row in cols_df.iterrows():
+        col = str(row.get("column_name") or "").strip()
+        if not col:
+            continue
+        desc = str(row.get("description") or "").lower()
+        score = 0.0
+        lower_col = col.lower()
+        if normalized == lower_col:
+            score += 100.0
+        elif normalized in lower_col or lower_col in normalized:
+            score += 70.0
+        elif normalized in desc:
+            score += 45.0
+        if bool(row.get("is_primary_key", False)):
+            score += 30.0
+        if lower_col.endswith("_id"):
+            score += 10.0
+        if score > 0:
+            candidate = (score, col)
+            if best is None or candidate > best:
+                best = candidate
+    return best[1] if best else None
 
 
 # ---------------------------------------------------------------------------
@@ -1315,7 +1339,7 @@ def build_blueprint(
 
     # ORDER BY: по агрегатному алиасу DESC, или нет
     order_by: str | None = None
-    if aggregation and aggregation.get("alias"):
+    if aggregation and aggregation.get("alias") and str(intent.get("strategy") or "") != "count_attributes":
         order_by = f"{aggregation['alias']} DESC"
 
     # LIMIT: только если явно задан в intent; без умолчания

@@ -5,7 +5,6 @@ from graph.nodes.query_ir import QueryIRNodes
 from graph.nodes.intent import IntentNodes
 from graph.nodes.hint_extractor import HintExtractorNodes
 from graph.nodes.hint_extractor_llm import HintExtractorLLMNodes
-from graph.nodes.explicit_mode_dispatcher import ExplicitModeDispatcherNodes
 from graph.nodes.explorer import ExplorerNodes
 from graph.nodes.sql_pipeline import SqlPipelineNodes
 from graph.nodes.plan_verifier import PlanVerifierNodes
@@ -18,10 +17,11 @@ from graph.nodes.dispatcher import DispatcherNodes
 
 class GraphNodes(
     QueryIRNodes,
+    # Legacy direct-call compatibility only. These nodes are not registered in
+    # the runtime graph, whose entrypoint is QuerySpec.
     IntentNodes,
     HintExtractorLLMNodes,
     HintExtractorNodes,
-    ExplicitModeDispatcherNodes,
     ExplorerNodes,
     SqlPipelineNodes,
     PlanVerifierNodes,
@@ -36,10 +36,7 @@ class GraphNodes(
 
     Каждый mixin содержит 1-3 узла графа:
     - QueryIRNodes: query_interpreter, catalog_grounder
-    - IntentNodes: intent_classifier, table_resolver
-    - HintExtractorLLMNodes: hint_extractor_llm (LLM-экстрактор подсказок)
-    - HintExtractorNodes: hint_extractor (regex + merge с LLM-результатом)
-    - ExplicitModeDispatcherNodes: explicit_mode_dispatcher (детерминированный)
+    - IntentNodes/HintExtractor*: legacy direct-call compatibility only
     - ExplorerNodes: table_explorer, column_selector
     - SqlPipelineNodes: sql_planner, sql_writer, sql_self_corrector,
       sql_static_checker, sql_validator_node

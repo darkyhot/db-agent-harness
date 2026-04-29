@@ -24,7 +24,6 @@ from core.query_ir import (
     QuerySpec,
     SourceBinding,
 )
-from core.semantic_frame import derive_semantic_frame, sanitize_user_input_for_semantics
 
 
 @dataclass
@@ -79,8 +78,7 @@ def ground_query_spec(
         min_confidence: Below this confidence we ask for clarification instead
             of silently selecting a table.
     """
-    user_input = sanitize_user_input_for_semantics(user_input)
-    semantic_frame = _derive_grounding_frame(query_spec, schema_loader, user_input)
+    semantic_frame: dict[str, Any] = {}
 
     if query_spec.clarification_needed and query_spec.clarification:
         return GroundingResult(
@@ -333,6 +331,7 @@ def _score_catalog_bindings(
         return []
 
     metric_terms = [m.target for m in query_spec.metrics if m.target]
+    entity_terms = _entity_terms(query_spec)
     dimension_terms = [d.target for d in query_spec.dimensions if d.target]
     filter_terms = [f.target for f in query_spec.filters if f.target]
     join_terms = [j.key for j in query_spec.join_constraints if j.key]
@@ -342,7 +341,7 @@ def _score_catalog_bindings(
         for item in (source.table, source.semantic)
         if item
     ]
-    all_terms = list(dict.fromkeys(metric_terms + dimension_terms + filter_terms + join_terms + source_terms))
+    all_terms = list(dict.fromkeys(entity_terms + metric_terms + dimension_terms + filter_terms + join_terms + source_terms))
     if not all_terms:
         all_terms = [user_input]
 
@@ -365,16 +364,34 @@ def _score_catalog_bindings(
         if _source_mentioned_in_text(schema, table, user_input):
             score += 6.0
         metric_score = 0.0
+        entity_score = 0.0
+        entity_coverage = 0
         dimension_score = 0.0
         for _, col in cols.iterrows():
             col_name = str(col.get("column_name") or "")
             col_desc = str(col.get("description") or "")
             metric_score += _score_text(col_name, col_desc, metric_terms, 3.0)
+            for term in entity_terms:
+                if _best_attribute_column_score(col, term) > 0:
+                    entity_coverage += 1
+                    entity_score += _best_attribute_column_score(col, term)
+                    break
             dimension_score += _score_text(col_name, col_desc, dimension_terms, 2.0)
             score += _score_text(col_name, col_desc, filter_terms, 1.3)
             score += _score_text(col_name, col_desc, join_terms, 1.0)
 
-        score += metric_score + dimension_score
+        if query_spec.strategy == "count_attributes":
+            full_coverage = _table_count_attribute_coverage(cols, entity_terms)
+            if full_coverage < len(entity_terms):
+                continue
+            score += full_coverage * 6.0 + entity_score
+            score += _score_text(table, description, entity_terms, 2.0)
+            if table_type in {"dim", "ref"}:
+                score += 8.0
+            elif table_type == "fact":
+                score -= 4.0
+        else:
+            score += metric_score + dimension_score
         frame_score = _frame_table_support_score(
             schema_loader=schema_loader,
             schema=schema,
@@ -418,6 +435,54 @@ def _count_id_metrics(query_spec: QuerySpec) -> bool:
         and str(metric.target or "").lower().endswith(("_id", "id"))
         for metric in metrics
     )
+
+
+_ATTRIBUTE_ALIASES: dict[str, list[str]] = {
+    "tb": ["tb_id"],
+    "тб": ["tb_id"],
+    "tb_id": ["tb_id"],
+    "gosb": ["gosb_id", "old_gosb_id"],
+    "госб": ["gosb_id", "old_gosb_id"],
+    "gosb_id": ["gosb_id", "old_gosb_id"],
+}
+
+
+def _entity_terms(query_spec: QuerySpec) -> list[str]:
+    terms: list[str] = []
+    for entity in query_spec.entities or []:
+        value = entity.target_column_hint or entity.canonical or entity.name
+        if value:
+            terms.append(value)
+    if query_spec.strategy == "count_attributes" and not terms:
+        terms.extend(metric.target for metric in query_spec.metrics if metric.operation == "count" and metric.target)
+    return list(dict.fromkeys(str(term).strip() for term in terms if str(term).strip()))
+
+
+def _table_count_attribute_coverage(cols, entity_terms: list[str]) -> int:
+    covered = 0
+    for term in entity_terms:
+        if any(_best_attribute_column_score(row, term) > 0 for _, row in cols.iterrows()):
+            covered += 1
+    return covered
+
+
+def _best_attribute_column_score(row: Any, term: str) -> float:
+    col_name = str(row.get("column_name") or "").strip()
+    if not col_name:
+        return 0.0
+    normalized_term = _normalize(term)
+    aliases = _ATTRIBUTE_ALIASES.get(normalized_term, [])
+    if col_name.lower() in aliases:
+        return 8.0 - aliases.index(col_name.lower())
+    desc = str(row.get("description") or "")
+    score = _score_text(col_name, desc, [term], 1.0)
+    if score <= 0:
+        return 0.0
+    if bool(row.get("is_primary_key", False)):
+        score += 1.5
+    if col_name.lower().endswith("_id"):
+        score += 0.8
+    return score
 
 
 def _score_text(name: str, description: str, terms: list[str], weight: float) -> float:
@@ -715,6 +780,7 @@ def _search_terms(query_spec: QuerySpec, user_input: str) -> list[str]:
         if source.table:
             terms.append(source.table)
     terms.extend(metric.target for metric in query_spec.metrics if metric.target)
+    terms.extend(_entity_terms(query_spec))
     terms.extend(dim.target for dim in query_spec.dimensions if dim.target)
     terms.extend(item.target for item in query_spec.filters if item.target)
     terms.append(user_input)
@@ -729,25 +795,6 @@ def _search_terms(query_spec: QuerySpec, user_input: str) -> list[str]:
 def _has_source(sources: list[SourceBinding], binding: SourceBinding) -> bool:
     key = binding.full_name.lower()
     return any(item.full_name.lower() == key for item in sources)
-
-
-def _derive_grounding_frame(query_spec: QuerySpec, schema_loader, user_input: str) -> dict[str, Any]:
-    """Build metadata-driven semantics for table scoring.
-
-    QuerySpec is the contract, but table grounding benefits from local catalog
-    rules such as value candidates and implicit subject flags. This keeps the
-    final SQL flexible while preventing unrelated joinable helper tables from
-    being promoted to sources.
-    """
-    try:
-        return derive_semantic_frame(
-            user_input,
-            query_spec.to_legacy_intent(),
-            schema_loader=schema_loader,
-            user_hints=query_spec.to_legacy_user_hints(),
-        )
-    except Exception:  # noqa: BLE001
-        return query_spec.to_semantic_frame()
 
 
 def _frame_table_support_score(
@@ -813,10 +860,16 @@ def _prune_unrequested_helper_sources(
     if len(sources) <= 1 or query_spec.join_constraints or query_spec.dimensions:
         return sources
     frame = semantic_frame or {}
-    if not (frame.get("filter_intents") or frame.get("subject") or frame.get("business_event")):
+    if not (
+        frame.get("filter_intents")
+        or frame.get("subject")
+        or frame.get("business_event")
+        or query_spec.filters
+    ):
         return sources
 
     kept: list[SourceBinding] = []
+    min_support = 1.0 if query_spec.filters else 0.5
     for source in sources:
         score = _frame_table_support_score(
             schema_loader=schema_loader,
@@ -826,16 +879,16 @@ def _prune_unrequested_helper_sources(
             user_input=user_input,
             semantic_frame=frame,
         )
-        if score >= 0.5:
+        if score >= min_support:
             kept.append(source)
             logger.debug(
-                "PruneHelper: keep %s (score=%.2f >= 0.5)",
-                source.full_name, score,
+                "PruneHelper: keep %s (score=%.2f >= %.2f)",
+                source.full_name, score, min_support,
             )
         else:
             logger.info(
-                "PruneHelper: drop %s (frame_support_score=%.2f < 0.5)",
-                source.full_name, score,
+                "PruneHelper: drop %s (frame_support_score=%.2f < %.2f)",
+                source.full_name, score, min_support,
             )
 
     if not kept:
@@ -1062,11 +1115,14 @@ def _prune_count_sources_covered_by_single_dictionary(
     """
     if len(sources) <= 1 or query_spec.dimensions or query_spec.filters or query_spec.join_constraints:
         return sources
-    metrics = [
-        metric for metric in (query_spec.metrics or [])
-        if metric.operation == "count" and str(metric.target or "").strip()
-    ]
-    if len(metrics) < 2:
+    targets = _entity_terms(query_spec)
+    if not targets:
+        targets = [
+            str(metric.target or "").strip()
+            for metric in (query_spec.metrics or [])
+            if metric.operation == "count" and str(metric.target or "").strip()
+        ]
+    if len(targets) < 2:
         return sources
 
     best: tuple[int, float, SourceBinding] | None = None
@@ -1082,14 +1138,14 @@ def _prune_count_sources_covered_by_single_dictionary(
             continue
         covered = 0
         pk_bonus = 0.0
-        for metric in metrics:
-            match = _best_metric_column_in_table(cols, str(metric.target or ""))
+        for target in targets:
+            match = _best_metric_column_in_table(cols, target)
             if match is None:
                 break
             covered += 1
             if bool(match.get("is_primary_key", False)):
                 pk_bonus += 1.0
-        if covered != len(metrics):
+        if covered != len(targets):
             continue
         rank = (covered, pk_bonus + source.confidence)
         candidate = (rank[0], rank[1], source)

@@ -11,22 +11,11 @@ import re
 import time
 from typing import Any
 
+from core.column_binding import bind_columns
 from core.join_analysis import detect_table_type, format_join_analysis
-from core.column_selector_deterministic import (
-    select_columns as _det_select_columns,
-    normalize_join_spec,
-    _derive_requested_slots,
-    _semantic_match_score,
-)
-from core.llm_column_verifier import verify_column_selection
+from core.join_selection import normalize_join_spec
+from core.query_ir import QuerySpec
 from graph.state import AgentState
-
-# Минимальная confidence для использования детерминированного результата без LLM.
-# При confidence >= порога LLM column_selector не вызывается.
-# Снижен с 0.70 до 0.55 (Direction 5.1): детерминированный селектор стал надёжнее
-# за счёт FK-метаданных/synonyms, поэтому промежуточная полоса 0.55-0.70
-# обрабатывается без LLM-похода.
-_DET_CONFIDENCE_THRESHOLD = 0.55
 
 logger = logging.getLogger(__name__)
 
@@ -529,121 +518,63 @@ class ExplorerNodes:
                 "graph_iterations": state.get("graph_iterations", 0) + 1,
             }
 
-        # --- Детерминированная попытка (без LLM) ---
-        # Запускаем перед LLM. Если confidence >= порога — возвращаем сразу.
-        # Это экономит один LLM-вызов (5с задержки) для стандартных запросов.
-        _det_result = _det_select_columns(
-            intent=intent,
+        raw_query_spec = state.get("query_spec") or {}
+        if not raw_query_spec and intent:
+            raw_query_spec = {
+                "task": "answer_data",
+                "strategy": "aggregate",
+                "entities": [],
+                "metrics": [
+                    {
+                        "operation": str(intent.get("aggregation_hint") or "count").lower(),
+                        "target": (list(intent.get("entities") or []) or [None])[0],
+                        "distinct_policy": "auto",
+                        "confidence": 0.5,
+                    }
+                ],
+                "dimensions": [],
+                "filters": [],
+                "source_constraints": [],
+                "join_constraints": [],
+                "clarification_needed": False,
+                "confidence": 0.5,
+            }
+        spec, spec_errors = QuerySpec.from_dict(raw_query_spec)
+        bound_result = None if spec is None else bind_columns(
+            query_spec=spec,
             table_structures=table_structures,
-            table_types=state.get("table_types", {}),
-            join_analysis_data=join_analysis_data,
+            table_types=state.get("table_types", {}) or {},
             schema_loader=self.schema,
-            user_input=user_input,
-            user_hints=state.get("user_hints", {}) or {},
-            semantic_frame=state.get("semantic_frame", {}) or {},
         )
-        _det_conf = _det_result.get("confidence", 0.0)
-        logger.info(
-            "ColumnSelector: детерминированный результат confidence=%.2f (%s)",
-            _det_conf,
-            _det_result.get("reason", ""),
-        )
-
-        # B.3: LLM-верификатор детерминированного выбора превратился в дев-инструмент.
-        # Раньше он сбрасывал confidence до 0.40 на critical issues и форсил
-        # LLM-fallback, но это давало ложные срабатывания на non-deterministic LLM.
-        # Теперь — только лог. Реальные правки делает plan_verifier (см. узел
-        # plan_verifier между sql_pipeline и plan_preview).
-        verifier_hint_from_critic = ""
-        if (
-            getattr(self, "llm_verifier_enabled", False)
-            and _det_conf >= _DET_CONFIDENCE_THRESHOLD
-            and _det_result.get("selected_columns")
-        ):
-            try:
-                _requested = _derive_requested_slots(user_input, intent)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("LLMColumnVerifier: не смогли вычислить slots: %s", exc)
-                _requested = {}
-            if _requested:
-                verdict = verify_column_selection(
-                    user_input=user_input,
-                    requested_slots=_requested,
-                    selected_columns=_det_result["selected_columns"],
-                    schema_loader=self.schema,
-                    llm_invoker=self,
-                    semantic_scorer=_semantic_match_score,
-                )
-                if verdict.get("hint"):
-                    logger.info(
-                        "ColumnSelector/verifier (passive): %s",
-                        verdict["hint"],
-                    )
-
-        _hints = state.get("user_hints", {}) or {}
-        # Только group_by_hints (явная ось группировки) требует пересмотра колонок через LLM.
-        # aggregate_hints не меняет набор колонок — только способ агрегации.
-        _has_explicit_group = bool(_hints.get("group_by_hints"))
-        if (
-            _det_conf >= _DET_CONFIDENCE_THRESHOLD
-            and not state.get("column_selector_hint", "")
-            and not _has_explicit_group
-        ):
-            # Достаточная уверенность и нет явных group_by-хинтов → пропускаем LLM
+        if bound_result and bound_result.get("selected_columns"):
             logger.info(
-                "ColumnSelector: confidence=%.2f >= %.2f → используем детерминированный результат",
-                _det_conf,
-                _DET_CONFIDENCE_THRESHOLD,
-            )
-            # Применяем explicit_join override (Блок B) к детерминированному результату
-            _det_join_spec = _apply_explicit_join_override(
-                _det_result["join_spec"],
-                _det_result["selected_columns"],
-                intent,
-                user_hints=state.get("user_hints"),
-            )
-            _det_join_spec = normalize_join_spec(
-                _det_join_spec,
-                self.schema,
-                state.get("table_types", {}) or {},
+                "ColumnSelector: QuerySpec binding confidence=%.2f (%s)",
+                float(bound_result.get("confidence", 0.0) or 0.0),
+                bound_result.get("reason", ""),
             )
             self.memory.add_message(
                 "assistant",
-                f"[column_selector/det] confidence={_det_conf:.2f}; "
-                f"таблиц: {len(_det_result['selected_columns'])}, "
-                f"join-ключей: {len(_det_join_spec)}",
+                f"[column_binding] таблиц: {len(bound_result['selected_columns'])}, "
+                f"join-ключей: {len(bound_result.get('join_spec') or [])}",
             )
             return {
-                "selected_columns": _det_result["selected_columns"],
-                "join_spec": _det_join_spec,
+                "selected_columns": bound_result["selected_columns"],
+                "join_spec": bound_result.get("join_spec") or [],
                 "column_selector_hint": "",
                 "messages": state["messages"] + [
                     {
                         "role": "assistant",
                         "content": (
-                            f"[det] Колонки выбраны детерминированно (conf={_det_conf:.2f}): "
-                            f"{', '.join(_det_result['selected_columns'].keys())}"
+                            "[binding] Колонки связаны по QuerySpec: "
+                            f"{', '.join(bound_result['selected_columns'].keys())}"
                         ),
                     }
                 ],
                 "graph_iterations": state.get("graph_iterations", 0) + 1,
             }
-
-        _fallback_reasons: list[str] = []
-        if _det_conf < _DET_CONFIDENCE_THRESHOLD:
-            _fallback_reasons.append(
-                f"confidence {_det_conf:.2f} < {_DET_CONFIDENCE_THRESHOLD:.2f}"
-            )
-        if state.get("column_selector_hint", ""):
-            _fallback_reasons.append("corrective_hint")
-        if verifier_hint_from_critic:
-            _fallback_reasons.append("verifier_critical")
-        if _has_explicit_group:
-            _fallback_reasons.append("explicit_group_by_hints")
-        logger.info(
-            "ColumnSelector: запускаем LLM (%s)",
-            ", ".join(_fallback_reasons) or "fallback_reason=unknown",
-        )
+        if spec_errors:
+            logger.warning("ColumnSelector: QuerySpec invalid for binding: %s", "; ".join(spec_errors))
+        logger.info("ColumnSelector: запускаем LLM column selector")
 
         # --- Системный промпт ---
         system_prompt = (
@@ -740,10 +671,6 @@ class ExplorerNodes:
 
         # Если sql_planner обнаружил пропущенную таблицу — добавляем корректирующую подсказку
         hint = state.get("column_selector_hint", "")
-        # B.3: верификатор детерминированного результата мог сгенерировать собственную
-        # критику — присоединяем её к существующей подсказке.
-        if verifier_hint_from_critic:
-            hint = (hint + "\n" + verifier_hint_from_critic).strip() if hint else verifier_hint_from_critic
         if hint:
             user_prompt += f"\n\n=== КОРРЕКТИРУЮЩАЯ ИНСТРУКЦИЯ ===\n{hint}"
             logger.info("ColumnSelector: применяю корректирующую подсказку")

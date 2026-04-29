@@ -2064,10 +2064,8 @@ class PlanEditNodes:
 
         updates: dict[str, Any] = {}
         for node in (
-            self.intent_classifier,
-            self.hint_extractor,
-            self.explicit_mode_dispatcher,
-            self.table_resolver,
+            self.query_interpreter,
+            self.catalog_grounder,
             self.table_explorer,
             self.column_selector,
             self.sql_planner,

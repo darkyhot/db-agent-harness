@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 QueryTask = Literal["answer_data", "inspect_schema", "edit_plan", "clarify"]
+QueryStrategy = Literal["count_attributes", "aggregate", "list", "inspect_schema", "edit_plan", "clarify"]
 MetricOperation = Literal["count", "sum", "avg", "min", "max", "list"]
 DistinctPolicy = Literal["auto", "distinct", "all"]
 TimeGrain = Literal["day", "week", "month", "quarter", "year"]
@@ -75,6 +76,16 @@ class DimensionSpec(StrictModel):
     evidence: list[Evidence] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     alternatives: list[Alternative] = Field(default_factory=list)
+
+
+class EntitySpec(StrictModel):
+    """Semantic business entity mentioned by the user before physical binding."""
+
+    name: str
+    canonical: str | None = None
+    target_column_hint: str | None = None
+    evidence: list[Evidence] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class FilterSpec(StrictModel):
@@ -162,6 +173,8 @@ class QuerySpec(StrictModel):
     """Single semantic source of truth for a user request."""
 
     task: QueryTask = "answer_data"
+    strategy: QueryStrategy = "aggregate"
+    entities: list[EntitySpec] = Field(default_factory=list)
     metrics: list[MetricSpec] = Field(default_factory=list)
     dimensions: list[DimensionSpec] = Field(default_factory=list)
     filters: list[FilterSpec] = Field(default_factory=list)
@@ -183,6 +196,29 @@ class QuerySpec(StrictModel):
     def _normalize_task(cls, value: Any) -> Any:
         return str(value or "answer_data").strip().lower()
 
+    @field_validator("strategy", mode="before")
+    @classmethod
+    def _normalize_strategy(cls, value: Any) -> Any:
+        return str(value or "aggregate").strip().lower()
+
+    @model_validator(mode="after")
+    def _validate_strategy_contract(self) -> "QuerySpec":
+        if self.task == "inspect_schema":
+            self.strategy = "inspect_schema"
+        elif self.task == "edit_plan":
+            self.strategy = "edit_plan"
+        elif self.task == "clarify":
+            self.strategy = "clarify"
+
+        if self.strategy == "count_attributes":
+            count_targets = [
+                metric for metric in self.metrics
+                if metric.operation == "count" and str(metric.target or "").strip()
+            ]
+            if len(self.entities) < 2 and len(count_targets) < 2:
+                raise ValueError("count_attributes requires at least two entities or count metric targets")
+        return self
+
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> tuple["QuerySpec | None", list[str]]:
         """Backward-compatible validation wrapper."""
@@ -198,6 +234,8 @@ class QuerySpec(StrictModel):
         """Compatibility projection for existing pipeline nodes."""
         first_metric = self.metrics[0] if self.metrics else None
         entities: list[str] = []
+        for entity in self.entities:
+            entities.append(entity.canonical or entity.name)
         for metric in self.metrics:
             if metric.target:
                 entities.append(metric.target)
@@ -218,9 +256,10 @@ class QuerySpec(StrictModel):
 
         return {
             "intent": intent_name,
+            "strategy": self.strategy,
             "entities": entities,
             "date_filters": date_filters,
-            "aggregation_hint": first_metric.operation if first_metric else None,
+            "aggregation_hint": first_metric.operation if first_metric else ("count" if self.strategy == "count_attributes" else None),
             "needs_search": False,
             "complexity": "join" if self.join_constraints or len(self.source_constraints) > 1 else "single_table",
             "clarification_question": self.clarification.question if self.clarification else "",
@@ -252,6 +291,15 @@ class QuerySpec(StrictModel):
             }
             for metric in self.metrics
         ]
+        if self.strategy == "count_attributes" and not agg_hints:
+            for entity in self.entities:
+                target = entity.target_column_hint or entity.canonical or entity.name
+                if target:
+                    agg_hints.append({
+                        "function": "count",
+                        "column": target,
+                        "distinct": True,
+                    })
         preferences_list = [dict(item) for item in agg_hints if item.get("function")]
         for idx, preferences in enumerate(preferences_list):
             if preferences.get("column") == "*":
@@ -404,6 +452,8 @@ def query_spec_json_schema() -> dict[str, Any]:
     schema = QuerySpec.model_json_schema()
     schema["required"] = [
         "task",
+        "strategy",
+        "entities",
         "metrics",
         "dimensions",
         "filters",

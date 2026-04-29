@@ -18,11 +18,10 @@ from core.database import DatabaseManager
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.schema_loader import SchemaLoader
-import core.column_selector_deterministic as column_selector_module
+import core.column_binding as column_binding_module
 import core.sql_planner_deterministic as sql_planner_module
 from core.sql_validator import SQLValidator
 from graph.nodes import GraphNodes
-import graph.nodes.intent as intent_module
 from graph.state import AgentState
 
 
@@ -59,39 +58,6 @@ def _check_limits(state: AgentState) -> str | None:
     if _is_timed_out(state):
         return "summarizer"
     return None
-
-
-# ======================================================================
-# Функции маршрутизации для новых узлов
-# ======================================================================
-
-def _route_after_intent_classifier(state: AgentState) -> str:
-    """Маршрутизация после intent_classifier."""
-    limit = _check_limits(state)
-    if limit:
-        return limit
-
-    if state.get("plan_preview_approved") and state.get("sql_blueprint"):
-        return "plan_preview"
-
-    if state.get("plan_edit_text") and state.get("sql_blueprint"):
-        return "plan_edit_router"
-
-    if state.get("needs_clarification"):
-        return END
-
-    intent = state.get("intent", {})
-
-    # Вопрос по схеме — сразу к summarizer (ответ из каталога)
-    if intent.get("intent") == "schema_question":
-        return "summarizer"
-
-    # Нужен поиск таблиц — к tool_dispatcher
-    if intent.get("needs_search"):
-        return "tool_dispatcher"
-
-    # Обычный путь — LLM-экстрактор подсказок → regex+merge hint_extractor → table_resolver
-    return "hint_extractor_llm"
 
 
 def _route_after_query_interpreter(state: AgentState) -> str:
@@ -134,10 +100,10 @@ def _route_after_tool_dispatcher(state: AgentState) -> str:
     if limit:
         return limit
 
-    # Если dispatcher обработал search запрос — возврат к intent_classifier
+    # Если dispatcher обработал search запрос — повторяем catalog grounding.
     intent = state.get("intent", {})
     if intent.get("search_results"):
-        return "table_resolver"
+        return "catalog_grounder"
 
     # Если dispatcher загрузил sample — возврат к error_diagnoser
     diagnosis = state.get("error_diagnosis", {})
@@ -145,19 +111,7 @@ def _route_after_tool_dispatcher(state: AgentState) -> str:
         return "error_diagnoser"
 
     # Fallback
-    return "table_resolver"
-
-
-def _route_after_table_resolver(state: AgentState) -> str:
-    """Маршрутизация после table_resolver."""
-    limit = _check_limits(state)
-    if limit:
-        return limit
-
-    if state.get("needs_disambiguation") or state.get("needs_clarification"):
-        return END
-
-    return "table_explorer"
+    return "catalog_grounder"
 
 
 def _route_after_sql_writer(state: AgentState) -> str:
@@ -346,9 +300,9 @@ def _route_after_error_diagnoser(state: AgentState) -> str:
     if limit:
         return limit
 
-    # Нужен replanning — к table_resolver с контекстом ошибки
+    # Нужен replanning — к catalog_grounder с контекстом ошибки
     if state.get("needs_replan"):
-        return "table_resolver"
+        return "catalog_grounder"
 
     # Тривиальный фикс кодом — SQL уже исправлен, к self-correction перед валидатором
     if state.get("sql_to_validate"):
@@ -412,9 +366,10 @@ def build_graph(
           → [успех] → summarizer → END
     """
     logger.info(
-        "Runtime modules: column_selector=%s, intent=%s, sql_planner=%s",
-        getattr(column_selector_module, "__file__", "<unknown>"),
-        getattr(intent_module, "__file__", "<unknown>"),
+        "Runtime modules: column_selector=%s, intent=%s, column_binding=%s, sql_planner=%s",
+        getattr(column_binding_module, "__file__", "<unknown>"),
+        "QuerySpec",
+        getattr(column_binding_module, "__file__", "<unknown>"),
         getattr(sql_planner_module, "__file__", "<unknown>"),
     )
     nodes = GraphNodes(
@@ -429,11 +384,6 @@ def build_graph(
     # Добавляем все узлы
     graph.add_node("query_interpreter", nodes.query_interpreter)
     graph.add_node("catalog_grounder", nodes.catalog_grounder)
-    graph.add_node("intent_classifier", nodes.intent_classifier)
-    graph.add_node("hint_extractor_llm", nodes.hint_extractor_llm)
-    graph.add_node("hint_extractor", nodes.hint_extractor)
-    graph.add_node("explicit_mode_dispatcher", nodes.explicit_mode_dispatcher)
-    graph.add_node("table_resolver", nodes.table_resolver)
     graph.add_node("table_explorer", nodes.table_explorer)
     graph.add_node("column_selector", nodes.column_selector)
     graph.add_node("sql_planner", nodes.sql_planner)
@@ -474,19 +424,13 @@ def build_graph(
     # Legacy nodes are still registered for direct tests and emergency tooling,
     # but the main graph no longer routes through a second interpretation path.
 
-    # tool_dispatcher → conditional routing (back to resolver or diagnoser)
+    # tool_dispatcher → conditional routing (back to grounding or diagnoser)
     graph.add_conditional_edges("tool_dispatcher", _route_after_tool_dispatcher, {
-        "table_resolver": "table_resolver",
+        "catalog_grounder": "catalog_grounder",
         "error_diagnoser": "error_diagnoser",
         "summarizer": "summarizer",
     })
 
-    # table_resolver → table_explorer или END, если нужно уточнение источника
-    graph.add_conditional_edges("table_resolver", _route_after_table_resolver, {
-        END: END,
-        "table_explorer": "table_explorer",
-        "summarizer": "summarizer",
-    })
     graph.add_edge("table_explorer", "column_selector")
     graph.add_edge("column_selector", "sql_planner")
 
@@ -569,7 +513,7 @@ def build_graph(
     # === Цикл коррекции ===
     # error_diagnoser → conditional routing
     graph.add_conditional_edges("error_diagnoser", _route_after_error_diagnoser, {
-        "table_resolver": "table_resolver",
+        "catalog_grounder": "catalog_grounder",
         "sql_self_corrector": "sql_self_corrector",
         "tool_dispatcher": "tool_dispatcher",
         "sql_fixer": "sql_fixer",

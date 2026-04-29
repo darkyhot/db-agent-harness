@@ -11,23 +11,11 @@ import logging
 import re
 from typing import Any
 
+from core.entity_resolver import resolve_entity_to_columns
 from core.join_analysis import detect_table_type
 from core.query_ir import QuerySpec
 
 logger = logging.getLogger(__name__)
-
-
-_ENTITY_COLUMN_ALIASES: dict[str, list[str]] = {
-    "tb": ["tb_id"],
-    "тб": ["tb_id"],
-    "tb_id": ["tb_id"],
-    "gosb": ["gosb_id", "old_gosb_id"],
-    "госб": ["gosb_id", "old_gosb_id"],
-    "gosb_id": ["gosb_id", "old_gosb_id"],
-    "задача": ["task_code", "task_id"],
-    "задачи": ["task_code", "task_id"],
-    "task": ["task_code", "task_id"],
-}
 
 
 def bind_columns(
@@ -36,6 +24,7 @@ def bind_columns(
     table_structures: dict[str, str],
     table_types: dict[str, str],
     schema_loader: Any,
+    llm_invoker: Any = None,
 ) -> dict[str, Any] | None:
     """Bind physical columns for a QuerySpec.
 
@@ -50,6 +39,7 @@ def bind_columns(
             table_structures=table_structures,
             table_types=table_types,
             schema_loader=schema_loader,
+            llm_invoker=llm_invoker,
         )
 
     targets = _count_attribute_targets(spec)
@@ -62,7 +52,6 @@ def bind_columns(
         }
 
     best_table: tuple[float, str, dict[str, str]] | None = None
-    table_count = len(table_structures)
     for idx, table_key in enumerate(table_structures):
         parts = table_key.split(".", 1)
         if len(parts) != 2:
@@ -73,7 +62,13 @@ def bind_columns(
         bindings: dict[str, str] = {}
         score = 0.0
         for target in targets:
-            col_score = _choose_count_attribute_column(cols_df, target)
+            col_score = _resolve_column_for_target(
+                target=target,
+                table_key=table_key,
+                schema_loader=schema_loader,
+                llm_invoker=llm_invoker,
+                role_hint="id",
+            )
             if col_score is None:
                 break
             col, value = col_score
@@ -128,6 +123,7 @@ def _bind_metric_dimension_columns(
     table_structures: dict[str, str],
     table_types: dict[str, str],
     schema_loader: Any,
+    llm_invoker: Any = None,
 ) -> dict[str, Any] | None:
     if not spec.metrics and not spec.dimensions and not spec.filters:
         return None
@@ -147,6 +143,8 @@ def _bind_metric_dimension_columns(
             schema_loader=schema_loader,
             target=target,
             prefer_fact=metric.operation != "count",
+            role_hint="metric" if metric.operation != "count" else "id",
+            llm_invoker=llm_invoker,
         )
         if not choice:
             continue
@@ -166,6 +164,8 @@ def _bind_metric_dimension_columns(
             schema_loader=schema_loader,
             target=dim.target,
             prefer_fact=False,
+            role_hint="any",
+            llm_invoker=llm_invoker,
         )
         if not choice:
             continue
@@ -185,6 +185,8 @@ def _bind_metric_dimension_columns(
             schema_loader=schema_loader,
             target=flt.target,
             prefer_fact=True,
+            role_hint="filter",
+            llm_invoker=llm_invoker,
         )
         if not choice:
             continue
@@ -212,6 +214,8 @@ def _choose_column_across_tables(
     schema_loader: Any,
     target: str,
     prefer_fact: bool,
+    role_hint: str = "any",
+    llm_invoker: Any = None,
 ) -> tuple[str, str] | None:
     best: tuple[float, str, str] | None = None
     table_count = len(table_structures)
@@ -222,7 +226,13 @@ def _choose_column_across_tables(
         cols_df = schema_loader.get_table_columns(parts[0], parts[1])
         if cols_df.empty:
             continue
-        col_score = _choose_count_attribute_column(cols_df, target)
+        col_score = _resolve_column_for_target(
+            target=target,
+            table_key=table_key,
+            schema_loader=schema_loader,
+            llm_invoker=llm_invoker,
+            role_hint=role_hint,
+        )
         if col_score is None:
             continue
         col, score = col_score
@@ -238,6 +248,30 @@ def _choose_column_across_tables(
     if best is None:
         return None
     return best[1], best[2]
+
+
+def _resolve_column_for_target(
+    *,
+    target: str,
+    table_key: str,
+    schema_loader: Any,
+    llm_invoker: Any,
+    role_hint: str,
+) -> tuple[str, float] | None:
+    """Универсальный матчинг колонки через entity_resolver (без алиасов)."""
+    resolution = resolve_entity_to_columns(
+        entity_term=target,
+        user_input="",
+        candidate_table_keys=[table_key],
+        schema_loader=schema_loader,
+        llm_invoker=llm_invoker,
+        role_hint=role_hint,
+    )
+    if not resolution.matched or resolution.column is None:
+        return None
+    # Масштаб 0..1000 для совместимости с table-level бонусами выше
+    # (т-тип +500/+120, table_name_score *80).
+    return resolution.column, resolution.confidence * 1000.0
 
 
 def _coerce_spec(query_spec: QuerySpec | dict[str, Any]) -> QuerySpec | None:
@@ -263,45 +297,6 @@ def _count_attribute_targets(spec: QuerySpec) -> list[str]:
         if metric.operation == "count" and metric.target:
             targets.append(metric.target)
     return list(dict.fromkeys(targets))
-
-
-def _choose_count_attribute_column(cols_df, target: str) -> tuple[str, float] | None:
-    aliases = _ENTITY_COLUMN_ALIASES.get(_normalize(target), [])
-    by_lower = {
-        str(row.get("column_name") or "").strip().lower(): row
-        for _, row in cols_df.iterrows()
-        if str(row.get("column_name") or "").strip()
-    }
-    for idx, alias in enumerate(aliases):
-        row = by_lower.get(alias)
-        if row is not None:
-            return str(row.get("column_name")), 1000.0 - idx
-
-    best: tuple[float, str] | None = None
-    for _, row in cols_df.iterrows():
-        col_name = str(row.get("column_name") or "").strip()
-        if not col_name:
-            continue
-        desc = str(row.get("description") or "")
-        score = _text_score(col_name, desc, target) * 100.0
-        if score <= 0:
-            continue
-        if bool(row.get("is_primary_key", False)):
-            score += 160.0
-        unique = _float(row.get("unique_perc"))
-        not_null = _float(row.get("not_null_perc"))
-        score += min(unique, 100.0) * 1.2 + min(not_null, 100.0) * 0.8
-        lower = col_name.lower()
-        if lower.endswith("_id"):
-            score += 60.0
-        if lower.startswith(("old_", "legacy_", "prev_")):
-            score -= 20.0
-        candidate = (score, col_name)
-        if best is None or candidate > best:
-            best = candidate
-    if best is None:
-        return None
-    return best[1], best[0]
 
 
 def _text_score(name: str, description: str, target: str) -> float:

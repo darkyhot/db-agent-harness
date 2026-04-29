@@ -272,10 +272,28 @@ def _collect_implicit_subject_flag_requests(
     subject = str((semantic_frame or {}).get("subject") or "").strip().lower()
     subject_stems = _subject_alias_stems(subject, schema_loader)
     relevant_stems = set(subject_stems) | set(query_stems)
-    for aliases in builtin_subject_aliases().values():
+    # Если query/subject стем перекликается с любым subject из metadata-lexicon —
+    # добавляем aliases этого subject в relevant_stems. Это заменяет старое
+    # «расширение через _BUILTIN_SUBJECT_ALIASES» и работает универсально:
+    # маппинг русско-английских терминов (например, «задач» ↔ «task») приходит
+    # из описаний flag-колонок и table descriptions, а не из захардкоженного словаря.
+    try:
+        lexicon = schema_loader.get_semantic_lexicon() or {}
+    except Exception:  # noqa: BLE001
+        lexicon = {}
+    # Объединяем основные subjects (из table grain / primary_subjects) и
+    # flag_subjects (выводимые из `is_X`-колонок) — обе секции одинаково помогают
+    # связать query stem (например, «задач») с subject token (например, «task»).
+    combined_subjects: dict[str, dict[str, Any]] = {}
+    combined_subjects.update(lexicon.get("subjects") or {})
+    for k, v in (lexicon.get("flag_subjects") or {}).items():
+        if k not in combined_subjects:
+            combined_subjects[k] = v
+    for subj_key, meta in combined_subjects.items():
         alias_stems: set[str] = set()
-        for alias in aliases:
-            alias_stems.update(_stem_set(alias))
+        alias_stems.update(_stem_set(str(subj_key)))
+        for alias in (meta or {}).get("aliases", []) or []:
+            alias_stems.update(_stem_set(str(alias)))
         if alias_stems & relevant_stems:
             relevant_stems.update(alias_stems)
     if not relevant_stems:
@@ -286,7 +304,34 @@ def _collect_implicit_subject_flag_requests(
         for req in existing_requests
         if str(req.get("column_key") or "").strip()
     }
+    # Если subject уже покрыт более конкретной value-match-заявкой (например,
+    # «фактический отток» → task_subtype с known_term, охватывающим subject стем),
+    # implicit boolean flag добавлять не нужно: это шум.
+    subject_already_covered = False
+    for req in existing_requests:
+        col_key = str(req.get("column_key") or "").strip().lower()
+        if not col_key or "." not in col_key:
+            continue
+        parts = col_key.split(".")
+        if len(parts) < 3:
+            continue
+        s, t, c = parts[0], parts[1], parts[2]
+        try:
+            profile = schema_loader.get_value_profile(s, t, c)
+        except Exception:  # noqa: BLE001
+            profile = {}
+        terms = list((profile or {}).get("known_terms", []) or []) + list((profile or {}).get("top_values", []) or [])
+        for term in terms:
+            term_stems = _stem_set(str(term))
+            if term_stems & relevant_stems:
+                subject_already_covered = True
+                break
+        if subject_already_covered:
+            break
+
     implicit_requests: list[dict[str, Any]] = []
+    if subject_already_covered:
+        return implicit_requests
 
     for table_key in selected_tables:
         if "." not in table_key:

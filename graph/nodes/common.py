@@ -24,11 +24,6 @@ try:
 except ImportError:
     repair_json = None
 
-try:
-    from core.synonym_map import expand_with_synonyms
-except ImportError:
-    expand_with_synonyms = None
-
 logger = logging.getLogger(__name__)
 
 

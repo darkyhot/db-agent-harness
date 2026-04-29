@@ -545,6 +545,7 @@ class ExplorerNodes:
             table_structures=table_structures,
             table_types=state.get("table_types", {}) or {},
             schema_loader=self.schema,
+            llm_invoker=self,
         )
         if bound_result and bound_result.get("selected_columns"):
             logger.info(

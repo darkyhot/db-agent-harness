@@ -437,16 +437,6 @@ def _count_id_metrics(query_spec: QuerySpec) -> bool:
     )
 
 
-_ATTRIBUTE_ALIASES: dict[str, list[str]] = {
-    "tb": ["tb_id"],
-    "тб": ["tb_id"],
-    "tb_id": ["tb_id"],
-    "gosb": ["gosb_id", "old_gosb_id"],
-    "госб": ["gosb_id", "old_gosb_id"],
-    "gosb_id": ["gosb_id", "old_gosb_id"],
-}
-
-
 def _entity_terms(query_spec: QuerySpec) -> list[str]:
     terms: list[str] = []
     for entity in query_spec.entities or []:
@@ -467,13 +457,15 @@ def _table_count_attribute_coverage(cols, entity_terms: list[str]) -> int:
 
 
 def _best_attribute_column_score(row: Any, term: str) -> float:
+    """Универсальный score «колонка ↔ entity term» через description/name overlap.
+
+    Без захардкоженных доменных алиасов — все «тб»/«госб»-маппинги уходят на
+    уровень entity_resolver. Здесь только структурные структурные бонусы:
+    PK и `_id`-суффикс (не язык, а SQL-конвенция).
+    """
     col_name = str(row.get("column_name") or "").strip()
     if not col_name:
         return 0.0
-    normalized_term = _normalize(term)
-    aliases = _ATTRIBUTE_ALIASES.get(normalized_term, [])
-    if col_name.lower() in aliases:
-        return 8.0 - aliases.index(col_name.lower())
     desc = str(row.get("description") or "")
     score = _score_text(col_name, desc, [term], 1.0)
     if score <= 0:
@@ -1165,23 +1157,21 @@ def _prune_count_sources_covered_by_single_dictionary(
 
 
 def _best_metric_column_in_table(cols, target: str):
+    """Подобрать колонку под target по описанию/имени без доменных алиасов.
+
+    Базовый сигнал — `_score_text` (токен-overlap по имени и описанию). PK-бонус
+    повышает score, чтобы при равенстве выбрать основной идентификатор.
+    """
     target_norm = _normalize(target)
     best: tuple[float, Any] | None = None
     for _, row in cols.iterrows():
         col_name = str(row.get("column_name") or "")
         desc = str(row.get("description") or "")
         score = _score_text(col_name, desc, [target_norm], 1.0)
-        normalized_name = _normalize(col_name)
-        if target_norm == "gosb_id" and normalized_name == "old_gosb_id":
-            score = max(score, 2.0)
-        if target_norm == "gosb" and normalized_name in {"old_gosb_id", "gosb_id"}:
-            score = max(score, 2.0)
-        if target_norm == "tb" and normalized_name == "tb_id":
-            score = max(score, 2.0)
-        if target_norm == "tb_id" and normalized_name == "tb_id":
-            score = max(score, 2.0)
         if score <= 0:
             continue
+        if bool(row.get("is_primary_key", False)):
+            score += 0.5
         candidate = (score, row)
         if best is None or candidate[0] > best[0]:
             best = candidate

@@ -26,7 +26,6 @@ import re
 from typing import Any, Iterable
 
 from core.log_safety import summarize_dict_keys
-from core.synonym_map import SYNONYM_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -302,15 +301,15 @@ def _normalize(text: str) -> str:
 
 
 def _expand_slot_synonyms(slot: str) -> list[str]:
-    """Расширить русский термин его английскими синонимами.
+    """Расширить slot его транслитерацией.
 
-    «сегмент» → ["segment", "seg"]; «клиент» → ["client", "customer", ...].
-    Если термин уже английский — возвращаем его как есть + транслитерацию.
+    Без захардкоженных русско-английских словарей: реальный матчинг с колонками
+    делает entity_resolver, который опирается на embeddings и описания. Здесь
+    оставлена только транслитерация (структурная нормализация: «сегмент» → «segment»
+    через табличный translit), полезная для подстрочных совпадений в именах таблиц.
     """
     slot_lower = slot.lower().strip()
     variants: list[str] = [slot_lower]
-    if slot_lower in SYNONYM_MAP:
-        variants.extend(SYNONYM_MAP[slot_lower])
     translit = _translit(slot_lower)
     if translit and translit != slot_lower:
         variants.append(translit)
@@ -688,7 +687,7 @@ def extract_user_hints(
 
 
 def _normalize_slot_key(token: str) -> str:
-    """Привести slot-токен к каноническому ключу через SYNONYM_MAP."""
+    """Привести slot-токен к каноническому ключу (lower + транслит)."""
     token_norm = token.lower().strip()
     # Если термин уже английский — берём первый синоним как представителя.
     variants = _expand_slot_synonyms(token_norm)

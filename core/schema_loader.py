@@ -14,7 +14,6 @@ from core.semantic_registry import (
     build_semantic_lexicon,
     find_best_subject,
 )
-from core.synonym_map import expand_with_synonyms
 from core.table_semantics import build_table_semantics
 from core.value_profiler import (
     build_db_profile,
@@ -93,9 +92,6 @@ def _should_run_semantic_search(query: str) -> bool:
     return any(len(token) >= 2 for token in tokens)
 
 
-def _should_expand_synonyms(query: str) -> bool:
-    """Synonym expansion is helpful for natural language, but harmful for literal fragments."""
-    return _should_run_semantic_search(query)
 
 
 class SchemaLoader:
@@ -293,7 +289,9 @@ class SchemaLoader:
             return []
 
         # Расширяем запрос синонимами для лучшего покрытия
-        synonyms = expand_with_synonyms(query) if _should_expand_synonyms(query) else []
+        # Без захардкоженного русско-английского словаря синонимов: расширение
+        # запроса делает semantic_search через GigaChat embeddings (отдельный путь).
+        synonyms: list[str] = []
         expanded = f"{query} {' '.join(synonyms)}".lower()
         # Разбиваем snake_case
         expanded = expanded.replace("_", " ")
@@ -328,7 +326,9 @@ class SchemaLoader:
             return df
 
         q = query.lower()
-        synonyms = expand_with_synonyms(query) if _should_expand_synonyms(query) else []
+        # Без захардкоженного русско-английского словаря синонимов: расширение
+        # запроса делает semantic_search через GigaChat embeddings (отдельный путь).
+        synonyms: list[str] = []
 
         # 1. Keyword поиск
         mask = (
@@ -1185,7 +1185,7 @@ class SchemaLoader:
             DataFrame с результатами (schema, table, column, description).
         """
         q = text.lower()
-        synonyms = expand_with_synonyms(text) if _should_expand_synonyms(text) else []
+        synonyms: list[str] = []
 
         # Поиск в описаниях и именах таблиц
         tdf = self.tables_df

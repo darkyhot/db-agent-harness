@@ -31,25 +31,11 @@ from typing import Any
 import pandas as pd
 
 from core.semantic_frame import sanitize_user_input_for_semantics
-from core.synonym_map import expand_with_synonyms
 
 logger = logging.getLogger(__name__)
 
-# Префиксы PK-нормализации: old_gosb_id → gosb_id
+# Префиксы PK-нормализации: old_gosb_id → gosb_id (структурная SQL-конвенция).
 _PK_NORM_RE = re.compile(r"^(old|new|prev|cur|current|actual|base|src|tgt)_", re.I)
-
-# Карта алиасов измерений: пользовательский слот → реальное имя колонки.
-# Используется как в COUNT preference (`_resolve_count_pref_column`), так и
-# в общем выборе колонок (`_choose_best_column`), чтобы для слота "тб" гарантированно
-# выбрать tb_id, а не isu_branch_id, чьё описание формально матчится по фаззи.
-_DIMENSION_ALIAS_MAP: dict[str, list[str]] = {
-    "gosb": ["gosb_id", "old_gosb_id"],
-    "госб": ["gosb_id", "old_gosb_id"],
-    "gosb_id": ["gosb_id", "old_gosb_id"],
-    "tb": ["tb_id"],
-    "тб": ["tb_id"],
-    "tb_id": ["tb_id"],
-}
 
 # Суффиксы id-подобных колонок — используются для штрафа в label-слотах
 # (когда пользователь спросил "название X", а кандидат — *_id).
@@ -206,7 +192,6 @@ _COUNT_HINTS = frozenset({'count', 'kolichestvo', 'qty', 'cnt'})
 _TABLE_ARTIFACT_TOKENS = frozenset({
     'schema', 'data', 'dwh', 'fact', 'dim', 'split', 'funnel', 'mart', 'table', 'tbl',
 })
-_DIMENSION_QUERY_STEMS = ('сегмент', 'регион', 'госб', 'тб', 'филиал')
 _COUNT_DATE_SUFFIXES = ("_dt", "_date", "_dttm", "_timestamp", "_ts", "date", "dttm", "report_dt")
 _TRANSLIT_TABLE = str.maketrans({
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
@@ -287,6 +272,18 @@ def _looks_like_table_artifact(token: str) -> bool:
 
 
 def _is_probable_grouping_token(raw_token: str) -> bool:
+    """Является ли слово/токен правдоподобным GROUP BY-измерением.
+
+    Принимаем кандидатом, если:
+    - токен явно колонкоподобен (`_id`/`_name`/etc., содержит `_`),
+    - чисто латиница (англоязычное имя колонки или термин),
+    - короткая (≤ 5 символов) кириллическая аббревиатура (ТБ, ГОСБ, БИК),
+    - явное упоминание даты.
+
+    Длинные русские прилагательные/существительные («фактическому», «оттоку»)
+    отсекаются — они не похожи на имя колонки. Конкретный матчинг с таблицей
+    далее идёт через `_choose_best_column` по описанию.
+    """
     token = str(raw_token or '').strip().lower()
     if not token:
         return False
@@ -296,10 +293,20 @@ def _is_probable_grouping_token(raw_token: str) -> bool:
         return True
     if _looks_like_explicit_column(token):
         return True
-    return any(token.startswith(stem) for stem in _DIMENSION_QUERY_STEMS)
+    if re.fullmatch(r"[a-z_][a-z0-9_]*", token):
+        return len(token) >= 3
+    # Кириллическое слово: принимаем только короткие аббревиатуры.
+    if re.fullmatch(r"[а-яё]+", token):
+        return 2 <= len(token) <= 5
+    return False
 
 
 def _is_trustworthy_dimension(slot: str) -> bool:
+    """Достаточно ли «осмысленного» в slot, чтобы передать его в column resolver.
+
+    Те же правила, что и для grouping-токенов: латинские >= 3 chars,
+    русские 2..5 (аббревиатуры), `_`-составные, либо `date`.
+    """
     lower = str(slot or '').lower().strip()
     if not lower:
         return False
@@ -308,9 +315,9 @@ def _is_trustworthy_dimension(slot: str) -> bool:
     parts = [p for p in lower.split('_') if p]
     if not parts:
         return False
-    if len(parts) == 1 and not any(parts[0].startswith(stem) for stem in _DIMENSION_QUERY_STEMS) and parts[0] != 'date':
-        return False
-    return True
+    if len(parts) > 1 or lower == 'date':
+        return True
+    return _is_probable_grouping_token(lower)
 
 
 def _is_count_unsafe_time_axis(col_name: str, dtype: str, sem_class: str) -> bool:
@@ -344,12 +351,21 @@ def _is_dimension_slot(slot: str) -> bool:
 
 
 def _fuzzy_overlap_score(slot_tokens: set[str], source_tokens: set[str]) -> float:
+    """Token overlap с приоритетом точного совпадения.
+
+    Короткие токены (< 3) учитываем только при точном совпадении — чтобы
+    двухбуквенные аббревиатуры вроде «ТБ» матчились с описанием
+    «Идентификатор ТБ» (после транслитерации = `tb`), но не давали
+    fuzzy-prefix совпадений с произвольными префиксами.
+    """
     matched = 0.0
     for st in slot_tokens:
-        if len(st) < 3:
+        if not st:
             continue
         if st in source_tokens:
             matched += 1.0
+            continue
+        if len(st) < 3:
             continue
         for src in source_tokens:
             if len(src) < 3:
@@ -399,10 +415,6 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
     if metric_cols:
         metric = metric_cols[0]
         metric_requires_numeric = metric.endswith(_METRIC_SUFFIXES)
-    elif agg_hint in {'sum', 'avg', 'min', 'max'} and re.search(
-        r'\b(outflow|churn|attrition)\b|отток', query,
-    ):
-        metric = 'outflow_отток'
     elif agg_hint in {'sum', 'avg', 'min', 'max', 'count'}:
         for entity in intent.get('entities') or []:
             seed = str(entity).strip()
@@ -411,11 +423,7 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
                 continue
             if seed_norm in {'organization', 'организация', 'организации', 'date', 'дата', 'дате'}:
                 continue
-            if any(seed_norm.startswith(stem) for stem in _DIMENSION_QUERY_STEMS):
-                continue
-            synonym_terms = sorted({str(term).strip() for term in expand_with_synonyms(seed) if str(term).strip()})
-            expanded_terms = [seed] + [term for term in synonym_terms if term != seed]
-            concept = _normalize_metric_concept(expanded_terms)
+            concept = _normalize_metric_concept([seed])
             if concept:
                 metric = concept
                 break
@@ -443,16 +451,19 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
         elif concept not in dimensions and f'{concept}_name' not in dimensions and not _looks_like_table_artifact(concept):
             dimensions.append(concept)
 
+    # has_date_filter определяется только по структурированному intent.date_filters,
+    # без парсинга русских стемов месяцев в тексте — это работа intent_classifier.
+    raw_date_filters = intent.get('date_filters') or {}
+    has_date_filter = bool(
+        isinstance(raw_date_filters, dict)
+        and (raw_date_filters.get('from') or raw_date_filters.get('to'))
+    )
     return {
         'dimensions': list(dict.fromkeys(dimensions)),
         'metric': metric,
         'metric_requires_numeric': metric_requires_numeric,
         'join_key_hints': list(dict.fromkeys(join_key_hints)),
-        'has_date_filter': ('январ' in query or 'феврал' in query or 'март' in query or
-                            'апрел' in query or 'май' in query or
-                            'мая' in query or 'июн' in query or
-                            'июл' in query or 'август' in query or 'сентябр' in query or
-                            'октябр' in query or 'ноябр' in query or 'декабр' in query),
+        'has_date_filter': has_date_filter,
         'explicit_count_metric': agg_hint == 'count' and bool(metric_cols),
     }
 
@@ -460,7 +471,10 @@ def _derive_requested_slots(user_input: str, intent: dict[str, Any]) -> dict[str
 def _semantic_match_score(col_name: str, desc: str, slot: str) -> float:
     col_tokens = set(_tokenize(col_name))
     desc_tokens = set(_tokenize(desc))
-    slot_tokens = [t for t in slot.split('_') if t]
+    # Используем `_tokenize` для slot'а — он добавляет транслитерационные формы
+    # (например, «тб» → {'тб','tb'}), что позволяет матчить русский slot против
+    # латинских имён колонок без захардкоженных алиасов.
+    slot_tokens = list(dict.fromkeys(_tokenize(slot) or [t for t in slot.split('_') if t]))
     slot_set = set(slot_tokens)
     if _is_label_slot(slot):
         slot_set = {t for t in slot_set if t not in {'name', 'label', 'title'}}
@@ -546,12 +560,10 @@ def _choose_best_column(
             allowed_tables = {dim_source_table}
 
     is_dimension_slot = _is_dimension_slot(slot)
-    slot_aliases = set(_DIMENSION_ALIAS_MAP.get((slot or "").lower(), []))
     candidates_log: list[tuple[float, str, str, float, str]] = []  # (score, table, col, semantic, tags)
     dropped_label_filter: list[str] = []
     dropped_id_for_label: list[str] = []
     saw_any_candidate_for_label = False
-    alias_hit_col: str | None = None
 
     for table_key in table_structures:
         if allowed_tables and table_key not in allowed_tables:
@@ -575,13 +587,6 @@ def _choose_best_column(
 
             desc = str(row.get('description', '') or '')
             semantic = _semantic_match_score(col_name, desc, slot)
-            # A.2: алиас-хит → пол semantic'а к 0.85 (ниже 1.0, чтобы description-only
-            # совпадение могло перебить алиас если оно выраженно сильнее).
-            lower_for_alias = col_name.lower()
-            is_alias_hit = bool(slot_aliases) and lower_for_alias in slot_aliases
-            if is_alias_hit:
-                semantic = max(semantic, 0.85)
-                alias_hit_col = f"{table_key}.{col_name}"
             if semantic <= 0 and require_numeric and _is_numeric(dtype) and not is_pk:
                 # Fallback для англоязычных metric-name колонок, когда
                 # описание не повторяет термин сущности из пользовательского запроса.
@@ -616,15 +621,11 @@ def _choose_best_column(
                 score -= 180
             elif lower_name.startswith(('fact_', 'avg_')):
                 score -= 40
-            # Legacy-id штраф: old_/legacy_ для слотов-id ниже канонического PK.
-            if lower_name.startswith(('old_', 'legacy_')) and (
-                slot.lower() in ('gosb', 'gosb_id', 'госб', 'tb', 'tb_id', 'тб')
-                or _is_dimension_slot(slot)
-            ):
+            # Legacy/legacy_-deprio: общая SQL-конвенция (не доменный словарь):
+            # `old_*`/`legacy_*` колонки — суррогатные/исторические версии,
+            # при наличии канонической колонки предпочитаем её.
+            if lower_name.startswith(('old_', 'legacy_')) and _is_dimension_slot(slot):
                 score -= 100
-            # ISU-префикс — историческое наследие; для слота tb предпочитаем tb_id.
-            if lower_name.startswith('isu_') and slot.lower() in ('tb', 'tb_id', 'тб', 'branch'):
-                score -= 120
 
             if _is_label_slot(slot):
                 if t_type in ('dim', 'ref', 'unknown'):
@@ -652,8 +653,6 @@ def _choose_best_column(
 
             candidate = (score, table_key, col_name)
             tags: list[str] = []
-            if is_alias_hit:
-                tags.append("alias")
             if (agg_hint or '').lower():
                 tags.append(f"agg={agg_hint}")
             candidates_log.append((score, table_key, col_name, semantic, ",".join(tags)))
@@ -677,9 +676,6 @@ def _choose_best_column(
             "ChooseBest[slot=%s]: dropped non-label cols (label slot): %s",
             slot, dropped_label_filter,
         )
-    if alias_hit_col and best and f"{best[1]}.{best[2]}" == alias_hit_col:
-        logger.info("ChooseBest[slot=%s]: alias hit → %s", slot, alias_hit_col)
-
     if best is None:
         if _is_label_slot(slot) and saw_any_candidate_for_label and (
             dropped_id_for_label or dropped_label_filter
@@ -820,6 +816,12 @@ def _choose_single_entity_count_column(
 
 
 def _resolve_count_pref_column(cols_df: pd.DataFrame, target: str) -> str | None:
+    """Подобрать колонку под COUNT-target по описанию/имени.
+
+    Без захардкоженных доменных алиасов. При наличии точного совпадения
+    имени → возвращаем как есть; иначе ранжируем по `_semantic_match_score`
+    с лёгким PK-бонусом и `old_/prev_/legacy_`-deprio (структурная конвенция).
+    """
     target_norm = str(target or "").strip().lower()
     if not target_norm or cols_df.empty:
         return None
@@ -827,22 +829,6 @@ def _resolve_count_pref_column(cols_df: pd.DataFrame, target: str) -> str | None
     by_lower = {name.lower(): name for name in names}
     if target_norm in by_lower:
         return by_lower[target_norm]
-    # COUNT-контекст: для gosb/госб/gosb_id предпочитаем канонический gosb_id,
-    # а old_gosb_id — fallback (раньше было наоборот, но это давало семантически
-    # неверный ответ на «сколько всего ГОСБ» — пользователь имеет в виду
-    # текущие ГОСБ, не исторический срез). Для tb — строго tb_id.
-    count_aliases = {
-        "gosb": ["gosb_id", "old_gosb_id"],
-        "госб": ["gosb_id", "old_gosb_id"],
-        "gosb_id": ["gosb_id", "old_gosb_id"],
-        "tb": ["tb_id"],
-        "тб": ["tb_id"],
-        "tb_id": ["tb_id"],
-    }
-    aliases = count_aliases.get(target_norm) or _DIMENSION_ALIAS_MAP.get(target_norm, [])
-    for alias in aliases:
-        if alias in by_lower:
-            return by_lower[alias]
     target_tokens = set(_tokenize(target_norm))
     best: tuple[float, str] | None = None
     for _, row in cols_df.iterrows():
@@ -858,12 +844,8 @@ def _resolve_count_pref_column(cols_df: pd.DataFrame, target: str) -> str | None
         if bool(row.get("is_primary_key", False)):
             score += 0.4
         lower_name = col_name.lower()
-        # Штраф legacy-префиксов: old_/prev_/legacy_/isu_ — это исторические
-        # суррогаты, текущий PK обычно идёт без префикса.
         if lower_name.startswith(("old_", "prev_", "legacy_")):
             score -= 0.4
-        if lower_name.startswith("isu_") and target_norm in {"tb", "тб", "tb_id", "branch", "bank"}:
-            score -= 0.5
         candidate = (score, col_name)
         if best is None or candidate > best:
             best = candidate

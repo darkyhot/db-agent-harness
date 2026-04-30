@@ -184,8 +184,7 @@ def build_semantic_lexicon(
             semantics = column_semantics.get(key, {})
             sem_class = str(semantics.get("semantic_class", "") or "")
             description = str(row.get("description", "") or "")
-            synonyms = str(row.get("synonyms", "") or "")
-            aliases = _collect_aliases(column.replace("_", " "), description, synonyms)
+            aliases = _collect_aliases(column.replace("_", " "), description)
             # Flag-колонки `is_X`/`has_X` маркируют принадлежность строки к subject=X.
             # Сохраняем их в отдельной секции `flag_subjects`, чтобы:
             #  1) filter_ranking мог найти aliases при поиске implicit subject flag;
@@ -196,7 +195,7 @@ def build_semantic_lexicon(
             if flag_subject_match and sem_class in {"flag", "enum_like"}:
                 subject_token = flag_subject_match.group(1).strip()
                 if subject_token and subject_token not in _STOPWORDS:
-                    subject_aliases = _collect_aliases(subject_token, description, synonyms)
+                    subject_aliases = _collect_aliases(subject_token, description)
                     if subject_aliases:
                         flag_subjects = lexicon.setdefault("flag_subjects", {})
                         entry = flag_subjects.setdefault(
@@ -353,6 +352,64 @@ def find_matching_dimensions(query: str, lexicon: dict[str, Any]) -> list[str]:
                 results.append(dim_key)
                 break
     return list(dict.fromkeys(results))
+
+
+def find_tables_for_term(term: str, lexicon: dict[str, Any]) -> list[str]:
+    """Найти таблицы каталога, совпадающие с term по subjects/flag_subjects/dimensions.
+
+    Возвращает список `schema.table` без дублей. Алиасы matchятся через stemmed-tokens
+    с тем же порогом, что и `find_best_subject` / `find_matching_dimensions`.
+    """
+    query_tokens = set(_stem_tokens(_tokenize(term)))
+    if not query_tokens:
+        return []
+
+    seen: set[str] = set()
+    result: list[str] = []
+
+    def _push(table_key: str) -> None:
+        norm = str(table_key or "").strip().lower()
+        if not norm or norm in seen:
+            return
+        seen.add(norm)
+        result.append(table_key)
+
+    def _alias_match(alias_tokens: set[str]) -> int:
+        if not alias_tokens:
+            return 0
+        # Однотокенные алиасы или однотокенные запросы матчим по совпадению одного токена;
+        # для многотокенных пар требуем минимум 2 пересечения, чтобы не ловить случайные слова.
+        threshold = 1 if len(alias_tokens) == 1 or len(query_tokens) == 1 else 2
+        overlap = len(query_tokens & alias_tokens)
+        return overlap if overlap >= threshold else 0
+
+    # flag_subjects сознательно не используем: флаг-колонки `is_X` выражают
+    # принадлежность к subject=X, но не делают всю таблицу её источником —
+    # включение их сюда даёт ложные boost'ы (см. комментарий в build_semantic_lexicon).
+    for meta in (lexicon.get("subjects") or {}).values():
+        best_overlap = 0
+        for alias in meta.get("aliases", []) or []:
+            alias_tokens = set(_stem_tokens(_tokenize(alias)))
+            best_overlap = max(best_overlap, _alias_match(alias_tokens))
+        if best_overlap > 0:
+            for tbl in meta.get("tables", []) or []:
+                _push(tbl)
+
+    for meta in (lexicon.get("dimensions") or {}).values():
+        match = False
+        for alias in meta.get("aliases", []) or []:
+            alias_tokens = set(_stem_tokens(_tokenize(alias)))
+            if _alias_match(alias_tokens):
+                match = True
+                break
+        if not match:
+            continue
+        for col_key in meta.get("column_keys", []) or []:
+            parts = str(col_key).split(".")
+            if len(parts) >= 2:
+                _push(f"{parts[0]}.{parts[1]}")
+
+    return result
 
 
 def find_matching_rules(query: str, registry: dict[str, Any]) -> list[dict[str, Any]]:

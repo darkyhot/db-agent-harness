@@ -24,6 +24,7 @@ from core.query_ir import (
     QuerySpec,
     SourceBinding,
 )
+from core.semantic_registry import find_tables_for_term
 
 
 @dataclass
@@ -129,6 +130,14 @@ def ground_query_spec(
         for constraint in query_spec.source_constraints
     )
     if not has_required_explicit_sources:
+        for binding in _lexicon_anchor_bindings(query_spec, schema_loader):
+            if binding.full_name.lower() in excluded:
+                continue
+            if not _has_source(sources, binding):
+                sources.append(binding)
+            if len(sources) >= max_sources:
+                break
+
         for binding in _score_catalog_bindings(
             query_spec,
             schema_loader,
@@ -281,6 +290,89 @@ def _excluded_source_names(query_spec: QuerySpec, schema_loader) -> set[str]:
         if schema and table:
             excluded.add(f"{schema}.{table}".lower())
     return excluded
+
+
+def _lexicon_anchor_bindings(
+    query_spec: QuerySpec,
+    schema_loader,
+) -> list[SourceBinding]:
+    """Подобрать таблицы детерминированно через semantic_lexicon.
+
+    Для каждого «термина» из QuerySpec (entities/metrics/dimensions) дёргаем
+    `find_tables_for_term` и считаем, сколько раз каждая таблица встретилась.
+    Чем выше покрытие термов, тем выше confidence — это якоря для дальнейшего
+    scoring'а, не финальный список.
+    """
+    try:
+        lexicon = schema_loader.get_semantic_lexicon()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("lexicon anchors: get_semantic_lexicon failed: %s", exc)
+        return []
+    if not lexicon:
+        return []
+
+    terms: list[str] = []
+    for entity in query_spec.entities or []:
+        for value in (entity.canonical, entity.name, entity.target_column_hint):
+            text = str(value or "").strip()
+            if text and text not in terms:
+                terms.append(text)
+    for metric in query_spec.metrics or []:
+        text = str(metric.target or "").strip()
+        if text and text not in terms:
+            terms.append(text)
+    for dim in query_spec.dimensions or []:
+        for value in (dim.target, getattr(dim, "label", "")):
+            text = str(value or "").strip()
+            if text and text not in terms:
+                terms.append(text)
+    for fil in query_spec.filters or []:
+        text = str(fil.target or "").strip()
+        if text and text not in terms:
+            terms.append(text)
+    if not terms:
+        return []
+
+    table_hits: dict[str, dict[str, Any]] = {}
+    for term in terms:
+        for table_key in find_tables_for_term(term, lexicon):
+            entry = table_hits.setdefault(
+                table_key.lower(),
+                {"key": table_key, "terms": [], "count": 0},
+            )
+            entry["count"] += 1
+            if term not in entry["terms"]:
+                entry["terms"].append(term)
+
+    if not table_hits:
+        return []
+
+    bindings: list[SourceBinding] = []
+    for entry in table_hits.values():
+        parts = entry["key"].split(".", 1)
+        if len(parts) != 2:
+            continue
+        schema_name, table_name = parts
+        coverage = entry["count"] / max(len(terms), 1)
+        confidence = min(0.95, 0.55 + 0.4 * coverage)
+        matched_terms = ", ".join(entry["terms"])
+        bindings.append(
+            SourceBinding(
+                schema=schema_name,
+                table=table_name,
+                reason=f"semantic_lexicon:{matched_terms}",
+                confidence=confidence,
+                evidence=[
+                    Evidence(
+                        source="semantic_lexicon",
+                        text=matched_terms,
+                        confidence=confidence,
+                    )
+                ],
+            )
+        )
+    bindings.sort(key=lambda b: b.confidence, reverse=True)
+    return bindings
 
 
 def _search_table_bindings(term: str, schema_loader, top_n: int) -> list[SourceBinding]:
@@ -504,9 +596,7 @@ def _normalize(text: str) -> str:
 
 
 def _row_text(row: Any) -> str:
-    description = str(row.get("description") or "")
-    synonyms = str(row.get("synonyms") or "").replace(",", " ")
-    return f"{description} {synonyms}".strip()
+    return str(row.get("description") or "").strip()
 
 
 def _column_match_score(column_name: str, description: str, term: str) -> float:

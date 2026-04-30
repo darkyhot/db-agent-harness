@@ -43,8 +43,7 @@ _ATTR_COLUMNS = [
     # как 0-й этап в core/join_analysis.rank_join_candidates.
     # sample_values: "v1|v2|v3" — типичные значения для value-resolver.
     # partition_key: bool — помечает колонку-партиционирование (для warnings в dry-run).
-    # synonyms: "syn1,syn2,syn3" — синонимы имени (подсказки для семантического фрейма).
-    "foreign_key_target", "sample_values", "partition_key", "synonyms",
+    "foreign_key_target", "sample_values", "partition_key",
 ]
 
 _GRAIN_ENUM = (
@@ -200,7 +199,7 @@ class SchemaLoader:
                 default = False if col == "partition_key" else ""
                 self._attrs_df[col] = default
         # Нормализация опциональных полей — пустые значения NaN → ""/False.
-        for col in ("foreign_key_target", "sample_values", "synonyms"):
+        for col in ("foreign_key_target", "sample_values"):
             if col in self._attrs_df.columns:
                 self._attrs_df[col] = self._attrs_df[col].fillna("").astype(str)
         if "partition_key" in self._attrs_df.columns:
@@ -442,6 +441,7 @@ class SchemaLoader:
             if col not in df.columns:
                 default = False if col == "partition_key" else ""
                 df[col] = default
+        df = df[_ATTR_COLUMNS]
         path = self._data_dir / "attr_list.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(path, index=False, encoding="utf-8")
@@ -986,24 +986,6 @@ class SchemaLoader:
         if not raw:
             return []
         return [part.strip() for part in raw.split("|") if part.strip()]
-
-    def get_column_synonyms(self, schema: str, table: str, column: str) -> list[str]:
-        """Получить synonyms колонки (разделитель — ',')."""
-        df = self.attrs_df
-        if "synonyms" not in df.columns:
-            return []
-        mask = (
-            (df["schema_name"] == schema)
-            & (df["table_name"] == table)
-            & (df["column_name"] == column)
-        )
-        rows = df[mask]
-        if rows.empty:
-            return []
-        raw = str(rows.iloc[0].get("synonyms", "") or "").strip()
-        if not raw:
-            return []
-        return [part.strip().lower() for part in raw.split(",") if part.strip()]
 
     def is_partition_key(self, schema: str, table: str, column: str) -> bool:
         """Проверить, помечена ли колонка как partition_key."""

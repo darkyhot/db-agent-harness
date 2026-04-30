@@ -131,17 +131,6 @@ def _resolve_column_token(
     if len(desc_matches) == 1:
         return desc_matches[0]
 
-    split = _split_table_name(main_table)
-    if split is not None:
-        schema_name, table_name = split
-        syn_matches: list[str] = []
-        for meta in cols_map.values():
-            synonyms = schema_loader.get_column_synonyms(schema_name, table_name, meta["column_name"])
-            if any(raw_lower == str(syn).strip().lower() for syn in synonyms):
-                syn_matches.append(meta["column_name"])
-        if len(syn_matches) == 1:
-            return syn_matches[0]
-
     return None
 
 
@@ -407,7 +396,6 @@ class PlanEditNodes:
                 _push(col, 70)
 
         cols_map = _table_columns_map(self.schema, main_table)
-        split = _split_table_name(main_table)
         for meta in cols_map.values():
             col_name = str(meta.get("column_name") or "")
             desc = str(meta.get("description") or "").strip().lower()
@@ -423,20 +411,6 @@ class PlanEditNodes:
                 _push(col_name, 72)
             elif raw_lower and (raw_lower in col_lower or raw_lower in normalized):
                 _push(col_name, 68)
-
-        if split is not None:
-            schema_name, table_name = split
-            for meta in cols_map.values():
-                col_name = str(meta.get("column_name") or "")
-                synonyms = self.schema.get_column_synonyms(schema_name, table_name, col_name)
-                for synonym in synonyms:
-                    syn = str(synonym or "").strip().lower()
-                    if not syn:
-                        continue
-                    if raw_lower == syn:
-                        _push(col_name, 93)
-                    elif raw_lower in syn:
-                        _push(col_name, 69)
 
         return [col for col, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))]
 

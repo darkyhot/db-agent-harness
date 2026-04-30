@@ -150,8 +150,6 @@ class QueryIRNodes:
             if result.plan_ir is not None:
                 result.plan_ir.sources = result.sources
                 result.plan_ir.main_source = result.sources[0] if result.sources else None
-        if result.sources and not result.needs_clarification:
-            self._review_grounding_with_llm(state, result)
         logger.info(
             "CatalogGrounder: sources=%s confidence=%.2f",
             [s.full_name for s in result.sources],
@@ -234,64 +232,6 @@ class QueryIRNodes:
                 f"- {schema}.{table}; grain={grain or 'unknown'}; desc={desc[:220]}"
             )
         return "\n".join(lines)
-
-    def _review_grounding_with_llm(self, state: AgentState, result) -> None:
-        """Let LLM reorder/drop only already grounded real source candidates."""
-        if len(result.sources) < 2:
-            return
-        options = [
-            {
-                "table": source.full_name,
-                "reason": source.reason,
-                "confidence": source.confidence,
-            }
-            for source in result.sources
-        ]
-        system_prompt = (
-            "Ты проверяешь выбор таблиц для SQL-агента. Можно выбирать ТОЛЬКО из "
-            "переданного списка реальных таблиц. Верни JSON: "
-            '{"tables": ["schema.table", ...], "rationale": "кратко"}. '
-            "Сохрани все таблицы, которые нужны для метрик, измерений или join."
-        )
-        user_prompt = (
-            "Запрос пользователя:\n"
-            f"{state.get('user_input', '')}\n\n"
-            "QuerySpec:\n"
-            f"{json.dumps(state.get('query_spec') or {}, ensure_ascii=False)}\n\n"
-            "Кандидаты:\n"
-            f"{json.dumps(options, ensure_ascii=False)}\n\n"
-            "JSON:"
-        )
-        try:
-            parsed = self._llm_json_with_retry(
-                system_prompt,
-                user_prompt,
-                temperature=0.0,
-                failure_tag="catalog_grounding_reviewer",
-                expect="object",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("CatalogGrounder reviewer failed: %s", exc)
-            return
-        requested = parsed.get("tables") if isinstance(parsed, dict) else None
-        if not isinstance(requested, list):
-            return
-        by_name = {source.full_name.lower(): source for source in result.sources}
-        reviewed = []
-        for item in requested:
-            source = by_name.get(str(item or "").strip().lower())
-            if source and source not in reviewed:
-                reviewed.append(source)
-        if not reviewed:
-            return
-        for source in result.sources:
-            if source not in reviewed:
-                reviewed.append(source)
-        result.sources = reviewed[: len(result.sources)]
-        if result.plan_ir is not None:
-            result.plan_ir.sources = result.sources
-            result.plan_ir.main_source = result.sources[0] if result.sources else None
-
 
 def _build_query_interpreter_system_prompt() -> str:
     schema = json.dumps(query_spec_json_schema(), ensure_ascii=False)

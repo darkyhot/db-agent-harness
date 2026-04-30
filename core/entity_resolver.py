@@ -106,9 +106,7 @@ def _truncate_desc(text: str) -> str:
 
 
 def _metadata_text(row: Any) -> str:
-    description = str(row.get("description") or "").strip()
-    synonyms = str(row.get("synonyms") or "").replace(",", " ").strip()
-    return f"{description} {synonyms}".strip()
+    return str(row.get("description") or "").strip()
 
 
 def _is_numeric_dtype(dtype: str) -> bool:

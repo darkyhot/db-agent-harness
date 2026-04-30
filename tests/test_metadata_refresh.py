@@ -15,8 +15,6 @@ class StubLLM:
 
     def invoke_with_system(self, system_prompt: str, user_prompt: str, temperature=None) -> str:
         self.calls.append((system_prompt, user_prompt))
-        if "поисковые синонимы" in system_prompt:
-            return '{"outflow_qty": ["отток", "количество оттока", "outflow"]}'
         if "один на строку" in user_prompt:
             return "идентификатор\nпризнак"
         return "1. Назначение\n2. Применение\n3. Ограничения\n4. Ключевые атрибуты"
@@ -121,7 +119,7 @@ def test_metadata_service_add_targets_refreshes_catalog(tmp_path, monkeypatch):
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -169,7 +167,6 @@ def test_metadata_service_remove_targets_prunes_catalog(tmp_path):
         "foreign_key_target": ["", ""],
         "sample_values": ["", ""],
         "partition_key": [False, False],
-        "synonyms": ["", ""],
     })
     loader = SchemaLoader(data_dir=tmp_path)
     loader.replace_catalog(tables_df, attrs_df)
@@ -206,7 +203,7 @@ def test_metadata_service_add_targets_rejects_invalid_schema(tmp_path):
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -233,7 +230,7 @@ def test_metadata_service_add_targets_rejects_missing_table(tmp_path):
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -261,7 +258,7 @@ def test_metadata_service_add_targets_rolls_back_manifest_for_failed_refresh(tmp
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -297,7 +294,7 @@ def test_metadata_service_add_targets_rolls_back_manifest_when_refresh_raises(tm
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -381,7 +378,7 @@ def test_metadata_service_deduplicates_column_few_shots(tmp_path, monkeypatch):
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -441,7 +438,7 @@ def test_metadata_service_builds_few_shots_before_generating_missing_description
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
     monkeypatch.setattr("core.metadata_refresh.inspect", lambda engine: OrderedInspector())
@@ -488,7 +485,6 @@ def test_metadata_service_add_targets_rebuilds_few_shots_without_scanning_manife
                 "foreign_key_target": "",
                 "sample_values": "",
                 "partition_key": False,
-                "synonyms": "",
             }
         ]),
     )
@@ -602,32 +598,6 @@ def test_generate_column_descriptions_uses_exact_few_shot_without_llm(tmp_path):
         "status_cd": "Код статуса",
     }
     assert llm.calls == []
-
-
-def test_generate_column_synonyms_uses_llm_json(tmp_path):
-    loader = SchemaLoader(data_dir=tmp_path)
-    llm = StubLLM()
-    service = MetadataRefreshService(
-        loader,
-        StubDB(),
-        llm,
-        targets_path=tmp_path / "metadata_targets.yaml",
-    )
-
-    result = service._generate_column_synonyms(
-        "schema_x",
-        "fact_outflow",
-        [
-            {
-                "column_name": "outflow_qty",
-                "dType": "int4",
-                "description": "Кол-во ФЛ переставших быть ЗП клиентами",
-            }
-        ],
-    )
-
-    assert result == {"outflow_qty": "отток,количество оттока,outflow"}
-    assert any("поисковые синонимы" in call[0] for call in llm.calls)
 
 
 def test_generate_table_description_uses_exact_few_shot_without_llm(tmp_path):

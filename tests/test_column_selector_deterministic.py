@@ -92,47 +92,6 @@ def test_choose_best_metric_prefers_outflow_qty_over_is_outflow_for_sum(tmp_path
     assert best == ("dm.uzp_dwh_fact_outflow", "outflow_qty")
 
 
-def test_choose_best_metric_uses_catalog_synonyms(tmp_path):
-    from core.column_selector_deterministic import _choose_best_column
-    from core.schema_loader import SchemaLoader
-
-    tables_df = pd.DataFrame({
-        "schema_name": ["dm"],
-        "table_name": ["fact_outflow"],
-        "description": ["Факт клиентских изменений"],
-        "grain": ["event"],
-    })
-    attrs_df = pd.DataFrame({
-        "schema_name": ["dm"] * 3,
-        "table_name": ["fact_outflow"] * 3,
-        "column_name": ["calc_fl_qty", "fact_payee_qty", "outflow_qty"],
-        "dType": ["int4", "int4", "int4"],
-        "description": [
-            "Расчетное количество получателей при расчета Оттока",
-            "Фактическое количество получателей начислений",
-            "Кол-во ФЛ переставших быть ЗП клиентами",
-        ],
-        "is_primary_key": [False, False, False],
-        "unique_perc": [1.0, 1.0, 1.0],
-        "not_null_perc": [100.0, 100.0, 100.0],
-        "synonyms": ["", "", "отток,фактический отток,количество оттока"],
-    })
-    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
-    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
-
-    loader = SchemaLoader(data_dir=tmp_path)
-    best = _choose_best_column(
-        table_structures={"dm.fact_outflow": "fact"},
-        table_types={"dm.fact_outflow": "fact"},
-        schema_loader=loader,
-        slot="фактический_отток",
-        require_numeric=True,
-        agg_hint="sum",
-    )
-
-    assert best == ("dm.fact_outflow", "outflow_qty")
-
-
 # ---------------------------------------------------------------------------
 # Task 1.2: group_by_hints influence on explorer (indirect test via state)
 # ---------------------------------------------------------------------------

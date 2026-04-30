@@ -18,7 +18,7 @@ class MetadataIssue:
     """Отдельная проблема каталога."""
 
     severity: str       # "error" | "warning" | "info"
-    category: str       # "grain" | "foreign_key" | "sample_values" | "partition_key" | "synonyms"
+    category: str       # "grain" | "foreign_key" | "sample_values" | "partition_key"
     subject: str        # "schema.table" или "schema.table.column"
     message: str
 

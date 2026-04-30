@@ -14,6 +14,7 @@ import yaml
 from sqlalchemy import inspect
 
 from core.enrichment_pipeline import EnrichmentPipeline
+from core.exceptions import KERBEROS_USER_MESSAGE, KerberosAuthError, is_kerberos_auth_error
 from core.schema_loader import DATA_DIR, SchemaLoader
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,13 @@ _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 def _is_identifier(value: str) -> bool:
     return bool(_IDENTIFIER_RE.match(value or ""))
+
+
+def _raise_if_kerberos_auth_error(exc: BaseException) -> None:
+    if isinstance(exc, KerberosAuthError):
+        raise exc
+    if is_kerberos_auth_error(exc):
+        raise KerberosAuthError(KERBEROS_USER_MESSAGE) from exc
 
 
 def _normalize_table_refs(refs: list[str]) -> list[tuple[str, str]]:
@@ -330,12 +338,14 @@ class MetadataRefreshService:
         def _read_comments(src_schema: str) -> tuple[str, dict[str, str]]:
             try:
                 src_columns = inspector.get_columns(table, schema=src_schema)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                _raise_if_kerberos_auth_error(exc)
                 return ("", {})
             try:
                 src_table_comment = inspector.get_table_comment(table, schema=src_schema)
                 src_comment = str(src_table_comment.get("text") or "").strip()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                _raise_if_kerberos_auth_error(exc)
                 src_comment = ""
             src_columns_map = {
                 str(col.get("name") or ""): str(col.get("comment") or "").strip()
@@ -702,6 +712,7 @@ class MetadataRefreshService:
         try:
             inspector = inspect(self.db.get_engine())
         except Exception as exc:  # noqa: BLE001
+            _raise_if_kerberos_auth_error(exc)
             logger.warning("Не удалось создать SQLAlchemy inspector: %s", exc)
             return {
                 "refreshed": [],
@@ -786,6 +797,7 @@ class MetadataRefreshService:
                         allow_generation=allow_generation,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    _raise_if_kerberos_auth_error(exc)
                     logger.warning("Metadata refresh skipped for %s: %s", full_name, exc)
                     failed.append(full_name)
                     continue

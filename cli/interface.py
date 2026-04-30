@@ -831,6 +831,10 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
                     parsed_refs,
                     progress_callback=_metadata_progress,
                 )
+            except KerberosAuthError as exc:
+                _status_print("")
+                print(f"\n❌ {exc}")
+                return
             except Exception as exc:  # noqa: BLE001
                 _status_print("")
                 logger.error("Metadata add error: %s", exc, exc_info=True)
@@ -869,6 +873,9 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
             print("Обновляю manifest и удаляю metadata для таблиц...")
             try:
                 result = self.metadata.remove_targets(parsed_refs)
+            except KerberosAuthError as exc:
+                print(f"\n❌ {exc}")
+                return
             except Exception as exc:  # noqa: BLE001
                 logger.error("Metadata remove error: %s", exc, exc_info=True)
                 print(f"Ошибка удаления таблиц: {exc}")
@@ -899,6 +906,10 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
 
         try:
             result = self.metadata.refresh_all(progress_callback=_metadata_progress)
+        except KerberosAuthError as exc:
+            _status_print("")
+            print(f"\n❌ {exc}")
+            return
         except Exception as exc:  # noqa: BLE001
             _status_print("")
             logger.error("Metadata refresh error: %s", exc, exc_info=True)

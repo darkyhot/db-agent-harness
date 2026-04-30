@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 MAX_GRAPH_ITERATIONS = 15
-MAX_WALL_CLOCK_SECONDS = 300  # 5 минут на весь граф
+MAX_WALL_CLOCK_SECONDS = 600  # 10 минут на весь граф
 
 
 def _is_timed_out(state: AgentState) -> bool:

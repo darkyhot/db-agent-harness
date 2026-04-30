@@ -1,6 +1,6 @@
 from psycopg2 import OperationalError
 
-from core.exceptions import KerberosAuthError, is_kerberos_auth_error
+from core.exceptions import KERBEROS_USER_MESSAGE, KerberosAuthError, is_kerberos_auth_error
 
 
 def test_is_kerberos_auth_error_detects_gss_failure():
@@ -26,3 +26,9 @@ def test_is_kerberos_auth_error_checks_exception_chain():
 
     assert is_kerberos_auth_error(wrapped) is True
     assert not isinstance(wrapped, KerberosAuthError)
+
+
+def test_kerberos_user_message_uses_plain_kinit_instruction():
+    assert "kinit в терминале" in KERBEROS_USER_MESSAGE
+    assert "`kinit`" not in KERBEROS_USER_MESSAGE
+    assert "<REALM>" not in KERBEROS_USER_MESSAGE

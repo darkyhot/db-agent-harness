@@ -36,10 +36,9 @@ RUNTIME_CONFIG_KEYS = ("llm_model", "debug_prompt", "show_plan", "llm_verifier_e
 _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
 # Таймаут на SQL-запросы (мс).
-# Намеренно меньше wall-clock таймаута графа (300s) — оставляем ~120s
-# на диагностику и retry через error_diagnoser. Подняли с 90с до 180с,
-# чтобы профилирующий ORDER BY random() LIMIT 100000 успевал на больших таблицах.
-STATEMENT_TIMEOUT_MS = 180_000  # 180 секунд (3 минуты)
+# Синхронизирован с wall-clock таймаутом графа, чтобы долгие запросы
+# не прерывались преждевременно на уровне оркестрации.
+STATEMENT_TIMEOUT_MS = 600_000  # 600 секунд (10 минут)
 
 
 def _has_top_level_limit(sql: str) -> bool:

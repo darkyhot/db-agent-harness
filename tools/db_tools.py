@@ -7,6 +7,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from core.database import DatabaseManager
+from core.exceptions import KerberosAuthError
 from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator
 from tools.path_safety import resolve_workspace_path
@@ -145,6 +146,8 @@ def create_db_tools(
                         f"Ключ ({columns}) в {schema}.{table} {prefix} "
                         f"(подтверждено БД).{db_suffix}\n{col_lines}"
                     )
+                except KerberosAuthError:
+                    raise
                 except Exception as db_e:
                     logger.warning(
                         "check_key_uniqueness: DB-проверка не удалась (%s), "

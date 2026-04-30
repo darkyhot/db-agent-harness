@@ -3,14 +3,16 @@
 import json
 import logging
 import re
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pandas as pd
 import sqlparse
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.engine import Engine
 
+from core.exceptions import KERBEROS_USER_MESSAGE, KerberosAuthError, is_kerberos_auth_error
 from core.log_safety import summarize_sql
 from tools.path_safety import resolve_workspace_path
 
@@ -254,13 +256,36 @@ class DatabaseManager:
         database = self._config.get("database", "prom")
 
         url = f"postgresql://{user}@{host}:{port}/{database}"
-        self._engine = create_engine(
+        engine = create_engine(
             url,
             pool_pre_ping=True,
             connect_args={"options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"},
         )
+        try:
+            with engine.connect():
+                pass
+        except Exception as exc:
+            engine.dispose()
+            if is_kerberos_auth_error(exc):
+                raise KerberosAuthError(KERBEROS_USER_MESSAGE) from exc
+            raise
+
+        self._engine = engine
         logger.info("Engine создан: %s@%s:%d/%s (timeout=%dms)", user, host, port, database, STATEMENT_TIMEOUT_MS)
         return self._engine
+
+    @contextmanager
+    def _connect(self) -> Iterator[Any]:
+        """Open a DB connection and normalize Kerberos/GSSAPI auth failures."""
+        try:
+            with self.get_engine().connect() as conn:
+                yield conn
+        except KerberosAuthError:
+            raise
+        except Exception as exc:
+            if is_kerberos_auth_error(exc):
+                raise KerberosAuthError(KERBEROS_USER_MESSAGE) from exc
+            raise
 
     def preview_query(self, sql: str, limit: int = 1000) -> pd.DataFrame:
         """Выполнить SELECT-запрос в режиме preview (с авто-LIMIT).
@@ -276,11 +301,11 @@ class DatabaseManager:
         if not _has_top_level_limit(sql_stripped):
             sql_stripped = f"SELECT * FROM ({sql_stripped}) _sub LIMIT :_limit"
             logger.info("Выполнение SELECT (с авто-LIMIT): %s", summarize_sql(sql_stripped))
-            with self.get_engine().connect() as conn:
+            with self._connect() as conn:
                 df = pd.read_sql(text(sql_stripped), conn, params={"_limit": limit})
         else:
             logger.info("Выполнение SELECT: %s", summarize_sql(sql_stripped))
-            with self.get_engine().connect() as conn:
+            with self._connect() as conn:
                 df = pd.read_sql(text(sql_stripped), conn)
 
         logger.info("Получено строк: %d", len(df))
@@ -290,7 +315,7 @@ class DatabaseManager:
         """Выполнить SELECT без авто-LIMIT (full read/export mode)."""
         sql_stripped = sql.strip().rstrip(";")
         logger.info("Выполнение SELECT без авто-LIMIT: %s", summarize_sql(sql_stripped))
-        with self.get_engine().connect() as conn:
+        with self._connect() as conn:
             df = pd.read_sql(text(sql_stripped), conn)
         logger.info("Получено строк (full): %d", len(df))
         return df
@@ -329,9 +354,8 @@ class DatabaseManager:
         Returns:
             Количество затронутых строк.
         """
-        engine = self.get_engine()
         logger.info("Выполнение WRITE: %s", summarize_sql(sql))
-        with engine.connect() as conn:
+        with self._connect() as conn:
             result = conn.execute(text(sql))
             conn.commit()
             affected = result.rowcount
@@ -347,9 +371,8 @@ class DatabaseManager:
         Returns:
             Сообщение об успешном выполнении.
         """
-        engine = self.get_engine()
         logger.info("Выполнение DDL: %s", summarize_sql(sql))
-        with engine.connect() as conn:
+        with self._connect() as conn:
             conn.execute(text(sql))
             conn.commit()
         logger.info("DDL выполнен успешно")
@@ -364,10 +387,9 @@ class DatabaseManager:
         Returns:
             План выполнения запроса.
         """
-        engine = self.get_engine()
         explain_sql = f"EXPLAIN {sql.strip().rstrip(';')}"
         logger.debug("EXPLAIN: %s", summarize_sql(explain_sql))
-        with engine.connect() as conn:
+        with self._connect() as conn:
             result = conn.execute(text(explain_sql))
             plan = "\n".join(row[0] for row in result)
         return plan
@@ -394,8 +416,7 @@ class DatabaseManager:
         if where:
             sql_str += f" WHERE {where}"
         sql = text(sql_str)
-        engine = self.get_engine()
-        with engine.connect() as conn:
+        with self._connect() as conn:
             result = conn.execute(sql)
             count = result.scalar()
         logger.info("Строк в %s.%s%s: %d",
@@ -427,8 +448,7 @@ class DatabaseManager:
                 COUNT(DISTINCT ({cols})) as unique_keys
             FROM "{schema}"."{table}"
         """)
-        engine = self.get_engine()
-        with engine.connect() as conn:
+        with self._connect() as conn:
             row = conn.execute(sql).fetchone()
 
         total = row[0]
@@ -475,8 +495,7 @@ class DatabaseManager:
             sql_str += f" WHERE {where}"
         sql_str += " LIMIT :n"
         sql = text(sql_str)
-        engine = self.get_engine()
-        with engine.connect() as conn:
+        with self._connect() as conn:
             df = pd.read_sql(sql, conn, params={"n": n})
         return df
 
@@ -503,8 +522,7 @@ class DatabaseManager:
             sql_str += f" WHERE {where}"
         sql_str += " ORDER BY random() LIMIT :n"
         sql = text(sql_str)
-        engine = self.get_engine()
-        with engine.connect() as conn:
+        with self._connect() as conn:
             df = pd.read_sql(sql, conn, params={"n": n})
         return df
 
@@ -524,8 +542,7 @@ class DatabaseManager:
                 WHERE table_schema = :schema AND table_name = :table
             )
         """
-        engine = self.get_engine()
-        with engine.connect() as conn:
+        with self._connect() as conn:
             result = conn.execute(text(sql), {"schema": schema, "table": table})
             return result.scalar()
 
@@ -545,8 +562,7 @@ class DatabaseManager:
             WHERE table_schema = :schema AND table_name = :table
             ORDER BY ordinal_position
         """
-        engine = self.get_engine()
-        with engine.connect() as conn:
+        with self._connect() as conn:
             df = pd.read_sql(text(sql), conn, params={"schema": schema, "table": table})
 
         if df.empty:

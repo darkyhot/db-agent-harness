@@ -17,6 +17,7 @@ from core.memory import MemoryManager
 from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator
 from core.database import DatabaseManager
+from core.exceptions import KERBEROS_USER_MESSAGE, KerberosAuthError, is_kerberos_auth_error
 from graph.state import AgentState
 
 try:
@@ -834,7 +835,11 @@ class BaseNodeMixin:
             if data.startswith("Ошибка"):
                 return ToolResult(success=False, data=data, error=data)
             return ToolResult(success=True, data=data)
+        except KerberosAuthError:
+            raise
         except Exception as e:
+            if is_kerberos_auth_error(e):
+                raise KerberosAuthError(KERBEROS_USER_MESSAGE) from e
             error_msg = f"Ошибка инструмента {tool_name}: {e}"
             logger.error("Tool %s ошибка: %s", tool_name, e)
             return ToolResult(success=False, data="", error=error_msg)

@@ -14,7 +14,7 @@ from core.text_normalize import (
     stem as _stem,
     tokenize as _tokenize,
 )
-from core.query_ir import FilterSpec
+from core.query_ir import FilterSpec, _parse_calendar_period, _target_looks_calendar
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +298,32 @@ def resolve_where(
         for k, v in dict(rejected_filter_choices or {}).items()
     }
     direct_filter_specs = _normalize_filter_specs(filter_specs)
+    calendar_applied, calendar_clarification = _apply_calendar_filter_specs(
+        conditions,
+        selected_columns,
+        direct_filter_specs,
+        schema_loader=schema_loader,
+    )
+    if calendar_clarification:
+        return {
+            "conditions": conditions,
+            "applied_rules": calendar_applied,
+            "reasoning": ["calendar_filter_without_time_axis"],
+            "filter_candidates": {},
+            "needs_clarification": True,
+            "clarification_message": calendar_clarification,
+            "clarification_spec": {
+                "type": "calendar_filter",
+                "message": calendar_clarification,
+            },
+            "user_filter_choices": user_filter_choices,
+            "rejected_filter_choices": rejected_filter_choices,
+        }
+    if calendar_applied:
+        direct_filter_specs = [
+            spec for idx, spec in enumerate(direct_filter_specs)
+            if f"query_spec:{idx}" not in set(calendar_applied)
+        ]
     direct_applied = _apply_exact_filter_specs(
         conditions,
         selected_columns,
@@ -306,6 +332,7 @@ def resolve_where(
         time_range=time_range,
     )
     applied_rules.extend(direct_applied)
+    applied_rules.extend(calendar_applied)
     semantic_filter_specs = _filter_specs_for_semantic_frame(
         selected_columns,
         direct_filter_specs,
@@ -547,6 +574,117 @@ def _normalize_filter_specs(raw: list[FilterSpec | dict[str, Any]] | None) -> li
             except Exception:  # noqa: BLE001
                 continue
     return specs
+
+
+def _apply_calendar_filter_specs(
+    conditions: list[str],
+    selected_columns: dict[str, dict[str, Any]],
+    filter_specs: list[FilterSpec],
+    *,
+    schema_loader=None,
+) -> tuple[list[str], str]:
+    applied: list[str] = []
+    for idx, spec in enumerate(filter_specs):
+        parsed = _parse_calendar_period(spec.value)
+        if not parsed or not _target_looks_calendar(spec.target):
+            continue
+        date_col = _find_time_axis_column(selected_columns, schema_loader=schema_loader)
+        if not date_col:
+            return applied, (
+                "Фильтр задан календарным периодом, но в выбранных таблицах не найдена "
+                "подходящая date/time-axis колонка."
+            )
+        start, end, _grain = parsed
+        _add_unique(conditions, f"{date_col} >= '{start}'::date")
+        _add_unique(conditions, f"{date_col} < '{end}'::date")
+        applied.append(f"query_spec:{idx}")
+    return applied, ""
+
+
+def _find_time_axis_column(
+    selected_columns: dict[str, dict[str, Any]],
+    *,
+    schema_loader=None,
+) -> str | None:
+    ranked: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for table_key, roles in (selected_columns or {}).items():
+        if "." not in table_key:
+            continue
+        schema, table = table_key.split(".", 1)
+        table_sem = schema_loader.get_table_semantics(schema, table) if schema_loader is not None else {}
+        time_axis = [str(v).strip().lower() for v in (table_sem.get("time_axis_columns") or []) if str(v).strip()]
+        columns = []
+        for role in ("filter", "select", "group_by", "aggregate"):
+            columns.extend(
+                str(col or "").strip()
+                for col in roles.get(role, []) or []
+                if str(col or "").strip() and str(col or "").strip() != "*"
+            )
+        if schema_loader is not None:
+            try:
+                cols_df = schema_loader.get_table_columns(schema, table)
+                for _, row in cols_df.iterrows():
+                    col = str(row.get("column_name") or "").strip()
+                    if col and col not in columns:
+                        columns.append(col)
+            except Exception:  # noqa: BLE001
+                pass
+        for col in columns:
+            if not col or col == "*" or col.lower() in seen:
+                continue
+            priority = _time_axis_priority(schema_loader, schema, table, col, time_axis)
+            if priority is None:
+                continue
+            seen.add(col.lower())
+            ranked.append((priority, col))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
+def _time_axis_priority(
+    schema_loader,
+    schema: str,
+    table: str,
+    col: str,
+    time_axis: list[str],
+) -> int | None:
+    name = col.lower()
+    dtype = ""
+    semantic_class = ""
+    tags: set[str] = set()
+    if schema_loader is not None:
+        try:
+            dtype = str(schema_loader.get_column_dtype(schema, table, col) or "").lower()
+        except Exception:  # noqa: BLE001
+            dtype = ""
+        sem = schema_loader.get_column_semantics(schema, table, col)
+        semantic_class = str(sem.get("semantic_class") or "").lower()
+        tags = {str(v).lower() for v in (sem.get("semantic_tags") or [])}
+    looks_date = (
+        semantic_class == "date"
+        or "time_axis" in tags
+        or dtype.startswith(("date", "timestamp"))
+        or name.endswith(("_dt", "_date", "_dttm", "_timestamp", "_ts"))
+        or name in {"date", "dttm"}
+    )
+    if not looks_date:
+        return None
+    if name in time_axis and name in {"report_dt", "report_date"}:
+        return 0
+    if name in time_axis or "time_axis" in tags:
+        return 1
+    if name in {"report_dt", "report_date"}:
+        return 2
+    if name.startswith(("inserted_", "updated_", "modified_", "created_", "load_", "etl_")):
+        return 8
+    if dtype.startswith("date") or name.endswith(("_dt", "_date")):
+        return 3
+    if dtype.startswith("timestamp") or name.endswith(("_dttm", "_timestamp", "_ts")):
+        return 5
+    return 9
 
 
 def _filter_specs_for_semantic_frame(

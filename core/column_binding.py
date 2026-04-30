@@ -135,7 +135,12 @@ def _bind_metric_dimension_columns(
         if not target:
             if metric.operation == "count" and table_structures:
                 table_key = next(iter(table_structures))
-                selected.setdefault(table_key, {}).setdefault("aggregate", []).append("*")
+                count_col = _choose_count_column_for_table(
+                    table_key=table_key,
+                    spec=spec,
+                    schema_loader=schema_loader,
+                )
+                selected.setdefault(table_key, {}).setdefault("aggregate", []).append(count_col or "*")
             continue
         choice = _choose_column_across_tables(
             table_structures=table_structures,
@@ -195,6 +200,9 @@ def _bind_metric_dimension_columns(
         roles.setdefault("filter", [])
         if col not in roles["filter"]:
             roles["filter"].append(col)
+
+    if spec.time_range is not None:
+        _ensure_time_axis_filters(selected, table_structures, schema_loader)
 
     if not selected:
         return None
@@ -297,6 +305,116 @@ def _count_attribute_targets(spec: QuerySpec) -> list[str]:
         if metric.operation == "count" and metric.target:
             targets.append(metric.target)
     return list(dict.fromkeys(targets))
+
+
+def _choose_count_column_for_table(
+    *,
+    table_key: str,
+    spec: QuerySpec,
+    schema_loader: Any,
+) -> str | None:
+    if "." not in table_key or not spec.entities:
+        return None
+    schema, table = table_key.split(".", 1)
+    table_sem = schema_loader.get_table_semantics(schema, table)
+    grain = str(table_sem.get("grain") or "").strip().lower()
+    subjects = {str(v).strip().lower() for v in (table_sem.get("primary_subjects") or []) if str(v).strip()}
+    if grain in {"event", "snapshot"} and "task" not in subjects:
+        return None
+    try:
+        cols_df = schema_loader.get_table_columns(schema, table)
+    except Exception:  # noqa: BLE001
+        return None
+    if cols_df.empty:
+        return None
+    best: tuple[float, str] | None = None
+    for _, row in cols_df.iterrows():
+        col = str(row.get("column_name") or "").strip()
+        if not col:
+            continue
+        sem = schema_loader.get_column_semantics(schema, table, col)
+        sem_class = str(sem.get("semantic_class") or "").lower()
+        score = 0.0
+        if bool(row.get("is_primary_key", False)):
+            score += 10.0
+        if sem_class in {"identifier", "join_key"}:
+            score += 5.0
+        if col.lower().endswith(("_id", "_code")):
+            score += 2.0
+        if score <= 0:
+            continue
+        candidate = (score, col)
+        if best is None or candidate > best:
+            best = candidate
+    return best[1] if best else None
+
+
+def _ensure_time_axis_filters(
+    selected: dict[str, dict[str, list[str]]],
+    table_structures: dict[str, str],
+    schema_loader: Any,
+) -> None:
+    candidate_tables = list(selected) or list(table_structures)
+    for table_key in candidate_tables:
+        if "." not in table_key:
+            continue
+        date_col = _choose_time_axis_column(table_key, schema_loader)
+        if not date_col:
+            continue
+        roles = selected.setdefault(table_key, {})
+        filters = roles.setdefault("filter", [])
+        if date_col not in filters:
+            filters.append(date_col)
+
+
+def _choose_time_axis_column(table_key: str, schema_loader: Any) -> str | None:
+    schema, table = table_key.split(".", 1)
+    table_sem = schema_loader.get_table_semantics(schema, table)
+    time_axis = [str(v).strip() for v in (table_sem.get("time_axis_columns") or []) if str(v).strip()]
+    try:
+        cols_df = schema_loader.get_table_columns(schema, table)
+    except Exception:  # noqa: BLE001
+        cols_df = None
+    if cols_df is None or cols_df.empty:
+        return time_axis[0] if time_axis else None
+    known = {str(row.get("column_name") or "").lower(): row for _, row in cols_df.iterrows()}
+    ranked: list[tuple[int, str]] = []
+    for col in time_axis:
+        if col.lower() in known:
+            ranked.append((_date_priority(schema_loader, schema, table, col, known[col.lower()]), col))
+    for col_lower, row in known.items():
+        col = str(row.get("column_name") or "").strip()
+        if not col or col in time_axis:
+            continue
+        dtype = str(row.get("dType") or row.get("dtype") or "").lower()
+        sem = schema_loader.get_column_semantics(schema, table, col)
+        sem_class = str(sem.get("semantic_class") or "").lower()
+        if sem_class == "date" or dtype.startswith(("date", "timestamp")):
+            ranked.append((_date_priority(schema_loader, schema, table, col, row), col))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
+def _date_priority(schema_loader: Any, schema: str, table: str, col: str, row: Any) -> int:
+    name = col.lower()
+    sem = schema_loader.get_column_semantics(schema, table, col)
+    tags = {str(v).lower() for v in (sem.get("semantic_tags") or [])}
+    dtype = str(row.get("dType") or row.get("dtype") or "").lower()
+    if "time_axis" in tags and name in {"report_dt", "report_date"}:
+        return 0
+    if "time_axis" in tags:
+        return 1
+    if name in {"report_dt", "report_date"}:
+        return 2
+    if name.startswith(("inserted_", "updated_", "modified_", "created_", "load_", "etl_")):
+        return 8
+    if dtype.startswith("date"):
+        return 3
+    if dtype.startswith("timestamp"):
+        return 5
+    return 9
 
 
 def _text_score(name: str, description: str, target: str) -> float:

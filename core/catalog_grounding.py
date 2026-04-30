@@ -112,22 +112,49 @@ def ground_query_spec(
     warnings: list[str] = []
     excluded = _excluded_source_names(query_spec, schema_loader)
 
+    ambiguous_required: ClarificationSpec | None = None
     for constraint in query_spec.source_constraints:
         bound = _bind_explicit_source(constraint, schema_loader)
         if bound is not None:
             if bound.full_name.lower() not in excluded:
                 sources.append(bound)
             continue
+        options = _explicit_source_options(constraint, schema_loader)
+        if constraint.required and len(options) > 1:
+            ambiguous_required = ClarificationSpec(
+                question="Найдено несколько таблиц с указанным именем. Уточните, какую схему использовать.",
+                reason="catalog_grounding_ambiguous_required_source",
+                field="source_constraints",
+                options=options,
+                evidence=[
+                    Evidence(
+                        source="query_spec",
+                        text=".".join(
+                            part for part in (constraint.schema, constraint.table or constraint.semantic) if part
+                        ),
+                        confidence=constraint.confidence or 0.8,
+                    )
+                ],
+            )
+            break
         if constraint.required:
             warnings.append(
                 "required source was not found in catalog: "
                 + ".".join(part for part in (constraint.schema, constraint.table or constraint.semantic) if part)
             )
+    if ambiguous_required is not None:
+        return GroundingResult(
+            query_spec=query_spec,
+            sources=sources,
+            clarification=ambiguous_required,
+            warnings=warnings,
+            confidence=0.0,
+        )
 
     search_terms = _search_terms(query_spec, user_input)
     has_required_explicit_sources = any(
-        constraint.required and constraint.schema and constraint.table
-        for constraint in query_spec.source_constraints
+        source.reason == "explicit_source_constraint"
+        for source in sources
     )
     if not has_required_explicit_sources:
         for binding in _lexicon_anchor_bindings(query_spec, schema_loader):
@@ -193,6 +220,7 @@ def ground_query_spec(
         user_input=user_input,
         semantic_frame=semantic_frame,
     )
+    sources = _required_sources_first(sources)
 
     if not sources and query_spec.task == "answer_data":
         clarification = ClarificationSpec(
@@ -227,7 +255,7 @@ def ground_query_spec(
         )
 
     plan_ir = PlanIR(
-        main_source=sources[0] if sources else None,
+        main_source=_main_source_with_required_priority(sources) if sources else None,
         sources=sources,
         metrics=query_spec.metrics,
         dimensions=query_spec.dimensions,
@@ -254,19 +282,27 @@ def _bind_explicit_source(constraint, schema_loader) -> SourceBinding | None:
     table = constraint.table
     if table and "." in table and not schema:
         schema, table = table.split(".", 1)
-    if not schema or not table:
+    if not table:
         return None
     df = schema_loader.tables_df
     if df.empty:
         return None
-    mask = (
-        df["schema_name"].astype(str).str.lower() == str(schema).lower()
-    ) & (
-        df["table_name"].astype(str).str.lower() == str(table).lower()
-    )
-    if df[mask].empty:
+    table_mask = df["table_name"].astype(str).str.lower() == str(table).lower()
+    if schema:
+        mask = table_mask & (df["schema_name"].astype(str).str.lower() == str(schema).lower())
+    else:
+        mask = table_mask
+    matches = df[mask]
+    if matches.empty or len(matches) > 1:
         return None
-    row = df[mask].iloc[0]
+    row = matches.iloc[0]
+    logger.info(
+        "CatalogTableScore: table=%s.%s score=1.000 confidence=%.2f type=explicit "
+        "reason=explicit_source_constraint",
+        str(row["schema_name"]),
+        str(row["table_name"]),
+        max(0.95, constraint.confidence),
+    )
     return SourceBinding(
         schema=str(row["schema_name"]),
         table=str(row["table_name"]),
@@ -274,6 +310,40 @@ def _bind_explicit_source(constraint, schema_loader) -> SourceBinding | None:
         confidence=max(0.95, constraint.confidence),
         evidence=constraint.evidence or [Evidence(source="query_spec", text=f"{schema}.{table}", confidence=1.0)],
     )
+
+
+def _explicit_source_options(constraint, schema_loader) -> list[str]:
+    schema = constraint.schema
+    table = constraint.table
+    if table and "." in table and not schema:
+        schema, table = table.split(".", 1)
+    if not table:
+        return []
+    df = schema_loader.tables_df
+    if df.empty:
+        return []
+    table_mask = df["table_name"].astype(str).str.lower() == str(table).lower()
+    if schema:
+        table_mask &= df["schema_name"].astype(str).str.lower() == str(schema).lower()
+    matches = df[table_mask]
+    return [
+        f"{str(row.get('schema_name') or '')}.{str(row.get('table_name') or '')}"
+        for _, row in matches.iterrows()
+        if str(row.get("schema_name") or "") and str(row.get("table_name") or "")
+    ]
+
+
+def _main_source_with_required_priority(sources: list[SourceBinding]) -> SourceBinding | None:
+    for source in sources:
+        if source.reason == "explicit_source_constraint":
+            return source
+    return sources[0] if sources else None
+
+
+def _required_sources_first(sources: list[SourceBinding]) -> list[SourceBinding]:
+    explicit = [source for source in sources if source.reason == "explicit_source_constraint"]
+    rest = [source for source in sources if source.reason != "explicit_source_constraint"]
+    return explicit + rest
 
 
 def _excluded_source_names(query_spec: QuerySpec, schema_loader) -> set[str]:
@@ -438,6 +508,7 @@ def _score_catalog_bindings(
         all_terms = [user_input]
 
     scored: list[tuple[float, SourceBinding]] = []
+    diagnostics: list[dict[str, Any]] = []
     for _, row in df.iterrows():
         schema = str(row.get("schema_name") or "")
         table = str(row.get("table_name") or "")
@@ -449,16 +520,28 @@ def _score_catalog_bindings(
         except Exception:  # noqa: BLE001
             cols = None
         if cols is None or cols.empty:
+            diagnostics.append({
+                "table": f"{schema}.{table}",
+                "score": 0.0,
+                "confidence": 0.0,
+                "type": "unknown",
+                "components": "no_columns",
+                "selected": False,
+            })
             continue
 
         table_type = detect_table_type(table, cols)
-        score = _score_text(table, description, source_terms, 1.4)
+        source_score = _score_text(table, description, source_terms, 1.4)
+        mention_score = 6.0 if _source_mentioned_in_text(schema, table, user_input) else 0.0
+        score = source_score
         if _source_mentioned_in_text(schema, table, user_input):
-            score += 6.0
+            score += mention_score
         metric_score = 0.0
         entity_score = 0.0
         entity_coverage = 0
         dimension_score = 0.0
+        filter_score = 0.0
+        join_score = 0.0
         for _, col in cols.iterrows():
             col_name = str(col.get("column_name") or "")
             col_desc = _row_text(col)
@@ -469,19 +552,35 @@ def _score_catalog_bindings(
                     entity_score += _best_attribute_column_score(col, term)
                     break
             dimension_score += _score_text(col_name, col_desc, dimension_terms, 2.0)
-            score += _score_text(col_name, col_desc, filter_terms, 1.3)
-            score += _score_text(col_name, col_desc, join_terms, 1.0)
+            filter_score += _score_text(col_name, col_desc, filter_terms, 1.3)
+            join_score += _score_text(col_name, col_desc, join_terms, 1.0)
+        score += filter_score + join_score
 
+        count_attr_bonus = 0.0
+        type_bonus = 0.0
         if query_spec.strategy == "count_attributes":
             full_coverage = _table_count_attribute_coverage(cols, entity_terms)
             if full_coverage < len(entity_terms):
+                diagnostics.append({
+                    "table": f"{schema}.{table}",
+                    "score": score,
+                    "confidence": 0.0,
+                    "type": table_type,
+                    "components": (
+                        f"source={source_score:.2f}, mention={mention_score:.2f}, "
+                        f"metric={metric_score:.2f}, entity={entity_score:.2f}, "
+                        f"dimension={dimension_score:.2f}, filter={filter_score:.2f}, "
+                        f"join={join_score:.2f}, count_coverage={full_coverage}/{len(entity_terms)}"
+                    ),
+                    "selected": False,
+                })
                 continue
-            score += full_coverage * 6.0 + entity_score
-            score += _score_text(table, description, entity_terms, 2.0)
+            count_attr_bonus += full_coverage * 6.0 + entity_score
+            count_attr_bonus += _score_text(table, description, entity_terms, 2.0)
             if table_type in {"dim", "ref"}:
-                score += 8.0
+                type_bonus += 8.0
             elif table_type == "fact":
-                score -= 4.0
+                type_bonus -= 4.0
         else:
             score += metric_score + dimension_score
         frame_score = _frame_table_support_score(
@@ -492,32 +591,89 @@ def _score_catalog_bindings(
             user_input=user_input,
             semantic_frame=semantic_frame,
         )
-        score += frame_score
+        score += count_attr_bonus + type_bonus + frame_score
         if metric_score and table_type == "fact":
+            type_bonus += 0.7
             score += 0.7
         if metric_score and _count_id_metrics(query_spec) and table_type in {"dim", "ref"}:
+            type_bonus += 1.6
             score += 1.6
         if dimension_score and table_type in {"dim", "ref"}:
+            type_bonus += 0.8
             score += 0.8
         if not metric_score and dimension_score and table_type == "fact":
+            type_bonus -= 0.5
             score -= 0.5
 
         if score <= 0:
+            diagnostics.append({
+                "table": f"{schema}.{table}",
+                "score": score,
+                "confidence": 0.0,
+                "type": table_type,
+                "components": (
+                    f"source={source_score:.2f}, mention={mention_score:.2f}, "
+                    f"metric={metric_score:.2f}, entity={entity_score:.2f}, "
+                    f"dimension={dimension_score:.2f}, filter={filter_score:.2f}, "
+                    f"join={join_score:.2f}, frame={frame_score:.2f}, "
+                    f"count_attr={count_attr_bonus:.2f}, type_bonus={type_bonus:.2f}"
+                ),
+                "selected": False,
+            })
             continue
         confidence = min(0.95, max(0.35, score / 12.0))
-        scored.append((
-            score,
-            SourceBinding(
-                schema=schema,
-                table=table,
-                reason="query_spec_slot_score",
-                confidence=confidence,
-                evidence=[Evidence(source="catalog_slot_score", text=", ".join(all_terms), confidence=confidence)],
+        binding = SourceBinding(
+            schema=schema,
+            table=table,
+            reason="query_spec_slot_score",
+            confidence=confidence,
+            evidence=[Evidence(source="catalog_slot_score", text=", ".join(all_terms), confidence=confidence)],
+        )
+        scored.append((score, binding))
+        diagnostics.append({
+            "table": binding.full_name,
+            "score": score,
+            "confidence": confidence,
+            "type": table_type,
+            "components": (
+                f"source={source_score:.2f}, mention={mention_score:.2f}, "
+                f"metric={metric_score:.2f}, entity={entity_score:.2f}, "
+                f"dimension={dimension_score:.2f}, filter={filter_score:.2f}, "
+                f"join={join_score:.2f}, frame={frame_score:.2f}, "
+                f"count_attr={count_attr_bonus:.2f}, type_bonus={type_bonus:.2f}"
             ),
-        ))
+            "selected": False,
+        })
 
     scored.sort(key=lambda item: item[0], reverse=True)
+    selected_keys = {binding.full_name.lower() for _, binding in scored[:top_n]}
+    for item in diagnostics:
+        item["selected"] = str(item["table"]).lower() in selected_keys
+    _log_catalog_table_scores(diagnostics)
     return [binding for _, binding in scored[:top_n]]
+
+
+def _log_catalog_table_scores(diagnostics: list[dict[str, Any]]) -> None:
+    if not diagnostics:
+        return
+    ordered = sorted(
+        diagnostics,
+        key=lambda item: (float(item.get("score") or 0.0), str(item.get("table") or "")),
+        reverse=True,
+    )
+    logger.info("CatalogTableScore: scored %d table(s)", len(ordered))
+    for idx, item in enumerate(ordered, start=1):
+        logger.info(
+            "CatalogTableScore: rank=%d selected=%s table=%s score=%.3f "
+            "confidence=%.2f type=%s components=[%s]",
+            idx,
+            bool(item.get("selected")),
+            item.get("table"),
+            float(item.get("score") or 0.0),
+            float(item.get("confidence") or 0.0),
+            item.get("type") or "unknown",
+            item.get("components") or "",
+        )
 
 
 def _count_id_metrics(query_spec: QuerySpec) -> bool:
@@ -947,6 +1103,10 @@ def _prune_unrequested_helper_sources(
 ) -> list[SourceBinding]:
     if len(sources) <= 1 or query_spec.join_constraints or query_spec.dimensions:
         return sources
+    required_sources = [
+        source for source in sources
+        if source.reason == "explicit_source_constraint"
+    ]
     frame = semantic_frame or {}
     if not (
         frame.get("filter_intents")
@@ -959,6 +1119,9 @@ def _prune_unrequested_helper_sources(
     kept: list[SourceBinding] = []
     min_support = 1.0 if query_spec.filters else 0.5
     for source in sources:
+        if source.reason == "explicit_source_constraint":
+            kept.append(source)
+            continue
         score = _frame_table_support_score(
             schema_loader=schema_loader,
             schema=source.schema,
@@ -980,6 +1143,8 @@ def _prune_unrequested_helper_sources(
             )
 
     if not kept:
+        if required_sources:
+            return required_sources
         logger.info(
             "PruneHelper: all candidates dropped, falling back to first source %s",
             sources[0].full_name if sources else "<none>",
@@ -1012,6 +1177,10 @@ def _prune_sources_to_minimal_covering_table(
         return sources
     if query_spec.join_constraints or _required_explicit_source_count(query_spec) > 1:
         return sources
+    required_sources = [
+        source for source in sources
+        if source.reason == "explicit_source_constraint"
+    ]
 
     required_terms = [
         str(item.target or "").strip()
@@ -1057,6 +1226,17 @@ def _prune_sources_to_minimal_covering_table(
         return sources
     candidates.sort(key=lambda item: item[0], reverse=True)
     chosen = candidates[0][1]
+    if required_sources:
+        required = required_sources[0]
+        if _source_covers_query_slots(
+            required,
+            query_spec=query_spec,
+            schema_loader=schema_loader,
+            user_input=user_input,
+        ):
+            chosen = required
+        else:
+            return sources
     if len(sources) > 1:
         dropped = [src.full_name for src in sources if src.full_name != chosen.full_name]
         logger.info(
@@ -1209,6 +1389,8 @@ def _prune_count_sources_covered_by_single_dictionary(
     not add requested information and only create row-count ambiguity.
     """
     if len(sources) <= 1 or query_spec.dimensions or query_spec.filters or query_spec.join_constraints:
+        return sources
+    if any(source.reason == "explicit_source_constraint" for source in sources):
         return sources
     targets = _entity_terms(query_spec)
     if not targets:

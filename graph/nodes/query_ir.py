@@ -9,6 +9,7 @@ from typing import Any
 from core.catalog_grounding import ground_query_spec
 from core.log_safety import summarize_dict_keys, summarize_text
 from core.query_ir import QuerySpec, query_spec_json_schema
+from core.semantic_frame import derive_semantic_frame
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,12 @@ class QueryIRNodes:
 
         legacy_intent = spec.to_legacy_intent()
         legacy_hints = spec.to_legacy_user_hints()
+        semantic_frame = derive_semantic_frame(
+            user_input,
+            legacy_intent,
+            schema_loader=self.schema,
+            user_hints=legacy_hints,
+        )
 
         return {
             "query_spec": spec.to_dict(),
@@ -96,7 +103,7 @@ class QueryIRNodes:
             "user_hints_llm": legacy_hints,
             "user_hints": legacy_hints,
             "hints_source": "query_spec",
-            "semantic_frame": {},
+            "semantic_frame": semantic_frame,
             "needs_clarification": bool(spec.clarification_needed),
             "clarification_message": spec.clarification.question if spec.clarification else "",
             "messages": state["messages"] + [
@@ -193,9 +200,19 @@ class QueryIRNodes:
 
         if result.sources:
             selected = [source.to_tuple() for source in result.sources]
+            canonical_query_spec = _canonicalize_query_spec_sources(spec.to_dict(), result.sources)
+            canonical_spec, _canonical_errors = QuerySpec.from_dict(canonical_query_spec)
+            canonical_hints = (
+                canonical_spec.to_legacy_user_hints()
+                if canonical_spec is not None
+                else spec.to_legacy_user_hints()
+            )
             update.update({
+                "query_spec": canonical_query_spec,
                 "selected_tables": selected,
                 "allowed_tables": [source.full_name for source in result.sources],
+                "user_hints": canonical_hints,
+                "user_hints_llm": canonical_hints,
                 "excluded_tables": list(excluded_tables),
                 "plan": [
                     "Ground QuerySpec against catalog: "
@@ -305,6 +322,38 @@ def _strip_unstated_physical_hints(spec: QuerySpec, user_input: str) -> None:
                 dim.target,
             )
             dim.join_key = None
+
+
+def _canonicalize_query_spec_sources(
+    query_spec: dict[str, Any],
+    sources,
+) -> dict[str, Any]:
+    """Fill schema for explicit source constraints after catalog grounding."""
+    canonical = dict(query_spec or {})
+    source_by_table = {
+        str(source.table).lower(): source
+        for source in sources
+        if getattr(source, "reason", "") == "explicit_source_constraint"
+    }
+    if not source_by_table:
+        return canonical
+    normalized_sources: list[dict[str, Any]] = []
+    for raw in canonical.get("source_constraints") or []:
+        if not isinstance(raw, dict):
+            normalized_sources.append(raw)
+            continue
+        item = dict(raw)
+        schema = item.get("schema")
+        table = item.get("table")
+        if table and "." in str(table) and not schema:
+            schema, table = str(table).split(".", 1)
+        source = source_by_table.get(str(table or "").lower())
+        if source is not None:
+            item["schema"] = source.schema
+            item["table"] = source.table
+        normalized_sources.append(item)
+    canonical["source_constraints"] = normalized_sources
+    return canonical
 
 
 def _apply_query_spec_guardrails(spec: QuerySpec, semantic_frame: dict[str, Any]) -> dict[str, Any]:

@@ -1,3 +1,5 @@
+import logging
+
 import pandas as pd
 
 from core.catalog_grounding import ground_query_spec
@@ -208,6 +210,125 @@ def test_catalog_grounding_binds_explicit_source(tmp_path):
     assert result.plan_ir.main_source.full_name == "dm.orders"
 
 
+def test_catalog_grounding_binds_unique_table_only_required_source(tmp_path):
+    loader = _loader(tmp_path)
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "distinct_policy": "auto", "confidence": 0.8}],
+        "dimensions": [],
+        "filters": [],
+        "source_constraints": [{"table": "orders", "required": True, "confidence": 1.0}],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.8,
+    })
+    assert spec is not None, errors
+
+    result = ground_query_spec(query_spec=spec, schema_loader=loader, user_input="сколько заказов")
+
+    assert result.needs_clarification is False
+    assert [source.full_name for source in result.sources] == ["dm.orders"]
+    assert result.plan_ir is not None
+    assert result.plan_ir.main_source.full_name == "dm.orders"
+
+
+def test_catalog_grounding_keeps_required_table_when_other_table_covers_slots(tmp_path):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm"],
+        "table_name": ["requested_orders", "better_orders"],
+        "description": ["Фактовая таблица заказов", "Заказы с суммой"],
+        "grain": ["transaction", "transaction"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm", "dm", "dm"],
+        "table_name": ["requested_orders", "better_orders", "better_orders"],
+        "column_name": ["order_id", "order_id", "amount"],
+        "dType": ["bigint", "bigint", "numeric"],
+        "description": ["ID заказа", "ID заказа", "Сумма заказа"],
+        "is_primary_key": [True, True, False],
+        "unique_perc": [100.0, 100.0, 50.0],
+        "not_null_perc": [100.0, 100.0, 95.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "sum", "target": "amount", "distinct_policy": "auto", "confidence": 0.8}],
+        "dimensions": [],
+        "filters": [],
+        "source_constraints": [{"table": "requested_orders", "required": True, "confidence": 1.0}],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.8,
+    })
+    assert spec is not None, errors
+
+    result = ground_query_spec(query_spec=spec, schema_loader=loader, user_input="сумма заказов")
+
+    assert result.needs_clarification is False
+    assert result.sources[0].full_name == "dm.requested_orders"
+    assert "dm.requested_orders" in [source.full_name for source in result.sources]
+
+
+def test_catalog_grounding_clarifies_ambiguous_table_only_required_source(tmp_path):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "ods"],
+        "table_name": ["orders", "orders"],
+        "description": ["Заказы DM", "Заказы ODS"],
+        "grain": ["transaction", "transaction"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm", "ods"],
+        "table_name": ["orders", "orders"],
+        "column_name": ["order_id", "order_id"],
+        "dType": ["bigint", "bigint"],
+        "description": ["ID заказа", "ID заказа"],
+        "is_primary_key": [True, True],
+        "unique_perc": [100.0, 100.0],
+        "not_null_perc": [100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "distinct_policy": "auto", "confidence": 0.8}],
+        "dimensions": [],
+        "filters": [],
+        "source_constraints": [{"table": "orders", "required": True, "confidence": 1.0}],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.8,
+    })
+    assert spec is not None, errors
+
+    result = ground_query_spec(query_spec=spec, schema_loader=loader, user_input="сколько заказов")
+
+    assert result.needs_clarification is True
+    assert result.clarification is not None
+    assert set(result.clarification.options) == {"dm.orders", "ods.orders"}
+
+
+def test_query_spec_promotes_calendar_literal_filter_to_time_range():
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "distinct_policy": "auto", "confidence": 0.8}],
+        "dimensions": [],
+        "filters": [{"target": "отчетный месяц", "operator": "=", "value": "февраль 2026", "confidence": 0.9}],
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.8,
+    })
+
+    assert spec is not None, errors
+    assert spec.time_range is not None
+    assert spec.time_range.start == "2026-02-01"
+    assert spec.time_range.end == "2026-03-01"
+    assert spec.filters == []
+
+
 def test_catalog_grounding_uses_metadata_filters_and_prunes_unrelated_helpers(tmp_path):
     tables_df = pd.DataFrame({
         "schema_name": ["dm", "dm", "dm"],
@@ -291,6 +412,47 @@ def test_catalog_grounding_uses_metadata_filters_and_prunes_unrelated_helpers(tm
 
     assert result.needs_clarification is False
     assert [source.full_name for source in result.sources] == ["dm.sale_funnel", "dm.fact_outflow"]
+
+
+def test_catalog_grounding_logs_table_scores(tmp_path, caplog):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm"],
+        "table_name": ["orders", "customers"],
+        "description": ["Фактовая таблица заказов", "Справочник клиентов"],
+        "grain": ["transaction", "customer"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm", "dm", "dm"],
+        "table_name": ["orders", "orders", "customers"],
+        "column_name": ["order_id", "amount", "customer_id"],
+        "dType": ["bigint", "numeric", "bigint"],
+        "description": ["ID заказа", "Сумма заказа", "ID клиента"],
+        "is_primary_key": [True, False, True],
+        "unique_perc": [100.0, 50.0, 100.0],
+        "not_null_perc": [100.0, 95.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "sum", "target": "amount", "distinct_policy": "auto", "confidence": 0.8}],
+        "dimensions": [],
+        "filters": [],
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.8,
+    })
+    assert spec is not None, errors
+
+    with caplog.at_level(logging.INFO, logger="core.catalog_grounding"):
+        ground_query_spec(query_spec=spec, schema_loader=loader, user_input="сумма заказов")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("CatalogTableScore: scored 2 table(s)" in msg for msg in messages)
+    assert any("table=dm.orders" in msg and "score=" in msg for msg in messages)
+    assert any("table=dm.customers" in msg and "score=" in msg for msg in messages)
 
 
 def _quality_loader(tmp_path, fact_segment_fill=1.5, include_join=True):

@@ -113,11 +113,29 @@ def ground_query_spec(
     excluded = _excluded_source_names(query_spec, schema_loader)
 
     ambiguous_required: ClarificationSpec | None = None
+    missing_required: ClarificationSpec | None = None
     for constraint in query_spec.source_constraints:
         bound = _bind_explicit_source(constraint, schema_loader)
         if bound is not None:
             if bound.full_name.lower() not in excluded:
                 sources.append(bound)
+            elif constraint.required:
+                missing_required = ClarificationSpec(
+                    question=(
+                        "Указанная обязательная таблица исключена из доступных источников. "
+                        "Уточните источник данных."
+                    ),
+                    reason="catalog_grounding_required_source_excluded",
+                    field="source_constraints",
+                    evidence=[
+                        Evidence(
+                            source="query_spec",
+                            text=_source_constraint_text(constraint),
+                            confidence=constraint.confidence or 0.8,
+                        )
+                    ],
+                )
+                break
             continue
         options = _explicit_source_options(constraint, schema_loader)
         if constraint.required and len(options) > 1:
@@ -138,15 +156,40 @@ def ground_query_spec(
             )
             break
         if constraint.required:
+            missing_required = ClarificationSpec(
+                question=(
+                    "Указанная обязательная таблица не найдена в metadata-каталоге: "
+                    f"{_source_constraint_text(constraint)}. "
+                    "Проверьте имя таблицы или обновите metadata."
+                ),
+                reason="catalog_grounding_missing_required_source",
+                field="source_constraints",
+                evidence=[
+                    Evidence(
+                        source="query_spec",
+                        text=_source_constraint_text(constraint),
+                        confidence=constraint.confidence or 0.8,
+                    )
+                ],
+            )
             warnings.append(
                 "required source was not found in catalog: "
                 + ".".join(part for part in (constraint.schema, constraint.table or constraint.semantic) if part)
             )
+            break
     if ambiguous_required is not None:
         return GroundingResult(
             query_spec=query_spec,
             sources=sources,
             clarification=ambiguous_required,
+            warnings=warnings,
+            confidence=0.0,
+        )
+    if missing_required is not None:
+        return GroundingResult(
+            query_spec=query_spec,
+            sources=sources,
+            clarification=missing_required,
             warnings=warnings,
             confidence=0.0,
         )
@@ -310,6 +353,18 @@ def _bind_explicit_source(constraint, schema_loader) -> SourceBinding | None:
         confidence=max(0.95, constraint.confidence),
         evidence=constraint.evidence or [Evidence(source="query_spec", text=f"{schema}.{table}", confidence=1.0)],
     )
+
+
+def _source_constraint_text(constraint) -> str:
+    schema = getattr(constraint, "schema", None)
+    table = getattr(constraint, "table", None)
+    semantic = getattr(constraint, "semantic", None)
+    if table and "." in str(table) and not schema:
+        return str(table)
+    return ".".join(
+        part for part in (str(schema or "").strip(), str(table or semantic or "").strip())
+        if part
+    ) or "<empty>"
 
 
 def _explicit_source_options(constraint, schema_loader) -> list[str]:

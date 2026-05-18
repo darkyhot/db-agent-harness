@@ -13,7 +13,7 @@ from typing import Any
 
 from core.entity_resolver import resolve_entity_to_columns
 from core.join_analysis import detect_table_type
-from core.query_ir import QuerySpec
+from core.query_ir import QuerySpec, _parse_calendar_period, _target_looks_calendar
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +184,8 @@ def _bind_metric_dimension_columns(
             roles["group_by"].append(col)
 
     for flt in spec.filters:
+        if _filter_is_calendar_literal(flt):
+            continue
         choice = _choose_column_across_tables(
             table_structures=table_structures,
             table_types=table_types,
@@ -213,6 +215,12 @@ def _bind_metric_dimension_columns(
         "confidence": 0.82,
         "reason": "QuerySpec metric/dimension binding",
     }
+
+
+def _filter_is_calendar_literal(flt: Any) -> bool:
+    target = str(getattr(flt, "target", "") or "")
+    value = getattr(flt, "value", None)
+    return bool(_parse_calendar_period(value) and _target_looks_calendar(f"{target} {value}"))
 
 
 def _choose_column_across_tables(

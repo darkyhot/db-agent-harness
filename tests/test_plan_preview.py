@@ -41,6 +41,9 @@ def _state(
     plan_preview_approved: bool = False,
     blueprint=None,
     user_hints=None,
+    selected_columns=None,
+    table_types=None,
+    allowed_tables=None,
 ):
     return {
         "explicit_mode": explicit_mode,
@@ -48,8 +51,10 @@ def _state(
         "plan_preview_pending": False,
         "plan_preview_iteration": 0,
         "sql_blueprint": blueprint or _blueprint(),
-        "selected_columns": {},
+        "selected_columns": selected_columns or {},
         "join_spec": [],
+        "table_types": table_types or {},
+        "allowed_tables": allowed_tables or [],
         "where_resolution": {},
         "user_hints": user_hints or {},
     }
@@ -253,3 +258,28 @@ def test_render_plan_time_granularity():
         user_hints={"time_granularity": "week"},
     )
     assert "week" in md
+
+
+def test_plan_preview_includes_deterministic_sql_without_execution():
+    node = _make_node(show_plan=True)
+    blueprint = _blueprint(
+        strategy="simple_select",
+        main_table="dm.sales",
+        where_conditions=["report_dt >= '2026-02-01'::date"],
+        aggregation={"function": "COUNT", "column": "*", "alias": "count_all"},
+        aggregations=[{"function": "COUNT", "column": "*", "alias": "count_all", "source_table": "dm.sales"}],
+        group_by=[],
+        order_by=None,
+    )
+    result = node.plan_preview(_state(
+        show_plan=True,
+        blueprint=blueprint,
+        selected_columns={"dm.sales": {"aggregate": ["*"], "filter": ["report_dt"]}},
+        table_types={"dm.sales": "fact"},
+        allowed_tables=["dm.sales"],
+    ))
+
+    assert result.get("plan_preview_pending") is True
+    assert result.get("sql_preview")
+    assert "SELECT" in result["confirmation_message"]
+    assert "FROM dm.sales" in result["confirmation_message"]

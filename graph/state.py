@@ -178,6 +178,7 @@ class AgentState(TypedDict):
     plan_preview_pending: bool
     plan_preview_approved: bool
     plan_preview_iteration: int
+    sql_preview: str
 
     # === Plan-verifier (LLM-валидация плана перед preview) ===
     # plan_verifier_done: True после первого прохода verifier — защита от

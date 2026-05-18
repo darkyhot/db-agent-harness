@@ -528,6 +528,22 @@ def _parse_calendar_period(value: Any) -> tuple[str, str, TimeGrain] | None:
         end_month = 1 if end_month > 12 else end_month
         return f"{year:04d}-{month:02d}-01", f"{end_year:04d}-{end_month:02d}-01", "quarter"
 
+    iso_month_match = re.search(r"\b(20\d{2})[-./](0?[1-9]|1[0-2])\b(?![-./]\d{1,2})", text)
+    if not iso_month_match:
+        iso_month_match = re.search(r"\b(0?[1-9]|1[0-2])[-./](20\d{2})\b", text)
+        if iso_month_match:
+            month = int(iso_month_match.group(1))
+            year = int(iso_month_match.group(2))
+            end_year = year + 1 if month == 12 else year
+            end_month = 1 if month == 12 else month + 1
+            return f"{year:04d}-{month:02d}-01", f"{end_year:04d}-{end_month:02d}-01", "month"
+    elif iso_month_match:
+        year = int(iso_month_match.group(1))
+        month = int(iso_month_match.group(2))
+        end_year = year + 1 if month == 12 else year
+        end_month = 1 if month == 12 else month + 1
+        return f"{year:04d}-{month:02d}-01", f"{end_year:04d}-{end_month:02d}-01", "month"
+
     month = None
     for stem, number in _RU_MONTHS.items():
         if stem in text:
@@ -554,7 +570,11 @@ def _normalize_calendar_literal_filters(spec: QuerySpec) -> None:
     has_time_range = bool(spec.time_range and (spec.time_range.start or spec.time_range.end))
     for item in spec.filters:
         parsed = _parse_calendar_period(item.value)
-        if parsed and _target_looks_calendar(item.target):
+        target_is_calendar = _target_looks_calendar(item.target)
+        value_looks_calendar = parsed is not None and _target_looks_calendar(
+            f"{item.target} {item.value}"
+        )
+        if parsed and (target_is_calendar or value_looks_calendar):
             if not has_time_range:
                 promoted = (parsed[0], parsed[1], parsed[2], item)
             continue

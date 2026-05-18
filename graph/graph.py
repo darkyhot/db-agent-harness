@@ -629,6 +629,7 @@ def create_initial_state(
         plan_preview_pending=False,
         plan_preview_approved=plan_preview_approved,
         plan_preview_iteration=plan_preview_iteration,
+        sql_preview=str(ctx.get("sql_preview") or ""),
         # Plan-verifier (LLM-валидация плана перед preview)
         plan_verifier_done=False,
         plan_verifier_applied=False,

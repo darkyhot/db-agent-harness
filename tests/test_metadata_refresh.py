@@ -1,6 +1,7 @@
 import pandas as pd
 import yaml
 
+from core.exceptions import KERBEROS_USER_MESSAGE, KerberosAuthError
 from core.metadata_refresh import (
     MetadataRefreshService,
     _find_candidate_primary_key,
@@ -119,7 +120,7 @@ def test_metadata_service_add_targets_refreshes_catalog(tmp_path, monkeypatch):
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -167,7 +168,6 @@ def test_metadata_service_remove_targets_prunes_catalog(tmp_path):
         "foreign_key_target": ["", ""],
         "sample_values": ["", ""],
         "partition_key": [False, False],
-        "synonyms": ["", ""],
     })
     loader = SchemaLoader(data_dir=tmp_path)
     loader.replace_catalog(tables_df, attrs_df)
@@ -204,7 +204,7 @@ def test_metadata_service_add_targets_rejects_invalid_schema(tmp_path):
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -231,7 +231,7 @@ def test_metadata_service_add_targets_rejects_missing_table(tmp_path):
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -259,7 +259,7 @@ def test_metadata_service_add_targets_rolls_back_manifest_for_failed_refresh(tmp
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -295,7 +295,7 @@ def test_metadata_service_add_targets_rolls_back_manifest_when_refresh_raises(tm
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -319,6 +319,28 @@ def test_metadata_service_add_targets_rolls_back_manifest_when_refresh_raises(tm
         raise AssertionError("Ожидалось исключение refresh_tables")
 
     assert service.list_targets() == []
+
+
+def test_metadata_refresh_raises_kerberos_error_instead_of_marking_failed(tmp_path, monkeypatch):
+    loader = SchemaLoader(data_dir=tmp_path)
+    service = MetadataRefreshService(
+        loader,
+        StubDB(),
+        StubLLM(),
+        targets_path=tmp_path / "metadata_targets.yaml",
+    )
+
+    def raise_gss_failure(_engine):
+        raise RuntimeError("FATAL: GSS authentication failed for user")
+
+    monkeypatch.setattr("core.metadata_refresh.inspect", raise_gss_failure)
+
+    try:
+        service.refresh_tables([("s_grnplm_ld_salesntwrk_pcap_sn_uzp", "orders")])
+    except KerberosAuthError as exc:
+        assert str(exc) == KERBEROS_USER_MESSAGE
+    else:
+        raise AssertionError("Ожидался KerberosAuthError")
 
 
 def test_metadata_service_recreates_storage_when_data_dir_is_missing(tmp_path, monkeypatch):
@@ -379,7 +401,7 @@ def test_metadata_service_deduplicates_column_few_shots(tmp_path, monkeypatch):
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
 
@@ -439,7 +461,7 @@ def test_metadata_service_builds_few_shots_before_generating_missing_description
             "schema_name", "table_name", "column_name", "dType",
             "is_not_null", "description", "is_primary_key",
             "not_null_perc", "unique_perc",
-            "foreign_key_target", "sample_values", "partition_key", "synonyms",
+            "foreign_key_target", "sample_values", "partition_key",
         ]),
     )
     monkeypatch.setattr("core.metadata_refresh.inspect", lambda engine: OrderedInspector())
@@ -486,7 +508,6 @@ def test_metadata_service_add_targets_rebuilds_few_shots_without_scanning_manife
                 "foreign_key_target": "",
                 "sample_values": "",
                 "partition_key": False,
-                "synonyms": "",
             }
         ]),
     )

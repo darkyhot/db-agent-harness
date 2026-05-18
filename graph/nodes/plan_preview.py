@@ -14,6 +14,9 @@ plan_preview_pending=True, confirmation_message=<Markdown план>.
 import logging
 from typing import Any
 
+from core.sql_builder import SqlBuilder
+from core.sql_formatter import format_sql_safe
+from core.sql_static_checker import check_sql
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,8 @@ def _render_plan(
     where_resolution: dict[str, Any],
     user_hints: dict[str, Any],
     plan_diff_summary: str = "",
+    sql_preview: str = "",
+    sql_preview_note: str = "",
 ) -> str:
     """Собрать человекочитаемый Markdown-план запроса."""
     lines: list[str] = ["**План запроса:**", ""]
@@ -127,10 +132,59 @@ def _render_plan(
     if time_gran:
         lines.append(f"- **Гранулярность:** {time_gran}")
 
+    if sql_preview:
+        lines.append("")
+        lines.append("**SQL preview:**")
+        lines.append("```sql")
+        lines.append(sql_preview)
+        lines.append("```")
+    elif sql_preview_note:
+        lines.append("")
+        lines.append(f"**SQL preview:** {sql_preview_note}")
+
     lines.append("")
     lines.append("_Введите «ок» для выполнения или уточните запрос (до 3 итераций)._")
 
     return "\n".join(lines)
+
+
+def _build_deterministic_sql_preview(
+    *,
+    sql_blueprint: dict[str, Any],
+    selected_columns: dict[str, Any],
+    join_spec: list[dict[str, Any]],
+    table_types: dict[str, str],
+    schema_loader: Any,
+    allowed_tables: list[str] | None = None,
+) -> tuple[str, str]:
+    """Build SQL text for preview without executing it or calling the LLM."""
+    try:
+        sql = SqlBuilder().build(
+            strategy=str(sql_blueprint.get("strategy") or "simple_select"),
+            selected_columns=selected_columns,
+            join_spec=join_spec,
+            blueprint=sql_blueprint,
+            table_types=table_types,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("plan_preview: deterministic SQL preview failed: %s", exc)
+        return "", "детерминированный SQL-preview недоступен для этого плана"
+    if not sql:
+        return "", "детерминированный SQL-preview недоступен для этого плана"
+    sql = format_sql_safe(sql)
+    try:
+        check = check_sql(
+            sql,
+            schema_loader=schema_loader,
+            allowed_tables=allowed_tables if allowed_tables else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("plan_preview: SQL preview static check failed: %s", exc)
+        return "", "SQL-preview не прошёл статическую проверку"
+    if not check.is_valid:
+        logger.info("plan_preview: SQL preview suppressed by static checker: %s", check.summary())
+        return "", "SQL-preview не прошёл статическую проверку"
+    return sql, ""
 
 
 class PlanPreviewNodes:
@@ -171,12 +225,22 @@ class PlanPreviewNodes:
         join_spec = state.get("join_spec") or []
         where_resolution = state.get("where_resolution") or {}
         user_hints = state.get("user_hints") or {}
+        table_types = state.get("table_types") or {}
+        allowed_tables = state.get("allowed_tables") or []
 
         # Если blueprint пуст — транзит (нечего показывать)
         if not sql_blueprint:
             logger.warning("plan_preview: sql_blueprint пуст — транзит")
             return {}
 
+        sql_preview, sql_preview_note = _build_deterministic_sql_preview(
+            sql_blueprint=sql_blueprint,
+            selected_columns=selected_columns,
+            join_spec=join_spec,
+            table_types=table_types,
+            schema_loader=getattr(self, "schema", None),
+            allowed_tables=allowed_tables,
+        )
         plan_md = _render_plan(
             sql_blueprint=sql_blueprint,
             selected_columns=selected_columns,
@@ -184,6 +248,8 @@ class PlanPreviewNodes:
             where_resolution=where_resolution,
             user_hints=user_hints,
             plan_diff_summary=str(state.get("plan_diff_summary") or ""),
+            sql_preview=sql_preview,
+            sql_preview_note=sql_preview_note,
         )
 
         iteration = state.get("plan_preview_iteration", 0)
@@ -195,5 +261,6 @@ class PlanPreviewNodes:
         return {
             "plan_preview_pending": True,
             "confirmation_message": plan_md,
+            "sql_preview": sql_preview,
             "plan_preview_iteration": iteration,
         }

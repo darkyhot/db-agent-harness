@@ -16,12 +16,6 @@ _STOPWORDS = {
 
 _FLAG_WORDS = {"признак", "flag", "is", "bool", "boolean"}
 _DATE_WORDS = {"date", "дата", "period", "период", "report"}
-_BUILTIN_SUBJECT_ALIASES: dict[str, list[str]] = {
-    "task": ["task", "ticket", "issue", "задача", "задачи", "задач", "воронка"],
-    "client": ["client", "customer", "клиент", "клиента", "клиенты"],
-    "employee": ["employee", "staff", "сотрудник", "сотрудника", "сотрудники"],
-    "organization": ["organization", "org", "branch", "госб", "тб", "организация"],
-}
 
 
 def _normalize_phrase(text: str) -> str:
@@ -128,11 +122,6 @@ def _is_overly_generic_match_phrase(column: str, phrase: str) -> bool:
     return False
 
 
-def builtin_subject_aliases() -> dict[str, list[str]]:
-    """Вернуть встроенную карту subject -> aliases для fallback-эвристик."""
-    return {key: list(values) for key, values in _BUILTIN_SUBJECT_ALIASES.items()}
-
-
 def build_semantic_lexicon(
     tables_df,
     attrs_df,
@@ -149,24 +138,40 @@ def build_semantic_lexicon(
         "time_phrases": {},
     }
 
-    for key, meta in (table_semantics or {}).items():
-        grain = str(meta.get("grain") or "").strip().lower()
-        if not grain or grain == "other":
-            continue
-        aliases = _collect_aliases(grain, str(meta.get("table") or ""), str(meta.get("schema") or ""))
-        if aliases:
-            entry = lexicon["subjects"].setdefault(grain, {"aliases": [], "tables": []})
-            for alias in aliases:
-                if alias not in entry["aliases"]:
-                    entry["aliases"].append(alias)
-            if key not in entry["tables"]:
-                entry["tables"].append(key)
+    # Маппинг table_key → описание из tables_df (для извлечения aliases из NL-описаний).
+    table_descriptions: dict[str, str] = {}
+    if tables_df is not None and not tables_df.empty:
+        for _, row in tables_df.iterrows():
+            tk = f"{row.get('schema_name', '') or ''}.{row.get('table_name', '') or ''}".lower()
+            table_descriptions[tk] = str(row.get("description", "") or "")
 
-    for subject, aliases in builtin_subject_aliases().items():
-        entry = lexicon["subjects"].setdefault(subject, {"aliases": [], "tables": []})
-        for alias in _collect_aliases(subject, *aliases):
+    def _add_subject(subject_key: str, table_key: str, description: str, table_meta: dict) -> None:
+        subject_key = subject_key.strip().lower()
+        if not subject_key or subject_key == "other":
+            return
+        aliases = _collect_aliases(
+            subject_key,
+            str(table_meta.get("table") or ""),
+            str(table_meta.get("schema") or ""),
+            description or "",
+        )
+        if not aliases:
+            return
+        entry = lexicon["subjects"].setdefault(subject_key, {"aliases": [], "tables": []})
+        for alias in aliases:
             if alias not in entry["aliases"]:
                 entry["aliases"].append(alias)
+        if table_key not in entry["tables"]:
+            entry["tables"].append(table_key)
+
+    for key, meta in (table_semantics or {}).items():
+        description = table_descriptions.get(key.lower(), "")
+        # 1. По grain (основной канал)
+        _add_subject(str(meta.get("grain") or ""), key, description, meta)
+        # 2. По primary_subjects (бизнес-сущности из table_semantics.json — учат
+        # связывать "ТБ"/"ГОСБ" с subject="organization" через текст описаний таблиц).
+        for ps in meta.get("primary_subjects") or []:
+            _add_subject(str(ps or ""), key, description, meta)
 
     if attrs_df is not None and not attrs_df.empty:
         for _, row in attrs_df.iterrows():
@@ -180,6 +185,29 @@ def build_semantic_lexicon(
             sem_class = str(semantics.get("semantic_class", "") or "")
             description = str(row.get("description", "") or "")
             aliases = _collect_aliases(column.replace("_", " "), description)
+            # Flag-колонки `is_X`/`has_X` маркируют принадлежность строки к subject=X.
+            # Сохраняем их в отдельной секции `flag_subjects`, чтобы:
+            #  1) filter_ranking мог найти aliases при поиске implicit subject flag;
+            #  2) НЕ влиять на find_best_subject / table_resolver — там это создаёт
+            #     ложные «boost'ы» для таблиц, у которых subject выражен только
+            #     через флаг-колонку, а не через имя/описание таблицы.
+            flag_subject_match = re.match(r"^(?:is|has)_(.+)$", column.lower())
+            if flag_subject_match and sem_class in {"flag", "enum_like"}:
+                subject_token = flag_subject_match.group(1).strip()
+                if subject_token and subject_token not in _STOPWORDS:
+                    subject_aliases = _collect_aliases(subject_token, description)
+                    if subject_aliases:
+                        flag_subjects = lexicon.setdefault("flag_subjects", {})
+                        entry = flag_subjects.setdefault(
+                            subject_token,
+                            {"aliases": [], "tables": []},
+                        )
+                        for alias in subject_aliases:
+                            if alias not in entry["aliases"]:
+                                entry["aliases"].append(alias)
+                        table_key = f"{schema}.{table}"
+                        if table_key not in entry["tables"]:
+                            entry["tables"].append(table_key)
             if sem_class == "date":
                 entry = lexicon["time_phrases"].setdefault("date", {"aliases": []})
                 for alias in aliases + _collect_aliases(*_DATE_WORDS):
@@ -295,6 +323,15 @@ def find_best_subject(query: str, lexicon: dict[str, Any]) -> str | None:
         if score > best_score:
             best_score = score
             best_subject = subject
+    for subject, meta in (lexicon.get("flag_subjects") or {}).items():
+        aliases = meta.get("aliases", []) or []
+        score = 0
+        for alias in aliases:
+            alias_tokens = set(_stem_tokens(_tokenize(alias)))
+            score = max(score, len(query_tokens & alias_tokens))
+        if score > best_score:
+            best_score = score
+            best_subject = subject
     return best_subject
 
 
@@ -315,6 +352,64 @@ def find_matching_dimensions(query: str, lexicon: dict[str, Any]) -> list[str]:
                 results.append(dim_key)
                 break
     return list(dict.fromkeys(results))
+
+
+def find_tables_for_term(term: str, lexicon: dict[str, Any]) -> list[str]:
+    """Найти таблицы каталога, совпадающие с term по subjects/flag_subjects/dimensions.
+
+    Возвращает список `schema.table` без дублей. Алиасы matchятся через stemmed-tokens
+    с тем же порогом, что и `find_best_subject` / `find_matching_dimensions`.
+    """
+    query_tokens = set(_stem_tokens(_tokenize(term)))
+    if not query_tokens:
+        return []
+
+    seen: set[str] = set()
+    result: list[str] = []
+
+    def _push(table_key: str) -> None:
+        norm = str(table_key or "").strip().lower()
+        if not norm or norm in seen:
+            return
+        seen.add(norm)
+        result.append(table_key)
+
+    def _alias_match(alias_tokens: set[str]) -> int:
+        if not alias_tokens:
+            return 0
+        # Однотокенные алиасы или однотокенные запросы матчим по совпадению одного токена;
+        # для многотокенных пар требуем минимум 2 пересечения, чтобы не ловить случайные слова.
+        threshold = 1 if len(alias_tokens) == 1 or len(query_tokens) == 1 else 2
+        overlap = len(query_tokens & alias_tokens)
+        return overlap if overlap >= threshold else 0
+
+    # flag_subjects сознательно не используем: флаг-колонки `is_X` выражают
+    # принадлежность к subject=X, но не делают всю таблицу её источником —
+    # включение их сюда даёт ложные boost'ы (см. комментарий в build_semantic_lexicon).
+    for meta in (lexicon.get("subjects") or {}).values():
+        best_overlap = 0
+        for alias in meta.get("aliases", []) or []:
+            alias_tokens = set(_stem_tokens(_tokenize(alias)))
+            best_overlap = max(best_overlap, _alias_match(alias_tokens))
+        if best_overlap > 0:
+            for tbl in meta.get("tables", []) or []:
+                _push(tbl)
+
+    for meta in (lexicon.get("dimensions") or {}).values():
+        match = False
+        for alias in meta.get("aliases", []) or []:
+            alias_tokens = set(_stem_tokens(_tokenize(alias)))
+            if _alias_match(alias_tokens):
+                match = True
+                break
+        if not match:
+            continue
+        for col_key in meta.get("column_keys", []) or []:
+            parts = str(col_key).split(".")
+            if len(parts) >= 2:
+                _push(f"{parts[0]}.{parts[1]}")
+
+    return result
 
 
 def find_matching_rules(query: str, registry: dict[str, Any]) -> list[dict[str, Any]]:

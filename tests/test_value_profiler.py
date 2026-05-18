@@ -1,5 +1,7 @@
 import pandas as pd
+import pytest
 
+from core.exceptions import KerberosAuthError
 from core.value_profiler import build_db_profile, fetch_table_profile_sample
 
 
@@ -11,6 +13,12 @@ class StubDB:
     def execute_query(self, sql: str, limit: int = 1000):
         self.sql_calls.append(sql)
         return self.frame
+
+
+class KerberosStubDB:
+    def execute_query(self, sql: str, limit: int = 1000):
+        _ = (sql, limit)
+        raise KerberosAuthError("kinit required")
 
 
 def test_fetch_table_profile_sample_loads_table_once():
@@ -25,6 +33,16 @@ def test_fetch_table_profile_sample_loads_table_once():
 
     assert list(sample["task_subtype"]) == ["фактический отток", "отток"]
     assert 'SELECT "task_subtype" FROM "dm"."sale_funnel" ORDER BY random() LIMIT 100000' == db.sql_calls[0]
+
+
+def test_fetch_table_profile_sample_does_not_swallow_kerberos_error():
+    with pytest.raises(KerberosAuthError):
+        fetch_table_profile_sample(
+            KerberosStubDB(),
+            schema="dm",
+            table="sale_funnel",
+            columns=["task_subtype"],
+        )
 
 
 def test_build_db_profile_counts_values_from_sample_dataframe():

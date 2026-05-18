@@ -687,6 +687,37 @@ class TestBuildBlueprint:
         assert bp["aggregation"]["column"] == "outflow_qty"
         assert bp["aggregation"]["alias"] == "sum_outflow_qty"
 
+    def test_join_keys_do_not_leak_into_aggregate_group_by(self):
+        cols = {
+            "dm.fact_outflow": {
+                "select": ["report_dt", "gosb_id", "tb_id"],
+                "filter": [],
+                "aggregate": ["outflow_qty"],
+                "group_by": ["report_dt"],
+            },
+            "dm.dim_gosb": {
+                "select": ["new_gosb_name", "old_gosb_id", "tb_id"],
+                "filter": [],
+                "aggregate": [],
+                "group_by": ["new_gosb_name"],
+            },
+        }
+
+        bp = build_blueprint(
+            self._intent(agg="sum"),
+            cols,
+            [
+                {"left": "dm.fact_outflow.gosb_id", "right": "dm.dim_gosb.old_gosb_id"},
+                {"left": "dm.fact_outflow.tb_id", "right": "dm.dim_gosb.tb_id"},
+            ],
+            {"dm.fact_outflow": "fact", "dm.dim_gosb": "dim"},
+            {},
+        )
+
+        assert bp["group_by"] == ["report_dt", "new_gosb_name"]
+        assert cols["dm.fact_outflow"]["select"] == ["report_dt"]
+        assert cols["dm.dim_gosb"]["select"] == ["new_gosb_name"]
+
     def test_no_aggregation_no_order_by(self):
         bp = build_blueprint(
             self._intent(agg=None),

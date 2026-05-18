@@ -12,6 +12,7 @@ from typing import Any
 from IPython.display import clear_output, display, Markdown
 
 from core.database import DatabaseManager
+from core.exceptions import KerberosAuthError
 from core.llm import RateLimitedLLM
 from core.memory import MemoryManager
 from core.query_cache import QueryCache
@@ -310,7 +311,11 @@ class CLIInterface:
         self.llm = RateLimitedLLM()
         self.memory = MemoryManager()
         self.schema = SchemaLoader()
-        EnrichmentPipeline(self.schema, llm=self.llm, db_manager=self.db).run()
+        try:
+            EnrichmentPipeline(self.schema, llm=self.llm, db_manager=self.db).run()
+        except KerberosAuthError as exc:
+            print(f"\n❌ {exc}")
+            sys.exit(1)
         self.metadata = MetadataRefreshService(self.schema, self.db, self.llm)
         self.validator = SQLValidator(self.db, schema_loader=self.schema)
 
@@ -826,6 +831,10 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
                     parsed_refs,
                     progress_callback=_metadata_progress,
                 )
+            except KerberosAuthError as exc:
+                _status_print("")
+                print(f"\n❌ {exc}")
+                return
             except Exception as exc:  # noqa: BLE001
                 _status_print("")
                 logger.error("Metadata add error: %s", exc, exc_info=True)
@@ -864,6 +873,9 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
             print("Обновляю manifest и удаляю metadata для таблиц...")
             try:
                 result = self.metadata.remove_targets(parsed_refs)
+            except KerberosAuthError as exc:
+                print(f"\n❌ {exc}")
+                return
             except Exception as exc:  # noqa: BLE001
                 logger.error("Metadata remove error: %s", exc, exc_info=True)
                 print(f"Ошибка удаления таблиц: {exc}")
@@ -894,6 +906,10 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
 
         try:
             result = self.metadata.refresh_all(progress_callback=_metadata_progress)
+        except KerberosAuthError as exc:
+            _status_print("")
+            print(f"\n❌ {exc}")
+            return
         except Exception as exc:  # noqa: BLE001
             _status_print("")
             logger.error("Metadata refresh error: %s", exc, exc_info=True)
@@ -1393,6 +1409,10 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
             if answer and answer != "Нет ответа.":
                 self._ask_feedback(user_input, executed_sql or "")
 
+        except KerberosAuthError as exc:
+            _status_print("")
+            print(f"\n❌ {exc}")
+            return
         except Exception as e:
             _status_print("")
             logger.error("Ошибка обработки запроса: %s", e, exc_info=True)

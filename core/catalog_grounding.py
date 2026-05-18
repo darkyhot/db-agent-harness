@@ -24,7 +24,7 @@ from core.query_ir import (
     QuerySpec,
     SourceBinding,
 )
-from core.semantic_frame import derive_semantic_frame, sanitize_user_input_for_semantics
+from core.semantic_registry import find_tables_for_term
 
 
 @dataclass
@@ -79,8 +79,7 @@ def ground_query_spec(
         min_confidence: Below this confidence we ask for clarification instead
             of silently selecting a table.
     """
-    user_input = sanitize_user_input_for_semantics(user_input)
-    semantic_frame = _derive_grounding_frame(query_spec, schema_loader, user_input)
+    semantic_frame: dict[str, Any] = {}
 
     if query_spec.clarification_needed and query_spec.clarification:
         return GroundingResult(
@@ -113,24 +112,102 @@ def ground_query_spec(
     warnings: list[str] = []
     excluded = _excluded_source_names(query_spec, schema_loader)
 
+    ambiguous_required: ClarificationSpec | None = None
+    missing_required: ClarificationSpec | None = None
     for constraint in query_spec.source_constraints:
         bound = _bind_explicit_source(constraint, schema_loader)
         if bound is not None:
             if bound.full_name.lower() not in excluded:
                 sources.append(bound)
+            elif constraint.required:
+                missing_required = ClarificationSpec(
+                    question=(
+                        "Указанная обязательная таблица исключена из доступных источников. "
+                        "Уточните источник данных."
+                    ),
+                    reason="catalog_grounding_required_source_excluded",
+                    field="source_constraints",
+                    evidence=[
+                        Evidence(
+                            source="query_spec",
+                            text=_source_constraint_text(constraint),
+                            confidence=constraint.confidence or 0.8,
+                        )
+                    ],
+                )
+                break
             continue
+        options = _explicit_source_options(constraint, schema_loader)
+        if constraint.required and len(options) > 1:
+            ambiguous_required = ClarificationSpec(
+                question="Найдено несколько таблиц с указанным именем. Уточните, какую схему использовать.",
+                reason="catalog_grounding_ambiguous_required_source",
+                field="source_constraints",
+                options=options,
+                evidence=[
+                    Evidence(
+                        source="query_spec",
+                        text=".".join(
+                            part for part in (constraint.schema, constraint.table or constraint.semantic) if part
+                        ),
+                        confidence=constraint.confidence or 0.8,
+                    )
+                ],
+            )
+            break
         if constraint.required:
+            missing_required = ClarificationSpec(
+                question=(
+                    "Указанная обязательная таблица не найдена в metadata-каталоге: "
+                    f"{_source_constraint_text(constraint)}. "
+                    "Проверьте имя таблицы или обновите metadata."
+                ),
+                reason="catalog_grounding_missing_required_source",
+                field="source_constraints",
+                evidence=[
+                    Evidence(
+                        source="query_spec",
+                        text=_source_constraint_text(constraint),
+                        confidence=constraint.confidence or 0.8,
+                    )
+                ],
+            )
             warnings.append(
                 "required source was not found in catalog: "
                 + ".".join(part for part in (constraint.schema, constraint.table or constraint.semantic) if part)
             )
+            break
+    if ambiguous_required is not None:
+        return GroundingResult(
+            query_spec=query_spec,
+            sources=sources,
+            clarification=ambiguous_required,
+            warnings=warnings,
+            confidence=0.0,
+        )
+    if missing_required is not None:
+        return GroundingResult(
+            query_spec=query_spec,
+            sources=sources,
+            clarification=missing_required,
+            warnings=warnings,
+            confidence=0.0,
+        )
 
     search_terms = _search_terms(query_spec, user_input)
     has_required_explicit_sources = any(
-        constraint.required and constraint.schema and constraint.table
-        for constraint in query_spec.source_constraints
+        source.reason == "explicit_source_constraint"
+        for source in sources
     )
     if not has_required_explicit_sources:
+        for binding in _lexicon_anchor_bindings(query_spec, schema_loader):
+            if binding.full_name.lower() in excluded:
+                continue
+            if not _has_source(sources, binding):
+                sources.append(binding)
+            if len(sources) >= max_sources:
+                break
+
         for binding in _score_catalog_bindings(
             query_spec,
             schema_loader,
@@ -186,6 +263,7 @@ def ground_query_spec(
         user_input=user_input,
         semantic_frame=semantic_frame,
     )
+    sources = _required_sources_first(sources)
 
     if not sources and query_spec.task == "answer_data":
         clarification = ClarificationSpec(
@@ -220,7 +298,7 @@ def ground_query_spec(
         )
 
     plan_ir = PlanIR(
-        main_source=sources[0] if sources else None,
+        main_source=_main_source_with_required_priority(sources) if sources else None,
         sources=sources,
         metrics=query_spec.metrics,
         dimensions=query_spec.dimensions,
@@ -247,19 +325,27 @@ def _bind_explicit_source(constraint, schema_loader) -> SourceBinding | None:
     table = constraint.table
     if table and "." in table and not schema:
         schema, table = table.split(".", 1)
-    if not schema or not table:
+    if not table:
         return None
     df = schema_loader.tables_df
     if df.empty:
         return None
-    mask = (
-        df["schema_name"].astype(str).str.lower() == str(schema).lower()
-    ) & (
-        df["table_name"].astype(str).str.lower() == str(table).lower()
-    )
-    if df[mask].empty:
+    table_mask = df["table_name"].astype(str).str.lower() == str(table).lower()
+    if schema:
+        mask = table_mask & (df["schema_name"].astype(str).str.lower() == str(schema).lower())
+    else:
+        mask = table_mask
+    matches = df[mask]
+    if matches.empty or len(matches) > 1:
         return None
-    row = df[mask].iloc[0]
+    row = matches.iloc[0]
+    logger.info(
+        "CatalogTableScore: table=%s.%s score=1.000 confidence=%.2f type=explicit "
+        "reason=explicit_source_constraint",
+        str(row["schema_name"]),
+        str(row["table_name"]),
+        max(0.95, constraint.confidence),
+    )
     return SourceBinding(
         schema=str(row["schema_name"]),
         table=str(row["table_name"]),
@@ -267,6 +353,52 @@ def _bind_explicit_source(constraint, schema_loader) -> SourceBinding | None:
         confidence=max(0.95, constraint.confidence),
         evidence=constraint.evidence or [Evidence(source="query_spec", text=f"{schema}.{table}", confidence=1.0)],
     )
+
+
+def _source_constraint_text(constraint) -> str:
+    schema = getattr(constraint, "schema", None)
+    table = getattr(constraint, "table", None)
+    semantic = getattr(constraint, "semantic", None)
+    if table and "." in str(table) and not schema:
+        return str(table)
+    return ".".join(
+        part for part in (str(schema or "").strip(), str(table or semantic or "").strip())
+        if part
+    ) or "<empty>"
+
+
+def _explicit_source_options(constraint, schema_loader) -> list[str]:
+    schema = constraint.schema
+    table = constraint.table
+    if table and "." in table and not schema:
+        schema, table = table.split(".", 1)
+    if not table:
+        return []
+    df = schema_loader.tables_df
+    if df.empty:
+        return []
+    table_mask = df["table_name"].astype(str).str.lower() == str(table).lower()
+    if schema:
+        table_mask &= df["schema_name"].astype(str).str.lower() == str(schema).lower()
+    matches = df[table_mask]
+    return [
+        f"{str(row.get('schema_name') or '')}.{str(row.get('table_name') or '')}"
+        for _, row in matches.iterrows()
+        if str(row.get("schema_name") or "") and str(row.get("table_name") or "")
+    ]
+
+
+def _main_source_with_required_priority(sources: list[SourceBinding]) -> SourceBinding | None:
+    for source in sources:
+        if source.reason == "explicit_source_constraint":
+            return source
+    return sources[0] if sources else None
+
+
+def _required_sources_first(sources: list[SourceBinding]) -> list[SourceBinding]:
+    explicit = [source for source in sources if source.reason == "explicit_source_constraint"]
+    rest = [source for source in sources if source.reason != "explicit_source_constraint"]
+    return explicit + rest
 
 
 def _excluded_source_names(query_spec: QuerySpec, schema_loader) -> set[str]:
@@ -283,6 +415,89 @@ def _excluded_source_names(query_spec: QuerySpec, schema_loader) -> set[str]:
         if schema and table:
             excluded.add(f"{schema}.{table}".lower())
     return excluded
+
+
+def _lexicon_anchor_bindings(
+    query_spec: QuerySpec,
+    schema_loader,
+) -> list[SourceBinding]:
+    """Подобрать таблицы детерминированно через semantic_lexicon.
+
+    Для каждого «термина» из QuerySpec (entities/metrics/dimensions) дёргаем
+    `find_tables_for_term` и считаем, сколько раз каждая таблица встретилась.
+    Чем выше покрытие термов, тем выше confidence — это якоря для дальнейшего
+    scoring'а, не финальный список.
+    """
+    try:
+        lexicon = schema_loader.get_semantic_lexicon()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("lexicon anchors: get_semantic_lexicon failed: %s", exc)
+        return []
+    if not lexicon:
+        return []
+
+    terms: list[str] = []
+    for entity in query_spec.entities or []:
+        for value in (entity.canonical, entity.name, entity.target_column_hint):
+            text = str(value or "").strip()
+            if text and text not in terms:
+                terms.append(text)
+    for metric in query_spec.metrics or []:
+        text = str(metric.target or "").strip()
+        if text and text not in terms:
+            terms.append(text)
+    for dim in query_spec.dimensions or []:
+        for value in (dim.target, getattr(dim, "label", "")):
+            text = str(value or "").strip()
+            if text and text not in terms:
+                terms.append(text)
+    for fil in query_spec.filters or []:
+        text = str(fil.target or "").strip()
+        if text and text not in terms:
+            terms.append(text)
+    if not terms:
+        return []
+
+    table_hits: dict[str, dict[str, Any]] = {}
+    for term in terms:
+        for table_key in find_tables_for_term(term, lexicon):
+            entry = table_hits.setdefault(
+                table_key.lower(),
+                {"key": table_key, "terms": [], "count": 0},
+            )
+            entry["count"] += 1
+            if term not in entry["terms"]:
+                entry["terms"].append(term)
+
+    if not table_hits:
+        return []
+
+    bindings: list[SourceBinding] = []
+    for entry in table_hits.values():
+        parts = entry["key"].split(".", 1)
+        if len(parts) != 2:
+            continue
+        schema_name, table_name = parts
+        coverage = entry["count"] / max(len(terms), 1)
+        confidence = min(0.95, 0.55 + 0.4 * coverage)
+        matched_terms = ", ".join(entry["terms"])
+        bindings.append(
+            SourceBinding(
+                schema=schema_name,
+                table=table_name,
+                reason=f"semantic_lexicon:{matched_terms}",
+                confidence=confidence,
+                evidence=[
+                    Evidence(
+                        source="semantic_lexicon",
+                        text=matched_terms,
+                        confidence=confidence,
+                    )
+                ],
+            )
+        )
+    bindings.sort(key=lambda b: b.confidence, reverse=True)
+    return bindings
 
 
 def _search_table_bindings(term: str, schema_loader, top_n: int) -> list[SourceBinding]:
@@ -333,6 +548,7 @@ def _score_catalog_bindings(
         return []
 
     metric_terms = [m.target for m in query_spec.metrics if m.target]
+    entity_terms = _entity_terms(query_spec)
     dimension_terms = [d.target for d in query_spec.dimensions if d.target]
     filter_terms = [f.target for f in query_spec.filters if f.target]
     join_terms = [j.key for j in query_spec.join_constraints if j.key]
@@ -342,11 +558,12 @@ def _score_catalog_bindings(
         for item in (source.table, source.semantic)
         if item
     ]
-    all_terms = list(dict.fromkeys(metric_terms + dimension_terms + filter_terms + join_terms + source_terms))
+    all_terms = list(dict.fromkeys(entity_terms + metric_terms + dimension_terms + filter_terms + join_terms + source_terms))
     if not all_terms:
         all_terms = [user_input]
 
     scored: list[tuple[float, SourceBinding]] = []
+    diagnostics: list[dict[str, Any]] = []
     for _, row in df.iterrows():
         schema = str(row.get("schema_name") or "")
         table = str(row.get("table_name") or "")
@@ -358,23 +575,69 @@ def _score_catalog_bindings(
         except Exception:  # noqa: BLE001
             cols = None
         if cols is None or cols.empty:
+            diagnostics.append({
+                "table": f"{schema}.{table}",
+                "score": 0.0,
+                "confidence": 0.0,
+                "type": "unknown",
+                "components": "no_columns",
+                "selected": False,
+            })
             continue
 
         table_type = detect_table_type(table, cols)
-        score = _score_text(table, description, source_terms, 1.4)
+        source_score = _score_text(table, description, source_terms, 1.4)
+        mention_score = 6.0 if _source_mentioned_in_text(schema, table, user_input) else 0.0
+        score = source_score
         if _source_mentioned_in_text(schema, table, user_input):
-            score += 6.0
+            score += mention_score
         metric_score = 0.0
+        entity_score = 0.0
+        entity_coverage = 0
         dimension_score = 0.0
+        filter_score = 0.0
+        join_score = 0.0
         for _, col in cols.iterrows():
             col_name = str(col.get("column_name") or "")
-            col_desc = str(col.get("description") or "")
+            col_desc = _row_text(col)
             metric_score += _score_text(col_name, col_desc, metric_terms, 3.0)
+            for term in entity_terms:
+                if _best_attribute_column_score(col, term) > 0:
+                    entity_coverage += 1
+                    entity_score += _best_attribute_column_score(col, term)
+                    break
             dimension_score += _score_text(col_name, col_desc, dimension_terms, 2.0)
-            score += _score_text(col_name, col_desc, filter_terms, 1.3)
-            score += _score_text(col_name, col_desc, join_terms, 1.0)
+            filter_score += _score_text(col_name, col_desc, filter_terms, 1.3)
+            join_score += _score_text(col_name, col_desc, join_terms, 1.0)
+        score += filter_score + join_score
 
-        score += metric_score + dimension_score
+        count_attr_bonus = 0.0
+        type_bonus = 0.0
+        if query_spec.strategy == "count_attributes":
+            full_coverage = _table_count_attribute_coverage(cols, entity_terms)
+            if full_coverage < len(entity_terms):
+                diagnostics.append({
+                    "table": f"{schema}.{table}",
+                    "score": score,
+                    "confidence": 0.0,
+                    "type": table_type,
+                    "components": (
+                        f"source={source_score:.2f}, mention={mention_score:.2f}, "
+                        f"metric={metric_score:.2f}, entity={entity_score:.2f}, "
+                        f"dimension={dimension_score:.2f}, filter={filter_score:.2f}, "
+                        f"join={join_score:.2f}, count_coverage={full_coverage}/{len(entity_terms)}"
+                    ),
+                    "selected": False,
+                })
+                continue
+            count_attr_bonus += full_coverage * 6.0 + entity_score
+            count_attr_bonus += _score_text(table, description, entity_terms, 2.0)
+            if table_type in {"dim", "ref"}:
+                type_bonus += 8.0
+            elif table_type == "fact":
+                type_bonus -= 4.0
+        else:
+            score += metric_score + dimension_score
         frame_score = _frame_table_support_score(
             schema_loader=schema_loader,
             schema=schema,
@@ -383,32 +646,89 @@ def _score_catalog_bindings(
             user_input=user_input,
             semantic_frame=semantic_frame,
         )
-        score += frame_score
+        score += count_attr_bonus + type_bonus + frame_score
         if metric_score and table_type == "fact":
+            type_bonus += 0.7
             score += 0.7
         if metric_score and _count_id_metrics(query_spec) and table_type in {"dim", "ref"}:
+            type_bonus += 1.6
             score += 1.6
         if dimension_score and table_type in {"dim", "ref"}:
+            type_bonus += 0.8
             score += 0.8
         if not metric_score and dimension_score and table_type == "fact":
+            type_bonus -= 0.5
             score -= 0.5
 
         if score <= 0:
+            diagnostics.append({
+                "table": f"{schema}.{table}",
+                "score": score,
+                "confidence": 0.0,
+                "type": table_type,
+                "components": (
+                    f"source={source_score:.2f}, mention={mention_score:.2f}, "
+                    f"metric={metric_score:.2f}, entity={entity_score:.2f}, "
+                    f"dimension={dimension_score:.2f}, filter={filter_score:.2f}, "
+                    f"join={join_score:.2f}, frame={frame_score:.2f}, "
+                    f"count_attr={count_attr_bonus:.2f}, type_bonus={type_bonus:.2f}"
+                ),
+                "selected": False,
+            })
             continue
         confidence = min(0.95, max(0.35, score / 12.0))
-        scored.append((
-            score,
-            SourceBinding(
-                schema=schema,
-                table=table,
-                reason="query_spec_slot_score",
-                confidence=confidence,
-                evidence=[Evidence(source="catalog_slot_score", text=", ".join(all_terms), confidence=confidence)],
+        binding = SourceBinding(
+            schema=schema,
+            table=table,
+            reason="query_spec_slot_score",
+            confidence=confidence,
+            evidence=[Evidence(source="catalog_slot_score", text=", ".join(all_terms), confidence=confidence)],
+        )
+        scored.append((score, binding))
+        diagnostics.append({
+            "table": binding.full_name,
+            "score": score,
+            "confidence": confidence,
+            "type": table_type,
+            "components": (
+                f"source={source_score:.2f}, mention={mention_score:.2f}, "
+                f"metric={metric_score:.2f}, entity={entity_score:.2f}, "
+                f"dimension={dimension_score:.2f}, filter={filter_score:.2f}, "
+                f"join={join_score:.2f}, frame={frame_score:.2f}, "
+                f"count_attr={count_attr_bonus:.2f}, type_bonus={type_bonus:.2f}"
             ),
-        ))
+            "selected": False,
+        })
 
     scored.sort(key=lambda item: item[0], reverse=True)
+    selected_keys = {binding.full_name.lower() for _, binding in scored[:top_n]}
+    for item in diagnostics:
+        item["selected"] = str(item["table"]).lower() in selected_keys
+    _log_catalog_table_scores(diagnostics)
     return [binding for _, binding in scored[:top_n]]
+
+
+def _log_catalog_table_scores(diagnostics: list[dict[str, Any]]) -> None:
+    if not diagnostics:
+        return
+    ordered = sorted(
+        diagnostics,
+        key=lambda item: (float(item.get("score") or 0.0), str(item.get("table") or "")),
+        reverse=True,
+    )
+    logger.info("CatalogTableScore: scored %d table(s)", len(ordered))
+    for idx, item in enumerate(ordered, start=1):
+        logger.info(
+            "CatalogTableScore: rank=%d selected=%s table=%s score=%.3f "
+            "confidence=%.2f type=%s components=[%s]",
+            idx,
+            bool(item.get("selected")),
+            item.get("table"),
+            float(item.get("score") or 0.0),
+            float(item.get("confidence") or 0.0),
+            item.get("type") or "unknown",
+            item.get("components") or "",
+        )
 
 
 def _count_id_metrics(query_spec: QuerySpec) -> bool:
@@ -418,6 +738,46 @@ def _count_id_metrics(query_spec: QuerySpec) -> bool:
         and str(metric.target or "").lower().endswith(("_id", "id"))
         for metric in metrics
     )
+
+
+def _entity_terms(query_spec: QuerySpec) -> list[str]:
+    terms: list[str] = []
+    for entity in query_spec.entities or []:
+        value = entity.target_column_hint or entity.canonical or entity.name
+        if value:
+            terms.append(value)
+    if query_spec.strategy == "count_attributes" and not terms:
+        terms.extend(metric.target for metric in query_spec.metrics if metric.operation == "count" and metric.target)
+    return list(dict.fromkeys(str(term).strip() for term in terms if str(term).strip()))
+
+
+def _table_count_attribute_coverage(cols, entity_terms: list[str]) -> int:
+    covered = 0
+    for term in entity_terms:
+        if any(_best_attribute_column_score(row, term) > 0 for _, row in cols.iterrows()):
+            covered += 1
+    return covered
+
+
+def _best_attribute_column_score(row: Any, term: str) -> float:
+    """Универсальный score «колонка ↔ entity term» через description/name overlap.
+
+    Без захардкоженных доменных алиасов — все «тб»/«госб»-маппинги уходят на
+    уровень entity_resolver. Здесь только структурные структурные бонусы:
+    PK и `_id`-суффикс (не язык, а SQL-конвенция).
+    """
+    col_name = str(row.get("column_name") or "").strip()
+    if not col_name:
+        return 0.0
+    desc = _row_text(row)
+    score = _score_text(col_name, desc, [term], 1.0)
+    if score <= 0:
+        return 0.0
+    if bool(row.get("is_primary_key", False)):
+        score += 1.5
+    if col_name.lower().endswith("_id"):
+        score += 0.8
+    return score
 
 
 def _score_text(name: str, description: str, terms: list[str], weight: float) -> float:
@@ -444,6 +804,10 @@ def _score_text(name: str, description: str, terms: list[str], weight: float) ->
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^0-9a-zа-яё_]+", " ", str(text).lower())).strip()
+
+
+def _row_text(row: Any) -> str:
+    return str(row.get("description") or "").strip()
 
 
 def _column_match_score(column_name: str, description: str, term: str) -> float:
@@ -496,7 +860,7 @@ def _best_dimension_column(
         col_name = str(row.get("column_name") or "").strip()
         if not col_name:
             continue
-        desc = str(row.get("description") or "")
+        desc = _row_text(row)
         score = _column_match_score(col_name, desc, term)
         if score <= 0:
             continue
@@ -715,6 +1079,7 @@ def _search_terms(query_spec: QuerySpec, user_input: str) -> list[str]:
         if source.table:
             terms.append(source.table)
     terms.extend(metric.target for metric in query_spec.metrics if metric.target)
+    terms.extend(_entity_terms(query_spec))
     terms.extend(dim.target for dim in query_spec.dimensions if dim.target)
     terms.extend(item.target for item in query_spec.filters if item.target)
     terms.append(user_input)
@@ -729,25 +1094,6 @@ def _search_terms(query_spec: QuerySpec, user_input: str) -> list[str]:
 def _has_source(sources: list[SourceBinding], binding: SourceBinding) -> bool:
     key = binding.full_name.lower()
     return any(item.full_name.lower() == key for item in sources)
-
-
-def _derive_grounding_frame(query_spec: QuerySpec, schema_loader, user_input: str) -> dict[str, Any]:
-    """Build metadata-driven semantics for table scoring.
-
-    QuerySpec is the contract, but table grounding benefits from local catalog
-    rules such as value candidates and implicit subject flags. This keeps the
-    final SQL flexible while preventing unrelated joinable helper tables from
-    being promoted to sources.
-    """
-    try:
-        return derive_semantic_frame(
-            user_input,
-            query_spec.to_legacy_intent(),
-            schema_loader=schema_loader,
-            user_hints=query_spec.to_legacy_user_hints(),
-        )
-    except Exception:  # noqa: BLE001
-        return query_spec.to_semantic_frame()
 
 
 def _frame_table_support_score(
@@ -812,12 +1158,25 @@ def _prune_unrequested_helper_sources(
 ) -> list[SourceBinding]:
     if len(sources) <= 1 or query_spec.join_constraints or query_spec.dimensions:
         return sources
+    required_sources = [
+        source for source in sources
+        if source.reason == "explicit_source_constraint"
+    ]
     frame = semantic_frame or {}
-    if not (frame.get("filter_intents") or frame.get("subject") or frame.get("business_event")):
+    if not (
+        frame.get("filter_intents")
+        or frame.get("subject")
+        or frame.get("business_event")
+        or query_spec.filters
+    ):
         return sources
 
     kept: list[SourceBinding] = []
+    min_support = 1.0 if query_spec.filters else 0.5
     for source in sources:
+        if source.reason == "explicit_source_constraint":
+            kept.append(source)
+            continue
         score = _frame_table_support_score(
             schema_loader=schema_loader,
             schema=source.schema,
@@ -826,19 +1185,21 @@ def _prune_unrequested_helper_sources(
             user_input=user_input,
             semantic_frame=frame,
         )
-        if score >= 0.5:
+        if score >= min_support:
             kept.append(source)
             logger.debug(
-                "PruneHelper: keep %s (score=%.2f >= 0.5)",
-                source.full_name, score,
+                "PruneHelper: keep %s (score=%.2f >= %.2f)",
+                source.full_name, score, min_support,
             )
         else:
             logger.info(
-                "PruneHelper: drop %s (frame_support_score=%.2f < 0.5)",
-                source.full_name, score,
+                "PruneHelper: drop %s (frame_support_score=%.2f < %.2f)",
+                source.full_name, score, min_support,
             )
 
     if not kept:
+        if required_sources:
+            return required_sources
         logger.info(
             "PruneHelper: all candidates dropped, falling back to first source %s",
             sources[0].full_name if sources else "<none>",
@@ -871,6 +1232,10 @@ def _prune_sources_to_minimal_covering_table(
         return sources
     if query_spec.join_constraints or _required_explicit_source_count(query_spec) > 1:
         return sources
+    required_sources = [
+        source for source in sources
+        if source.reason == "explicit_source_constraint"
+    ]
 
     required_terms = [
         str(item.target or "").strip()
@@ -916,6 +1281,17 @@ def _prune_sources_to_minimal_covering_table(
         return sources
     candidates.sort(key=lambda item: item[0], reverse=True)
     chosen = candidates[0][1]
+    if required_sources:
+        required = required_sources[0]
+        if _source_covers_query_slots(
+            required,
+            query_spec=query_spec,
+            schema_loader=schema_loader,
+            user_input=user_input,
+        ):
+            chosen = required
+        else:
+            return sources
     if len(sources) > 1:
         dropped = [src.full_name for src in sources if src.full_name != chosen.full_name]
         logger.info(
@@ -939,6 +1315,13 @@ def _target_is_label_slot(target: str) -> bool:
     if t.endswith(("_name", "_label", "_title")):
         return True
     return any(token in t for token in _LABEL_TARGET_TOKENS)
+
+
+def _dimension_requests_label(dim: Any) -> bool:
+    return (
+        _target_is_label_slot(getattr(dim, "target", ""))
+        or _target_is_label_slot(getattr(dim, "label", ""))
+    )
 
 
 def _source_has_label_column_for_term(
@@ -979,7 +1362,7 @@ def _source_has_label_column_for_term(
         )
         if not is_label_col:
             continue
-        desc = str(row.get("description") or "")
+        desc = _row_text(row)
         if _column_match_score(col_name, desc, term) > 0:
             return True
     return False
@@ -1014,7 +1397,7 @@ def _source_covers_query_slots(
             continue
         if dim.source_table and str(dim.source_table).strip().lower() != source_name:
             return False
-        if _target_is_label_slot(target):
+        if _dimension_requests_label(dim):
             if not _source_has_label_column_for_term(
                 schema_loader, source.schema, source.table, target
             ):
@@ -1062,11 +1445,16 @@ def _prune_count_sources_covered_by_single_dictionary(
     """
     if len(sources) <= 1 or query_spec.dimensions or query_spec.filters or query_spec.join_constraints:
         return sources
-    metrics = [
-        metric for metric in (query_spec.metrics or [])
-        if metric.operation == "count" and str(metric.target or "").strip()
-    ]
-    if len(metrics) < 2:
+    if any(source.reason == "explicit_source_constraint" for source in sources):
+        return sources
+    targets = _entity_terms(query_spec)
+    if not targets:
+        targets = [
+            str(metric.target or "").strip()
+            for metric in (query_spec.metrics or [])
+            if metric.operation == "count" and str(metric.target or "").strip()
+        ]
+    if len(targets) < 2:
         return sources
 
     best: tuple[int, float, SourceBinding] | None = None
@@ -1082,14 +1470,14 @@ def _prune_count_sources_covered_by_single_dictionary(
             continue
         covered = 0
         pk_bonus = 0.0
-        for metric in metrics:
-            match = _best_metric_column_in_table(cols, str(metric.target or ""))
+        for target in targets:
+            match = _best_metric_column_in_table(cols, target)
             if match is None:
                 break
             covered += 1
             if bool(match.get("is_primary_key", False)):
                 pk_bonus += 1.0
-        if covered != len(metrics):
+        if covered != len(targets):
             continue
         rank = (covered, pk_bonus + source.confidence)
         candidate = (rank[0], rank[1], source)
@@ -1109,23 +1497,21 @@ def _prune_count_sources_covered_by_single_dictionary(
 
 
 def _best_metric_column_in_table(cols, target: str):
+    """Подобрать колонку под target по описанию/имени без доменных алиасов.
+
+    Базовый сигнал — `_score_text` (токен-overlap по имени и описанию). PK-бонус
+    повышает score, чтобы при равенстве выбрать основной идентификатор.
+    """
     target_norm = _normalize(target)
     best: tuple[float, Any] | None = None
     for _, row in cols.iterrows():
         col_name = str(row.get("column_name") or "")
-        desc = str(row.get("description") or "")
+        desc = _row_text(row)
         score = _score_text(col_name, desc, [target_norm], 1.0)
-        normalized_name = _normalize(col_name)
-        if target_norm == "gosb_id" and normalized_name == "old_gosb_id":
-            score = max(score, 2.0)
-        if target_norm == "gosb" and normalized_name in {"old_gosb_id", "gosb_id"}:
-            score = max(score, 2.0)
-        if target_norm == "tb" and normalized_name == "tb_id":
-            score = max(score, 2.0)
-        if target_norm == "tb_id" and normalized_name == "tb_id":
-            score = max(score, 2.0)
         if score <= 0:
             continue
+        if bool(row.get("is_primary_key", False)):
+            score += 0.5
         candidate = (score, row)
         if best is None or candidate[0] > best[0]:
             best = candidate

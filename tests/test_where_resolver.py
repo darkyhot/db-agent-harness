@@ -152,6 +152,68 @@ def test_where_resolver_honors_user_filter_choices_without_text_augmentation(tmp
     assert any(r.startswith("user_choice:") for r in result["reasoning"])
 
 
+def test_where_resolver_calendar_literal_uses_date_range_not_metric_column(tmp_path):
+    loader = _loader(tmp_path)
+    result = resolve_where(
+        user_input="Сколько задач за отчетный месяц февраль 2026",
+        intent={"filter_conditions": []},
+        selected_columns={
+            "dm.uzp_data_split_mzp_sale_funnel": {
+                "aggregate": ["task_code"],
+                "filter": ["m_avg_salary_amt"],
+            }
+        },
+        selected_tables=["dm.uzp_data_split_mzp_sale_funnel"],
+        schema_loader=loader,
+        semantic_frame={},
+        base_conditions=[],
+        filter_specs=[{"target": "отчетный месяц", "operator": "=", "value": "февраль 2026", "confidence": 0.9}],
+    )
+
+    assert result["needs_clarification"] is False
+    assert "report_dt >= '2026-02-01'::date" in result["conditions"]
+    assert "report_dt < '2026-03-01'::date" in result["conditions"]
+    assert not any("m_avg_salary_amt" in cond for cond in result["conditions"])
+
+
+def test_where_resolver_calendar_literal_clarifies_without_date_axis(tmp_path):
+    import pandas as pd
+    from core.schema_loader import SchemaLoader
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["metrics_only"],
+        "description": ["Таблица метрик"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["metrics_only"],
+        "column_name": ["m_avg_salary_amt"],
+        "dType": ["numeric"],
+        "description": ["Средняя зарплата в отчетный месяц"],
+        "is_primary_key": [False],
+        "unique_perc": [50.0],
+        "not_null_perc": [100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    result = resolve_where(
+        user_input="Сколько задач за отчетный месяц февраль 2026",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.metrics_only": {"aggregate": ["m_avg_salary_amt"]}},
+        selected_tables=["dm.metrics_only"],
+        schema_loader=loader,
+        semantic_frame={},
+        base_conditions=[],
+        filter_specs=[{"target": "отчетный месяц", "operator": "=", "value": "февраль 2026", "confidence": 0.9}],
+    )
+
+    assert result["needs_clarification"] is True
+    assert "date/time-axis" in result["clarification_message"]
+
+
 def test_where_resolver_skips_rejected_candidate_without_reasking(tmp_path):
     loader = _loader(tmp_path)
     loader.ensure_value_profiles()

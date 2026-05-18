@@ -158,6 +158,43 @@ def _compute_group_by(
     return group_by
 
 
+def _drop_join_only_select_columns(
+    selected_columns: dict[str, dict],
+    join_spec: list[dict],
+    aggregation: dict | None,
+) -> None:
+    """Remove technical join keys from SELECT roles for aggregate joins."""
+    if not aggregation or not join_spec:
+        return
+    join_cols_by_table: dict[str, set[str]] = {}
+    for item in join_spec:
+        for side in ("left", "right"):
+            ref = str(item.get(side) or "")
+            parts = ref.rsplit(".", 1)
+            if len(parts) != 2:
+                continue
+            table_key, col_name = parts
+            join_cols_by_table.setdefault(table_key, set()).add(col_name)
+
+    for table_key, roles in selected_columns.items():
+        join_cols = join_cols_by_table.get(table_key)
+        if not join_cols:
+            continue
+        protected = set(roles.get("group_by", [])) | set(roles.get("aggregate", [])) | set(roles.get("filter", []))
+        select_cols = list(roles.get("select", []) or [])
+        cleaned = [
+            col for col in select_cols
+            if col not in join_cols or col in protected
+        ]
+        if cleaned != select_cols:
+            roles["select"] = cleaned
+            logger.info(
+                "DeterministicPlanner: removed join-only select columns from %s: %s",
+                table_key,
+                [col for col in select_cols if col not in cleaned],
+            )
+
+
 # ---------------------------------------------------------------------------
 # 2a-ext. TIME GRANULARITY — DATE_TRUNC wrap для group_by
 # ---------------------------------------------------------------------------
@@ -251,12 +288,6 @@ def _compute_having(
     if not main_table or not schema_loader:
         return []
 
-    # Импорт здесь, чтобы избежать кругов и зависеть только при наличии хинтов.
-    try:
-        from core.user_hint_extractor import match_unit_column
-    except Exception:  # noqa: BLE001
-        return []
-
     parts = main_table.split(".", 1)
     if len(parts) != 2:
         return []
@@ -271,7 +302,7 @@ def _compute_having(
         if value is None:
             continue
         unit = hint.get("unit_hint", "") or ""
-        col = match_unit_column(unit, main_table, schema_loader) if unit else None
+        col = _match_unit_column_from_catalog(unit, main_cols) if unit else None
         if not col and not main_cols.empty:
             try:
                 pk_mask = main_cols.get(
@@ -298,6 +329,36 @@ def _compute_having(
             f"COUNT(DISTINCT {col})", op, value, unit,
         )
     return result
+
+
+def _match_unit_column_from_catalog(unit: str, cols_df) -> str | None:
+    """Resolve HAVING unit to a column using only structured hint text and catalog columns."""
+    normalized = str(unit or "").strip().lower()
+    if not normalized or cols_df is None or cols_df.empty:
+        return None
+    best: tuple[float, str] | None = None
+    for _, row in cols_df.iterrows():
+        col = str(row.get("column_name") or "").strip()
+        if not col:
+            continue
+        desc = str(row.get("description") or "").lower()
+        score = 0.0
+        lower_col = col.lower()
+        if normalized == lower_col:
+            score += 100.0
+        elif normalized in lower_col or lower_col in normalized:
+            score += 70.0
+        elif normalized in desc:
+            score += 45.0
+        if bool(row.get("is_primary_key", False)):
+            score += 30.0
+        if lower_col.endswith("_id"):
+            score += 10.0
+        if score > 0:
+            candidate = (score, col)
+            if best is None or candidate > best:
+                best = candidate
+    return best[1] if best else None
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1042,78 @@ def _find_date_column(selected_columns: dict[str, dict]) -> str | None:
     return None
 
 
+def _has_calendar_filter(intent: dict, time_range: dict | None) -> bool:
+    if time_range and (time_range.get("start") or time_range.get("end")):
+        return True
+    date_filters = (intent or {}).get("date_filters") or {}
+    if date_filters.get("from") or date_filters.get("to"):
+        return True
+    return False
+
+
+def _ensure_time_axis_filter_column(selected_columns: dict[str, dict], schema_loader) -> None:
+    for table_key, roles in selected_columns.items():
+        if "." not in table_key:
+            continue
+        if _find_date_column({table_key: roles}):
+            continue
+        schema, table = table_key.split(".", 1)
+        date_col = _choose_catalog_time_axis_column(schema_loader, schema, table)
+        if not date_col:
+            continue
+        filters = roles.setdefault("filter", [])
+        if date_col not in filters:
+            filters.append(date_col)
+
+
+def _choose_catalog_time_axis_column(schema_loader, schema: str, table: str) -> str | None:
+    table_sem = schema_loader.get_table_semantics(schema, table)
+    time_axis = [str(v).strip().lower() for v in (table_sem.get("time_axis_columns") or []) if str(v).strip()]
+    try:
+        cols_df = schema_loader.get_table_columns(schema, table)
+    except Exception:  # noqa: BLE001
+        return None
+    if cols_df is None or cols_df.empty:
+        return None
+    ranked: list[tuple[int, str]] = []
+    for _, row in cols_df.iterrows():
+        col = str(row.get("column_name") or "").strip()
+        if not col:
+            continue
+        col_lower = col.lower()
+        dtype = str(row.get("dType") or row.get("dtype") or "").lower()
+        sem = schema_loader.get_column_semantics(schema, table, col)
+        sem_class = str(sem.get("semantic_class") or "").lower()
+        tags = {str(v).lower() for v in (sem.get("semantic_tags") or [])}
+        looks_date = (
+            sem_class == "date"
+            or "time_axis" in tags
+            or dtype.startswith(("date", "timestamp"))
+            or col_lower.endswith(("_dt", "_date", "_dttm", "_timestamp", "_ts"))
+        )
+        if not looks_date:
+            continue
+        if col_lower in time_axis and col_lower in {"report_dt", "report_date"}:
+            priority = 0
+        elif col_lower in time_axis or "time_axis" in tags:
+            priority = 1
+        elif col_lower in {"report_dt", "report_date"}:
+            priority = 2
+        elif col_lower.startswith(_DATE_COLUMN_DEPRIO_PREFIXES):
+            priority = 8
+        elif dtype.startswith("date") or col_lower.endswith(("_dt", "_date")):
+            priority = 3
+        elif dtype.startswith("timestamp") or col_lower.endswith(("_dttm", "_timestamp", "_ts")):
+            priority = 5
+        else:
+            priority = 9
+        ranked.append((priority, col))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
 # ---------------------------------------------------------------------------
 # 5. Главная функция
 # ---------------------------------------------------------------------------
@@ -1205,6 +1338,7 @@ def build_blueprint(
         )
         aggregation = aggregations[0] if aggregations else None
 
+    _drop_join_only_select_columns(selected_columns, join_spec, aggregation)
     group_by    = _compute_group_by(selected_columns, aggregation)
 
     # Применяем DATE_TRUNC из time_granularity (если задана)
@@ -1212,6 +1346,9 @@ def build_blueprint(
     if _time_gran:
         group_by = _apply_time_granularity(group_by, selected_columns, _time_gran, schema_loader)
         logger.info("DeterministicPlanner: time_granularity='%s' → group_by=%s", _time_gran, group_by)
+
+    if schema_loader is not None and _has_calendar_filter(intent, time_range):
+        _ensure_time_axis_filter_column(selected_columns, schema_loader)
 
     base_where_conditions = _compute_where_from_intent(
         intent, selected_columns, user_input=user_input, schema_loader=schema_loader,
@@ -1315,7 +1452,12 @@ def build_blueprint(
 
     # ORDER BY: по агрегатному алиасу DESC, или нет
     order_by: str | None = None
-    if aggregation and aggregation.get("alias"):
+    if (
+        aggregation
+        and aggregation.get("alias")
+        and group_by
+        and str(intent.get("strategy") or "") != "count_attributes"
+    ):
         order_by = f"{aggregation['alias']} DESC"
 
     # LIMIT: только если явно задан в intent; без умолчания

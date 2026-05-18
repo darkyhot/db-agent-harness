@@ -9,7 +9,7 @@ from typing import Any
 from core.catalog_grounding import ground_query_spec
 from core.log_safety import summarize_dict_keys, summarize_text
 from core.query_ir import QuerySpec, query_spec_json_schema
-from core.semantic_frame import derive_semantic_frame, sanitize_user_input_for_semantics
+from core.semantic_frame import derive_semantic_frame
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -34,13 +34,12 @@ class QueryIRNodes:
             return {"graph_iterations": iterations}
 
         user_input = state.get("user_input", "") or ""
-        semantic_user_input = sanitize_user_input_for_semantics(user_input)
         logger.info("QueryInterpreter: запрос: %s", summarize_text(user_input, label="user_input"))
 
         system_prompt = _build_query_interpreter_system_prompt()
         user_prompt = _build_query_interpreter_user_prompt(
             user_input=user_input,
-            catalog_context=self._get_query_ir_catalog_context(semantic_user_input),
+            catalog_context=self._get_query_ir_catalog_context(user_input),
             prev_sql=state.get("prev_sql", ""),
             prev_summary=state.get("prev_result_summary", ""),
         )
@@ -81,6 +80,8 @@ class QueryIRNodes:
                 "graph_iterations": iterations,
             }
 
+        _strip_unstated_physical_hints(spec, user_input)
+
         logger.info(
             "QueryInterpreter: QuerySpec=%s",
             summarize_dict_keys(spec.to_dict(), label="query_spec"),
@@ -88,16 +89,12 @@ class QueryIRNodes:
 
         legacy_intent = spec.to_legacy_intent()
         legacy_hints = spec.to_legacy_user_hints()
-        try:
-            semantic_frame = derive_semantic_frame(
-                semantic_user_input,
-                legacy_intent,
-                schema_loader=self.schema,
-                user_hints=legacy_hints,
-            )
-        except Exception:  # noqa: BLE001
-            semantic_frame = spec.to_semantic_frame()
-        semantic_frame = _apply_query_spec_guardrails(spec, semantic_frame)
+        semantic_frame = derive_semantic_frame(
+            user_input,
+            legacy_intent,
+            schema_loader=self.schema,
+            user_hints=legacy_hints,
+        )
 
         return {
             "query_spec": spec.to_dict(),
@@ -141,7 +138,7 @@ class QueryIRNodes:
         result = ground_query_spec(
             query_spec=spec,
             schema_loader=self.schema,
-            user_input=sanitize_user_input_for_semantics(state.get("user_input", "") or ""),
+            user_input=state.get("user_input", "") or "",
         )
         excluded_tables = {
             str(item).strip().lower()
@@ -160,8 +157,6 @@ class QueryIRNodes:
             if result.plan_ir is not None:
                 result.plan_ir.sources = result.sources
                 result.plan_ir.main_source = result.sources[0] if result.sources else None
-        if result.sources and not result.needs_clarification:
-            self._review_grounding_with_llm(state, result)
         logger.info(
             "CatalogGrounder: sources=%s confidence=%.2f",
             [s.full_name for s in result.sources],
@@ -205,9 +200,19 @@ class QueryIRNodes:
 
         if result.sources:
             selected = [source.to_tuple() for source in result.sources]
+            canonical_query_spec = _canonicalize_query_spec_sources(spec.to_dict(), result.sources)
+            canonical_spec, _canonical_errors = QuerySpec.from_dict(canonical_query_spec)
+            canonical_hints = (
+                canonical_spec.to_legacy_user_hints()
+                if canonical_spec is not None
+                else spec.to_legacy_user_hints()
+            )
             update.update({
+                "query_spec": canonical_query_spec,
                 "selected_tables": selected,
                 "allowed_tables": [source.full_name for source in result.sources],
+                "user_hints": canonical_hints,
+                "user_hints_llm": canonical_hints,
                 "excluded_tables": list(excluded_tables),
                 "plan": [
                     "Ground QuerySpec against catalog: "
@@ -240,80 +245,10 @@ class QueryIRNodes:
             grain = str(row.get("grain") or "")
             if not schema or not table:
                 continue
-            col_bits: list[str] = []
-            try:
-                cols = self.schema.get_table_columns(schema, table).head(12)
-                for _, col in cols.iterrows():
-                    name = str(col.get("column_name") or "")
-                    dtype = str(col.get("dType") or "")
-                    col_desc = str(col.get("description") or "")
-                    if name:
-                        col_bits.append(f"{name}:{dtype}:{col_desc[:60]}")
-            except Exception:  # noqa: BLE001
-                col_bits = []
             lines.append(
-                f"- {schema}.{table}; grain={grain or 'unknown'}; desc={desc[:160]}; "
-                f"cols={'; '.join(col_bits)}"
+                f"- {schema}.{table}; grain={grain or 'unknown'}; desc={desc[:220]}"
             )
         return "\n".join(lines)
-
-    def _review_grounding_with_llm(self, state: AgentState, result) -> None:
-        """Let LLM reorder/drop only already grounded real source candidates."""
-        if len(result.sources) < 2:
-            return
-        options = [
-            {
-                "table": source.full_name,
-                "reason": source.reason,
-                "confidence": source.confidence,
-            }
-            for source in result.sources
-        ]
-        system_prompt = (
-            "Ты проверяешь выбор таблиц для SQL-агента. Можно выбирать ТОЛЬКО из "
-            "переданного списка реальных таблиц. Верни JSON: "
-            '{"tables": ["schema.table", ...], "rationale": "кратко"}. '
-            "Сохрани все таблицы, которые нужны для метрик, измерений или join."
-        )
-        user_prompt = (
-            "Запрос пользователя:\n"
-            f"{state.get('user_input', '')}\n\n"
-            "QuerySpec:\n"
-            f"{json.dumps(state.get('query_spec') or {}, ensure_ascii=False)}\n\n"
-            "Кандидаты:\n"
-            f"{json.dumps(options, ensure_ascii=False)}\n\n"
-            "JSON:"
-        )
-        try:
-            parsed = self._llm_json_with_retry(
-                system_prompt,
-                user_prompt,
-                temperature=0.0,
-                failure_tag="catalog_grounding_reviewer",
-                expect="object",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("CatalogGrounder reviewer failed: %s", exc)
-            return
-        requested = parsed.get("tables") if isinstance(parsed, dict) else None
-        if not isinstance(requested, list):
-            return
-        by_name = {source.full_name.lower(): source for source in result.sources}
-        reviewed = []
-        for item in requested:
-            source = by_name.get(str(item or "").strip().lower())
-            if source and source not in reviewed:
-                reviewed.append(source)
-        if not reviewed:
-            return
-        for source in result.sources:
-            if source not in reviewed:
-                reviewed.append(source)
-        result.sources = reviewed[: len(result.sources)]
-        if result.plan_ir is not None:
-            result.plan_ir.sources = result.sources
-            result.plan_ir.main_source = result.sources[0] if result.sources else None
-
 
 def _build_query_interpreter_system_prompt() -> str:
     schema = json.dumps(query_spec_json_schema(), ensure_ascii=False)
@@ -329,18 +264,96 @@ def _build_query_interpreter_system_prompt() -> str:
         "- Верни ТОЛЬКО JSON-объект без markdown.\n"
         "- task='answer_data' для расчётов/выборок; 'inspect_schema' для вопросов о каталоге; "
         "'edit_plan' для правки прошлого плана; 'clarify' для неоднозначности.\n"
+        "- strategy выбирай явно: 'count_attributes' для вопросов вида "
+        "'сколько есть X и Y' / 'сколько всего X и Y', где нужно посчитать "
+        "кардинальности нескольких атрибутов; 'aggregate' для обычных агрегатов; "
+        "'list' для перечислений.\n"
+        "- Для strategy='count_attributes' заполняй entities смысловыми именами "
+        "из запроса, например entities=[{'name':'ТБ'}, {'name':'госб'}]. "
+        "Не маппь их на физические колонки и не выбирай таблицу, если пользователь "
+        "явно не назвал источник.\n"
         "- filters описывают бизнес-смысл, не SQL.\n"
-        "- Если пользователь просит несколько показателей (например ТБ и ГОСБ), "
-        "верни несколько объектов в metrics, не один.\n"
+        "- Если пользователь просит несколько обычных показателей, верни несколько "
+        "objects в metrics, не один.\n"
         "- В dimensions[*].label можно положить опциональное человеко-читаемое имя оси "
         "(напр. 'Дата отчёта'); поле описательное, downstream его не использует. "
         "Других полей у dimension нет — не добавляй ничего, кроме перечисленных в JSON Schema.\n"
         "- order_by заполняй для просьб о сортировке; direction должен быть ASC или DESC.\n"
-        "- source_constraints заполняй только если источник явно назван или сильно следует из каталога.\n"
+        "- source_constraints заполняй только если источник явно назван пользователем; "
+        "не угадывай таблицу на этапе QuerySpec.\n"
         "- excluded_source_constraints заполняй только при явном запрете источника в правке плана.\n"
+        "- target_column_hint, dimensions[*].source_table и dimensions[*].join_key "
+        "заполняй ТОЛЬКО если пользователь явно написал физическое имя колонки/таблицы "
+        "(например outflow_qty или schema.table). Не выбирай колонки по каталогу: "
+        "физическую привязку выполнит downstream catalog/column resolver.\n"
         "- Каждое важное поле снабжай confidence и evidence.\n\n"
         f"JSON Schema:\n{schema}"
     )
+
+
+def _strip_unstated_physical_hints(spec: QuerySpec, user_input: str) -> None:
+    """Drop physical hints that were inferred from catalog instead of user text."""
+    haystack = str(user_input or "").lower()
+
+    def _mentioned(value: str | None) -> bool:
+        item = str(value or "").strip().lower()
+        return bool(item and item in haystack)
+
+    for entity in spec.entities:
+        if entity.target_column_hint and not _mentioned(entity.target_column_hint):
+            logger.info(
+                "QueryInterpreter: drop inferred target_column_hint=%s for entity=%s",
+                entity.target_column_hint,
+                entity.name,
+            )
+            entity.target_column_hint = None
+    for dim in spec.dimensions:
+        if dim.source_table and not _mentioned(dim.source_table):
+            logger.info(
+                "QueryInterpreter: drop inferred dimension source_table=%s for target=%s",
+                dim.source_table,
+                dim.target,
+            )
+            dim.source_table = None
+        if dim.join_key and not _mentioned(dim.join_key):
+            logger.info(
+                "QueryInterpreter: drop inferred dimension join_key=%s for target=%s",
+                dim.join_key,
+                dim.target,
+            )
+            dim.join_key = None
+
+
+def _canonicalize_query_spec_sources(
+    query_spec: dict[str, Any],
+    sources,
+) -> dict[str, Any]:
+    """Fill schema for explicit source constraints after catalog grounding."""
+    canonical = dict(query_spec or {})
+    source_by_table = {
+        str(source.table).lower(): source
+        for source in sources
+        if getattr(source, "reason", "") == "explicit_source_constraint"
+    }
+    if not source_by_table:
+        return canonical
+    normalized_sources: list[dict[str, Any]] = []
+    for raw in canonical.get("source_constraints") or []:
+        if not isinstance(raw, dict):
+            normalized_sources.append(raw)
+            continue
+        item = dict(raw)
+        schema = item.get("schema")
+        table = item.get("table")
+        if table and "." in str(table) and not schema:
+            schema, table = str(table).split(".", 1)
+        source = source_by_table.get(str(table or "").lower())
+        if source is not None:
+            item["schema"] = source.schema
+            item["table"] = source.table
+        normalized_sources.append(item)
+    canonical["source_constraints"] = normalized_sources
+    return canonical
 
 
 def _apply_query_spec_guardrails(spec: QuerySpec, semantic_frame: dict[str, Any]) -> dict[str, Any]:

@@ -553,10 +553,8 @@ def test_date_column_ambiguity_lowers_confidence(tmp_path):
         assert result["confidence"] <= 0.85
 
 
-def test_alias_hit_logged_at_info(tmp_path, caplog):
-    """C.1: alias-hit должен попасть в INFO-лог."""
-    import logging
-
+def test_short_cyrillic_slot_resolves_via_description_overlap(tmp_path):
+    """Без alias-словарей: «тб» → tb_id матчится по описанию «Идентификатор ТБ»."""
     from core.column_selector_deterministic import _choose_best_column
     from core.schema_loader import SchemaLoader
 
@@ -577,11 +575,10 @@ def test_alias_hit_logged_at_info(tmp_path, caplog):
     attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
     loader = SchemaLoader(data_dir=tmp_path)
 
-    with caplog.at_level(logging.INFO, logger="core.column_selector_deterministic"):
-        _choose_best_column(
-            table_structures={"dm.uzp_dim_gosb": "Справочник ТБ"},
-            table_types={"dm.uzp_dim_gosb": "dim"},
-            schema_loader=loader,
-            slot="тб",
-        )
-    assert any("alias hit" in rec.message for rec in caplog.records)
+    best = _choose_best_column(
+        table_structures={"dm.uzp_dim_gosb": "Справочник ТБ"},
+        table_types={"dm.uzp_dim_gosb": "dim"},
+        schema_loader=loader,
+        slot="тб",
+    )
+    assert best == ("dm.uzp_dim_gosb", "tb_id")

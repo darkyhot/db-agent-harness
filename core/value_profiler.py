@@ -8,6 +8,8 @@ from typing import Any
 
 import pandas as pd
 
+from core.exceptions import KerberosAuthError
+
 logger = logging.getLogger(__name__)
 
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
@@ -135,6 +137,8 @@ def fetch_table_profile_sample(
     )
     try:
         return db_manager.execute_query(sql, limit=sample_limit)
+    except KerberosAuthError:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.info("ValueProfiler: table sample skipped for %s.%s: %s", schema, table, exc)
         return pd.DataFrame()

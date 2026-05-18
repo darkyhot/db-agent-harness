@@ -47,6 +47,7 @@ def build_agent_context(
     # Импорты выполняются внутри функции, чтобы фабрика могла быть импортирована
     # без тяжёлых зависимостей в тестах.
     from core.database import DatabaseManager
+    from core.exceptions import KerberosAuthError
     from core.llm import RateLimitedLLM
     from core.memory import MemoryManager
     from core.query_cache import QueryCache
@@ -64,6 +65,8 @@ def build_agent_context(
     if run_enrichment:
         try:
             EnrichmentPipeline(schema, llm=llm, db_manager=db).run()
+        except KerberosAuthError:
+            raise
         except Exception as e:
             logger.warning("EnrichmentPipeline: %s — продолжаем без enrichment", e)
 

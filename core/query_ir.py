@@ -6,12 +6,14 @@ an in-process validation library only; no network access is needed at runtime.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 QueryTask = Literal["answer_data", "inspect_schema", "edit_plan", "clarify"]
+QueryStrategy = Literal["count_attributes", "aggregate", "list", "inspect_schema", "edit_plan", "clarify"]
 MetricOperation = Literal["count", "sum", "avg", "min", "max", "list"]
 DistinctPolicy = Literal["auto", "distinct", "all"]
 TimeGrain = Literal["day", "week", "month", "quarter", "year"]
@@ -75,6 +77,16 @@ class DimensionSpec(StrictModel):
     evidence: list[Evidence] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     alternatives: list[Alternative] = Field(default_factory=list)
+
+
+class EntitySpec(StrictModel):
+    """Semantic business entity mentioned by the user before physical binding."""
+
+    name: str
+    canonical: str | None = None
+    target_column_hint: str | None = None
+    evidence: list[Evidence] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class FilterSpec(StrictModel):
@@ -162,6 +174,8 @@ class QuerySpec(StrictModel):
     """Single semantic source of truth for a user request."""
 
     task: QueryTask = "answer_data"
+    strategy: QueryStrategy = "aggregate"
+    entities: list[EntitySpec] = Field(default_factory=list)
     metrics: list[MetricSpec] = Field(default_factory=list)
     dimensions: list[DimensionSpec] = Field(default_factory=list)
     filters: list[FilterSpec] = Field(default_factory=list)
@@ -183,6 +197,29 @@ class QuerySpec(StrictModel):
     def _normalize_task(cls, value: Any) -> Any:
         return str(value or "answer_data").strip().lower()
 
+    @field_validator("strategy", mode="before")
+    @classmethod
+    def _normalize_strategy(cls, value: Any) -> Any:
+        return str(value or "aggregate").strip().lower()
+
+    @model_validator(mode="after")
+    def _validate_strategy_contract(self) -> "QuerySpec":
+        if self.task == "inspect_schema":
+            self.strategy = "inspect_schema"
+        elif self.task == "edit_plan":
+            self.strategy = "edit_plan"
+        elif self.task == "clarify":
+            self.strategy = "clarify"
+
+        if self.strategy == "count_attributes":
+            count_targets = [
+                metric for metric in self.metrics
+                if metric.operation == "count" and str(metric.target or "").strip()
+            ]
+            if len(self.entities) < 2 and len(count_targets) < 2:
+                raise ValueError("count_attributes requires at least two entities or count metric targets")
+        return self
+
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> tuple["QuerySpec | None", list[str]]:
         """Backward-compatible validation wrapper."""
@@ -192,12 +229,15 @@ class QuerySpec(StrictModel):
             return None, _validation_errors(exc)
         if spec.task == "clarify" and spec.clarification is None:
             return None, ["clarification: required when task='clarify'"]
+        _normalize_calendar_literal_filters(spec)
         return spec, []
 
     def to_legacy_intent(self) -> dict[str, Any]:
         """Compatibility projection for existing pipeline nodes."""
         first_metric = self.metrics[0] if self.metrics else None
         entities: list[str] = []
+        for entity in self.entities:
+            entities.append(entity.canonical or entity.name)
         for metric in self.metrics:
             if metric.target:
                 entities.append(metric.target)
@@ -218,9 +258,10 @@ class QuerySpec(StrictModel):
 
         return {
             "intent": intent_name,
+            "strategy": self.strategy,
             "entities": entities,
             "date_filters": date_filters,
-            "aggregation_hint": first_metric.operation if first_metric else None,
+            "aggregation_hint": first_metric.operation if first_metric else ("count" if self.strategy == "count_attributes" else None),
             "needs_search": False,
             "complexity": "join" if self.join_constraints or len(self.source_constraints) > 1 else "single_table",
             "clarification_question": self.clarification.question if self.clarification else "",
@@ -252,6 +293,15 @@ class QuerySpec(StrictModel):
             }
             for metric in self.metrics
         ]
+        if self.strategy == "count_attributes" and not agg_hints:
+            for entity in self.entities:
+                target = entity.target_column_hint or entity.canonical or entity.name
+                if target:
+                    agg_hints.append({
+                        "function": "count",
+                        "column": target,
+                        "distinct": True,
+                    })
         preferences_list = [dict(item) for item in agg_hints if item.get("function")]
         for idx, preferences in enumerate(preferences_list):
             if preferences.get("column") == "*":
@@ -307,7 +357,11 @@ class QuerySpec(StrictModel):
             "aggregate_hints": agg_hints,
             "aggregation_preferences": preferences,
             "aggregation_preferences_list": preferences_list,
-            "time_granularity": self.time_range.grain if self.time_range else None,
+            "time_granularity": (
+                self.time_range.grain
+                if self.time_range and any(_target_looks_calendar(dim.target) for dim in self.dimensions)
+                else None
+            ),
             "negative_filters": [
                 str(f.value)
                 for f in self.filters
@@ -404,6 +458,8 @@ def query_spec_json_schema() -> dict[str, Any]:
     schema = QuerySpec.model_json_schema()
     schema["required"] = [
         "task",
+        "strategy",
+        "entities",
         "metrics",
         "dimensions",
         "filters",
@@ -426,6 +482,123 @@ def _drop_empty(value: Any) -> Any:
     if isinstance(value, list):
         return [_drop_empty(item) for item in value if _drop_empty(item) not in (None, [], {}, "")]
     return value
+
+
+_RU_MONTHS = {
+    "январ": 1,
+    "феврал": 2,
+    "март": 3,
+    "апрел": 4,
+    "май": 5,
+    "мая": 5,
+    "июн": 6,
+    "июл": 7,
+    "август": 8,
+    "сентябр": 9,
+    "октябр": 10,
+    "ноябр": 11,
+    "декабр": 12,
+}
+_CALENDAR_TARGET_TOKENS = (
+    "дат", "date", "dt", "dttm", "timestamp", "месяц", "month",
+    "период", "period", "квартал", "quarter", "год", "year", "отчет",
+    "отчёт",
+)
+
+
+def _target_looks_calendar(target: str) -> bool:
+    text = str(target or "").strip().lower()
+    return bool(text) and any(token in text for token in _CALENDAR_TARGET_TOKENS)
+
+
+def _parse_calendar_period(value: Any) -> tuple[str, str, TimeGrain] | None:
+    text = str(value or "").strip().lower().replace("ё", "е")
+    if not text:
+        return None
+
+    quarter_match = re.search(r"(?:^|\b)(?:q|кв(?:артал)?\.?)\s*([1-4])(?:\D+|$).*?\b(20\d{2})\b", text)
+    if not quarter_match:
+        quarter_match = re.search(r"\b([1-4])\s*(?:кв(?:артал)?\.?|quarter|q)\D+?\b(20\d{2})\b", text)
+    if quarter_match:
+        quarter = int(quarter_match.group(1))
+        year = int(quarter_match.group(2))
+        month = (quarter - 1) * 3 + 1
+        end_month = month + 3
+        end_year = year + 1 if end_month > 12 else year
+        end_month = 1 if end_month > 12 else end_month
+        return f"{year:04d}-{month:02d}-01", f"{end_year:04d}-{end_month:02d}-01", "quarter"
+
+    iso_month_match = re.search(r"\b(20\d{2})[-./](0?[1-9]|1[0-2])\b(?![-./]\d{1,2})", text)
+    if not iso_month_match:
+        iso_month_match = re.search(r"\b(0?[1-9]|1[0-2])[-./](20\d{2})\b", text)
+        if iso_month_match:
+            month = int(iso_month_match.group(1))
+            year = int(iso_month_match.group(2))
+            end_year = year + 1 if month == 12 else year
+            end_month = 1 if month == 12 else month + 1
+            return f"{year:04d}-{month:02d}-01", f"{end_year:04d}-{end_month:02d}-01", "month"
+    elif iso_month_match:
+        year = int(iso_month_match.group(1))
+        month = int(iso_month_match.group(2))
+        end_year = year + 1 if month == 12 else year
+        end_month = 1 if month == 12 else month + 1
+        return f"{year:04d}-{month:02d}-01", f"{end_year:04d}-{end_month:02d}-01", "month"
+
+    month = None
+    for stem, number in _RU_MONTHS.items():
+        if stem in text:
+            month = number
+            break
+    year_match = re.search(r"\b(20\d{2})\b", text)
+    if month and year_match:
+        year = int(year_match.group(1))
+        end_year = year + 1 if month == 12 else year
+        end_month = 1 if month == 12 else month + 1
+        return f"{year:04d}-{month:02d}-01", f"{end_year:04d}-{end_month:02d}-01", "month"
+
+    if re.fullmatch(r"20\d{2}", text):
+        year = int(text)
+        return f"{year:04d}-01-01", f"{year + 1:04d}-01-01", "year"
+
+    return None
+
+
+def _normalize_calendar_literal_filters(spec: QuerySpec) -> None:
+    """Promote literal calendar filters into TimeRangeSpec and drop duplicates."""
+    kept: list[FilterSpec] = []
+    promoted: tuple[str, str, TimeGrain, FilterSpec] | None = None
+    has_time_range = bool(spec.time_range and (spec.time_range.start or spec.time_range.end))
+    for item in spec.filters:
+        parsed = _parse_calendar_period(item.value)
+        target_is_calendar = _target_looks_calendar(item.target)
+        value_looks_calendar = parsed is not None and _target_looks_calendar(
+            f"{item.target} {item.value}"
+        )
+        if parsed and (target_is_calendar or value_looks_calendar):
+            if not has_time_range:
+                promoted = (parsed[0], parsed[1], parsed[2], item)
+            continue
+        kept.append(item)
+
+    if promoted is None:
+        spec.filters = kept
+        return
+
+    start, end, grain, source_filter = promoted
+    spec.time_range = TimeRangeSpec(
+        start=start,
+        end=end,
+        grain=grain,
+        evidence=source_filter.evidence or [
+            Evidence(
+                source="query_spec_calendar_filter",
+                text=f"{source_filter.target} {source_filter.operator} {source_filter.value}",
+                confidence=source_filter.confidence or 0.8,
+            )
+        ],
+        confidence=max(source_filter.confidence, 0.8),
+    )
+    spec.filters = kept
 
 
 def _validation_errors(exc: ValidationError) -> list[str]:

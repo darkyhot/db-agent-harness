@@ -77,6 +77,16 @@ class TestLLMCache:
         assert default is rllm._llm
         assert len(rllm._llm_cache) == 0
 
+    def test_invoke_logs_full_response(self, rllm, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO, logger="core.llm")
+
+        assert rllm.invoke("prompt") == "ok"
+
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert "LLM полный ответ:\nok" in messages
+
 
 class TestGlobalRateLimit:
     def test_global_last_call_shared(self):

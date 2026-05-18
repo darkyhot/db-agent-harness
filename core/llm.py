@@ -133,6 +133,7 @@ class RateLimitedLLM:
                 RateLimitedLLM._global_last_call_time = time.time()
                 response = llm.invoke(messages)
                 logger.info("LLM ответ получен (попытка %d)", attempt)
+                logger.info("LLM полный ответ:\n%s", response.content)
                 return response.content
             except Exception as e:
                 logger.warning(

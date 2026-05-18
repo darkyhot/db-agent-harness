@@ -6,7 +6,6 @@ import re
 from typing import Any
 
 from core.semantic_registry import (
-    builtin_subject_aliases,
     find_best_subject,
     find_matching_dimensions,
     find_matching_rules,
@@ -365,11 +364,6 @@ def derive_semantic_frame(
     user_hints = user_hints or {}
 
     subject = find_best_subject(haystack, lexicon) if lexicon else None
-    if subject is None:
-        for candidate, aliases in builtin_subject_aliases().items():
-            if any(token in haystack for token in aliases):
-                subject = candidate
-                break
 
     raw_filter_intents = _derive_filter_intents(user_input=clean_input, intent=intent, schema_loader=schema_loader)
 

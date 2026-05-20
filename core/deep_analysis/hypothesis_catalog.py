@@ -13,20 +13,20 @@ from __future__ import annotations
 
 from typing import Callable
 
-from core.deep_analysis.types import ColumnRole, HypothesisSpec, TableProfile
+from core.deep_analysis.types import ColumnRole, HypothesisSpec, TableAnalysisContext, TableProfile
 
-TemplateFn = Callable[[TableProfile], list[HypothesisSpec]]
+TemplateFn = Callable[[TableProfile, TableAnalysisContext | None], list[HypothesisSpec]]
 
 
 def _hid(prefix: str, *parts: str) -> str:
     return "_".join([prefix, *[p.replace(".", "_") for p in parts]])
 
 
-def _tpl_seasonality_numeric(p: TableProfile) -> list[HypothesisSpec]:
+def _tpl_seasonality_numeric(p: TableProfile, ctx: TableAnalysisContext | None = None) -> list[HypothesisSpec]:
     """For each (date, numeric) pair, check seasonality on day/week/month/quarter."""
     out: list[HypothesisSpec] = []
-    dates = p.date_columns()
-    nums = p.numeric_columns()
+    dates = (ctx.time_axes if ctx else []) or p.date_columns()
+    nums = (ctx.measures if ctx else []) or p.numeric_columns()
     if not dates or not nums:
         return out
     # Take just the best date column (widest range) to keep combinatorics sane.
@@ -51,10 +51,10 @@ def _tpl_seasonality_numeric(p: TableProfile) -> list[HypothesisSpec]:
     return out
 
 
-def _tpl_seasonality_counts(p: TableProfile) -> list[HypothesisSpec]:
+def _tpl_seasonality_counts(p: TableProfile, ctx: TableAnalysisContext | None = None) -> list[HypothesisSpec]:
     """Per-date counts + per-category counts over time (vacation-fraud style)."""
     out: list[HypothesisSpec] = []
-    dates = p.date_columns()
+    dates = (ctx.time_axes if ctx else []) or p.date_columns()
     if not dates:
         return out
     best_date = max(dates, key=lambda c: (p.columns[c].n_unique, 0))
@@ -71,7 +71,7 @@ def _tpl_seasonality_counts(p: TableProfile) -> list[HypothesisSpec]:
     # Category-wise seasonality — e.g. type=отпуск растёт в конце квартала.
     # Only iterate over equivalence-class representatives — running the same
     # seasonality on post_id, post_name, pos_name (all 1:1) triples the noise.
-    cat_reps = p.representatives(p.category_columns(max_cardinality=50))
+    cat_reps = p.representatives((ctx.peer_groups if ctx else []) or p.category_columns(max_cardinality=50))
     for cat in cat_reps[:3]:
         out.append(HypothesisSpec(
             hypothesis_id=_hid("seasonality_cat", best_date, cat),
@@ -85,7 +85,7 @@ def _tpl_seasonality_counts(p: TableProfile) -> list[HypothesisSpec]:
     return out
 
 
-def _tpl_group_anomalies(p: TableProfile) -> list[HypothesisSpec]:
+def _tpl_group_anomalies(p: TableProfile, ctx: TableAnalysisContext | None = None) -> list[HypothesisSpec]:
     """Entity-level mass-deviation hypotheses — produce violators CSVs.
 
     We iterate up to 3 entity-candidate columns at different granularities so
@@ -96,16 +96,16 @@ def _tpl_group_anomalies(p: TableProfile) -> list[HypothesisSpec]:
     # Reduce to equivalence-class reps so e.g. saphr_id and a duplicate
     # pos_id↔post_id pair don't each spawn the full set of group hypotheses.
     candidates = p.representatives(
-        p.entity_candidates(min_card=5, max_card=50_000)
+        (ctx.entity_keys if ctx else []) or p.entity_candidates(min_card=5, max_card=50_000)
     )
-    dates = p.date_columns()
+    dates = (ctx.time_axes if ctx else []) or p.date_columns()
     if not candidates:
         return out
 
     best_date = max(dates, key=lambda c: p.columns[c].n_unique) if dates else None
-    num_cols = p.representatives(p.numeric_columns())
+    num_cols = p.representatives((ctx.measures if ctx else []) or p.numeric_columns())
     flag_cols = p.representatives(p.flag_columns())
-    cat_cols = p.representatives(p.category_columns())
+    cat_cols = p.representatives((ctx.peer_groups if ctx else []) or p.category_columns())
 
     # Pick up to 3 distinct granularity levels. Sort descending and take both
     # ends to capture finest + coarsest cohorts.
@@ -199,9 +199,48 @@ def _tpl_group_anomalies(p: TableProfile) -> list[HypothesisSpec]:
     return out
 
 
-def _tpl_outliers_numeric(p: TableProfile) -> list[HypothesisSpec]:
+def _tpl_entity_drilldown(p: TableProfile, ctx: TableAnalysisContext | None = None) -> list[HypothesisSpec]:
+    """Pinpoint single-entity anomalies like one INN among thousands."""
     out: list[HypothesisSpec] = []
-    nums = p.numeric_columns()
+    entity_keys = p.representatives(
+        (ctx.entity_keys if ctx else []) or p.entity_candidates(min_card=5, max_card=100_000)
+    )
+    if not entity_keys:
+        return out
+    date_col = ((ctx.time_axes if ctx else []) or p.date_columns() or [None])[0]
+    metric_cols = p.representatives((ctx.measures if ctx else []) or p.numeric_columns())[:6]
+    peer_cols = p.representatives((ctx.peer_groups if ctx else []) or p.category_columns(max_cardinality=100))[:4]
+    dimension_cols = p.representatives((ctx.dimensions if ctx else []) or p.category_columns(max_cardinality=50))[:4]
+
+    # Do not cap to 3 as group_anomalies does. We still bound the catalog to
+    # keep runtime sane, but cover all obvious business entity levels first.
+    for entity_col in entity_keys[:8]:
+        out.append(HypothesisSpec(
+            hypothesis_id=_hid("entity_drill", entity_col),
+            runner="entity_drilldown",
+            title=f"Точечные аномалии по {entity_col}",
+            rationale=(
+                f"Ищем отдельные значения {entity_col}, которые выбиваются "
+                "из похожих объектов по периоду, сегменту и ключевым метрикам."
+            ),
+            params={
+                "entity_col": entity_col,
+                "date_col": date_col,
+                "metric_cols": [c for c in metric_cols if c != entity_col],
+                "dimension_cols": [c for c in dimension_cols if c != entity_col],
+                "peer_cols": [c for c in peer_cols if c != entity_col],
+                "time_grains": ["month", "quarter"] if date_col else [],
+                "top_k": 30,
+            },
+            priority=0.97 if entity_col == entity_keys[0] else 0.88,
+            est_cost_seconds=45.0,
+        ))
+    return out
+
+
+def _tpl_outliers_numeric(p: TableProfile, ctx: TableAnalysisContext | None = None) -> list[HypothesisSpec]:
+    out: list[HypothesisSpec] = []
+    nums = (ctx.measures if ctx else []) or p.numeric_columns()
     if not nums:
         return out
     out.append(HypothesisSpec(
@@ -226,12 +265,12 @@ def _tpl_outliers_numeric(p: TableProfile) -> list[HypothesisSpec]:
     return out
 
 
-def _tpl_dependencies(p: TableProfile) -> list[HypothesisSpec]:
+def _tpl_dependencies(p: TableProfile, ctx: TableAnalysisContext | None = None) -> list[HypothesisSpec]:
     """Scan pairwise column dependencies. One hypothesis per analysis covers
     all analysable columns — the runner itself iterates pairs and caps work."""
     candidates = (
-        p.numeric_columns()
-        + p.category_columns(max_cardinality=50)
+        ((ctx.measures if ctx else []) or p.numeric_columns())
+        + ((ctx.peer_groups if ctx else []) or p.category_columns(max_cardinality=50))
         + p.flag_columns()
     )
     # Drop obvious id columns — they have unique values and give no signal.
@@ -255,9 +294,9 @@ def _tpl_dependencies(p: TableProfile) -> list[HypothesisSpec]:
     )]
 
 
-def _tpl_regime_shifts(p: TableProfile) -> list[HypothesisSpec]:
+def _tpl_regime_shifts(p: TableProfile, ctx: TableAnalysisContext | None = None) -> list[HypothesisSpec]:
     out: list[HypothesisSpec] = []
-    dates = p.date_columns()
+    dates = (ctx.time_axes if ctx else []) or p.date_columns()
     if not dates:
         return out
     best_date = max(dates, key=lambda c: p.columns[c].n_unique)
@@ -272,7 +311,7 @@ def _tpl_regime_shifts(p: TableProfile) -> list[HypothesisSpec]:
         est_cost_seconds=10.0,
     ))
     # One regime_shifts per numeric metric (top 3 to avoid combinatorics).
-    for num in p.numeric_columns()[:3]:
+    for num in ((ctx.measures if ctx else []) or p.numeric_columns())[:3]:
         out.append(HypothesisSpec(
             hypothesis_id=_hid("regime_num", best_date, num),
             runner="regime_shifts",
@@ -292,17 +331,21 @@ TEMPLATES: tuple[TemplateFn, ...] = (
     _tpl_seasonality_counts,
     _tpl_seasonality_numeric,
     _tpl_group_anomalies,
+    _tpl_entity_drilldown,
     _tpl_outliers_numeric,
     _tpl_dependencies,
     _tpl_regime_shifts,
 )
 
 
-def generate_catalog_hypotheses(profile: TableProfile) -> list[HypothesisSpec]:
+def generate_catalog_hypotheses(
+    profile: TableProfile,
+    analysis_context: TableAnalysisContext | None = None,
+) -> list[HypothesisSpec]:
     out: list[HypothesisSpec] = []
     for tpl in TEMPLATES:
         try:
-            items = tpl(profile)
+            items = tpl(profile, analysis_context)
         except Exception:
             items = []
         for item in items:

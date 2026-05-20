@@ -286,9 +286,9 @@ def _check_all_horizons(
         metric_name = "количество событий" if agg == "count" else f"{agg}({value_col})"
         top_label = str(top)
         summary = (
-            f"По разрезу «{horizon_name}»{label_suffix} {metric_name} "
-            f"в бакете `{top_label}` отклоняется на {top_dev * 100:+.1f}% "
-            f"от общего среднего (p={p_value:.1e})."
+            f"В разрезе «{horizon_name}»{label_suffix} показатель «{metric_name}» "
+            f"для значения «{top_label}» отклоняется на {top_dev * 100:+.1f}% "
+            f"от обычного уровня."
         )
         findings.append(Finding(
             hypothesis_id=spec.hypothesis_id + hypothesis_id_suffix,

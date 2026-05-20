@@ -26,6 +26,7 @@ import pandas as pd
 
 from core.database import DatabaseManager
 from core.deep_analysis.business_insights import extract_business_insights
+from core.deep_analysis.context import build_table_analysis_context
 from core.deep_analysis.equivalence import compute_equivalence_groups
 from core.deep_analysis.hypothesis_catalog import generate_catalog_hypotheses
 from core.deep_analysis.hypothesis_llm import enrich_hypotheses
@@ -41,6 +42,7 @@ from core.deep_analysis.types import (
     BusinessInsight,
     Finding,
     HypothesisSpec,
+    TableAnalysisContext,
     TableProfile,
 )
 from core.deep_analysis.user_hypothesis import UserHypothesisPlan
@@ -49,6 +51,12 @@ from core.schema_loader import SchemaLoader
 
 FAST_BUDGET_SEC = 40 * 60     # 40 min
 DEEP_BUDGET_SEC = 3 * 60 * 60  # 3 hours
+
+# Below this row count no runner can fire (seasonality needs >=50, outliers
+# >=50, group_anomalies >=8 entities x >=10 obs). Running the LLM text stages
+# on such a table only produces hallucinated dates/conclusions, so we stop
+# right after profiling and emit an explicit "not enough data" report.
+MIN_ROWS_FOR_ANALYSIS = 50
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent / "workspace" / "deep_analysis"
 
@@ -60,7 +68,9 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent / "workspace" / "
 # always thread the user-supplied filter through.
 LoaderFn = Callable[..., tuple[pd.DataFrame, LoadPlan]]
 EnrichFn = Callable[[Any, TableProfile, list[HypothesisSpec], str], list[HypothesisSpec]]
-# Signature: insights_fn(llm, findings, profile, user_hypothesis_text, table_semantics)
+# Signature: insights_fn(llm, findings, profile, user_hypothesis_text,
+# table_semantics, analysis_context) -> list[BusinessInsight]. Older injected
+# test functions with the 5-arg shape are still supported.
 #   -> list[BusinessInsight]. Default wraps extract_business_insights; tests
 # inject a fake to bypass the LLM and return a canned list.
 InsightsFn = Callable[..., list[BusinessInsight]]
@@ -103,8 +113,11 @@ class AnalysisResult:
     mode: AnalysisMode
     wall_seconds: float
     report_path: Path
+    technical_report_path: Path | None = None
+    insufficient_data: bool = False
     run_records: list[HypothesisRunRecord] = field(default_factory=list)
     business_insights: list[BusinessInsight] = field(default_factory=list)
+    analysis_context: TableAnalysisContext | None = None
 
 
 def run_deep_analysis(
@@ -166,17 +179,60 @@ def run_deep_analysis(
         # Equivalence (post_id ↔ post_name ↔ pos_name etc.) — catalogue/runners
         # use representatives only so the report doesn't triple-count findings.
         profile.equivalence_groups = compute_equivalence_groups(df, profile)
+        analysis_context = build_table_analysis_context(profile, schema_loader)
+        ctx.table_context = analysis_context
         log.info("Profile brief:\n%s", profile_to_brief(profile))
+        log.info("Analysis context:\n%s", analysis_context.short_brief())
+
+        # Gate: on a tiny table no runner can fire (size guards) and the LLM
+        # text stages would only hallucinate dates/conclusions. Stop here with
+        # an explicit "not enough data" report instead of an in-vented verdict.
+        if profile.n_rows < MIN_ROWS_FOR_ANALYSIS:
+            notice = (
+                f"Недостаточно данных для анализа: в таблице {profile.n_rows} "
+                f"строк(и), а для статистических проверок нужно минимум "
+                f"{MIN_ROWS_FOR_ANALYSIS}."
+            )
+            log.warning(
+                "Insufficient data: %d rows < %d — skipping hypotheses/runners/insights",
+                profile.n_rows, MIN_ROWS_FOR_ANALYSIS,
+            )
+            progress.sub(notice)
+            report_path, tech_path = write_report(
+                [], profile, [], mode, output_dir,
+                run_records=[], wall_seconds=time.time() - started_at,
+                business_insights=[], notice=notice,
+                analysis_context=analysis_context,
+            )
+            wall = time.time() - started_at
+            return AnalysisResult(
+                output_dir=output_dir,
+                findings=[],
+                profile=profile,
+                hypotheses=[],
+                mode=mode,
+                wall_seconds=wall,
+                report_path=report_path,
+                technical_report_path=tech_path,
+                insufficient_data=True,
+                run_records=[],
+                business_insights=[],
+                analysis_context=analysis_context,
+            )
 
         # Stage 3: hypothesis generation
         progress.stage("Формирую гипотезы")
-        catalog = generate_catalog_hypotheses(profile)
+        catalog = generate_catalog_hypotheses(profile, analysis_context)
         progress.sub(f"Каталог: {len(catalog)} шт.")
         if enrich_fn is not None:
-            enriched = enrich_fn(llm, profile, catalog, table_desc)
+            enriched = _call_enrich_fn(enrich_fn, llm, profile, catalog, table_desc, analysis_context)
         elif llm is not None:
             try:
-                enriched = enrich_hypotheses(llm, profile, catalog, table_semantics=table_desc)
+                enriched = enrich_hypotheses(
+                    llm, profile, catalog,
+                    table_semantics=table_desc,
+                    analysis_context=analysis_context,
+                )
             except Exception as exc:
                 log.warning("LLM enrichment failed: %s", exc)
                 enriched = catalog
@@ -202,8 +258,9 @@ def run_deep_analysis(
         )
         if insights_fn is not None:
             try:
-                business_insights = insights_fn(
-                    llm, findings, profile, user_focus, table_desc,
+                business_insights = _call_insights_fn(
+                    insights_fn, llm, findings, profile, user_focus,
+                    table_desc, analysis_context,
                 )
             except Exception as exc:
                 log.warning("Injected insights_fn failed: %s", exc)
@@ -214,17 +271,19 @@ def run_deep_analysis(
                     llm, findings, profile,
                     user_hypothesis_text=user_focus,
                     table_semantics=table_desc,
+                    analysis_context=analysis_context,
                 )
             except Exception as exc:
                 log.warning("Business insights stage failed: %s", exc)
 
         # Stage 5: report
         progress.stage("Формирую отчёт")
-        report_path = write_report(
+        report_path, tech_path = write_report(
             findings, profile, hypotheses, mode, output_dir,
             run_records=run_records,
             wall_seconds=time.time() - started_at,
             business_insights=business_insights,
+            analysis_context=analysis_context,
         )
     finally:
         detach_run_log(log_handler)
@@ -239,9 +298,51 @@ def run_deep_analysis(
         mode=mode,
         wall_seconds=wall,
         report_path=report_path,
+        technical_report_path=tech_path if 'tech_path' in locals() else None,
+        insufficient_data=False,
         business_insights=business_insights if 'business_insights' in locals() else [],
         run_records=run_records,
+        analysis_context=analysis_context if 'analysis_context' in locals() else None,
     )
+
+
+def _call_enrich_fn(
+    fn: EnrichFn,
+    llm: Any,
+    profile: TableProfile,
+    catalog: list[HypothesisSpec],
+    table_desc: str,
+    analysis_context: TableAnalysisContext,
+) -> list[HypothesisSpec]:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(llm, profile, catalog, table_desc, analysis_context)
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()):
+        return fn(llm, profile, catalog, table_desc, analysis_context)
+    if len(sig.parameters) >= 5:
+        return fn(llm, profile, catalog, table_desc, analysis_context)
+    return fn(llm, profile, catalog, table_desc)
+
+
+def _call_insights_fn(
+    fn: InsightsFn,
+    llm: Any,
+    findings: list[Finding],
+    profile: TableProfile,
+    user_focus: str | None,
+    table_desc: str,
+    analysis_context: TableAnalysisContext,
+) -> list[BusinessInsight]:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(llm, findings, profile, user_focus, table_desc, analysis_context)
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()):
+        return fn(llm, findings, profile, user_focus, table_desc, analysis_context)
+    if len(sig.parameters) >= 6:
+        return fn(llm, findings, profile, user_focus, table_desc, analysis_context)
+    return fn(llm, findings, profile, user_focus, table_desc)
 
 
 def _loader_accepts_where(loader: LoaderFn) -> bool:

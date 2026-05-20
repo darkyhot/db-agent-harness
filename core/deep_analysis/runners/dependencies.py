@@ -199,8 +199,11 @@ def _finding_num_num(
         title=f"Корреляция {a} ↔ {b}",
         severity=severity,
         summary=(
-            f"Spearman ρ={rho:+.2f} (p={p:.1e}) между `{a}` и `{b}`. "
-            f"Разрез по децилям `{a}` с средним `{b}` — в `{csv}`."
+            f"Между «{a}» и «{b}» есть "
+            f"{'сильная' if abs(rho) >= 0.6 else 'заметная'} "
+            f"{'прямая' if rho > 0 else 'обратная'} связь: "
+            f"чем больше «{a}», тем {'больше' if rho > 0 else 'меньше'} «{b}». "
+            f"Детальная разбивка — в `{csv}`."
         ),
         metrics={"spearman_rho": float(rho), "p_value": float(p), "n": int(mask.sum())},
         entity_csv=csv,
@@ -241,8 +244,8 @@ def _finding_cat_cat(
         title=f"Зависимость {a} ↔ {b}",
         severity=severity,
         summary=(
-            f"Cramér's V={cramer_v:.2f} (χ²={chi2:.0f}, p={p:.1e}) — "
-            f"значения `{a}` и `{b}` сильно связаны. Таблица долей — в `{csv}`."
+            f"Значения «{a}» и «{b}» тесно связаны — одно почти всегда "
+            f"определяет другое. Таблица долей — в `{csv}`."
         ),
         metrics={"cramer_v": cramer_v, "chi2": float(chi2), "p_value": float(p), "n": int(n)},
         entity_csv=csv,
@@ -291,9 +294,8 @@ def _finding_num_cat(
         title=f"`{a}` зависит от `{b}`",
         severity=severity,
         summary=(
-            f"η²={eta_sq:.2f} (F={f_stat:.1f}, p={p:.1e}) — "
-            f"среднее `{a}` значимо различается между категориями `{b}`. "
-            f"Сводка по категориям — в `{csv}`."
+            f"Среднее значение «{a}» заметно различается между категориями "
+            f"«{b}». Сводка по категориям — в `{csv}`."
         ),
         metrics={"eta_sq": eta_sq, "f_stat": float(f_stat), "p_value": float(p), "n_groups": len(groups)},
         entity_csv=csv,

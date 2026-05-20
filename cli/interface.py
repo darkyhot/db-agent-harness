@@ -20,7 +20,7 @@ from core.enrichment_pipeline import EnrichmentPipeline
 from core.metadata_refresh import MetadataRefreshService, parse_table_refs
 from core.schema_loader import SchemaLoader
 from core.sql_validator import SQLValidator, detect_mode, SQLMode
-from graph.graph import build_graph, create_initial_state
+from graph.graph import build_orchestrated_graph, create_initial_state
 from tools.db_tools import create_db_tools
 from tools.fs_tools import FS_TOOLS
 from tools.path_safety import resolve_workspace_path
@@ -36,6 +36,16 @@ LOG_FILE = WORKSPACE_DIR / "agent.log"
 
 # Маппинг узлов графа на пользовательские статусы
 _NODE_STATUS = {
+    # LLM-центричный оркестратор (plan-and-execute)
+    "orchestrator": "Планирую следующий шаг...",
+    "step_extract_sources": "Извлекаю таблицы из SQL...",
+    "step_pull_metadata": "Подтягиваю описания таблиц...",
+    "step_explain_plan": "Получаю план выполнения (EXPLAIN)...",
+    "step_explain_sql": "Объясняю SQL-запрос...",
+    "step_execute_sql": "Выполняю SQL-запрос...",
+    "step_create_directory": "Создаю папку...",
+    "step_file_operation": "Работаю с файлом...",
+    "step_run_analytics": "Запускаю аналитический pipeline...",
     # Новая архитектура (11 узлов)
     "intent_classifier": "Анализирую запрос...",
     "table_resolver": "Определяю нужные таблицы...",
@@ -330,13 +340,19 @@ class CLIInterface:
         self._prev_sql: str = ""
         self._prev_result_summary: str = ""
 
+        # Режим Q&A по отчёту deep_table_analysis. Пока не None — обычные
+        # вопросы в чат отвечаются по отчёту, а не строят SQL. Сбрасывается
+        # командой /reset.
+        self._deep_ctx: dict[str, Any] | None = None
+
         # Флаги из конфига
         self.debug_prompt = self.db.runtime_config.get("debug_prompt", False)
         self.show_plan = self.db.runtime_config.get("show_plan", False)
         self.llm_verifier_enabled = self.db.runtime_config.get("llm_verifier_enabled", False)
 
-        # Сборка графа
-        self.graph = build_graph(
+        # Сборка графа (точка входа — LLM-оркестратор; аналитический pipeline
+        # вызывается оркестратором как один шаг run_analytics).
+        self.graph = build_orchestrated_graph(
             self.llm, self.db, self.schema, self.memory, self.validator, all_tools,
             debug_prompt=self.debug_prompt,
             show_plan=self.show_plan,
@@ -520,7 +536,7 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
         db_tools = create_db_tools(self.db, self.validator, self.schema)
         schema_tools = create_schema_tools(self.schema)
         all_tools = FS_TOOLS + db_tools + schema_tools
-        self.graph = build_graph(
+        self.graph = build_orchestrated_graph(
             self.llm, self.db, self.schema, self.memory, self.validator, all_tools,
             debug_prompt=self.debug_prompt,
             show_plan=self.show_plan,
@@ -710,6 +726,12 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
         self._extract_long_term_memory()
         user_id = self.db.runtime_config.get("user_id", "")
         self.memory.start_session(user_id)
+        was_deep = self._deep_ctx is not None
+        self._deep_ctx = None
+        self._prev_sql = ""
+        self._prev_result_summary = ""
+        if was_deep:
+            print("✓ Режим deep_table_analysis закрыт.")
         print("✓ Контекст сброшен. Новая сессия начата.")
 
     def _handle_memory(self) -> None:
@@ -925,23 +947,21 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
                 print(f"  {item}")
         self._rebuild_graph()
 
-    def _ask_feedback(self, user_input: str, sql: str) -> None:
-        """Запросить у пользователя оценку ответа (y/n/skip).
+    def _ask_feedback(self, user_input: str, sql: str) -> str:
+        """Запросить у пользователя оценку ответа.
 
-        При отрицательной оценке предлагает ввести правильный SQL.
-        Результат записывается в memory/feedback.jsonl.
+        Возвращает 'up' | 'down' | 'skip'. При отрицательной оценке
+        предлагает ввести правильный SQL. Положительные/отрицательные
+        вердикты пишутся в memory/feedback.jsonl.
         """
         try:
             verdict_raw = input("\nКак ответ? [y=хороший, n=плохой, skip=пропустить]: ").strip().lower()
         except EOFError:
-            return
-
-        if verdict_raw in ("skip", "s", ""):
-            return
+            return "skip"
 
         if verdict_raw in ("y", "yes", "д", "да", "1", "+"):
             self.memory.log_user_feedback(user_input, sql, verdict="up")
-            return
+            return "up"
 
         if verdict_raw in ("n", "no", "н", "нет", "0", "-"):
             try:
@@ -955,7 +975,9 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
                 corrected_sql=corrected or None,
             )
             print("✓ Отзыв записан. Спасибо — это улучшает качество ответов.")
-            return
+            return "down"
+
+        return "skip"
 
     def _handle_deep_table_analysis(self, args: list[str]) -> None:
         """Run deep pattern-discovery analysis on a single table.
@@ -965,7 +987,7 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
                 [--where=<SQL>] [free-form hypothesis]
         """
         from core.deep_analysis.loader import _sanitize_where_clause
-        from core.deep_analysis.orchestrator import run_deep_analysis
+        from core.deep_analysis.orchestrator import MIN_ROWS_FOR_ANALYSIS, run_deep_analysis
         from core.deep_analysis.user_hypothesis import apply_user_plan_edit, build_user_hypothesis_plan
 
         if not args:
@@ -1004,6 +1026,7 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
         if hypothesis_text:
             _status_print("Загружаю профиль таблицы для плана гипотезы...")
             try:
+                from core.deep_analysis.context import build_table_analysis_context
                 from core.deep_analysis.loader import SafeLoader
                 from core.deep_analysis.profiler import profile_dataframe
 
@@ -1014,13 +1037,29 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
                     where=where_clause,
                 )
                 _, profile = profile_dataframe(df, load_plan)
+                analysis_context = build_table_analysis_context(profile, self.schema)
             except Exception as exc:
                 _status_print("")
                 logger.error("deep_table_analysis profile failed: %s", exc, exc_info=True)
                 print(f"Ошибка при загрузке таблицы: {exc}")
                 return
             _status_print("")
-            user_plan = build_user_hypothesis_plan(self.llm, hypothesis_text, profile)
+            # Не звать LLM-план на крошечной таблице — он начнёт выдумывать
+            # выводы/даты. Тот же порог, что и в оркестраторе.
+            if profile.n_rows < MIN_ROWS_FOR_ANALYSIS:
+                print(
+                    f"\nНедостаточно данных для анализа: в таблице "
+                    f"{profile.n_rows} строк(и), нужно минимум "
+                    f"{MIN_ROWS_FOR_ANALYSIS}. План гипотезы не строится — "
+                    "на таком объёме выводы статистически не подтверждаются."
+                )
+                return
+            table_semantics = analysis_context.short_brief()
+            user_plan = build_user_hypothesis_plan(
+                self.llm, hypothesis_text, profile,
+                table_semantics=table_semantics,
+                analysis_context=analysis_context,
+            )
             if user_plan is None:
                 print(
                     "Не удалось превратить гипотезу в формальный план. "
@@ -1037,7 +1076,11 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
                 if reply.lower() in self._PLAN_APPROVE_TOKENS or not reply:
                     break
                 _status_print("Пересобираю план с учётом правки...")
-                edited = apply_user_plan_edit(self.llm, user_plan, reply, profile)
+                edited = apply_user_plan_edit(
+                    self.llm, user_plan, reply, profile,
+                    table_semantics=table_semantics,
+                    analysis_context=analysis_context,
+                )
                 _status_print("")
                 if edited is None:
                     print("Не смог применить правку. Попробуйте ещё раз.")
@@ -1069,15 +1112,75 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
             return
 
         _status_print("")
+        tech_hint = (
+            f" Техническая версия: {result.technical_report_path}"
+            if getattr(result, "technical_report_path", None) else ""
+        )
         print(
             f"\nАнализ завершён за {result.wall_seconds:.0f}с. "
-            f"Находок: {len(result.findings)}. Отчёт: {result.report_path}"
+            f"Находок: {len(result.findings)}. Отчёт: {result.report_path}."
+            f"{tech_hint}"
         )
         try:
             print()
             print(result.report_path.read_text(encoding="utf-8"))
         except Exception:
             pass
+
+        if getattr(result, "insufficient_data", False):
+            # Нечего обсуждать — в режим Q&A не входим.
+            return
+
+        try:
+            report_text = result.report_path.read_text(encoding="utf-8")
+        except Exception:
+            report_text = ""
+        self._deep_ctx = {
+            "table": f"{schema_part}.{table_part}",
+            "output_dir": result.output_dir,
+            "report_md": report_text,
+        }
+        print(
+            "\n" + "─" * 60 + "\n"
+            f"📊 Режим deep_table_analysis активен ({schema_part}.{table_part}).\n"
+            "Задавайте вопросы по отчёту и выгруженным CSV — отвечаю строго "
+            "по ним.\nДля выхода из режима выполните команду /reset.\n"
+            + "─" * 60
+        )
+
+    def _answer_from_deep_report(self, user_input: str) -> None:
+        """Ответить на вопрос строго по последнему отчёту deep_table_analysis.
+
+        Активно только когда self._deep_ctx установлен (после успешного
+        /deep_table_analysis и до /reset). SQL-граф не вызывается.
+        """
+        from core.deep_analysis.report_qa import answer_from_report, build_csv_index
+
+        ctx = self._deep_ctx or {}
+        report_md = ctx.get("report_md", "")
+        output_dir = ctx.get("output_dir")
+        if not report_md:
+            print(
+                "Отчёт недоступен. Выполните /reset и запустите "
+                "/deep_table_analysis заново."
+            )
+            return
+
+        _status_print("Ищу ответ в отчёте...")
+        try:
+            csv_index = build_csv_index(output_dir) if output_dir else "(нет CSV)"
+            answer = answer_from_report(self.llm, user_input, report_md, csv_index)
+        except Exception as exc:
+            _status_print("")
+            logger.error("deep report Q&A failed: %s", exc, exc_info=True)
+            print(f"Ошибка при ответе по отчёту: {exc}")
+            return
+        _status_print("")
+        print("\n" + answer)
+        print(
+            f"\n_(режим deep_table_analysis · {ctx.get('table', '')} · "
+            "выход — /reset)_"
+        )
 
     def _handle_exit(self) -> None:
         """Завершение работы с сохранением резюме."""
@@ -1391,23 +1494,33 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
             answer = result.get("final_answer", "Нет ответа.")
             print(f"\n{answer}")
 
-            # Сохраняем успешные read-запросы в кэш + multi-turn контекст
+            # Извлекаем executed_sql и обновляем multi-turn контекст
+            # (нужен независимо от вердикта — для follow-up в этой сессии).
             executed_sql: str | None = None
             if not _is_write and answer and answer != "Нет ответа.":
                 for tc in reversed(result.get("tool_calls", [])):
                     if tc.get("tool") == "execute_query":
                         executed_sql = tc.get("args", {}).get("sql")
                         break
-                self.query_cache.put(user_input, answer, sql=executed_sql)
-                # Обновляем multi-turn контекст для следующего запроса
                 if executed_sql:
                     self._prev_sql = executed_sql
                     summary = re.sub(r'```[^`]*```', '', answer, flags=re.DOTALL).strip()
                     self._prev_result_summary = summary[:200]
 
             # Feedback loop: запрашиваем оценку ответа
+            verdict = "skip"
             if answer and answer != "Нет ответа.":
-                self._ask_feedback(user_input, executed_sql or "")
+                verdict = self._ask_feedback(user_input, executed_sql or "")
+
+            # Кэшируем только при явно положительной оценке — иначе
+            # пользователь не сможет перевыполнить «плохой» запрос.
+            if (
+                verdict == "up"
+                and not _is_write
+                and answer
+                and answer != "Нет ответа."
+            ):
+                self.query_cache.put(user_input, answer, sql=executed_sql)
 
         except KerberosAuthError as exc:
             _status_print("")
@@ -1459,5 +1572,7 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
             elif user_input.startswith("/"):
                 print(f"Неизвестная команда: {user_input}")
                 print("Используйте /help для списка команд.")
+            elif self._deep_ctx is not None:
+                self._answer_from_deep_report(user_input)
             else:
                 self._process_query(user_input)

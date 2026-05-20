@@ -16,7 +16,7 @@ from typing import Any
 from core.deep_analysis.hypothesis_llm import _RUNNER_SCHEMAS, _format_runner_schemas, _parse_llm_json, _validate_hypothesis_dict
 from core.deep_analysis.logging_setup import get_logger
 from core.deep_analysis.profiler import profile_to_brief
-from core.deep_analysis.types import HypothesisSpec, TableProfile
+from core.deep_analysis.types import HypothesisSpec, TableAnalysisContext, TableProfile
 from core.llm import RateLimitedLLM
 
 
@@ -35,16 +35,18 @@ _SYSTEM_PROMPT = """Ты — аналитик. Пользователь сфор
 {
   "title": "короткое название",
   "rationale": "переформулировка гипотезы в 1-2 предложения",
-  "runner": "seasonality|group_anomalies|outliers",
+  "runner": "seasonality|group_anomalies|entity_drilldown|outliers|dependencies|regime_shifts",
   "params": { ... },
   "priority": 1.0,
   "plan_explanation": "человекочитаемое объяснение, что именно будет посчитано: какие колонки, какие разрезы, какие метрики, какой критерий аномалии. 3-6 строк."
 }
 
 Правила:
-- Используй только колонки из профиля таблицы.
+- Ты ТОЛЬКО формулируешь ПЛАН будущей проверки. Ты НЕ видел результатов и НЕ делаешь выводов.
+- КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО называть конкретные даты, числа, проценты, имена сущностей или утверждать о наличии/отсутствии паттерна ("повышенный риск", "обнаружен отток", "с 2026-..." и т.п.). Таких данных у тебя нет — это галлюцинация.
+- Используй только колонки и диапазоны дат, явно присутствующие в профиле таблицы. Ничего не выдумывай.
 - Приоритет всегда 1.0 (пользовательская гипотеза идёт первой).
-- plan_explanation должен быть конкретным: "группировка по employee_id и quarter(date), метрика — доля type='отпуск', порог z-score > 2".
+- plan_explanation описывает ЧТО БУДЕТ ПОСЧИТАНО, а не что найдено: "группировка по employee_id и quarter(date), метрика — доля type='отпуск', критерий аномалии — отклонение от когорты".
 """
 
 
@@ -53,6 +55,7 @@ def build_user_hypothesis_plan(
     user_text: str,
     profile: TableProfile,
     table_semantics: str = "",
+    analysis_context: TableAnalysisContext | None = None,
 ) -> UserHypothesisPlan | None:
     """Ask the LLM to translate user_text into a HypothesisSpec + a plan doc.
 
@@ -64,6 +67,8 @@ def build_user_hypothesis_plan(
     user = (
         f"{profile_to_brief(profile)}\n\n"
         f"Семантика таблицы: {table_semantics or '(нет)'}\n\n"
+        f"Бизнес-контекст таблицы:\n"
+        f"{analysis_context.short_brief() if analysis_context else '(нет)'}\n\n"
         f"Гипотеза пользователя:\n{user_text}"
     )
     try:
@@ -110,6 +115,8 @@ def apply_user_plan_edit(
     original: UserHypothesisPlan,
     user_feedback: str,
     profile: TableProfile,
+    table_semantics: str = "",
+    analysis_context: TableAnalysisContext | None = None,
 ) -> UserHypothesisPlan | None:
     """Re-derive the plan after the user edits it.
 
@@ -121,4 +128,8 @@ def apply_user_plan_edit(
         f"Предыдущий план:\n{original.plan_text}\n"
         f"Правка пользователя: {user_feedback}"
     )
-    return build_user_hypothesis_plan(llm, combined, profile)
+    return build_user_hypothesis_plan(
+        llm, combined, profile,
+        table_semantics=table_semantics,
+        analysis_context=analysis_context,
+    )

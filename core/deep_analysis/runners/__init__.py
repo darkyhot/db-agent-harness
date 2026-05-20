@@ -7,6 +7,7 @@ from collections.abc import Callable
 import pandas as pd
 
 from core.deep_analysis.runners.dependencies import run_dependencies
+from core.deep_analysis.runners.entity_drilldown import run_entity_drilldown
 from core.deep_analysis.runners.group_anomalies import run_group_anomalies
 from core.deep_analysis.runners.outliers import run_outliers
 from core.deep_analysis.runners.regime_shifts import run_regime_shifts
@@ -28,6 +29,7 @@ RUNNERS: dict[str, RunnerFn] = {
     "group_anomalies": run_group_anomalies,
     "outliers": run_outliers,
     "dependencies": run_dependencies,
+    "entity_drilldown": run_entity_drilldown,
     "regime_shifts": run_regime_shifts,
 }
 

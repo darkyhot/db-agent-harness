@@ -126,10 +126,11 @@ def run_regime_shifts(
     severity = severity_from_score(max_abs / 20, thresholds=(1.0, 2.0, 5.0))
     metric_label = "количество событий" if agg == "count" else f"{agg}({value_col})"
     summary = (
-        f"Найдено {len(rows)} точек смены режима в ряду {metric_label} "
-        f"(частота {freq}). Сильнейшая — {top['date']}: "
-        f"{top['mean_before_30']:.2f} → {top['mean_after_30']:.2f} "
-        f"({top['rel_shift_pct']:+.1f}%). Полный список — в `{csv}`."
+        f"Поведение показателя «{metric_label}» менялось скачком "
+        f"{len(rows)} раз(а). Самое сильное изменение — {top['date']}: "
+        f"уровень сместился на {top['rel_shift_pct']:+.1f}% "
+        f"({top['mean_before_30']:.2f} → {top['mean_after_30']:.2f}). "
+        f"Полный список — в `{csv}`."
     )
     return [Finding(
         hypothesis_id=spec.hypothesis_id,

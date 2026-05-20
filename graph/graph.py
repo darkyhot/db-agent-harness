@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 MAX_GRAPH_ITERATIONS = 15
 MAX_WALL_CLOCK_SECONDS = 600  # 10 минут на весь граф
+MAX_ORCH_STEPS = 12  # guard от зацикливания LLM-планировщика
 
 
 def _is_timed_out(state: AgentState) -> bool:
@@ -343,10 +344,65 @@ def _route_after_sql_fixer(state: AgentState) -> str:
 
 
 # ======================================================================
+# Маршрутизация LLM-оркестратора
+# ======================================================================
+
+# Node-id'ы намеренно НЕ совпадают с ключами AgentState (LangGraph запрещает
+# имена узлов, конфликтующие со state-ключами, напр. orch_explain_plan).
+ORCH_STEP_NODES = {
+    "extract_sources": "step_extract_sources",
+    "pull_metadata": "step_pull_metadata",
+    "explain_plan": "step_explain_plan",
+    "explain_sql": "step_explain_sql",
+    "execute_sql": "step_execute_sql",
+    "create_directory": "step_create_directory",
+    "file_operation": "step_file_operation",
+    "run_analytics": "step_run_analytics",
+}
+
+
+def _route_after_orchestrator(state: AgentState) -> str:
+    """Маршрутизация после LLM-оркестратора.
+
+    Терминалы (пауза на пользователя / финальный ответ) уходят в END или
+    summarizer, иначе — в выбранный orchestrator-узлом шаг. Любой неизвестный
+    шаг безопасно деградирует в run_analytics (= прежнее поведение агента).
+    """
+    if state.get("orch_step_count", 0) >= MAX_ORCH_STEPS:
+        logger.warning("Достигнут лимит шагов оркестратора (%d)", MAX_ORCH_STEPS)
+        return "summarizer"
+
+    limit = _check_limits(state)
+    if limit:
+        return limit
+
+    # Пауза на пользователя — отдаём управление CLI (он возобновит граф).
+    if state.get("needs_confirmation"):
+        return END
+    if state.get("needs_clarification"):
+        return END
+    if state.get("plan_preview_pending"):
+        return END
+
+    step = str(state.get("orch_next_step") or "")
+    terminating = step in ("summarize", "finish") or bool(state.get("final_answer"))
+
+    if terminating:
+        # Inner subgraph / orchestrator уже сформировали final_answer →
+        # outer summarizer ничего не добавит. Только при полностью пустом
+        # final_answer уводим в summarizer.
+        if state.get("final_answer"):
+            return END
+        return "summarizer"
+
+    return ORCH_STEP_NODES.get(step, "step_run_analytics")
+
+
+# ======================================================================
 # Сборка графа
 # ======================================================================
 
-def build_graph(
+def build_analytics_subgraph(
     llm: RateLimitedLLM,
     db_manager: DatabaseManager,
     schema_loader: SchemaLoader,
@@ -357,9 +413,15 @@ def build_graph(
     show_plan: bool = False,
     llm_verifier_enabled: bool = False,
 ) -> StateGraph:
-    """Собрать граф агента.
+    """Собрать детерминированный аналитический подграф.
 
-    Новая архитектура с 13 узлами:
+    Тело и маршрутизация — те же, что и раньше (13 узлов, plan_verifier
+    управляется ``llm_verifier_enabled``). Остаётся публично доступным как
+    ``build_graph`` (для тестов и инструментов). В оркестрованном графе
+    вызывается как один составной шаг ``run_analytics`` через
+    ``build_orchestrated_graph``.
+
+    Архитектура (13 узлов):
     intent_classifier → table_resolver → table_explorer → column_selector
       → sql_planner → sql_writer → sql_self_corrector → sql_validator
           → [ошибка] → error_diagnoser → sql_fixer → sql_self_corrector → sql_validator
@@ -531,7 +593,95 @@ def build_graph(
     # summarizer → END
     graph.add_edge("summarizer", END)
 
-    logger.info("Граф агента собран (13 узлов)")
+    logger.info("Аналитический подграф собран (13 узлов)")
+    return graph.compile()
+
+
+# Публичное имя аналитического графа сохраняется: тесты и инструменты,
+# импортирующие build_graph, продолжают получать прежний детерминированный
+# pipeline. Продуктовый путь (CLI) использует build_orchestrated_graph.
+build_graph = build_analytics_subgraph
+
+
+def build_orchestrated_graph(
+    llm: RateLimitedLLM,
+    db_manager: DatabaseManager,
+    schema_loader: SchemaLoader,
+    memory: MemoryManager,
+    sql_validator: SQLValidator,
+    tools: list,
+    debug_prompt: bool = False,
+    show_plan: bool = False,
+    llm_verifier_enabled: bool = False,
+) -> StateGraph:
+    """Собрать LLM-центричный граф (plan-and-execute).
+
+    В центре — orchestrator-узел: детерминированный guard сырого SQL, иначе
+    LLM выбирает следующий шаг из реестра. Аналитический pipeline вызывается
+    как один составной шаг run_analytics через скомпилированный
+    build_analytics_subgraph (text2sql-пайплайн не модифицируется и
+    продолжает уважать ``llm_verifier_enabled``).
+
+    orchestrator ⇄ {extract_sources, pull_metadata, explain_plan, explain_sql,
+    execute_sql, create_directory, file_operation, run_analytics} →
+    summarizer → END (или END при паузе на пользователя: confirm/clarify/
+    plan_preview).
+    """
+    nodes = GraphNodes(
+        llm, db_manager, schema_loader, memory, sql_validator, tools,
+        debug_prompt=debug_prompt,
+        show_plan=show_plan,
+        llm_verifier_enabled=llm_verifier_enabled,
+    )
+    # Аналитический pipeline как один вызываемый шаг. Отдельный экземпляр
+    # подграфа допустим: llm/db/schema/memory/validator/tools — те же объекты.
+    nodes._analytics_subgraph = build_analytics_subgraph(
+        llm, db_manager, schema_loader, memory, sql_validator, tools,
+        debug_prompt=debug_prompt,
+        show_plan=show_plan,
+        llm_verifier_enabled=llm_verifier_enabled,
+    )
+
+    graph = StateGraph(AgentState)
+    graph.add_node("orchestrator", nodes.orchestrator)
+    graph.add_node("step_extract_sources", nodes.orch_extract_sources)
+    graph.add_node("step_pull_metadata", nodes.orch_pull_metadata)
+    graph.add_node("step_explain_plan", nodes.orch_explain_plan)
+    graph.add_node("step_explain_sql", nodes.orch_explain_sql)
+    graph.add_node("step_execute_sql", nodes.orch_execute_sql)
+    graph.add_node("step_create_directory", nodes.orch_create_directory)
+    graph.add_node("step_file_operation", nodes.orch_file_operation)
+    graph.add_node("step_run_analytics", nodes.orch_run_analytics)
+    graph.add_node("summarizer", nodes.summarizer)
+
+    graph.set_entry_point("orchestrator")
+    graph.add_conditional_edges("orchestrator", _route_after_orchestrator, {
+        END: END,
+        "summarizer": "summarizer",
+        "step_extract_sources": "step_extract_sources",
+        "step_pull_metadata": "step_pull_metadata",
+        "step_explain_plan": "step_explain_plan",
+        "step_explain_sql": "step_explain_sql",
+        "step_execute_sql": "step_execute_sql",
+        "step_create_directory": "step_create_directory",
+        "step_file_operation": "step_file_operation",
+        "step_run_analytics": "step_run_analytics",
+    })
+    # Каждый шаг возвращает управление оркестратору (единый хаб маршрутизации).
+    for step_node in (
+        "step_extract_sources",
+        "step_pull_metadata",
+        "step_explain_plan",
+        "step_explain_sql",
+        "step_execute_sql",
+        "step_create_directory",
+        "step_file_operation",
+        "step_run_analytics",
+    ):
+        graph.add_edge(step_node, "orchestrator")
+    graph.add_edge("summarizer", END)
+
+    logger.info("Оркестрованный граф собран (orchestrator + 8 шагов)")
     return graph.compile()
 
 
@@ -647,4 +797,19 @@ def create_initial_state(
         previous_sql_blueprint=dict(ctx.get("previous_sql_blueprint") or {}),
         plan_diff=dict(ctx.get("plan_diff") or {}),
         plan_diff_summary=str(ctx.get("plan_diff_summary") or ""),
+        explorer_error=dict(ctx.get("explorer_error") or {}),
+        # LLM-центричный оркестратор: все поля переживают рекурсивный
+        # перезапуск графа из CLI (resume через plan_context=result).
+        orch_history=list(ctx.get("orch_history") or []),
+        orch_plan=list(ctx.get("orch_plan") or []),
+        orch_next_step=str(ctx.get("orch_next_step") or ""),
+        orch_step_count=int(ctx.get("orch_step_count", 0) or 0),
+        orch_sql=str(ctx.get("orch_sql") or ""),
+        orch_fs_path=str(ctx.get("orch_fs_path") or ""),
+        orch_fs_tool=str(ctx.get("orch_fs_tool") or ""),
+        orch_fs_content=str(ctx.get("orch_fs_content") or ""),
+        orch_sources=list(ctx.get("orch_sources") or []),
+        orch_metadata=str(ctx.get("orch_metadata") or ""),
+        orch_explain_plan=str(ctx.get("orch_explain_plan") or ""),
+        orch_resume_step=str(ctx.get("orch_resume_step") or ""),
     )

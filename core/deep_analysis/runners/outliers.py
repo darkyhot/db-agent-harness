@@ -78,8 +78,9 @@ def _run_mad(
             title=f"Выбросы в колонке {col}",
             severity=severity_from_score(max_z, thresholds=(2.5, 4.0, 6.0)),
             summary=(
-                f"В колонке `{col}` найдено {n_out} строк с |robust-z|≥{_MAD_THRESHOLD} "
-                f"(макс z={max_z:.2f}). Полный список — в `{csv_path}`."
+                f"В колонке «{col}» найдено {n_out} аномальных значений, "
+                f"резко выпадающих из общего диапазона. "
+                f"Полный список — в `{csv_path}`."
             ),
             metrics={
                 "column": col,
@@ -138,8 +139,9 @@ def _run_isolation_forest(
         title=spec.title,
         severity=severity,
         summary=(
-            f"IsolationForest на {num.shape[1]} числовых колонках "
-            f"выявил {n_out} многомерных аномалий из {len(num)} строк. Полный список — `{csv_path}`."
+            f"Среди {len(num)} строк найдено {n_out} нетипичных записей, "
+            f"которые по совокупности {num.shape[1]} числовых признаков "
+            f"не похожи на остальные. Полный список — `{csv_path}`."
         ),
         metrics={
             "n_outliers": n_out,

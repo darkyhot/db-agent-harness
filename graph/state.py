@@ -211,3 +211,36 @@ class AgentState(TypedDict):
     # Keys: "kind" ("conflict_with_excluded" | "no_eligible_source"),
     #       "must_keep_filtered" (list[str]), "excluded_tables" (list[str]).
     explorer_error: dict[str, Any]
+
+    # === LLM-центричный оркестратор (plan-and-execute) ===
+    # Заполняется orchestrator-узлом и step-узлами. Граф с оркестратором
+    # (build_orchestrated_graph) ставит в центр LLM, которая динамически
+    # выбирает следующий шаг из реестра способностей. Аналитический pipeline
+    # вызывается как один составной шаг run_analytics (build_analytics_subgraph).
+    # Все поля переживают рекурсивный перезапуск из CLI через plan_context.
+    orch_history: list[dict[str, Any]]
+    # [{"step": "execute_sql", "reason": "...", "ok": True}, ...] — журнал решений.
+    orch_plan: list[str]
+    # Очередь предзапланированных шагов (детерм. guard или полный LLM-план).
+    orch_next_step: str
+    # Шаг, выбранный orchestrator на текущей итерации (для _route_after_orchestrator).
+    orch_step_count: int
+    # Счётчик итераций планировщика (guard от зацикливания, MAX_ORCH_STEPS).
+    orch_sql: str
+    # SQL, с которым работают шаги execute_sql / explain_sql / extract_sources.
+    orch_fs_path: str
+    # Относительный путь внутри workspace/ для разрешённых filesystem-шагов.
+    orch_fs_tool: str
+    # Имя FS-инструмента для шага file_operation (create_file|read_file|edit_file|delete_file|list_files).
+    orch_fs_content: str
+    # Содержимое файла для create_file / edit_file.
+    orch_sources: list[str]
+    # Таблицы, извлечённые из orch_sql (step_extract_sources).
+    orch_metadata: str
+    # Описание задействованных таблиц/колонок из справочника (step_pull_metadata).
+    orch_explain_plan: str
+    # Результат EXPLAIN для orch_sql (step_explain_plan); может быть пометкой
+    # о недоступности плана — узел не падает на ошибке БД.
+    orch_resume_step: str
+    # Куда вернуться после паузы на пользователя (например "run_analytics"):
+    # на resume orchestrator повторно входит в шаг, а не перепланирует.

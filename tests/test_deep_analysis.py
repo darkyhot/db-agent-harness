@@ -20,11 +20,13 @@ import numpy as np
 import pandas as pd
 
 from core.deep_analysis.hypothesis_catalog import generate_catalog_hypotheses
+from core.deep_analysis.context import build_table_analysis_context
 from core.deep_analysis.loader import LoadPlan, _sanitize_where_clause
 from core.deep_analysis.orchestrator import run_deep_analysis
 from core.deep_analysis.profiler import profile_dataframe
 from core.deep_analysis.progress import ProgressReporter
 from core.deep_analysis.runners.dependencies import run_dependencies
+from core.deep_analysis.runners.entity_drilldown import run_entity_drilldown
 from core.deep_analysis.runners.group_anomalies import run_group_anomalies
 from core.deep_analysis.runners.outliers import run_outliers
 from core.deep_analysis.runners.regime_shifts import run_regime_shifts
@@ -177,6 +179,7 @@ def test_catalog_generates_expected_hypotheses():
     runners_seen = {h.runner for h in catalog}
     assert "seasonality" in runners_seen
     assert "group_anomalies" in runners_seen
+    assert "entity_drilldown" in runners_seen
     assert "outliers" in runners_seen
     # End-of-quarter shift hypothesis must be present (our vacation fraud signal).
     eoq = [h for h in catalog if h.params.get("metric") == "end_of_quarter_shift"]
@@ -295,10 +298,15 @@ def test_integration_end_to_end_with_mock_loader():
             output_root=Path(tmp),
         )
         assert result.report_path.exists()
-        report = result.report_path.read_text(encoding="utf-8")
-        # Diagnostics block should be present.
+        assert result.technical_report_path and result.technical_report_path.exists()
+        # Business report is the clean deliverable; diagnostics/profile now
+        # live in the technical report only.
+        business = result.report_path.read_text(encoding="utf-8")
+        report = result.technical_report_path.read_text(encoding="utf-8")
         assert "## Диагностика выполнения" in report
         assert "## Профайл колонок" in report
+        assert "## Что нашли в данных" in business
+        assert "report_technical.md" in business
         # The vacation fraud finding must show up.
         assert any(
             "Сдвиг распределения" in f.title or "квартал" in f.title.lower()
@@ -343,11 +351,17 @@ def test_run_deep_analysis_passes_where_to_loader_and_report():
             output_root=Path(tmp),
             where="report_dt >= '2026-01-01'",
         )
-        report_text = result.report_path.read_text(encoding="utf-8")
+        # Only 2 rows → the insufficient-data gate fires; the WHERE filter is
+        # still threaded to the loader/profile and echoed in the technical
+        # report's notice header.
+        report_text = result.technical_report_path.read_text(encoding="utf-8")
+        business_text = result.report_path.read_text(encoding="utf-8")
 
+    assert result.insufficient_data is True
     assert seen["where"] == "report_dt >= '2026-01-01'"
     assert result.profile.where_clause == "report_dt >= '2026-01-01'"
     assert "Фильтр (WHERE): `report_dt >= '2026-01-01'`" in report_text
+    assert "Недостаточно данных" in business_text
 
 
 def test_sanitize_where_clause_allows_select_predicates():
@@ -517,19 +531,20 @@ def test_business_insights_render_in_report_via_insights_fn():
         assert rows[0]["priority"] == "top"
         assert rows[0]["recommended_action"]
 
-        # Markdown report contains the new section, ordered before TL;DR.
+        # Business report carries the curated insights section.
         report = result.report_path.read_text(encoding="utf-8")
         assert "## 🎯 Главное для бизнеса" in report
         assert "Сотрудники концентрируют отпуска" in report
         assert "**Куда смотреть:**" in report
         assert "**На что влияет:**" in report
         assert "**Что сделать:**" in report
-        # New section must be ABOVE TL;DR, not below it.
-        assert report.index("Главное для бизнеса") < report.index("## TL;DR")
-        # Drill-down anchor + link must both be present.
+        # Technical report keeps insights ABOVE the mechanical TL;DR and the
+        # per-finding drill-down anchors/links.
+        tech = result.technical_report_path.read_text(encoding="utf-8")
+        assert tech.index("Главное для бизнеса") < tech.index("## TL;DR")
         target_id = captured["target_id"]
-        assert f'<a id="{target_id}"></a>' in report
-        assert f"(#{target_id})" in report
+        assert f'<a id="{target_id}"></a>' in tech
+        assert f"(#{target_id})" in tech
 
 
 def test_business_insights_failure_is_graceful():
@@ -562,11 +577,15 @@ def test_business_insights_failure_is_graceful():
         )
 
         assert result.business_insights == []
-        report = result.report_path.read_text(encoding="utf-8")
-        # Section must be absent — TL;DR + diagnostics are still there.
-        assert "Главное для бизнеса" not in report
-        assert "## TL;DR" in report
-        assert "## Диагностика выполнения" in report
+        # Insights failed → technical report omits the curated section but
+        # still has TL;DR + diagnostics. Business report shows an explicit
+        # "no insights" placeholder instead of fabricated takeaways.
+        tech = result.technical_report_path.read_text(encoding="utf-8")
+        business = result.report_path.read_text(encoding="utf-8")
+        assert "🎯 Главное для бизнеса" not in tech
+        assert "## TL;DR" in tech
+        assert "## Диагностика выполнения" in tech
+        assert "Существенных бизнес-выводов" in business
 
 
 def test_business_insights_extract_with_stub_llm():
@@ -655,3 +674,143 @@ def test_business_insights_extract_with_stub_llm():
     # the prompt directly here, but we can re-derive: the validator only knows
     # ids of findings that were fed). info_minor_nulls would never appear
     # anyway as the LLM didn't reference it — covered indirectly.
+
+
+def test_entity_drilldown_finds_one_inn_period_spike():
+    rng = np.random.default_rng(0)
+    inns = [f"77{i:08d}" for i in range(1000)]
+    months = pd.date_range("2025-01-01", periods=12, freq="MS")
+    rows = []
+    target_inn = inns[427]
+    for inn_idx, inn in enumerate(inns):
+        segment = f"segment_{inn_idx % 10}"
+        for dt in months:
+            amount = float(rng.normal(1000, 80))
+            if inn == target_inn and dt == pd.Timestamp("2025-06-01"):
+                amount = 50000.0
+            rows.append((inn, segment, dt, amount))
+    df = pd.DataFrame(rows, columns=["inn", "segment_name", "report_dt", "amount"])
+    plan = LoadPlan(
+        schema="schema", table="payments", total_rows=len(df),
+        kept_columns=list(df.columns), dropped_wide_text=[],
+        strategy="full", sample_rows=None,
+        est_bytes_per_row=40, est_full_bytes=40 * len(df),
+    )
+    df, profile = profile_dataframe(df, plan)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = AnalysisContext(
+            schema="schema", table="payments", mode=AnalysisMode.FAST,
+            deadline_ts=1e18, output_dir=tmp, progress=ProgressReporter(),
+        )
+        spec = HypothesisSpec(
+            hypothesis_id="entity_inn_spike",
+            runner="entity_drilldown",
+            title="Точечные аномалии по inn",
+            rationale="",
+            params={
+                "entity_col": "inn",
+                "date_col": "report_dt",
+                "metric_cols": ["amount"],
+                "peer_cols": ["segment_name"],
+                "dimension_cols": [],
+                "time_grains": ["month"],
+                "top_k": 20,
+            },
+            priority=1.0,
+        )
+        findings = run_entity_drilldown(df, profile, spec, ctx)
+        assert findings
+        f = findings[0]
+        assert f.entity_csv is not None
+        cards = pd.read_csv(Path(tmp) / f.entity_csv)
+        assert target_inn in set(cards["entity"].astype(str))
+        target_rows = cards[cards["entity"].astype(str) == target_inn]
+        assert any(target_rows["period"].astype(str).str.startswith("2025-06"))
+        assert {"baseline", "actual", "deviation_pct", "reason"}.issubset(cards.columns)
+
+
+def test_table_analysis_context_uses_schema_metadata():
+    from core.schema_loader import SchemaLoader
+
+    df = pd.DataFrame({
+        "report_dt": pd.date_range("2025-01-01", periods=200, freq="D"),
+        "inn": [f"77{i:08d}" for i in range(200)],
+        "segment_name": ["mass"] * 100 + ["premium"] * 100,
+        "outflow_qty": np.arange(200),
+        "is_key_client": [0, 1] * 100,
+    })
+    plan = LoadPlan(
+        schema="schema", table="uzp_dwh_fact_outflow", total_rows=len(df),
+        kept_columns=list(df.columns), dropped_wide_text=[],
+        strategy="full", sample_rows=None,
+        est_bytes_per_row=40, est_full_bytes=40 * len(df),
+    )
+    _, profile = profile_dataframe(df, plan, table_description="Информация по фактическим оттокам")
+    ctx = build_table_analysis_context(profile, SchemaLoader())
+    assert ctx.grain == "event"
+    assert ctx.business_subject == "event"
+    assert "inn" in ctx.entity_keys
+    assert "report_dt" in ctx.time_axes
+    assert "outflow_qty" in ctx.measures
+    assert "segment_name" in ctx.peer_groups or "segment_name" in ctx.dimensions
+
+
+def test_business_report_is_action_first_with_entity_examples():
+    from core.deep_analysis.report import _render_business_md
+    from core.deep_analysis.types import TableAnalysisContext, TableProfile
+
+    profile = TableProfile(
+        schema="s", table="t", n_rows=1000, n_cols=4, columns={},
+        table_description="Платежи клиентов",
+    )
+    analysis_ctx = TableAnalysisContext(
+        schema="s", table="t", description="Платежи клиентов",
+        grain="payment", table_role="fact", business_subject="client",
+        entity_keys=["inn"], time_axes=["report_dt"], measures=["amount"],
+        dimensions=["segment_name"], peer_groups=["segment_name"],
+    )
+    finding = Finding(
+        hypothesis_id="entity_inn_spike",
+        runner="entity_drilldown",
+        title="Точечные аномалии по inn",
+        severity="critical",
+        summary="Найден адресный всплеск.",
+        metrics={"n_entity_cards": 1, "max_abs_z": 9.5},
+        entity_csv="entities_entity_inn_spike.csv",
+        details={"examples": [{
+            "entity": "7700000427",
+            "metric": "amount",
+            "period": "2025-06",
+            "peer_group": "segment_name=premium",
+            "actual": 50000.0,
+            "baseline": 1000.0,
+            "deviation_pct": 4900.0,
+        }]},
+    )
+    md = _render_business_md(
+        [finding], profile, AnalysisMode.FAST,
+        analysis_context=analysis_ctx,
+    )
+    assert "## Контекст таблицы" in md
+    assert "## Что проверить первым" in md
+    assert "7700000427" in md
+    assert "entities_entity_inn_spike.csv" in md
+    assert "robust_z" not in md
+    assert "p_value" not in md
+
+
+def test_report_qa_csv_index_includes_manifest(tmp_path):
+    from core.deep_analysis.report_qa import build_csv_index
+
+    csv_path = tmp_path / "entities_entity_inn_spike.csv"
+    csv_path.write_text(
+        "entity,metric,reason,peer_group\n"
+        "7700000427,amount,amount: 50000 выше peer-baseline 1000,segment=premium\n"
+        "7700000427,row_count,row_count: 12 выше peer-baseline 1,segment=premium\n",
+        encoding="utf-8",
+    )
+    index = build_csv_index(tmp_path)
+    assert "- rows: 2" in index
+    assert "top entity: 7700000427 (2)" in index
+    assert "top metric: amount (1), row_count (1)" in index

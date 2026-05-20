@@ -56,6 +56,7 @@ def run_group_anomalies(
     period = params.get("period")  # "quarter" | "month" | None
     value_col = params.get("value_col")
     category_col = params.get("category_col")
+    metric = _normalise_metric(metric, value_col=value_col, category_col=category_col)
 
     work = df.copy()
     if date_col and date_col in work.columns:
@@ -80,6 +81,10 @@ def run_group_anomalies(
             if not category_col or category_col not in work.columns or not date_col:
                 return []
             agg_df = _agg_end_of_quarter_shift(work, entity_col, date_col, category_col)
+        elif metric == "category_concentration":
+            if not category_col or category_col not in work.columns:
+                return []
+            agg_df = _agg_category_concentration(work, entity_col, category_col)
         else:
             return []
     except Exception as exc:
@@ -107,8 +112,8 @@ def run_group_anomalies(
             title=spec.title,
             severity="info",
             summary=(
-                f"Проверено {len(agg_df)} сущностей ({entity_col}) — "
-                f"массовых отклонений (|z|>{_THRESHOLD}) не обнаружено."
+                f"Проверено {len(agg_df)} объектов ({entity_col}) — "
+                f"массовых отклонений не обнаружено."
             ),
             metrics={"n_entities": int(len(agg_df)), "n_violators": 0},
         )]
@@ -121,14 +126,14 @@ def run_group_anomalies(
     # Describe top violators in-line so the report is useful without opening the CSV.
     top_rows = violators.head(5)
     top_lines = ", ".join(
-        f"{r[entity_col]}={r['metric_value']:.2f} (z={r['robust_z']:+.2f})"
+        f"{r[entity_col]} ({r['metric_value']:.2f})"
         for _, r in top_rows.iterrows()
         if pd.notna(r.get(entity_col))
     )
     summary = (
-        f"Из {len(agg_df)} сущностей ({entity_col}) {len(violators)} "
-        f"имеют аномальную метрику (|z|>{_THRESHOLD}). "
-        f"Топ: {top_lines}. Полный список в `{csv_path}`."
+        f"Из {len(agg_df)} объектов ({entity_col}) {len(violators)} "
+        f"резко выбиваются из общей массы. "
+        f"Самые заметные: {top_lines}. Полный список — в `{csv_path}`."
     )
     return [Finding(
         hypothesis_id=spec.hypothesis_id,
@@ -153,6 +158,24 @@ def run_group_anomalies(
 
 
 # ---------- metric aggregations ----------
+
+
+def _normalise_metric(
+    metric: str | None,
+    *,
+    value_col: str | None,
+    category_col: str | None,
+) -> str | None:
+    """Support newer public mode names while preserving old metrics."""
+    if metric == "entity_vs_peer":
+        return "mean" if value_col else "row_count"
+    if metric == "entity_period_spike":
+        return "mean" if value_col else "row_count"
+    if metric == "entity_category_concentration":
+        return "category_concentration" if category_col else "row_count"
+    if metric == "entity_metric_mix":
+        return "mean" if value_col else "row_count"
+    return metric
 
 
 def _period_index(dt: pd.Series, period: str | None) -> pd.Series | None:
@@ -292,4 +315,32 @@ def _agg_end_of_quarter_shift(
         })
     if not rows:
         return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def _agg_category_concentration(
+    df: pd.DataFrame,
+    entity_col: str,
+    category_col: str,
+) -> pd.DataFrame:
+    rows = []
+    global_share = df[category_col].value_counts(normalize=True)
+    for entity, grp in df.groupby(entity_col):
+        n_total = len(grp)
+        if n_total < _MIN_ENTITY_SAMPLE:
+            continue
+        entity_share = grp[category_col].value_counts(normalize=True)
+        best_val = None
+        best_lift = 0.0
+        for val, share in entity_share.items():
+            lift = float(share) - float(global_share.get(val, 0.0))
+            if lift > best_lift:
+                best_lift = lift
+                best_val = val
+        rows.append({
+            entity_col: entity,
+            "metric_value": best_lift,
+            "top_category": best_val,
+            "n_obs": n_total,
+        })
     return pd.DataFrame(rows)

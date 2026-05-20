@@ -20,7 +20,7 @@ from typing import Any
 from core.deep_analysis.hypothesis_llm import _parse_llm_json
 from core.deep_analysis.logging_setup import get_logger
 from core.deep_analysis.report import _impact_score
-from core.deep_analysis.types import BusinessInsight, Finding, TableProfile
+from core.deep_analysis.types import BusinessInsight, Finding, TableAnalysisContext, TableProfile
 from core.llm import RateLimitedLLM
 
 # How many top findings we hand to the LLM. Larger = better recall but more
@@ -34,29 +34,44 @@ _ELIGIBLE_SEVERITIES = {"critical", "strong", "notable"}
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
-_SYSTEM_PROMPT = """Ты — старший бизнес-аналитик банка. На вход тебе дают:
-- семантику таблицы и (опционально) гипотезу пользователя
-- список метрических находок (severity, заголовок, summary, ключевые метрики, runner)
+_SYSTEM_PROMPT = """Ты — старший бизнес-аналитик банка. Тебе дают бизнес-контекст таблицы, (опц.) гипотезу пользователя и список находок (severity, заголовок, summary, метрики, runner, примеры entity-карточек). Твой читатель — руководитель/владелец процесса, НЕ инженер. Технический разбор таблицы его не интересует — только что это значит для бизнеса и что делать.
 
-Задача — выделить НЕ БОЛЕЕ {max_insights} бизнес-инсайтов (можно меньше — если действительно стоящих меньше, лучше 2 хороших, чем 5 натянутых).
+Задача — выделить НЕ БОЛЕЕ {max_insights} бизнес-инсайтов (лучше 2 сильных, чем 5 натянутых).
 
-Каждый инсайт должен отвечать на ТРИ вопроса в бизнес-терминах:
-1. **Куда смотреть** — конкретный объект (сегмент, период, колонка, CSV нарушителей)
-2. **На что это влияет** — деньги/риск/клиенты/операционка (НЕ повторяй summary, скажи именно бизнес-следствие)
-3. **Что сделать** — конкретное действие, кому отдать, что проверить
+Каждый инсайт отвечает на ТРИ вопроса ПРОСТЫМ деловым языком:
+1. **where_to_look** — конкретный объект: сегмент/период/подразделение/файл нарушителей (с числом из находки: "8 сотрудников", "отдел X", "последние 10 дней квартала").
+2. **business_impact** — деньги/риск/клиенты/операционка. НЕ пересказывай summary — назови бизнес-следствие.
+3. **recommended_action** — конкретный шаг и кому отдать (HR-аудит, фрод-команда, владелец витрины).
 
-Игнорируй технические/малозначимые находки (мелкие nullы, слабые статистические корреляции без бизнес-смысла, info-severity).
-Если несколько находок описывают одно и то же бизнес-явление — объедини их в один инсайт и перечисли все finding_id в related_finding_ids.
+ПЕРЕВОДИ МЕТРИКИ, А НЕ ПОВТОРЯЙ ИХ. Глоссарий (эти слова в ответе НЕ употреблять):
+- robust_z / max_abs_z / z — насколько сильно объект выбивается из своей группы ("резко выше остальных").
+- cramer_v / eta_sq / spearman_rho — насколько жёстко одно предопределяет другое ("значение почти всегда определяет ...").
+- p_value / chi2 / kw_stat / f_stat — статистическая надёжность; пользователю НЕ озвучивать вообще.
+- rel_deviation_pct / max_rel_deviation_pct / rel_shift_pct — отклонение от нормы в процентах ("на 18% выше обычного").
+- n_violators / n_outliers — сколько объектов аномальны ("у 8 сотрудников").
+- changepoint / regime shift — момент, когда поведение скачком изменилось.
+
+ЗАПРЕЩЕНО (это пустые шаблоны — за них штраф):
+- "нужно провести аналитику / разобраться / понять что привело к этому"
+- "плохое распределение данных", "данные требуют внимания", "возможны аномалии"
+- любой инсайт без конкретного объекта ИЛИ без числа из находки ИЛИ без адресата действия.
+
+НЕ ВЫДУМЫВАЙ числа, даты, проценты и имена. Используй ТОЛЬКО значения, присутствующие в переданных находках. Если в находке нет числа — описывай качественно, без цифр.
+Если семантика таблицы = "(нет)" — выведи домен из имён таблицы/колонок в находках и опирайся на него.
+Игнорируй info-severity и слабые статистические связи без бизнес-смысла. Дубли по одному явлению — объедини, перечислив все id в related_finding_ids.
+
+Пример ПЛОХО: "Обнаружено плохое распределение по отделам, нужно провести аналитику и понять причины."
+Пример ХОРОШО: "8 сотрудников отдела продаж оформляют отпуск строго в последние 3 дня квартала — типичный признак подгонки KPI; передать список (entities_*.csv) в HR-аудит для сверки с фактической явкой."
 
 Верни СТРОГО JSON без пояснений:
 {{
   "insights": [
     {{
-      "title": "короткий заголовок одной строкой",
+      "title": "короткий заголовок одной строкой, без жаргона",
       "priority": "top|high|medium",
       "where_to_look": "...",
-      "business_impact": "1-3 предложения, что это значит для бизнеса",
-      "recommended_action": "конкретное действие",
+      "business_impact": "1-3 предложения, бизнес-следствие",
+      "recommended_action": "конкретное действие + кому отдать",
       "related_finding_ids": ["hypothesis_id1", "hypothesis_id2"],
       "confidence": "high|medium|low"
     }}
@@ -101,6 +116,7 @@ def _serialize_findings(findings: list[Finding]) -> list[dict[str, Any]]:
             "summary": f.summary,
             "metrics": compact_metrics,
             "entity_csv": f.entity_csv,
+            "examples": (f.details or {}).get("examples", [])[:5],
         })
     return out
 
@@ -164,6 +180,7 @@ def extract_business_insights(
     profile: TableProfile,
     user_hypothesis_text: str | None = None,
     table_semantics: str | None = None,
+    analysis_context: TableAnalysisContext | None = None,
     max_insights: int = 5,
 ) -> list[BusinessInsight]:
     """Distill findings into <= max_insights actionable business takeaways.
@@ -182,6 +199,8 @@ def extract_business_insights(
     user = (
         f"Таблица: {profile.schema}.{profile.table}\n"
         f"Семантика: {table_semantics or '(нет)'}\n"
+        f"Бизнес-контекст:\n"
+        f"{analysis_context.short_brief() if analysis_context else '(нет)'}\n"
         f"Гипотеза пользователя (фокус релевантности): {user_hypothesis_text or '(не задана)'}\n\n"
         f"Находки (top-{len(top_findings)} по severity и impact):\n"
         f"{json.dumps(_serialize_findings(top_findings), ensure_ascii=False, indent=2)}"

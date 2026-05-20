@@ -11,13 +11,14 @@ Public entry points:
 """
 
 from core.deep_analysis.orchestrator import run_deep_analysis
-from core.deep_analysis.types import AnalysisMode, Finding, HypothesisSpec
+from core.deep_analysis.types import AnalysisMode, Finding, HypothesisSpec, TableAnalysisContext
 from core.deep_analysis.user_hypothesis import build_user_hypothesis_plan
 
 __all__ = [
     "AnalysisMode",
     "Finding",
     "HypothesisSpec",
+    "TableAnalysisContext",
     "build_user_hypothesis_plan",
     "run_deep_analysis",
 ]

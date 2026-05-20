@@ -159,6 +159,55 @@ class TableProfile:
 
 
 @dataclass
+class TableAnalysisContext:
+    """Business-facing interpretation of a profiled table.
+
+    This is intentionally separate from ``TableProfile``: the profile is the
+    factual shape of the loaded dataframe, while this context says how to read
+    that shape in business terms.
+    """
+
+    schema: str
+    table: str
+    description: str = ""
+    grain: str = ""
+    table_role: str = ""
+    business_subject: str = ""
+    primary_subjects: list[str] = field(default_factory=list)
+    entity_keys: list[str] = field(default_factory=list)
+    time_axes: list[str] = field(default_factory=list)
+    measures: list[str] = field(default_factory=list)
+    dimensions: list[str] = field(default_factory=list)
+    flags: list[str] = field(default_factory=list)
+    peer_groups: list[str] = field(default_factory=list)
+    column_descriptions: dict[str, str] = field(default_factory=dict)
+    column_semantic_classes: dict[str, str] = field(default_factory=dict)
+    business_synonyms: dict[str, list[str]] = field(default_factory=dict)
+
+    def short_brief(self) -> str:
+        """Compact prompt/report representation."""
+        def _fmt(items: list[str], limit: int = 12) -> str:
+            if not items:
+                return "—"
+            shown = ", ".join(items[:limit])
+            if len(items) > limit:
+                shown += f", …(+{len(items) - limit})"
+            return shown
+
+        return "\n".join([
+            f"Таблица: {self.schema}.{self.table}",
+            f"Описание: {self.description or '—'}",
+            f"Grain/роль: {self.grain or '—'} / {self.table_role or '—'}",
+            f"Основная бизнес-сущность: {self.business_subject or '—'}",
+            f"Ключи сущностей: {_fmt(self.entity_keys)}",
+            f"Временные оси: {_fmt(self.time_axes)}",
+            f"Метрики: {_fmt(self.measures)}",
+            f"Измерения/peer-группы: {_fmt(self.peer_groups or self.dimensions)}",
+            f"Флаги: {_fmt(self.flags)}",
+        ])
+
+
+@dataclass
 class HypothesisSpec:
     """A single hypothesis to check.
 
@@ -220,6 +269,7 @@ class AnalysisContext:
     deadline_ts: float                        # unix timestamp, hard stop
     output_dir: str                           # workspace/deep_analysis/<table>/<ts>/
     progress: "ProgressReporter"              # forward ref
+    table_context: TableAnalysisContext | None = None
 
     def seconds_left(self) -> float:
         import time

@@ -1,6 +1,7 @@
 """Фасад GraphNodes: объединяет все mixin-узлы в один класс для графа."""
 
 from graph.nodes.common import BaseNodeMixin
+from graph.nodes.orchestrator import OrchestratorNodes
 from graph.nodes.query_ir import QueryIRNodes
 from graph.nodes.intent import IntentNodes
 from graph.nodes.hint_extractor import HintExtractorNodes
@@ -16,6 +17,7 @@ from graph.nodes.dispatcher import DispatcherNodes
 
 
 class GraphNodes(
+    OrchestratorNodes,
     QueryIRNodes,
     # Legacy direct-call compatibility only. These nodes are not registered in
     # the runtime graph, whose entrypoint is QuerySpec.
@@ -35,6 +37,9 @@ class GraphNodes(
     """Узлы графа агента — фасад, объединяющий все mixin-классы.
 
     Каждый mixin содержит 1-3 узла графа:
+    - OrchestratorNodes: orchestrator + step-узлы plan-and-execute
+      (orch_extract_sources/pull_metadata/explain_plan/explain_sql/
+      execute_sql/create_directory/file_operation/run_analytics)
     - QueryIRNodes: query_interpreter, catalog_grounder
     - IntentNodes/HintExtractor*: legacy direct-call compatibility only
     - ExplorerNodes: table_explorer, column_selector

@@ -1507,10 +1507,12 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
                     summary = re.sub(r'```[^`]*```', '', answer, flags=re.DOTALL).strip()
                     self._prev_result_summary = summary[:200]
 
-            # Feedback loop: запрашиваем оценку ответа
+            # Feedback loop: спрашиваем оценку только если был выполнен SQL
+            # (text2sql-пайплайн, в т.ч. вызванный оркестратором). Для чистых
+            # файловых/планировочных шагов оркестратора feedback бессмыслен.
             verdict = "skip"
-            if answer and answer != "Нет ответа.":
-                verdict = self._ask_feedback(user_input, executed_sql or "")
+            if executed_sql and answer and answer != "Нет ответа.":
+                verdict = self._ask_feedback(user_input, executed_sql)
 
             # Кэшируем только при явно положительной оценке — иначе
             # пользователь не сможет перевыполнить «плохой» запрос.

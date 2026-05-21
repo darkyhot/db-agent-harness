@@ -136,7 +136,10 @@ def test_summarizer_appends_preview_markdown_from_execute_query():
     assert "| 1 | Alice |" in answer
 
 
-def test_summarizer_blocks_answer_data_without_successful_execute_query():
+def test_summarizer_shows_generated_sql_when_execute_query_did_not_succeed():
+    """Summarizer должен показывать сгенерированный SQL, если execute_query
+    не прошёл (awaiting_validation / ошибка / лимит итераций), вместо глухого
+    'данных недостаточно'. Так пользователь видит, что было задумано."""
     nodes = _make_nodes("```sql\nSELECT COUNT(*) FROM dm.clients\n```")
     state = _state("Сколько клиентов?")
     state["query_spec"] = {
@@ -150,11 +153,15 @@ def test_summarizer_blocks_answer_data_without_successful_execute_query():
             "result": "awaiting_validation",
         }
     ]
+    state["last_error"] = "SQL self-correction отклонил запрос: пример"
 
     result = nodes.summarizer(state)
 
-    assert "SQL не был выполнен" in result["final_answer"]
-    assert "```sql" not in result["final_answer"]
+    answer = result["final_answer"]
+    assert "SQL не был выполнен" in answer
+    assert "```sql" in answer
+    assert "SELECT COUNT(*) AS cnt FROM dm.clients" in answer
+    assert "SQL self-correction" in answer
 
 
 def test_summarizer_prepends_scalar_summary_from_single_row_preview():

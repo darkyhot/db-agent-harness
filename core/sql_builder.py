@@ -450,8 +450,13 @@ def _build_fact_dim_join(
     if not select_items:
         select_items = [f"COUNT(*) AS cnt"]
 
-    # WHERE
-    where_clause = _build_where_clause(blueprint.get("where_conditions", []), f_alias)
+    # WHERE — при use_full_refs в FROM нет алиаса, квалифицируем условия
+    # коротким именем таблицы (консистентно с SELECT/JOIN), иначе алиасом.
+    where_qualifier = main_table.split(".")[-1] if use_full_refs else f_alias
+    where_clause = _build_where_clause(
+        blueprint.get("where_conditions", []),
+        where_qualifier,
+    )
 
     group_by_cols = blueprint.get("group_by", [])
     order_by_clause = _build_order_by(blueprint.get("order_by"))

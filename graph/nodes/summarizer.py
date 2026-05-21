@@ -21,6 +21,42 @@ class SummarizerNodes:
             and bool(query_spec.get("metrics"))
         )
 
+    def _last_generated_sql(
+        self,
+        state: AgentState,
+        tool_calls: list[dict[str, Any]],
+    ) -> str:
+        """Найти последний сгенерированный SQL для показа пользователю.
+
+        Источники по убыванию приоритета:
+        1. ``state["sql_to_validate"]`` или ``state["pending_sql_tool_call"]``
+           — последний кандидат, отправленный в validator.
+        2. ``state["sql_blueprint"]["generated_sql"]`` — если writer успел
+           положить его в blueprint.
+        3. Последний ``execute_query`` (с ошибкой) — в этом случае возвращаем
+           отправленный SQL, чтобы пользователь видел, что было запущено.
+        """
+        sql = str(state.get("sql_to_validate") or "").strip()
+        if sql:
+            return sql
+        pending = state.get("pending_sql_tool_call") or {}
+        if isinstance(pending, dict):
+            sql = str((pending.get("args") or {}).get("sql") or "").strip()
+            if sql:
+                return sql
+        blueprint = state.get("sql_blueprint") or {}
+        if isinstance(blueprint, dict):
+            sql = str(blueprint.get("generated_sql") or "").strip()
+            if sql:
+                return sql
+        for tc in reversed(tool_calls or []):
+            if tc.get("tool") != "execute_query":
+                continue
+            sql = str((tc.get("args") or {}).get("sql") or "").strip()
+            if sql:
+                return sql
+        return ""
+
     def _has_successful_execute_query(self, tool_calls: list[dict[str, Any]]) -> bool:
         for tc in reversed(tool_calls or []):
             if tc.get("tool") != "execute_query":
@@ -121,12 +157,27 @@ class SummarizerNodes:
         capped_tool_calls = self._cap_tool_calls(state.get("tool_calls", []))
 
         if self._is_answer_data_request(state) and not self._has_successful_execute_query(capped_tool_calls):
-            answer = (
-                "SQL не был выполнен, поэтому данных для ответа недостаточно. "
-                "Нужно успешно выполнить запрос и затем сформировать ответ по результату."
-            )
+            last_sql = self._last_generated_sql(state, capped_tool_calls)
+            last_error = str(state.get("last_error") or "").strip()
+            parts = ["SQL не был выполнен, поэтому данных для ответа недостаточно."]
+            if last_sql:
+                parts.append(
+                    "Сгенерированный SQL (не выполнен, проверьте вручную):\n"
+                    f"```sql\n{last_sql}\n```"
+                )
+            if last_error:
+                parts.append(f"Причина: {last_error}")
+            if not last_sql:
+                parts.append(
+                    "Нужно успешно выполнить запрос и затем сформировать ответ по результату."
+                )
+            answer = "\n\n".join(parts)
             self.memory.add_message("assistant", answer)
-            logger.warning("Summarizer: answer_data без успешного execute_query — SQL-only ответ заблокирован")
+            logger.warning(
+                "Summarizer: answer_data без успешного execute_query — "
+                "возвращаю SQL-only ответ (sql_present=%s)",
+                bool(last_sql),
+            )
             return {
                 "final_answer": answer,
                 "messages": state["messages"] + [

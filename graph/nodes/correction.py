@@ -265,6 +265,7 @@ class CorrectionNodes:
                 last_sql = last_args.get("sql", "")
 
         seen_fingerprints = list(state.get("correction_error_fingerprints") or [])
+        seen_sql_hashes = list(state.get("correction_sql_hashes") or [])
         if last_sql and error:
             fingerprint = hashlib.sha256(f"{last_sql}\n---\n{error}".encode("utf-8")).hexdigest()
             if fingerprint in seen_fingerprints:
@@ -274,11 +275,30 @@ class CorrectionNodes:
                     "retry_count": retry_count + 1,
                     "final_answer": (
                         "Не удалось исправить SQL: повторяется одна и та же ошибка статической проверки. "
-                        f"Последняя ошибка: {error}"
+                        f"Последняя ошибка: {error}\n\nПоследний SQL:\n```sql\n{last_sql}\n```"
                     ),
                     "graph_iterations": iterations,
                 }
             seen_fingerprints.append(fingerprint)
+        if last_sql:
+            sql_hash = hashlib.sha256(last_sql.encode("utf-8")).hexdigest()
+            if sql_hash in seen_sql_hashes:
+                logger.warning(
+                    "ErrorDiagnoser: тот же SQL повторно дошёл до correction "
+                    "(ошибка варьируется) — останавливаю loop"
+                )
+                return {
+                    "last_error": None,
+                    "retry_count": retry_count + 1,
+                    "correction_error_fingerprints": seen_fingerprints,
+                    "correction_sql_hashes": seen_sql_hashes,
+                    "final_answer": (
+                        "Не удалось исправить SQL: fixer возвращает один и тот же запрос. "
+                        f"Последняя ошибка: {error}\n\nПоследний SQL:\n```sql\n{last_sql}\n```"
+                    ),
+                    "graph_iterations": iterations,
+                }
+            seen_sql_hashes.append(sql_hash)
 
         ambiguous_cols = self._extract_ambiguous_columns(error or "")
         if ambiguous_cols and last_sql:
@@ -303,6 +323,7 @@ class CorrectionNodes:
                         "step_idx": step_idx,
                     },
                     "correction_error_fingerprints": seen_fingerprints,
+                    "correction_sql_hashes": seen_sql_hashes,
                     "graph_iterations": iterations,
                     "messages": state["messages"] + [
                         {"role": "assistant", "content": "Диагноз ошибки: ambiguous_column — удалена лишняя неоднозначная колонка"}
@@ -318,6 +339,7 @@ class CorrectionNodes:
                 "retry_count": retry_count + 1,
                 "last_error": None,
                 "correction_error_fingerprints": seen_fingerprints,
+                "correction_sql_hashes": seen_sql_hashes,
                 "graph_iterations": iterations,
                 "messages": state["messages"] + [
                     {"role": "assistant", "content": "Диагноз ошибки: ambiguous_column — нужна квалификация колонки"}
@@ -435,6 +457,7 @@ class CorrectionNodes:
             "last_error": None,
             "graph_iterations": iterations,
             "correction_error_fingerprints": seen_fingerprints,
+            "correction_sql_hashes": seen_sql_hashes,
             "messages": state["messages"] + [
                 {"role": "assistant", "content": f"Диагноз ошибки: {diagnosis.get('error_type', 'unknown')} — {diagnosis.get('root_cause', '')}"}
             ],

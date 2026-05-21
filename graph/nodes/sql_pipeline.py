@@ -134,7 +134,16 @@ def _collect_required_tables(
 
 
 def _missing_blueprint_outputs(sql: str, blueprint: dict[str, Any]) -> list[str]:
-    """Cheap semantic guard: SQL text should mention planned metrics/dimensions."""
+    """Cheap semantic guard: SQL text should mention planned metrics/dimensions.
+
+    Сверка идёт по РЕАЛЬНЫМ колонкам blueprint:
+    - metrics: `aggregations[].column` (или `.alias`),
+    - dimensions: `blueprint["group_by"]` (имена колонок планнера).
+
+    Раньше dimensions сверялись по `required_output`, который содержит
+    семантические ярлыки из QuerySpec (например, "дата", "ГОСБ") и никогда
+    не встречаются в SQL — guard всегда rejected корректный SQL.
+    """
     sql_l = str(sql or "").lower()
     missing: list[str] = []
     aggregations = blueprint.get("aggregations") or []
@@ -150,10 +159,13 @@ def _missing_blueprint_outputs(sql: str, blueprint: dict[str, Any]) -> list[str]
         names = [name for name in (col, alias) if name]
         if names and not any(re.search(rf"\b{re.escape(name.lower())}\b", sql_l) for name in names):
             missing.append(f"metric:{col}")
-    for dim in blueprint.get("required_output") or []:
-        name = str(dim or "").strip()
-        if name and not re.search(rf"\b{re.escape(name.lower())}\b", sql_l):
-            missing.append(f"dimension:{name}")
+    for col in blueprint.get("group_by") or []:
+        name = str(col or "").strip()
+        if not name:
+            continue
+        bare = name.rsplit(".", 1)[-1]
+        if not re.search(rf"\b{re.escape(bare.lower())}\b", sql_l):
+            missing.append(f"dimension:{bare}")
     return missing
 
 

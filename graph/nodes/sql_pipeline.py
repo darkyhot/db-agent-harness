@@ -386,6 +386,56 @@ def _build_join_rule(strategy: str, join_spec: list[dict]) -> str:
     return "\nПРАВИЛА JOIN (на основе проверенных ключей):\n" + "\n".join(parts) + "\n"
 
 
+def _extract_rejected_columns_from_errors(errors: list[str]) -> list[str]:
+    """Достать имена «отвергнутых» колонок из текстов ошибок static checker.
+
+    Используется Fix E: накапливаем rejected_columns в стейте, чтобы
+    error_diagnoser мог обрывать цикл, если LLM повторно вводит то же
+    галлюцинированное имя (в т.ч. в quoted-форме).
+    """
+    out: list[str] = []
+    import re as _re
+    patterns = [
+        # "Найдены unqualified-колонки, отсутствующие в каталоге: a, b, c."
+        (
+            r"Найдены unqualified-колонки,\s*отсутствующие в каталоге:\s*([^.]+)",
+            lambda body: [
+                t.strip()
+                for t in body.split(",")
+                if _re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", t.strip())
+            ],
+        ),
+        # "Возможные галлюцинированные колонки (не найдены в каталоге): a, alias.b, c."
+        (
+            r"Возможные галлюцинированные колонки[^:]*:\s*([^.]+)",
+            lambda body: [
+                t.strip().rsplit(".", 1)[-1].strip()
+                for t in body.split(",")
+                if t.strip()
+            ],
+        ),
+        # "Найдены quoted-identifier'ы, отсутствующие в каталоге: \"x\", \"y\"."
+        (
+            r"Найдены quoted-identifier[^:]*:\s*([^.]+)",
+            lambda body: [
+                m.strip()
+                for m in _re.findall(r'"([^"]+)"', body)
+            ],
+        ),
+    ]
+    for err in errors or []:
+        text = str(err or "")
+        for pat, splitter in patterns:
+            match = _re.search(pat, text)
+            if not match:
+                continue
+            for token in splitter(match.group(1)):
+                t = token.strip()
+                if t and t not in out:
+                    out.append(t)
+    return out
+
+
 def _build_specific_clarification(where_resolution: dict[str, Any] | None) -> str:
     """Построить конкретный вопрос по фильтру из кандидатов where_resolution.
 
@@ -1165,6 +1215,24 @@ class SqlPipelineNodes:
             js_str = json.dumps(join_spec, ensure_ascii=False, indent=2)
             user_parts.append(f"JOIN ключи:\n{js_str}")
 
+        # Нерешённые фильтры из WhereResolver (dtype-несовместимость и т.п.).
+        # LLM НЕ ДОЛЖЕН выдумывать колонки для этих фильтров.
+        _wres = state.get("where_resolution") or {}
+        _unresolved = list(_wres.get("unresolved_filters") or [])
+        if _unresolved:
+            _u_str = json.dumps(_unresolved, ensure_ascii=False, indent=2)
+            user_parts.append(
+                "Нерешённые фильтры (WhereResolver не нашёл совместимой колонки — "
+                "НЕ ВЫДУМЫВАЙ для них колонки и не вставляй их в WHERE):\n" + _u_str
+            )
+        _implicit = list(_wres.get("implicit_filters") or [])
+        if _implicit:
+            _i_str = json.dumps(_implicit, ensure_ascii=False, indent=2)
+            user_parts.append(
+                "Фильтры, уже закодированные в выбранной таблице "
+                "(дополнительный WHERE НЕ нужен):\n" + _i_str
+            )
+
         # Multi-turn: добавить предыдущий SQL как базу для модификации (followup)
         prev_sql = state.get("prev_sql", "")
         if prev_sql and state.get("intent", {}).get("intent") == "followup":
@@ -1446,6 +1514,14 @@ class SqlPipelineNodes:
             "- Используются только разрешённые таблицы и реальные выбранные колонки.\n"
             "- JOIN не меняет смысл результата и не выглядит как размножение строк.\n"
             "- SQL в целом корректен для PostgreSQL/Greenplum.\n\n"
+            "ЖЁСТКИЕ ПРАВИЛА:\n"
+            "- НИКОГДА не вводи колонки, которых нет в секции «Колонки таблиц». "
+            "Если фильтр семантически нужен, но подходящей колонки в выбранной "
+            "таблице нет — verdict='reject' с конкретной issue, а НЕ выдумывание "
+            "имени колонки (в т.ч. в кавычках с пробелами/кириллицей).\n"
+            "- Если SQL уже корректно покрывает «Нерешённые фильтры» через выбор "
+            "таблицы (см. блок implicit_filters) или через имеющиеся условия — "
+            "verdict='pass', не дописывай псевдо-фильтры.\n\n"
             "Верни ТОЛЬКО JSON без markdown по схеме:\n"
             '{"verdict": "pass|fix|reject|clarify", '
             '"issues": ["краткая проблема"], '
@@ -1477,6 +1553,60 @@ class SqlPipelineNodes:
                 )
         if allowed_tables:
             user_parts.append("Разрешённые таблицы:\n" + "\n".join(f"- {t}" for t in allowed_tables))
+
+        # Полный список колонок каждой задействованной таблицы — чтобы ревьюер
+        # не выдумывал имена. По одной строке: column (dtype) — description.
+        try:
+            tables_seen: set[tuple[str, str]] = set()
+            for tk in (state.get("selected_columns") or {}).keys():
+                if "." in tk:
+                    s, t = tk.split(".", 1)
+                    tables_seen.add((s.strip().lower(), t.strip().lower()))
+            for tk in (state.get("allowed_tables") or []):
+                if "." in tk:
+                    s, t = tk.split(".", 1)
+                    tables_seen.add((s.strip().lower(), t.strip().lower()))
+            if tables_seen:
+                catalog_parts = []
+                for s, t in sorted(tables_seen):
+                    cols_df = self.schema.get_table_columns(s, t)
+                    if cols_df.empty or "column_name" not in cols_df.columns:
+                        continue
+                    rows = []
+                    for _, row in cols_df.iterrows():
+                        col = str(row.get("column_name") or "").strip()
+                        if not col:
+                            continue
+                        dtype = str(row.get("dType") or row.get("dtype") or "").strip()
+                        rows.append(f"  - {col} ({dtype})" if dtype else f"  - {col}")
+                    if rows:
+                        catalog_parts.append(f"{s}.{t}:\n" + "\n".join(rows[:80]))
+                if catalog_parts:
+                    user_parts.append(
+                        "Колонки таблиц (ТОЛЬКО эти существуют — "
+                        "не выдумывай других):\n" + "\n\n".join(catalog_parts)
+                    )
+        except Exception as _exc:  # noqa: BLE001
+            logger.debug("SqlSelfCorrector: catalog enrichment failed: %s", _exc)
+
+        # Нерешённые фильтры и фильтры, покрытые таблицей — явный сигнал ревьюеру
+        # не выдумывать имена колонок «по семантике».
+        _wres = state.get("where_resolution") or {}
+        _unresolved = list(_wres.get("unresolved_filters") or [])
+        if _unresolved:
+            user_parts.append(
+                "Нерешённые фильтры (WhereResolver не нашёл совместимой колонки):\n"
+                + json.dumps(_unresolved, ensure_ascii=False, indent=2, default=str)
+                + "\nЕсли в SQL для них нет условий — это НОРМАЛЬНО (verdict='pass'), "
+                "не дописывай псевдо-колонки."
+            )
+        _implicit = list(_wres.get("implicit_filters") or [])
+        if _implicit:
+            user_parts.append(
+                "Фильтры, уже закодированные в выбранной таблице "
+                "(дополнительный WHERE НЕ нужен):\n"
+                + json.dumps(_implicit, ensure_ascii=False, indent=2, default=str)
+            )
 
         system_prompt, user_prompt = self._trim_to_budget(system_prompt, "\n\n".join(user_parts))
 
@@ -1695,10 +1825,19 @@ class SqlPipelineNodes:
                 "Исправь SQL перед отправкой в БД."
             )
             logger.warning("StaticChecker: найдены ошибки: %s", error_msg[:300])
+            # Fix E: копим имена колонок, которые checker уже отверг —
+            # error_diagnoser использует это, чтобы не пустить SQL с теми же
+            # «галлюцинированными» именами обратно в цикл.
+            rejected_acc = list(state.get("rejected_columns") or [])
+            for col in _extract_rejected_columns_from_errors(check_result.errors):
+                key = col.strip().lower()
+                if key and key not in rejected_acc:
+                    rejected_acc.append(key)
             return {
                 "last_error": error_msg,
                 "sql_to_validate": None,
                 "pending_sql_tool_call": None,
+                "rejected_columns": rejected_acc,
                 "graph_iterations": iterations,
                 "messages": state["messages"] + [
                     {"role": "assistant", "content": error_msg}

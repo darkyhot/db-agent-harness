@@ -446,3 +446,134 @@ def test_user_filter_choices_bypasses_clarification(tmp_path):
     )
     # clarification_message должен быть пустым
     assert result.get("clarification_message", "") == ""
+
+
+# ---------------------------------------------------------------------------
+# Fix B: dtype-check для filter_specs (bool колонка ≠ text литерал)
+# ---------------------------------------------------------------------------
+
+
+def _bool_loader(tmp_path, *, table_name="generic_facts", description="Универсальные факты"):
+    """Минимальный SchemaLoader с boolean-колонкой is_task.
+
+    Имя таблицы намеренно нейтральное — иначе сработает эвристика H и
+    фильтр уйдёт не в unresolved, а в implicit.
+    """
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": [table_name],
+        "description": [description],
+        "grain": ["row"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 2,
+        "table_name": [table_name] * 2,
+        "column_name": ["report_dt", "is_task"],
+        "dType": ["date", "bool"],
+        "description": ["Дата", "Признак: задача"],
+        "is_primary_key": [False, False],
+        "unique_perc": [0.5, 50.0],
+        "not_null_perc": [99.0, 99.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_bool_column_vs_text_value_goes_to_unresolved(tmp_path):
+    """Регрессия (лог 2026-05-22): is_task = 'фактический отток' попадал в SQL.
+
+    Имя таблицы НЕ кодирует "отток" → H-эвристика не срабатывает →
+    фильтр остаётся в unresolved_filters.
+    """
+    from core.query_ir import FilterSpec
+    loader = _bool_loader(tmp_path, table_name="tasks", description="Реестр задач")
+    loader.ensure_value_profiles()
+    result = resolve_where(
+        user_input="Сколько задач по технической блокировке",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.tasks": {"select": ["is_task"], "filter": ["is_task"]}},
+        selected_tables=["dm.tasks"],
+        schema_loader=loader,
+        semantic_frame=None,
+        base_conditions=[],
+        filter_specs=[
+            FilterSpec(target="is_task", operator="=", value="техническая блокировка", value_kind="literal")
+        ],
+    )
+    assert not any("is_task" in cond and "блокировк" in cond for cond in result["conditions"])
+    unresolved = result.get("unresolved_filters") or []
+    assert unresolved, "ожидаем dtype-mismatch фильтр в unresolved_filters"
+    assert unresolved[0]["reason"] == "dtype_mismatch"
+    assert unresolved[0]["candidate_dtype"].lower().startswith("bool")
+    assert unresolved[0]["value"] == "техническая блокировка"
+    # implicit_filters пустой — таблица "tasks" не кодирует "блокировку"
+    assert not result.get("implicit_filters")
+
+
+def test_filter_value_encoded_in_table_migrates_to_implicit(tmp_path):
+    """Fix H: 'фактический отток' + таблица fact_outflow → implicit_filters,
+    а не unresolved. Это разблокирует выполнение SQL без галлюцинаций.
+    """
+    from core.query_ir import FilterSpec
+    loader = _bool_loader(
+        tmp_path, table_name="fact_outflow", description="Факты по фактическому оттоку"
+    )
+    loader.ensure_value_profiles()
+    result = resolve_where(
+        user_input="Сколько задач по фактическому оттоку",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.fact_outflow": {"select": ["is_task"], "filter": ["is_task"]}},
+        selected_tables=["dm.fact_outflow"],
+        schema_loader=loader,
+        semantic_frame=None,
+        base_conditions=[],
+        filter_specs=[
+            FilterSpec(target="is_task", operator="=", value="фактический отток", value_kind="literal")
+        ],
+    )
+    assert not any("is_task" in cond and "фактическ" in cond for cond in result["conditions"])
+    # unresolved опустошён, фильтр переехал в implicit_filters
+    assert not result.get("unresolved_filters")
+    implicit = result.get("implicit_filters") or []
+    assert implicit, "ожидаем перенос в implicit_filters"
+    assert implicit[0]["applied_via"] == "table_name_encoding"
+    assert implicit[0]["value"] == "фактический отток"
+    assert "outflow" in implicit[0]["table"]
+
+
+def test_numeric_column_vs_numeric_value_passes(tmp_path):
+    """Контр-тест: int-колонка + int литерал — фильтр применяется, unresolved пуст."""
+    from core.query_ir import FilterSpec
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["fact_x"],
+        "description": ["x"],
+        "grain": ["row"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["fact_x"],
+        "column_name": ["amount"],
+        "dType": ["int8"],
+        "description": ["amount"],
+        "is_primary_key": [False],
+        "unique_perc": [50.0],
+        "not_null_perc": [100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+    result = resolve_where(
+        user_input="amount > 100",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.fact_x": {"select": ["amount"], "filter": ["amount"]}},
+        selected_tables=["dm.fact_x"],
+        schema_loader=loader,
+        semantic_frame=None,
+        base_conditions=[],
+        filter_specs=[FilterSpec(target="amount", operator=">", value=100, value_kind="literal")],
+    )
+    assert any("amount" in cond and "100" in cond for cond in result["conditions"])
+    assert not result.get("unresolved_filters")

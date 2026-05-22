@@ -76,6 +76,49 @@ def _business_event_is_already_encoded_in_table(
     )
 
 
+def _filter_value_encoded_in_table(
+    *,
+    schema_loader,
+    table_key: str,
+    value: Any,
+) -> bool:
+    """True если значение фильтра уже семантически закодировано в имени/описании
+    выбранной таблицы (например "фактический отток" + uzp_dwh_fact_outflow).
+
+    Использует _event_stems для расширения значимыми синонимами (отток→outflow).
+    Сравнение по стемам, чтобы пройти морфологию русского ("оттока"→"отток").
+    """
+    if schema_loader is None or value is None or "." not in str(table_key):
+        return False
+    schema, table = str(table_key).split(".", 1)
+    try:
+        table_info = schema_loader.get_table_info(schema, table) or ""
+    except Exception:  # noqa: BLE001
+        return False
+    haystack = f"{schema}.{table} {table_info}"
+    haystack_stems = {_stem(tok) for tok in _tokenize(haystack) if tok}
+    if not haystack_stems:
+        return False
+    value_stems = _event_stems(str(value))
+    # Доп. стемы из самой строки — на случай если value не покрыт _event_stems.
+    value_stems = value_stems | {
+        _stem(tok) for tok in _tokenize(str(value)) if len(tok) >= 4
+    }
+    significant = {s for s in value_stems if s and len(s) >= 4}
+    if not significant:
+        return False
+    for token_stem in significant:
+        for cand in haystack_stems:
+            if cand == token_stem:
+                return True
+            if (
+                min(len(cand), len(token_stem)) >= 5
+                and (cand.startswith(token_stem) or token_stem.startswith(cand))
+            ):
+                return True
+    return False
+
+
 def _event_stems(business_event: str) -> set[str]:
     stems = {_stem(tok) for tok in _tokenize(business_event) if len(tok) >= 4}
     normalized = _normalize_text(business_event)
@@ -171,6 +214,129 @@ def _parse_condition(condition: str) -> tuple[str, str, str] | None:
     elif low in {"false", "0"}:
         value_norm = "false"
     return column, op, value_norm
+
+
+def _dtype_bucket(dtype: str) -> str:
+    """Категоризовать dtype колонки в крупные группы для type-check."""
+    d = (dtype or "").lower()
+    if "bool" in d:
+        return "bool"
+    if (
+        "int" in d
+        or "number" in d
+        or "decimal" in d
+        or "float" in d
+        or "numeric" in d
+        or "double" in d
+    ):
+        return "numeric"
+    if "timestamp" in d or "time" in d:
+        return "datetime"
+    if "date" in d:
+        return "date"
+    return "text"
+
+
+def _value_bucket(value: Any) -> str:
+    """Категоризовать Python-значение в ту же группу, что _dtype_bucket."""
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "numeric"
+    if value is None:
+        return "any"
+    text = str(value).strip()
+    if not text:
+        return "text"
+    low = text.lower()
+    if low in {"true", "false"}:
+        return "bool"
+    # Числовой литерал
+    try:
+        float(text)
+        return "numeric"
+    except (ValueError, TypeError):
+        pass
+    # ISO-дата YYYY-MM-DD или YYYY-MM
+    if re.match(r"^\d{4}-\d{2}(-\d{2})?$", text):
+        return "date"
+    if re.match(r"^\d{4}-\d{2}-\d{2}[ T]", text):
+        return "datetime"
+    return "text"
+
+
+def _dtype_compatible(col_dtype: str, value: Any) -> bool:
+    """True если literal-значение совместимо с dtype колонки."""
+    col = _dtype_bucket(col_dtype)
+    val = _value_bucket(value)
+    if val == "any":
+        return True
+    if col == val:
+        return True
+    # Допустимые кроссовые комбинации.
+    compatible = {
+        ("numeric", "text"),  # 42 в text-колонке — допустим (text ≥ numeric)
+        ("date", "datetime"),
+        ("datetime", "date"),
+        ("text", "numeric"),  # '42' в numeric — Postgres сам кастит
+    }
+    return (col, val) in compatible
+
+
+def _check_filter_dtype_compatibility(
+    *,
+    column: str,
+    table_key: str,
+    value: Any,
+    schema_loader,
+) -> tuple[bool, str]:
+    """Проверить, что литерал значение совместим с dtype колонки.
+
+    Returns:
+        (is_compatible, dtype). dtype — пустая строка если каталог не знает колонку.
+    """
+    if schema_loader is None or "." not in table_key:
+        return True, ""
+    schema, table = table_key.split(".", 1)
+    try:
+        dtype = str(schema_loader.get_column_dtype(schema, table, column) or "").strip()
+    except Exception:  # noqa: BLE001
+        return True, ""
+    if not dtype:
+        return True, ""
+    return _dtype_compatible(dtype, value), dtype
+
+
+# Регекс для извлечения сырого литерала из condition без bool-нормализации
+# (которая ломает type-check `is_outflow = 1` → numeric, не bool).
+_CONDITION_LITERAL_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*(>=|<=|!=|<>|=|<|>|ILIKE|LIKE|IN|NOT IN|IS NOT|IS)\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_condition_literal(condition: str) -> Any:
+    """Извлечь правую часть condition БЕЗ bool/numeric нормализации.
+
+    Возвращает Python-значение пригодное для `_value_bucket`:
+    - quoted строка → str без кавычек
+    - голый числовой литерал → int/float
+    - всё остальное → str.
+    """
+    match = _CONDITION_LITERAL_RE.match(str(condition or "").strip())
+    if not match:
+        return None
+    raw = match.group(3).strip()
+    raw = raw.replace("::date", "").replace("::timestamp", "").strip()
+    if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
+        return raw[1:-1]
+    # Числовой литерал — отдаём как число, чтобы value_bucket=numeric.
+    try:
+        if "." in raw:
+            return float(raw)
+        return int(raw)
+    except (ValueError, TypeError):
+        return raw
 
 
 def _add_unique(conditions: list[str], condition: str) -> None:
@@ -290,6 +456,7 @@ def resolve_where(
     conditions: list[str] = list(base_conditions or [])
     reasoning: list[str] = []
     applied_rules: list[str] = []
+    unresolved_filters: list[dict[str, Any]] = []
     clarification_message = ""
     clarification_spec: dict[str, Any] = {}
     user_filter_choices = dict(user_filter_choices or {})
@@ -330,6 +497,7 @@ def resolve_where(
         direct_filter_specs,
         schema_loader=schema_loader,
         time_range=time_range,
+        unresolved=unresolved_filters,
     )
     applied_rules.extend(direct_applied)
     applied_rules.extend(calendar_applied)
@@ -477,7 +645,39 @@ def resolve_where(
                 reasoning.append(f"ambiguity:{request_id}:gap={score_gap:.1f}")
                 break
 
-        _add_unique(conditions, str(best.get("condition") or ""))
+        best_condition = str(best.get("condition") or "")
+        best_column = str(best.get("column") or "")
+        best_table_key = str(best.get("table_key") or "")
+        # Direction: dtype-check. Извлекаем литерал из condition и проверяем
+        # его на совместимость с dtype выбранной колонки. Если не подходит —
+        # фильтр уходит в unresolved_filters, condition в SQL не попадает.
+        literal_value = _extract_condition_literal(best_condition)
+        if literal_value is not None and best_column and best_table_key:
+            compatible, dtype = _check_filter_dtype_compatibility(
+                column=best_column,
+                table_key=best_table_key,
+                value=literal_value,
+                schema_loader=schema_loader,
+            )
+            if not compatible:
+                logger.info(
+                    "WhereResolver: пропущен ranked-фильтр %s (%s) — dtype=%s vs value=%r",
+                    best_column, best_table_key, dtype, literal_value,
+                )
+                unresolved_filters.append({
+                    "target": str(best.get("target") or best_column),
+                    "value": literal_value,
+                    "candidate_column": best_column,
+                    "candidate_table": best_table_key,
+                    "candidate_dtype": dtype,
+                    "reason": "dtype_mismatch",
+                    "source": f"ranked:{request_id}",
+                })
+                reasoning.append(
+                    f"dtype_mismatch:{request_id}:{best_column} ({dtype})"
+                )
+                continue
+        _add_unique(conditions, best_condition)
         applied_rules.append(str(request_id))
         evidence = ", ".join(best.get("evidence", []) or [])
         reasoning.append(
@@ -539,11 +739,53 @@ def resolve_where(
     conditions = _drop_system_timestamp_when_time_axis_present(
         conditions, selected_columns, schema_loader=schema_loader,
     )
+
+    # Fix H: значения unresolved_filters, уже семантически закодированные
+    # в имени/описании выбранной таблицы (например "фактический отток" +
+    # uzp_dwh_fact_outflow), переезжают в implicit_filters. Summarizer
+    # упомянет их в финальном ответе ("учтён в таблице X").
+    implicit_filters: list[dict[str, Any]] = []
+    if unresolved_filters and selected_tables:
+        survivors: list[dict[str, Any]] = []
+        for item in unresolved_filters:
+            primary_table = (
+                str(item.get("candidate_table") or "")
+                or (selected_tables[0] if selected_tables else "")
+            )
+            value = item.get("value")
+            covered = False
+            tables_to_check = (
+                [primary_table] if primary_table else list(selected_tables)
+            )
+            for tk in tables_to_check:
+                if _filter_value_encoded_in_table(
+                    schema_loader=schema_loader,
+                    table_key=tk,
+                    value=value,
+                ):
+                    implicit_filters.append({
+                        "target": item.get("target"),
+                        "value": value,
+                        "applied_via": "table_name_encoding",
+                        "table": tk,
+                    })
+                    reasoning.append(
+                        f"implicit_filter:{tk}:{value}"
+                    )
+                    covered = True
+                    break
+            if not covered:
+                survivors.append(item)
+        unresolved_filters = survivors
+
     logger.info(
-        "WhereResolver: filter_intents=%d, applied_rules=%s, conditions=%d, candidates=%s",
+        "WhereResolver: filter_intents=%d, applied_rules=%s, conditions=%d, "
+        "unresolved=%d, implicit=%d, candidates=%s",
         len(filter_intents),
         applied_rules,
         len(conditions),
+        len(unresolved_filters),
+        len(implicit_filters),
         summarize_dict_keys(
             {k: [c.get('column') for c in v[:3]] for k, v in ranked_candidates.items()},
             label="candidates",
@@ -559,6 +801,8 @@ def resolve_where(
         "clarification_spec": clarification_spec,
         "user_filter_choices": user_filter_choices,
         "rejected_filter_choices": rejected_filter_choices,
+        "unresolved_filters": unresolved_filters,
+        "implicit_filters": implicit_filters,
     }
 
 
@@ -836,6 +1080,7 @@ def _apply_exact_filter_specs(
     *,
     schema_loader=None,
     time_range: dict[str, Any] | None = None,
+    unresolved: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     applied: list[str] = []
     if not filter_specs:
@@ -859,6 +1104,31 @@ def _apply_exact_filter_specs(
             schema_loader=schema_loader,
             time_range=time_range,
         ):
+            continue
+        # Direction: dtype-check. Не выпускаем условие, у которого значение
+        # несовместимо с типом выбранной колонки (например boolean = 'text').
+        compatible, dtype = _check_filter_dtype_compatibility(
+            column=column,
+            table_key=table_key,
+            value=spec.value,
+            schema_loader=schema_loader,
+        )
+        if not compatible:
+            logger.info(
+                "WhereResolver: пропущен exact-фильтр %s = %r — dtype=%s несовместим",
+                column, spec.value, dtype,
+            )
+            if unresolved is not None:
+                unresolved.append({
+                    "target": str(spec.target or ""),
+                    "value": spec.value,
+                    "operator": str(spec.operator or "="),
+                    "candidate_column": column,
+                    "candidate_table": table_key,
+                    "candidate_dtype": dtype,
+                    "reason": "dtype_mismatch",
+                    "source": f"query_spec:{idx}",
+                })
             continue
         condition = _condition_from_filter_spec(column, spec)
         if condition:

@@ -5,6 +5,7 @@ import logging
 import re
 from typing import Any
 
+from core.sql_static_checker import check_sql
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -168,11 +169,36 @@ class SummarizerNodes:
         if data_intent and not self._has_successful_execute_query(capped_tool_calls):
             last_error = str(state.get("last_error") or "").strip()
             parts = ["SQL не был выполнен, поэтому данных для ответа недостаточно."]
+            sql_is_valid = False
             if last_sql:
-                parts.append(
-                    "Сгенерированный SQL (не выполнен, проверьте вручную):\n"
-                    f"```sql\n{last_sql}\n```"
-                )
+                # Fix G: не вставляем SQL в ответ, если static checker его
+                # отверг — иначе пользователь видит запрос с галлюцинированными
+                # колонками (типа "тип события") и думает, что он рабочий.
+                try:
+                    check = check_sql(
+                        last_sql,
+                        schema_loader=getattr(self, "schema", None),
+                        allowed_tables=state.get("allowed_tables") or None,
+                    )
+                    sql_is_valid = bool(check.is_valid)
+                except Exception as _exc:  # noqa: BLE001
+                    logger.debug(
+                        "Summarizer: повторная проверка SQL упала (%s) — "
+                        "считаю SQL невалидным",
+                        _exc,
+                    )
+                    sql_is_valid = False
+                if sql_is_valid:
+                    parts.append(
+                        "Сгенерированный SQL (не выполнен, проверьте вручную):\n"
+                        f"```sql\n{last_sql}\n```"
+                    )
+                else:
+                    parts.append(
+                        "Сгенерированный SQL не прошёл статическую проверку и "
+                        "поэтому не показывается. Уточните вопрос или признак "
+                        "фильтрации — агент не смог построить корректный запрос."
+                    )
             if last_error:
                 parts.append(f"Причина: {last_error}")
             if not last_sql:
@@ -183,8 +209,8 @@ class SummarizerNodes:
             self.memory.add_message("assistant", answer)
             logger.warning(
                 "Summarizer: answer_data без успешного execute_query — "
-                "возвращаю SQL-only ответ (sql_present=%s)",
-                bool(last_sql),
+                "возвращаю SQL-only ответ (sql_present=%s, sql_valid=%s)",
+                bool(last_sql), sql_is_valid,
             )
             return {
                 "final_answer": answer,
@@ -252,6 +278,21 @@ class SummarizerNodes:
                 f"{answer.rstrip()}\n\n"
                 f"Предварительный результат:\n{preview_markdown}"
             ).strip()
+        # Fix H: упоминаем implicit_filters — фильтры, "съеденные" выбором таблицы.
+        _wres = state.get("where_resolution") or {}
+        _implicit = list(_wres.get("implicit_filters") or [])
+        if _implicit:
+            lines = []
+            for item in _implicit:
+                target = item.get("target") or ""
+                value = item.get("value")
+                table = item.get("table") or ""
+                label = f"«{value}»" if value is not None else target
+                lines.append(f"- {label} — учтён выбором таблицы `{table}`")
+            if lines:
+                note = "Применённые фильтры через выбор источника:\n" + "\n".join(lines)
+                if note not in answer:
+                    answer = f"{answer.rstrip()}\n\n{note}".strip()
         self.memory.add_message("assistant", answer)
 
         logger.info("Summarizer: ответ сформирован")

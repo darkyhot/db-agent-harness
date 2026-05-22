@@ -266,6 +266,47 @@ class CorrectionNodes:
 
         seen_fingerprints = list(state.get("correction_error_fingerprints") or [])
         seen_sql_hashes = list(state.get("correction_sql_hashes") or [])
+        # Fix E: если новый SQL опять упоминает имя из rejected_columns —
+        # обрываем цикл, не запускаем LLM. Покрывает паттерн «event_type →
+        # "тип события"»: разные синтаксические формы одного отвергнутого
+        # концепта. Сравнение идёт нормализовано — bare-токен и содержимое
+        # quoted-identifier ловятся одинаково.
+        rejected_cols = [
+            str(c).strip().lower()
+            for c in (state.get("rejected_columns") or [])
+            if str(c).strip()
+        ]
+        if last_sql and rejected_cols:
+            bare_tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", last_sql)
+            quoted_tokens = re.findall(r'"([^"]+)"', last_sql)
+            sql_tokens_lower = (
+                {t.strip().lower() for t in bare_tokens if t.strip()}
+                | {t.strip().lower() for t in quoted_tokens if t.strip()}
+            )
+            hit = next(
+                (col for col in rejected_cols if col in sql_tokens_lower),
+                None,
+            )
+            if hit:
+                logger.warning(
+                    "ErrorDiagnoser: SQL снова ссылается на отвергнутую колонку %r — "
+                    "останавливаю correction-loop",
+                    hit,
+                )
+                return {
+                    "last_error": None,
+                    "retry_count": retry_count + 1,
+                    "correction_error_fingerprints": seen_fingerprints,
+                    "correction_sql_hashes": seen_sql_hashes,
+                    "final_answer": (
+                        "Не удалось исправить SQL: попытки повторно используют "
+                        f"колонку «{hit}», которой нет в каталоге. "
+                        "Уточните формулировку запроса (какой признак фильтровать "
+                        "и в какой таблице).\n\n"
+                        f"Последний SQL:\n```sql\n{last_sql}\n```"
+                    ),
+                    "graph_iterations": iterations,
+                }
         if last_sql and error:
             fingerprint = hashlib.sha256(f"{last_sql}\n---\n{error}".encode("utf-8")).hexdigest()
             if fingerprint in seen_fingerprints:
@@ -397,7 +438,12 @@ class CorrectionNodes:
             "- use_tool: вызов диагностического инструмента (get_sample, get_table_columns)\n\n"
             "Если стратегия replace_column — заполни replacements:\n"
             '[{"old": "старое_имя", "new": "правильное_имя"}]\n'
-            "Правильное имя бери ТОЛЬКО из метаданных колонок ниже.\n\n"
+            "Правильное имя бери ТОЛЬКО из метаданных колонок ниже.\n"
+            "ВАЖНО: в `old`/`new` должны быть ТОЛЬКО голые имена колонок "
+            "(идентификаторы вида [a-zA-Z_][a-zA-Z0-9_]*) — БЕЗ операторов, "
+            "литералов и пробелов. Если нужно поменять предикат целиком "
+            "(колонку + значение/оператор) — выбирай fix_strategy='rewrite_sql' "
+            "и не заполняй replacements. Иначе ты потеряешь литералы запроса.\n\n"
             "Если причина неясна — установи needs_sample: true для вызова get_sample.\n"
             "Если ошибка неисправима — установи needs_replan: true."
         )
@@ -464,6 +510,12 @@ class CorrectionNodes:
         }
 
         # --- Тривиальное исправление кодом (replace_column) ---
+        # Fix F: принимаем replace_column ТОЛЬКО если old/new — голые идентификаторы.
+        # Любой пробел/кавычка/оператор означает, что diagnoser хочет менять
+        # предикат целиком — это потеряет литералы (баг с is_task = 'фактический
+        # отток' → is_task = true). В таком случае откатываемся на полный
+        # LLM-перепис через sql_fixer (rewrite_sql).
+        _bare_id_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
         if (
             diagnosis.get("fix_strategy") == "replace_column"
             and diagnosis.get("replacements")
@@ -475,6 +527,16 @@ class CorrectionNodes:
                 old_col = repl.get("old", "")
                 new_col = repl.get("new", "")
                 if not old_col or not new_col:
+                    all_replacements_valid = False
+                    break
+                if not (_bare_id_re.match(str(old_col)) and _bare_id_re.match(str(new_col))):
+                    logger.warning(
+                        "ErrorDiagnoser: replace_column отвергнут — old=%r/new=%r "
+                        "не bare-идентификаторы; делегирую sql_fixer (rewrite_sql)",
+                        old_col, new_col,
+                    )
+                    diagnosis["fix_strategy"] = "rewrite_sql"
+                    result["error_diagnosis"] = diagnosis
                     all_replacements_valid = False
                     break
                 # Проверяем что новая колонка реально существует в метаданных

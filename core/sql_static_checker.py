@@ -649,6 +649,77 @@ def _check_columns_against_catalog(
         result=result,
     )
 
+    _check_quoted_identifiers(
+        sql=sql,
+        real_tables=real_tables,
+        cte_columns=cte_columns,
+        result=result,
+    )
+
+
+def _check_quoted_identifiers(
+    *,
+    sql: str,
+    real_tables: dict[tuple[str, str], set[str]],
+    cte_columns: dict[str, set[str]],
+    result: StaticCheckResult,
+) -> None:
+    """Проверить, что `"..."` quoted-идентификаторы существуют в каталоге.
+
+    Остальные проверки (`_check_columns_against_catalog`,
+    `_extract_contextual_unqualified_identifiers`) стирают quoted-IDs до
+    валидации, поэтому LLM может вставить выдуманную колонку вида
+    `"тип события"`, и она проедет через checker незаметно. Здесь ловим такие.
+
+    Пропускаем quoted-IDs в позиции `AS "..."` — это определение алиаса,
+    обрабатывается отдельно в `_check_cyrillic_aliases`.
+    """
+    if not real_tables and not cte_columns:
+        return
+
+    valid_columns: set[str] = set()
+    for cols in real_tables.values():
+        valid_columns.update(cols)
+    for cols in cte_columns.values():
+        valid_columns.update(cols)
+
+    valid_table_names = {t for _, t in real_tables}
+    valid_schema_names = {s for s, _ in real_tables}
+
+    quoted_pat = re.compile(r'"([^"]+)"')
+    seen: set[str] = set()
+    missing: list[str] = []
+    as_prefix_pat = re.compile(r'\bAS\s*$', re.IGNORECASE)
+
+    for m in quoted_pat.finditer(sql):
+        ident_raw = m.group(1)
+        ident = ident_raw.lower().strip()
+        if not ident or ident in seen:
+            continue
+        # Skip alias definitions: `... AS "..."`
+        before = sql[: m.start()].rstrip()
+        if as_prefix_pat.search(before):
+            continue
+        seen.add(ident)
+        # Empty or whitespace-only — skip
+        if not ident.strip():
+            continue
+        if (
+            ident in valid_columns
+            or ident in valid_table_names
+            or ident in valid_schema_names
+        ):
+            continue
+        missing.append(ident_raw)
+
+    if missing:
+        result.add_error(
+            "Найдены quoted-identifier'ы, отсутствующие в каталоге: "
+            + ", ".join(f'"{m}"' for m in missing[:5])
+            + ". Используй колонки только из списка каталога; "
+            "не выдумывай имена в кавычках."
+        )
+
 
 def _extract_select_columns(sql: str) -> list[str]:
     """Извлечь колонки из SELECT-клаузы (без агрегатных функций).

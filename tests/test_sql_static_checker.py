@@ -482,3 +482,65 @@ class TestUnqualifiedCatalogColumns:
 
         assert result.is_valid
         assert not result.errors
+
+
+class TestQuotedIdentifierValidation:
+    """Quoted-identifier'ы должны валидироваться против каталога.
+
+    Регрессия (agent log от 2026-05-22): SqlSelfCorrector подставил
+    `"тип события"` — колонку, которой нет в таблице, и static checker
+    её пропустил, потому что quoted-IDs стирались до проверки.
+    """
+
+    def test_quoted_cyrillic_missing_column_errors(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "fact_outflow"): [
+                {"column_name": "report_dt", "dType": "date"},
+                {"column_name": "is_task", "dType": "bool"},
+            ]
+        })
+        sql = (
+            "SELECT COUNT(*) AS cnt FROM dm.fact_outflow "
+            "WHERE report_dt >= '2026-02-01'::date "
+            "AND is_task = true "
+            'AND "тип события" = \'фактический отток\''
+        )
+        result = check_sql(sql, schema_loader=loader)
+        assert not result.is_valid
+        assert any('тип события' in e for e in result.errors)
+
+    def test_quoted_valid_column_passes(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "clients"): [
+                {"column_name": "client_id", "dType": "int8"},
+                {"column_name": "name", "dType": "text"},
+            ]
+        })
+        sql = 'SELECT "client_id" FROM dm.clients WHERE "name" = \'X\''
+        result = check_sql(sql, schema_loader=loader)
+        # quoted "client_id" / "name" реально существуют — не должно быть ошибок
+        assert not any("quoted-identifier" in e for e in result.errors)
+
+    def test_quoted_alias_definition_not_flagged(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "sales"): [
+                {"column_name": "amount", "dType": "numeric"},
+            ]
+        })
+        # `AS "выручка"` — это soft-fix транслитерация алиаса;
+        # quoted-ID валидатор не должен помечать выражение в позиции AS.
+        sql = 'SELECT SUM(amount) AS "выручка" FROM dm.sales'
+        result = check_sql(sql, schema_loader=loader)
+        # Может быть warning о транслитерации, но не ошибка quoted-id
+        assert not any("quoted-identifier" in e for e in result.errors)
+
+    def test_quoted_missing_english_column_errors(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "clients"): [
+                {"column_name": "client_id", "dType": "int8"},
+            ]
+        })
+        sql = 'SELECT client_id FROM dm.clients WHERE "event_type" = \'X\''
+        result = check_sql(sql, schema_loader=loader)
+        assert not result.is_valid
+        assert any('event_type' in e for e in result.errors)

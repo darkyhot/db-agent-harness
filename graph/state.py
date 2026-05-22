@@ -157,6 +157,18 @@ class AgentState(TypedDict):
     # semantic frame запроса и результат where_resolver
     semantic_frame: dict[str, Any]
     where_resolution: dict[str, Any]
+    # Фильтры из QuerySpec, которые WhereResolver не смог привязать к колонке
+    # с совместимым dtype (например boolean-колонка для строкового значения).
+    # Передаётся sql_writer/sql_self_corrector как явный сигнал «не выдумывай колонки».
+    unresolved_filters: list[dict[str, Any]]
+    # Фильтры, чьё значение уже семантически закодировано в имени выбранной
+    # таблицы (например "фактический отток" + таблица uzp_dwh_fact_outflow).
+    # В SQL не попадают, но Summarizer упоминает их в финальном ответе.
+    implicit_filters: list[dict[str, Any]]
+    # Колонки, которые статический проверщик уже отверг как несуществующие.
+    # Используется error_diagnoser для обрыва correction-loop, если LLM
+    # повторно вводит ту же галлюцинированную колонку (в т.ч. в quoted-форме).
+    rejected_columns: list[str]
     join_decision: dict[str, Any]
     planning_confidence: dict[str, Any]
     evidence_trace: dict[str, Any]

@@ -22,6 +22,17 @@ from graph.state import AgentState
 logger = logging.getLogger(__name__)
 
 
+def _filter_label(item: dict[str, Any]) -> str:
+    """Краткая метка для unresolved/implicit фильтра."""
+    target = str(item.get("target") or "").strip()
+    value = item.get("value")
+    if target and value is not None:
+        return f"{target} = {value!r}"
+    if target:
+        return target
+    return str(value) if value is not None else "?"
+
+
 def _iter_aggregations(sql_blueprint: dict[str, Any]) -> list[dict[str, Any]]:
     aggregations = sql_blueprint.get("aggregations")
     if isinstance(aggregations, list) and aggregations:
@@ -39,6 +50,8 @@ def _render_plan(
     plan_diff_summary: str = "",
     sql_preview: str = "",
     sql_preview_note: str = "",
+    unresolved_filters: list[dict[str, Any]] | None = None,
+    implicit_filters: list[dict[str, Any]] | None = None,
 ) -> str:
     """Собрать человекочитаемый Markdown-план запроса."""
     lines: list[str] = ["**План запроса:**", ""]
@@ -109,6 +122,23 @@ def _render_plan(
     if filter_parts:
         lines.append(f"- **Фильтры:** {', '.join(filter_parts)}")
 
+    # Фильтры, уже закодированные в таблице (implicit) — не в WHERE,
+    # но пользователь должен видеть, что они "съедены" выбором таблицы.
+    if implicit_filters:
+        items = ", ".join(
+            f"{_filter_label(item)} → учтён в `{item.get('table') or ''}`"
+            for item in implicit_filters
+        )
+        lines.append(f"- **Учтено таблицей:** {items}")
+
+    # Фильтры, для которых нет подходящей колонки — не применены.
+    if unresolved_filters:
+        items = ", ".join(
+            f"{_filter_label(item)} (не привязан: {item.get('reason') or 'нет колонки'})"
+            for item in unresolved_filters
+        )
+        lines.append(f"- **Фильтры без колонки:** {items}")
+
     # Группировка
     group_by = sql_blueprint.get("group_by") or []
     if group_by:
@@ -156,8 +186,14 @@ def _build_deterministic_sql_preview(
     table_types: dict[str, str],
     schema_loader: Any,
     allowed_tables: list[str] | None = None,
-) -> tuple[str, str]:
-    """Build SQL text for preview without executing it or calling the LLM."""
+) -> tuple[str, str, bool]:
+    """Build SQL text for preview without executing it or calling the LLM.
+
+    Returns:
+        (sql, note, static_check_failed). Если static_check_failed=True,
+        план НЕ должен показываться пользователю — нужно отдать управление
+        sql_writer/correction-loop, чтобы они переписали SQL.
+    """
     try:
         sql = SqlBuilder().build(
             strategy=str(sql_blueprint.get("strategy") or "simple_select"),
@@ -168,9 +204,9 @@ def _build_deterministic_sql_preview(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("plan_preview: deterministic SQL preview failed: %s", exc)
-        return "", "детерминированный SQL-preview недоступен для этого плана"
+        return "", "детерминированный SQL-preview недоступен для этого плана", False
     if not sql:
-        return "", "детерминированный SQL-preview недоступен для этого плана"
+        return "", "детерминированный SQL-preview недоступен для этого плана", False
     sql = format_sql_safe(sql)
     try:
         check = check_sql(
@@ -180,11 +216,11 @@ def _build_deterministic_sql_preview(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("plan_preview: SQL preview static check failed: %s", exc)
-        return "", "SQL-preview не прошёл статическую проверку"
+        return "", "SQL-preview не прошёл статическую проверку", True
     if not check.is_valid:
         logger.info("plan_preview: SQL preview suppressed by static checker: %s", check.summary())
-        return "", "SQL-preview не прошёл статическую проверку"
-    return sql, ""
+        return "", "SQL-preview не прошёл статическую проверку", True
+    return sql, "", False
 
 
 class PlanPreviewNodes:
@@ -233,7 +269,7 @@ class PlanPreviewNodes:
             logger.warning("plan_preview: sql_blueprint пуст — транзит")
             return {}
 
-        sql_preview, sql_preview_note = _build_deterministic_sql_preview(
+        sql_preview, sql_preview_note, static_check_failed = _build_deterministic_sql_preview(
             sql_blueprint=sql_blueprint,
             selected_columns=selected_columns,
             join_spec=join_spec,
@@ -241,6 +277,26 @@ class PlanPreviewNodes:
             schema_loader=getattr(self, "schema", None),
             allowed_tables=allowed_tables,
         )
+
+        iteration = state.get("plan_preview_iteration", 0)
+
+        # Fix A: если deterministic SQL не прошёл статическую проверку — НЕ
+        # показываем план пользователю (иначе он видит фильтры с
+        # bool=text mismatch и подтверждает заведомо невыполнимый план).
+        # Транзит: пусть sql_writer / LLM-fallback / correction-loop разберутся.
+        if static_check_failed:
+            logger.warning(
+                "plan_preview: SQL preview не прошёл статическую проверку — "
+                "пропускаем показ плана (explicit_mode=%s, iteration=%d)",
+                explicit_mode, iteration,
+            )
+            return {
+                "plan_preview_pending": False,
+                "plan_preview_iteration": iteration,
+            }
+
+        unresolved_filters = list(where_resolution.get("unresolved_filters") or [])
+        implicit_filters = list(where_resolution.get("implicit_filters") or [])
         plan_md = _render_plan(
             sql_blueprint=sql_blueprint,
             selected_columns=selected_columns,
@@ -250,9 +306,10 @@ class PlanPreviewNodes:
             plan_diff_summary=str(state.get("plan_diff_summary") or ""),
             sql_preview=sql_preview,
             sql_preview_note=sql_preview_note,
+            unresolved_filters=unresolved_filters,
+            implicit_filters=implicit_filters,
         )
 
-        iteration = state.get("plan_preview_iteration", 0)
         logger.info(
             "plan_preview: показываем план (explicit_mode=%s, show_plan=%s, iteration=%d)",
             explicit_mode, show_plan, iteration,

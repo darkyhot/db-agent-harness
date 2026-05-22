@@ -649,12 +649,29 @@ class OrchestratorNodes:
                 "orch_history": history + [{"step": "run_analytics", "reason": "no subgraph", "ok": False}],
             }
 
+        # [DEBUG-PROBE] Phase 0: вход в run_analytics
+        logger.info(
+            "[DEBUG-PROBE] run_analytics INPUT: final_answer_present=%s, "
+            "tool_calls=%d, query_spec_present=%s",
+            bool(state.get("final_answer")),
+            len(state.get("tool_calls") or []),
+            bool(state.get("query_spec")),
+        )
+
         final_state: dict[str, Any] = dict(state)
         try:
             for event in sub.stream(dict(state)):
-                payload = list(event.values())[0]
-                if isinstance(payload, dict):
-                    final_state.update(payload)
+                for node_name, payload in event.items():
+                    if isinstance(payload, dict):
+                        # [DEBUG-PROBE] какие ключи обновляет каждый узел
+                        has_fa = "final_answer" in payload and bool(payload.get("final_answer"))
+                        logger.info(
+                            "[DEBUG-PROBE] subgraph event node=%s keys=%s final_answer_in_payload=%s",
+                            node_name,
+                            sorted(payload.keys()),
+                            has_fa,
+                        )
+                        final_state.update(payload)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Orchestrator/run_analytics failed")
             return {
@@ -662,6 +679,15 @@ class OrchestratorNodes:
                 "orch_next_step": "finish",
                 "orch_history": history + [{"step": "run_analytics", "reason": str(exc)[:200], "ok": False}],
             }
+
+        # [DEBUG-PROBE] Phase 0: финальное состояние после прохода подграфа
+        logger.info(
+            "[DEBUG-PROBE] run_analytics AFTER stream: final_answer_present=%s, "
+            "tool_calls=%d, query_spec_present=%s",
+            bool(final_state.get("final_answer")),
+            len(final_state.get("tool_calls") or []),
+            bool(final_state.get("query_spec")),
+        )
 
         paused = bool(
             final_state.get("plan_preview_pending")
@@ -681,6 +707,15 @@ class OrchestratorNodes:
         else:
             out["orch_resume_step"] = ""
             out["orch_next_step"] = "finish"
+
+        # [DEBUG-PROBE] Phase 0: что именно возвращаем в outer-граф
+        logger.info(
+            "[DEBUG-PROBE] run_analytics RETURN: final_answer_present=%s, "
+            "tool_calls=%d, orch_next_step=%s",
+            bool(out.get("final_answer")),
+            len(out.get("tool_calls") or []),
+            out.get("orch_next_step"),
+        )
         return out
 
     # ------------------------------------------------------------------

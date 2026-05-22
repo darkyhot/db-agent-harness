@@ -141,6 +141,19 @@ class SummarizerNodes:
 
     def summarizer(self, state: AgentState) -> dict[str, Any]:
         """Узел формирования финального ответа пользователю."""
+        # [DEBUG-PROBE] Phase 0: вход в summarizer
+        _capped_for_probe = self._cap_tool_calls(state.get("tool_calls", []))
+        logger.info(
+            "[DEBUG-PROBE] summarizer ENTER: final_answer_present=%s, "
+            "tool_calls=%d, query_spec_present=%s, "
+            "is_answer_data=%s, has_successful_exec=%s",
+            bool(state.get("final_answer")),
+            len(state.get("tool_calls") or []),
+            bool(state.get("query_spec")),
+            self._is_answer_data_request(state),
+            self._has_successful_execute_query(_capped_for_probe),
+        )
+
         # Сохраняем примеры исправлений в долгосрочную память
         new_examples = state.get("correction_examples", [])
         if new_examples:

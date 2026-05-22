@@ -82,27 +82,6 @@ def _extract_leading_sql(text: str) -> str | None:
     return s
 
 
-_CREATE_DIR_RE = re.compile(
-    r"^\s*(?:создай|создать|сделай|сделать)\s+(?:мне\s+)?"
-    r"(?:папку|директори[юя]|каталог)\s*(?P<path>.*)$",
-    re.IGNORECASE,
-)
-_MKDIR_RE = re.compile(r"^\s*mkdir\s+(?:-p\s+)?(?P<path>.+)$", re.IGNORECASE)
-
-
-def _extract_create_directory_path(text: str) -> str | None:
-    """Return requested workspace-relative directory path, if input asks for it."""
-    raw = (text or "").strip()
-    match = _CREATE_DIR_RE.match(raw) or _MKDIR_RE.match(raw)
-    if not match:
-        return None
-    path = str(match.group("path") or "").strip()
-    path = path.strip("`'\"«»“”")
-    path = re.sub(r"\s+(?:пожалуйста|please)\s*$", "", path, flags=re.IGNORECASE).strip()
-    path = path.rstrip(" .;")
-    return path
-
-
 def _strip_workspace_prefix(path: str) -> str:
     """Убрать ведущий 'workspace/' из пути, чтобы пользователь мог писать оба варианта."""
     p = path.strip().replace("\\", "/")
@@ -178,13 +157,34 @@ class OrchestratorNodes:
         if pending in ("summarize", "finish") and state.get("orch_history"):
             return {"orch_next_step": pending, "graph_iterations": iterations}
 
-        # 3) Очередь предзапланированных шагов (детерм. guard / полный LLM-план).
+        # 3) Очередь предзапланированных шагов (multi-step LLM-план или
+        #    хвост от guard сырого SQL). Элемент — либо строка (имя шага),
+        #    либо dict {"step": "...", ...args} с полными аргументами.
         queued = list(state.get("orch_plan") or [])
         if queued:
             nxt = queued.pop(0)
+            if isinstance(nxt, dict):
+                step_name = str(nxt.get("step") or "").strip()
+                logger.info("Orchestrator: queued (dict) → %s", step_name)
+                upd: dict[str, Any] = {
+                    "orch_next_step": step_name,
+                    "orch_plan": queued,
+                    "orch_step_count": step_count + 1,
+                    "graph_iterations": iterations,
+                }
+                # Аргументы шага из dict перетирают текущие значения state.
+                if "path" in nxt or "folder" in nxt:
+                    upd["orch_fs_path"] = str(nxt.get("path") or nxt.get("folder") or "")
+                if "fs_tool" in nxt:
+                    upd["orch_fs_tool"] = str(nxt.get("fs_tool") or "")
+                if "content" in nxt:
+                    upd["orch_fs_content"] = str(nxt.get("content") or "")
+                if "sql" in nxt:
+                    upd["orch_sql"] = str(nxt.get("sql") or "")
+                return upd
             logger.info("Orchestrator: queued → %s", nxt)
             return {
-                "orch_next_step": nxt,
+                "orch_next_step": str(nxt),
                 "orch_plan": queued,
                 "orch_step_count": step_count + 1,
                 "graph_iterations": iterations,
@@ -206,21 +206,6 @@ class OrchestratorNodes:
                     "orch_history": [{
                         "step": "guard:raw_sql",
                         "reason": "input is a standalone SQL statement",
-                        "ok": True,
-                    }],
-                    "graph_iterations": iterations,
-                }
-
-            fs_path = _extract_create_directory_path(user_input)
-            if fs_path is not None:
-                logger.info("Orchestrator: deterministic create-directory guard → %s", fs_path or "<empty>")
-                return {
-                    "orch_fs_path": fs_path,
-                    "orch_next_step": "create_directory",
-                    "orch_step_count": step_count + 1,
-                    "orch_history": [{
-                        "step": "guard:create_directory",
-                        "reason": "input asks to create workspace directory",
                         "ok": True,
                     }],
                     "graph_iterations": iterations,
@@ -285,6 +270,28 @@ class OrchestratorNodes:
             logger.warning("Orchestrator: неизвестный шаг '%s' → run_analytics", step)
             step = "run_analytics"
 
+        # Guardrail: LLM иногда видит в session memory предыдущий хороший ответ
+        # и пытается "переиспользовать" его, выбирая summarize/finish без answer
+        # в текущем ходу. Признак — orch_history текущего хода пуст (нет ни
+        # execute_sql/run_analytics, ни успешного FS-шага). В этом случае
+        # summarize/finish без готового answer привёл бы к outer-summarizer с
+        # пустым контекстом и LLM-ответу "Данных недостаточно". Безопасно
+        # деградируем в аналитику.
+        if step in ("summarize", "finish") and not answer:
+            has_real_work = any(
+                h.get("step") in (
+                    "execute_sql", "run_analytics",
+                    "create_directory", "file_operation",
+                ) and h.get("ok")
+                for h in history
+            )
+            if not has_real_work:
+                logger.warning(
+                    "Orchestrator: '%s' без выполненной работы в orch_history → run_analytics",
+                    step,
+                )
+                step = "run_analytics"
+
         update: dict[str, Any] = {
             "orch_next_step": step,
             "orch_step_count": step_count + 1,
@@ -301,20 +308,64 @@ class OrchestratorNodes:
             update["orch_fs_content"] = fs_content
 
         # Необязательный полный план: первый шаг сейчас, остаток — в очередь.
+        # Поддерживаем два формата:
+        #   1) [{"step": "...", ...args}, ...] — новый, multi-step с args.
+        #   2) ["step_name", ...] — старый, только имена шагов (для совместимости
+        #      с guard сырого SQL: ["summarize"]).
         plan = decision.get("plan")
         if isinstance(plan, list) and plan:
-            seq = [str(x).strip() for x in plan if str(x).strip() in _VALID_ORCH_STEPS]
-            if seq:
-                update["orch_next_step"] = seq[0]
-                update["orch_plan"] = seq[1:]
-                step = seq[0]
+            normalized: list[Any] = []
+            for item in plan:
+                if isinstance(item, dict):
+                    step_name = str(item.get("step") or "").strip()
+                    if step_name in _VALID_ORCH_STEPS:
+                        normalized.append(item)
+                elif isinstance(item, str) and item.strip() in _VALID_ORCH_STEPS:
+                    normalized.append(item.strip())
+            if normalized:
+                first = normalized[0]
+                if isinstance(first, dict):
+                    step = str(first.get("step") or "").strip()
+                    update["orch_next_step"] = step
+                    if "path" in first or "folder" in first:
+                        update["orch_fs_path"] = str(first.get("path") or first.get("folder") or "")
+                    if "fs_tool" in first:
+                        update["orch_fs_tool"] = str(first.get("fs_tool") or "")
+                    if "content" in first:
+                        update["orch_fs_content"] = str(first.get("content") or "")
+                    if "sql" in first:
+                        update["orch_sql"] = str(first.get("sql") or "")
+                else:
+                    step = str(first)
+                    update["orch_next_step"] = step
+                update["orch_plan"] = normalized[1:]
+                update["orch_plan_active"] = True
+                # Новый план перетирает предыдущий накопитель сообщений.
+                update["orch_plan_step_answers"] = []
 
         if step == "ask_clarification":
             update["needs_clarification"] = True
             update["clarification_message"] = question or "Уточните, пожалуйста, запрос."
-        elif step == "finish":
+        elif step in ("summarize", "finish"):
+            # summarize/finish с готовым answer — оркестратор сам сформулировал
+            # ответ; пробрасываем его в final_answer, чтобы роутер ушёл в END
+            # минуя outer-summarizer (иначе тот пойдёт в LLM с пустым tool_results
+            # и вернёт "Данных недостаточно").
             if answer:
                 update["final_answer"] = answer
+            elif step == "finish":
+                # Fallback: LLM забыла answer, но в текущем ходу был выполнен
+                # FS-шаг — используем его сообщение как final_answer, чтобы
+                # outer-summarizer не запускался с пустым контекстом.
+                fallback = ""
+                for msg in reversed(state.get("messages") or []):
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        content = str(msg.get("content") or "").strip()
+                        if content:
+                            fallback = content
+                            break
+                if fallback:
+                    update["final_answer"] = fallback
 
         return update
 
@@ -559,17 +610,9 @@ class OrchestratorNodes:
         answer = f"Папка создана в workspace/: {path}"
         self.memory.add_message("tool", f"[create_directory] {result_text}")
         self.memory.add_message("assistant", answer)
-        return {
-            "final_answer": answer,
-            "tool_calls": tool_calls,
-            "orch_next_step": "finish",
-            "messages": state["messages"] + [{"role": "assistant", "content": answer}],
-            "orch_history": history + [{
-                "step": "create_directory",
-                "reason": "ok",
-                "ok": True,
-            }],
-        }
+        return self._finalize_fs_step_success(
+            state, answer, tool_calls, history, "create_directory", "ok",
+        )
 
     def orch_file_operation(self, state: AgentState) -> dict[str, Any]:
         fs_tool = str(state.get("orch_fs_tool") or "").strip()
@@ -630,13 +673,9 @@ class OrchestratorNodes:
         answer = self._render_tool_result(result_text)
         self.memory.add_message("tool", f"[{fs_tool}] {answer[:500]}")
         self.memory.add_message("assistant", answer)
-        return {
-            "final_answer": answer,
-            "tool_calls": tool_calls,
-            "orch_next_step": "finish",
-            "messages": state["messages"] + [{"role": "assistant", "content": answer}],
-            "orch_history": history + [{"step": "file_operation", "reason": f"{fs_tool} ok", "ok": True}],
-        }
+        return self._finalize_fs_step_success(
+            state, answer, tool_calls, history, "file_operation", f"{fs_tool} ok",
+        )
 
     def orch_run_analytics(self, state: AgentState) -> dict[str, Any]:
         sub = getattr(self, "_analytics_subgraph", None)
@@ -690,6 +729,51 @@ class OrchestratorNodes:
         return out
 
     # ------------------------------------------------------------------
+    # Финализация FS-шага: plan-active → композируем итог; иначе → возврат
+    # в orchestrator для пере-планирования через LLM.
+    # ------------------------------------------------------------------
+
+    def _finalize_fs_step_success(
+        self,
+        state: AgentState,
+        answer: str,
+        tool_calls: list,
+        history: list,
+        step_name: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Корректное завершение успешного FS-шага.
+
+        - plan_active=True + queue empty → последний шаг плана: композируем
+          final_answer из накопленных сообщений и завершаем граф (`finish`).
+        - plan_active=True + queue не пуст → промежуточный шаг плана: возвращаем
+          управление оркестратору; он dequeue'ит следующий шаг.
+        - plan_active=False → step-by-step режим: возвращаем управление
+          оркестратору; он перепланирует через LLM (которая решит `finish` с
+          answer или следующий шаг).
+        """
+        plan_active = bool(state.get("orch_plan_active"))
+        queue_remaining = bool(state.get("orch_plan"))
+        step_answers = list(state.get("orch_plan_step_answers") or [])
+        step_answers.append(answer)
+
+        base: dict[str, Any] = {
+            "tool_calls": tool_calls,
+            "messages": state["messages"] + [{"role": "assistant", "content": answer}],
+            "orch_history": history + [{"step": step_name, "reason": reason, "ok": True}],
+            "orch_plan_step_answers": step_answers,
+        }
+        if plan_active and not queue_remaining:
+            composed = "\n".join(step_answers) if len(step_answers) > 1 else answer
+            base["final_answer"] = composed
+            base["orch_next_step"] = "finish"
+            base["orch_plan_active"] = False
+            base["orch_plan_step_answers"] = []
+        else:
+            base["orch_next_step"] = ""
+        return base
+
+    # ------------------------------------------------------------------
     # Промпты планировщика
     # ------------------------------------------------------------------
 
@@ -706,7 +790,8 @@ class OrchestratorNodes:
             "- file_operation: пользователь просит создать/прочитать/изменить/удалить "
             "файл или показать список файлов в workspace/. Укажи:\n"
             "  'fs_tool': одно из create_file|read_file|edit_file|delete_file|list_files,\n"
-            "  'path': относительный путь внутри workspace/ (без префикса 'workspace/'),\n"
+            "  'path': относительный путь внутри workspace/ (без префикса 'workspace/');\n"
+            "         для файла во вложенной папке пиши полный путь, например 'семплы/data.csv',\n"
             "  'content': содержимое файла (только для create_file и edit_file).\n"
             "- explain_sql: пользователь просит ОБЪЯСНИТЬ присланный SQL (не "
             "выполнять). Положи запрос в 'sql'. Можно предварительно вызвать "
@@ -722,7 +807,8 @@ class OrchestratorNodes:
             "'question'.\n"
             "- summarize: данные уже получены (execute_sql) — сформировать ответ.\n"
             "- finish: задача завершена ИЛИ запрос вне твоих возможностей. "
-            "Готовый текст ответа положи в 'answer'.\n\n"
+            "ОБЯЗАТЕЛЬНО заполни 'answer' — короткий отчёт пользователю о результате\n"
+            "  (что создано/прочитано/изменено; для multi-step — все выполненные шаги).\n\n"
             "Границы возможностей:\n"
             "- Ты умеешь отвечать на вопросы по данным каталога (SQL-аналитика, "
             "объяснение/выполнение SQL), создавать папки и работать с файлами "
@@ -733,17 +819,52 @@ class OrchestratorNodes:
             "и в 'answer' честно скажи, что это вне твоих возможностей и что ты "
             "отвечаешь на вопросы по данным каталога. НЕ запускай run_analytics "
             "для таких запросов.\n\n"
+            "ДЕКОМПОЗИЦИЯ MULTI-STEP ЗАПРОСОВ:\n"
+            "Если запрос содержит несколько действий в одном предложении "
+            "('создай папку X и в ней файл Y', 'прочитай файл A и запиши анализ в B') — "
+            "сделай одно из двух:\n"
+            "(1) Если аргументы ВСЕХ шагов известны заранее (статичные имена/содержимое) — "
+            "верни поле 'plan' со списком ВСЕХ шагов в правильном порядке. КАЖДЫЙ "
+            "элемент plan — объект {\"step\": \"...\", ...args}:\n"
+            "  Пример: пользователь говорит \"создай папку семплы и в ней csv файл "
+            "с 10 строками gosb_id\":\n"
+            "  {\"step\": \"create_directory\", \"path\": \"семплы\",\n"
+            "   \"plan\": [\n"
+            "     {\"step\": \"create_directory\", \"path\": \"семплы\"},\n"
+            "     {\"step\": \"file_operation\", \"fs_tool\": \"create_file\",\n"
+            "      \"path\": \"семплы/gosb_ids.csv\",\n"
+            "      \"content\": \"gosb_id\\n0\\n1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n\"}\n"
+            "   ],\n"
+            "   \"reason\": \"Сначала папка, затем файл в ней\"}\n"
+            "  Поле 'step' верхнего уровня = первый элемент plan (дублируй args тоже).\n"
+            "(2) Если аргументы следующего шага зависят от результата текущего "
+            "(надо сначала прочитать файл, чтобы знать что записать) — верни ОДИН "
+            "шаг БЕЗ 'plan'. После его выполнения тебя позовут снова — увидишь "
+            "результат в журнале tool_calls и спланируешь следующий шаг.\n"
+            "ПРАВИЛО: НЕ кладй ВЕСЬ запрос в одно поле path/folder. Если в "
+            "пользовательском вводе есть союз \"и\", запятая или второе действие — "
+            "это multi-step, используй (1) или (2).\n\n"
             "Правила:\n"
             "- Верни ТОЛЬКО JSON-объект, без markdown.\n"
             "- Формат: {\"step\": \"...\", \"sql\": \"...\", \"path\": \"...\", "
             "\"fs_tool\": \"...\", \"content\": \"...\", "
-            "\"question\": \"...\", \"answer\": \"...\", \"plan\": [\"...\"], \"reason\": \"...\"}.\n"
+            "\"question\": \"...\", \"answer\": \"...\", "
+            "\"plan\": [{...}, ...], \"reason\": \"...\"}.\n"
             "- 'sql'/'path'/'fs_tool'/'content'/'question'/'answer'/'plan' заполняй только когда нужны.\n"
             "- Если запрос ПО ДАННЫМ, но сомневаешься в деталях — run_analytics "
             "(безопасный дефолт для аналитики). Сомнение про данные ≠ запрос вне "
             "возможностей: последнее всегда 'finish'.\n"
             "- Не зацикливайся: после execute_sql(READ) иди в summarize/finish; "
             "после explain_sql — finish.\n"
+            "- 'summarize' разрешён ТОЛЬКО если в журнале текущего хода "
+            "(orch_history) уже есть успешный execute_sql или run_analytics. "
+            "Контекст сессии ≠ журнал хода: предыдущий ответ оттуда НЕ "
+            "считается выполненной работой. При повторе того же запроса от "
+            "пользователя — выбирай run_analytics.\n"
+            "- После успешного FS-шага (create_directory/file_operation), если "
+            "задача пользователя ПОЛНОСТЬЮ выполнена — выбирай 'finish' с answer. "
+            "Если требуется ещё одно действие (например, после read_file нужно "
+            "что-то записать) — выбирай следующий шаг, не finish.\n"
         )
 
     def _orchestrator_user_prompt(self, state: AgentState) -> str:
@@ -789,6 +910,20 @@ class OrchestratorNodes:
             artifacts.append("execute_query=выполнен (готово к summarize)")
         if artifacts:
             parts.append("Доступные артефакты: " + ", ".join(artifacts))
+
+        # Сводка последних FS-tool вызовов — критична для step-by-step режима,
+        # чтобы LLM при пере-планировании видела результат предыдущего шага
+        # (например, прочитанный файл) и могла построить следующий шаг.
+        fs_tool_names = _FILE_OP_TOOLS | {"create_directory"}
+        recent_fs = [tc for tc in tcs if tc.get("tool") in fs_tool_names][-3:]
+        if recent_fs:
+            lines = []
+            for tc in recent_fs:
+                args = tc.get("args") or {}
+                path = args.get("path") or args.get("subdir") or ""
+                result = str(tc.get("result") or "")[:300]
+                lines.append(f"  • {tc.get('tool')}({path}) → {result}")
+            parts.append("Результаты предыдущих FS-шагов:\n" + "\n".join(lines))
 
         parts.append("Верни JSON со следующим шагом:")
         return "\n\n".join(parts)

@@ -220,8 +220,18 @@ class AgentState(TypedDict):
     # Все поля переживают рекурсивный перезапуск из CLI через plan_context.
     orch_history: list[dict[str, Any]]
     # [{"step": "execute_sql", "reason": "...", "ok": True}, ...] — журнал решений.
-    orch_plan: list[str]
-    # Очередь предзапланированных шагов (детерм. guard или полный LLM-план).
+    orch_plan: list[Any]
+    # Очередь предзапланированных шагов. Элементы — либо строка (имя шага), либо
+    # dict {"step": "...", ...args} с полными аргументами для шага (multi-step
+    # FS-план от LLM, args которого известны заранее).
+    orch_plan_active: bool
+    # True, когда LLM вернул план (поле 'plan'). Сигнализирует FS-step нодам:
+    # когда очередь опустеет, нужно компоновать final_answer и завершать граф,
+    # а не перепланировать. False — step-by-step режим (LLM перепланирует после
+    # каждого шага).
+    orch_plan_step_answers: list[str]
+    # Накопитель кратких сообщений FS-шагов текущего multi-step плана. Финальный
+    # ответ при завершении плана = "\n".join(orch_plan_step_answers).
     orch_next_step: str
     # Шаг, выбранный orchestrator на текущей итерации (для _route_after_orchestrator).
     orch_step_count: int

@@ -802,6 +802,8 @@ def create_initial_state(
         # перезапуск графа из CLI (resume через plan_context=result).
         orch_history=list(ctx.get("orch_history") or []),
         orch_plan=list(ctx.get("orch_plan") or []),
+        orch_plan_active=bool(ctx.get("orch_plan_active") or False),
+        orch_plan_step_answers=list(ctx.get("orch_plan_step_answers") or []),
         orch_next_step=str(ctx.get("orch_next_step") or ""),
         orch_step_count=int(ctx.get("orch_step_count", 0) or 0),
         orch_sql=str(ctx.get("orch_sql") or ""),

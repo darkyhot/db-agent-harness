@@ -307,7 +307,16 @@ def test_where_resolver_treats_business_event_as_table_context_for_single_select
         base_conditions=[],
     )
     assert result["needs_clarification"] is False
-    assert "table_context_covers_business_event" in result["reasoning"]
+    # Either suppression path is fine — F2 short-circuit (G1) or the older
+    # business-event-encoded-in-table guard. Both fold the filter into the
+    # table context without surfacing a clarification.
+    assert any(
+        marker in result["reasoning"]
+        for marker in (
+            "table_context_covers_business_event",
+            "table_context_covers_value:dm.uzp_dwh_fact_outflow:фактический отток",
+        )
+    )
 
 
 def test_where_resolver_adds_implicit_subject_flag_for_task_subject(tmp_path):
@@ -577,3 +586,273 @@ def test_numeric_column_vs_numeric_value_passes(tmp_path):
     )
     assert any("amount" in cond and "100" in cond for cond in result["conditions"])
     assert not result.get("unresolved_filters")
+
+
+# ---------------------------------------------------------------------------
+# G1/G2/G3: F2 fallback clarification — table-encoded short-circuit and
+# plausibility filter for offered candidates (2026-05-25 regression).
+# ---------------------------------------------------------------------------
+
+
+def test_f2_short_circuits_when_value_encoded_in_selected_table(tmp_path):
+    """When the filter intent's value is already encoded in the chosen table
+    (e.g. «фактический отток» + uzp_dwh_fact_outflow) AND the intent's
+    column_key points at a DIFFERENT table, the F2 fallback should fold the
+    filter into implicit_filters and emit no clarification.
+    """
+    loader = _loader(tmp_path)
+    tables_df = pd.read_csv(tmp_path / "tables_list.csv")
+    tables_df = pd.concat([
+        tables_df,
+        pd.DataFrame({
+            "schema_name": ["dm"],
+            "table_name": ["uzp_dwh_fact_outflow"],
+            "description": ["Информация по фактическим оттокам для УЗП"],
+            "grain": ["snapshot"],
+        }),
+    ], ignore_index=True)
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+
+    frame = {
+        "business_event": "фактический отток",
+        "filter_intents": [
+            {
+                "request_id": "text:dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+                "kind": "text_search",
+                "query_text": "фактический отток",
+                "value": "фактический отток",
+                "column_key": "dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+            }
+        ],
+    }
+    result = resolve_where(
+        user_input="Сколько задач по фактическому оттоку",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.uzp_dwh_fact_outflow": {"select": ["inn"], "aggregate": ["inn"]}},
+        selected_tables=["dm.uzp_dwh_fact_outflow"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+    )
+    assert result["needs_clarification"] is False
+    assert result["clarification_spec"] == {} or not result["clarification_spec"]
+    assert any(
+        item.get("applied_via") == "table_name_encoding"
+        and item.get("table") == "dm.uzp_dwh_fact_outflow"
+        for item in result.get("implicit_filters") or []
+    )
+    assert any(
+        r.startswith("table_context_covers_value:dm.uzp_dwh_fact_outflow")
+        for r in result["reasoning"]
+    )
+
+
+def test_f2_filters_out_identifier_and_low_confidence_candidates():
+    """G2: F2 fallback must skip semantic_class=identifier and confidence=low
+    candidates when offering choices to the user. The previous behaviour
+    surfaced login/ФИО columns for free-text values like «фактический отток».
+    """
+    from core.where_resolver import resolve_where
+    import types
+
+    # Build a tiny in-memory loader stub that exposes the minimum surface
+    # resolve_where uses; we monkey-rank candidates via a fake
+    # rank_filter_candidates by patching the module attribute.
+    class _Stub:
+        tables_df = pd.DataFrame({
+            "schema_name": ["dm"],
+            "table_name": ["t"],
+            "description": ["test table"],
+            "grain": ["snapshot"],
+        })
+        def get_table_info(self, schema, table):
+            return "Таблица: dm.t\nОписание: test table\nКолонки:"
+        def get_table_columns(self, schema, table):
+            return pd.DataFrame(columns=["column_name", "dType", "description"])
+        def get_table_semantics(self, schema, table):
+            return {}
+        def get_column_semantics(self, schema, table, column):
+            return {}
+        def get_value_profile(self, schema, table, column):
+            return {}
+
+    import core.where_resolver as wr
+    original = wr.rank_filter_candidates
+
+    def fake_rank(*, user_input, intent, selected_tables, schema_loader, semantic_frame):
+        return {
+            "text:dm.t.fake": [
+                {
+                    "request_id": "text:dm.t.fake",
+                    "column": "autor_login",
+                    "description": "Логин автора задачи",
+                    "score": 18.0,
+                    "confidence": "low",
+                    "semantic_class": "identifier",
+                    "condition": "autor_login ILIKE '%фактический отток%'",
+                    "table_key": "dm.t",
+                    "value": "фактический отток",
+                    "evidence": [],
+                },
+                {
+                    "request_id": "text:dm.t.fake",
+                    "column": "event_label",
+                    "description": "Метка события",
+                    "score": 55.0,
+                    "confidence": "medium",
+                    "semantic_class": "enum_like",
+                    "condition": "event_label = 'фактический отток'",
+                    "table_key": "dm.t",
+                    "value": "фактический отток",
+                    "evidence": [],
+                },
+            ]
+        }
+
+    wr.rank_filter_candidates = fake_rank
+    try:
+        frame = {
+            "filter_intents": [
+                {
+                    "request_id": "text:dm.t.fake",
+                    "kind": "text_search",
+                    "query_text": "фактический отток",
+                    "value": "фактический отток",
+                    # column_key intentionally on a DIFFERENT table so G1
+                    # short-circuit does not fire.
+                    "column_key": "dm.other.col",
+                }
+            ]
+        }
+        result = wr.resolve_where(
+            user_input="фактический отток",
+            intent={"filter_conditions": []},
+            selected_columns={"dm.t": {"select": ["x"], "aggregate": ["x"]}},
+            selected_tables=["dm.t"],
+            schema_loader=_Stub(),
+            semantic_frame=frame,
+            base_conditions=[],
+        )
+    finally:
+        wr.rank_filter_candidates = original
+
+    spec = result["clarification_spec"]
+    assert spec, "expected a structured clarification_spec"
+    cols = [opt["column"] for opt in spec["options"]]
+    assert "autor_login" not in cols, "identifier column must be filtered out"
+    assert "event_label" in cols, "plausible enum_like candidate must remain"
+
+
+def test_f2_falls_back_to_generic_message_when_no_plausible_candidate():
+    """G2: when every candidate is identifier/low/sub-threshold, F2 should
+    emit the generic message and an EMPTY clarification_spec (no implausible
+    options shown to the user).
+    """
+    import core.where_resolver as wr
+
+    class _Stub:
+        tables_df = pd.DataFrame({
+            "schema_name": ["dm"],
+            "table_name": ["t"],
+            "description": ["test"],
+            "grain": ["snapshot"],
+        })
+        def get_table_info(self, schema, table): return "Таблица: dm.t"
+        def get_table_columns(self, schema, table):
+            return pd.DataFrame(columns=["column_name", "dType", "description"])
+        def get_table_semantics(self, schema, table): return {}
+        def get_column_semantics(self, schema, table, column): return {}
+        def get_value_profile(self, schema, table, column): return {}
+
+    def fake_rank(**_):
+        return {
+            "text:dm.t.fake": [
+                {
+                    "request_id": "text:dm.t.fake",
+                    "column": "autor_login",
+                    "score": 18.0,
+                    "confidence": "low",
+                    "semantic_class": "identifier",
+                    "condition": "autor_login ILIKE '%X%'",
+                    "table_key": "dm.t",
+                    "value": "X",
+                    "evidence": [],
+                },
+            ]
+        }
+
+    original = wr.rank_filter_candidates
+    wr.rank_filter_candidates = fake_rank
+    try:
+        result = wr.resolve_where(
+            user_input="X",
+            intent={"filter_conditions": []},
+            selected_columns={"dm.t": {"select": ["x"], "aggregate": ["x"]}},
+            selected_tables=["dm.t"],
+            schema_loader=_Stub(),
+            semantic_frame={
+                "filter_intents": [
+                    {
+                        "request_id": "text:dm.t.fake",
+                        "query_text": "X",
+                        "value": "X",
+                        "column_key": "dm.other.col",
+                    }
+                ]
+            },
+            base_conditions=[],
+        )
+    finally:
+        wr.rank_filter_candidates = original
+
+    assert result["needs_clarification"] is True
+    # No structured options surface implausible columns to the user.
+    assert not result["clarification_spec"]
+    assert "Нашёл несколько возможных способов" in result["clarification_message"]
+
+
+def test_f2_spec_is_cleared_by_business_event_suppression(tmp_path):
+    """G3: when the business-event-encoded-in-table suppression fires, it
+    must clear BOTH clarification_message AND clarification_spec — otherwise
+    F2's spec leaks through and the UI keeps asking.
+    """
+    loader = _loader(tmp_path)
+    tables_df = pd.read_csv(tmp_path / "tables_list.csv")
+    tables_df = pd.concat([
+        tables_df,
+        pd.DataFrame({
+            "schema_name": ["dm"],
+            "table_name": ["uzp_dwh_fact_outflow"],
+            "description": ["Информация по фактическим оттокам"],
+            "grain": ["snapshot"],
+        }),
+    ], ignore_index=True)
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+
+    frame = {
+        "business_event": "фактический отток",
+        "filter_intents": [
+            {
+                "request_id": "text:dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+                "kind": "text_search",
+                "query_text": "фактический отток",
+                "value": "фактический отток",
+                "column_key": "dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+            }
+        ],
+    }
+    result = resolve_where(
+        user_input="Сколько фактических оттоков",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.uzp_dwh_fact_outflow": {"select": ["inn"], "aggregate": ["inn"]}},
+        selected_tables=["dm.uzp_dwh_fact_outflow"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+    )
+    assert result["clarification_message"] == ""
+    assert not result["clarification_spec"]

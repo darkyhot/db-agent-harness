@@ -276,4 +276,14 @@ def test_where_resolver_suppresses_stale_outflow_filter_when_aggregate_covers_it
     )
 
     assert result["needs_clarification"] is False
-    assert "aggregate_metric_covers_business_event" in result["reasoning"]
+    # Either suppression path is acceptable — F2 short-circuit (G1) or the
+    # older aggregate-metric guard. Both fold the filter into the table
+    # context without surfacing a clarification.
+    assert any(
+        marker in r or r.startswith("table_context_covers_value:")
+        for r in result["reasoning"]
+        for marker in ("aggregate_metric_covers_business_event",)
+    ) or any(
+        r.startswith("table_context_covers_value:")
+        for r in result["reasoning"]
+    )

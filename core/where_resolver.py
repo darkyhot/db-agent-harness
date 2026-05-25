@@ -457,6 +457,7 @@ def resolve_where(
     reasoning: list[str] = []
     applied_rules: list[str] = []
     unresolved_filters: list[dict[str, Any]] = []
+    implicit_filters: list[dict[str, Any]] = []
     clarification_message = ""
     clarification_spec: dict[str, Any] = {}
     user_filter_choices = dict(user_filter_choices or {})
@@ -738,23 +739,90 @@ def resolve_where(
         and not clarification_message
         and len(all_rejected_request_ids) < len(filter_intents)
     ):
-        # Find the first unbound intent that has candidates we can offer the user.
-        # We surface the user's value verbatim + the top candidate columns; the
-        # generic «уточните признак» wording (without choices) is the regression
-        # we fix here.
+        # G1: short-circuit when an intent's value is already encoded in the
+        # chosen table (e.g. "фактический отток" + uzp_dwh_fact_outflow) AND
+        # the intent's lexicon binding pointed at a *different* table. The
+        # second condition mirrors _business_event_is_already_encoded_in_table:
+        # if the filter_intent's column_key is on a selected table, the user
+        # still needs candidates from that table — we must not silently fold
+        # the filter away.
+        selected_lower = {str(t).strip().lower() for t in (selected_tables or []) if t}
+        table_encoded_request_ids: set[str] = set()
+        for intent in filter_intents:
+            req_id = str(intent.get("request_id") or "")
+            if not req_id or req_id in all_rejected_request_ids:
+                continue
+            value = intent.get("value") or intent.get("query_text")
+            if value in (None, ""):
+                continue
+            intent_column_key = str(intent.get("column_key") or "").strip().lower()
+            intent_table_key = ".".join(intent_column_key.split(".")[:2]) if intent_column_key else ""
+            if intent_table_key and intent_table_key in selected_lower:
+                continue
+            covered_by: str | None = None
+            for table_key in selected_tables or []:
+                if _filter_value_encoded_in_table(
+                    schema_loader=schema_loader,
+                    table_key=table_key,
+                    value=value,
+                ):
+                    covered_by = table_key
+                    break
+            if covered_by:
+                implicit_filters.append({
+                    "target": intent.get("column_hint") or intent.get("query_text"),
+                    "value": value,
+                    "applied_via": "table_name_encoding",
+                    "table": covered_by,
+                    "source": f"fallback:{req_id}",
+                })
+                reasoning.append(f"table_context_covers_value:{covered_by}:{value}")
+                logger.info(
+                    "WhereResolver: F2 short-circuit — value=%r already encoded "
+                    "in table %s; folding into implicit_filters",
+                    value, covered_by,
+                )
+                table_encoded_request_ids.add(req_id)
+
+        # Find the first unbound, non-table-encoded intent. We surface the
+        # user's value verbatim + the top candidate columns; the generic
+        # «уточните признак» wording (without choices) is the regression we
+        # fix here.
         offered_intent: dict[str, Any] | None = None
         offered_candidates: list[dict[str, Any]] = []
+        _PLAUSIBLE_CONFIDENCE = {"medium", "high"}
+        _IMPLAUSIBLE_SEMANTIC_CLASSES = {"identifier", "join_key"}
+        _MIN_OFFER_SCORE = 30.0
         for intent in filter_intents:
             req_id = str(intent.get("request_id") or "")
             if req_id in all_rejected_request_ids:
                 continue
-            intent_candidates = list(ranked_candidates.get(req_id) or [])
+            if req_id in table_encoded_request_ids:
+                continue
+            # G2: keep only plausible candidates — drop low-confidence noise,
+            # identifier-class columns (login/fio/id can't hold values like
+            # "фактический отток"), and weak-score matches.
+            intent_candidates = [
+                cand for cand in (ranked_candidates.get(req_id) or [])
+                if str(cand.get("confidence") or "").lower() in _PLAUSIBLE_CONFIDENCE
+                and str(cand.get("semantic_class") or "").lower() not in _IMPLAUSIBLE_SEMANTIC_CLASSES
+                and float(cand.get("score") or 0.0) >= _MIN_OFFER_SCORE
+            ]
             if intent_candidates:
                 offered_intent = intent
                 offered_candidates = intent_candidates[:3]
                 break
 
-        if offered_intent is not None and offered_candidates:
+        # If G1 covered every unbound intent, nothing to clarify — return
+        # silently (no message, no spec).
+        if (
+            offered_intent is None
+            and table_encoded_request_ids
+            and len(table_encoded_request_ids) + len(all_rejected_request_ids)
+                >= len(filter_intents)
+        ):
+            pass  # all intents accounted for; skip clarification entirely
+        elif offered_intent is not None and offered_candidates:
             value_text = str(
                 offered_intent.get("value")
                 or offered_intent.get("query_text")
@@ -816,6 +884,7 @@ def resolve_where(
         )
     ):
         clarification_message = ""
+        clarification_spec = {}
         reasoning.append("table_context_covers_business_event")
         logger.info(
             "WhereResolver: suppress clarification — business_event уже покрыт выбранной таблицей %s",
@@ -833,6 +902,7 @@ def resolve_where(
         )
     ):
         clarification_message = ""
+        clarification_spec = {}
         reasoning.append("aggregate_metric_covers_business_event")
         logger.info(
             "WhereResolver: suppress clarification — business_event покрыт aggregate-метрикой"
@@ -846,7 +916,7 @@ def resolve_where(
     # в имени/описании выбранной таблицы (например "фактический отток" +
     # uzp_dwh_fact_outflow), переезжают в implicit_filters. Summarizer
     # упомянет их в финальном ответе ("учтён в таблице X").
-    implicit_filters: list[dict[str, Any]] = []
+    # (G1 may already have populated implicit_filters from the F2 short-circuit.)
     if unresolved_filters and selected_tables:
         survivors: list[dict[str, Any]] = []
         for item in unresolved_filters:

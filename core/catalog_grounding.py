@@ -297,6 +297,42 @@ def ground_query_spec(
             confidence=best_conf,
         )
 
+    # H2: when 2+ candidates survived pruning with comparable confidence and
+    # none of them is a user-pinned explicit source, surface a clarification
+    # instead of silently picking the top one. Without this guard the agent
+    # would choose unstably between equally-valid fact tables across runs.
+    if (
+        query_spec.task == "answer_data"
+        and not query_spec.join_constraints
+        and not any(s.reason == "explicit_source_constraint" for s in sources)
+    ):
+        ambiguous_strong = _detect_ambiguous_strong_sources(sources)
+        if ambiguous_strong:
+            options = [s.full_name for s in ambiguous_strong]
+            clarification = ClarificationSpec(
+                question=(
+                    "Запрос подходит к нескольким таблицам с близкой уверенностью. "
+                    "Уточните, какую использовать."
+                ),
+                reason="catalog_grounding_ambiguous_strong_sources",
+                field="source_constraints",
+                options=options,
+                evidence=[Evidence(source="catalog_grounder", text=user_input, confidence=best_conf)],
+            )
+            logger.info(
+                "CatalogGrounder: ambiguous strong sources detected — options=%s "
+                "(confidences=%s)",
+                options,
+                [round(s.confidence, 3) for s in ambiguous_strong],
+            )
+            return GroundingResult(
+                query_spec=query_spec,
+                sources=sources,
+                clarification=clarification,
+                warnings=warnings,
+                confidence=best_conf,
+            )
+
     if sources:
         primary = _main_source_with_required_priority(sources)
         if primary is not None:
@@ -338,6 +374,48 @@ def ground_query_spec(
         warnings=warnings,
         confidence=plan_ir.confidence,
     )
+
+
+_AMBIGUITY_EXCLUDED_REASONS = {
+    "explicit_source_constraint",       # user-pinned
+    "dimension_quality_enrichment",     # JOIN sidekick, not an alternative
+}
+
+
+def _detect_ambiguous_strong_sources(
+    sources: list[SourceBinding],
+    *,
+    confidence_floor: float = 0.65,
+    min_gap_pct: float = 0.15,
+    max_options: int = 3,
+) -> list[SourceBinding]:
+    """Return the set of sources that are tied for "best" within `min_gap_pct`
+    of the top confidence, all above `confidence_floor`. When the result has
+    ≥2 entries, the caller should surface a clarification instead of silently
+    picking sources[0].
+
+    Excludes: explicit/required sources (user pinned) and dimension-quality
+    enrichment sidekicks (they exist to JOIN with a fact, not compete with it).
+    """
+    candidates = [
+        s for s in sources
+        if s.reason not in _AMBIGUITY_EXCLUDED_REASONS
+        and float(s.confidence or 0.0) >= confidence_floor
+    ]
+    if len(candidates) < 2:
+        return []
+    candidates.sort(key=lambda s: float(s.confidence or 0.0), reverse=True)
+    top_conf = float(candidates[0].confidence or 0.0)
+    if top_conf <= 0.0:
+        return []
+    tied: list[SourceBinding] = [candidates[0]]
+    for cand in candidates[1:]:
+        gap = (top_conf - float(cand.confidence or 0.0)) / top_conf
+        if gap < min_gap_pct:
+            tied.append(cand)
+    if len(tied) < 2:
+        return []
+    return tied[:max_options]
 
 
 def _primary_source_covers_entities(

@@ -748,9 +748,18 @@ def resolve_where(
         # the filter away.
         selected_lower = {str(t).strip().lower() for t in (selected_tables or []) if t}
         table_encoded_request_ids: set[str] = set()
+        # H1: only text-style intents are eligible for the table-encoding fold.
+        # boolean_true / flag intents are structural (is_X = true), and
+        # explicit_filter intents pin a user-specified column/value — neither
+        # can be «semantically covered» by the table choice. Folding them
+        # silently drops a filter the user asked for.
+        _G1_ELIGIBLE_KINDS = {"text_search", "phrase_filter", ""}
         for intent in filter_intents:
             req_id = str(intent.get("request_id") or "")
             if not req_id or req_id in all_rejected_request_ids:
+                continue
+            kind = str(intent.get("kind") or "").strip().lower()
+            if kind not in _G1_ELIGIBLE_KINDS:
                 continue
             value = intent.get("value") or intent.get("query_text")
             if value in (None, ""):

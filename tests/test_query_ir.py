@@ -531,8 +531,13 @@ def test_catalog_grounding_uses_metadata_filters_and_prunes_unrelated_helpers(tm
         max_sources=3,
     )
 
-    assert result.needs_clarification is False
-    assert [source.full_name for source in result.sources] == ["dm.sale_funnel", "dm.fact_outflow"]
+    # H2: when two strong fact-table candidates remain after pruning and
+    # neither is a user-pinned explicit source, the grounder asks instead
+    # of silently picking one. Both candidates appear in the options.
+    assert result.needs_clarification is True
+    assert result.clarification is not None
+    assert result.clarification.reason == "catalog_grounding_ambiguous_strong_sources"
+    assert set(result.clarification.options or []) == {"dm.sale_funnel", "dm.fact_outflow"}
 
 
 def test_catalog_grounding_logs_table_scores(tmp_path, caplog):
@@ -802,3 +807,118 @@ def test_where_resolver_skips_exact_date_filter_when_calendar_range_exists(tmp_p
 
     assert result["conditions"] == ["order_dt >= '2026-02-01'::date", "order_dt < '2026-03-01'::date"]
     assert result["applied_rules"] == []
+
+
+# ---------------------------------------------------------------------------
+# H2: _detect_ambiguous_strong_sources — pick a clarification when 2+ tables
+# tie within 15% of the top confidence; skip otherwise.
+# ---------------------------------------------------------------------------
+
+
+def _binding(table: str, confidence: float, reason: str = "query_spec_slot_score"):
+    from core.query_ir import SourceBinding
+    return SourceBinding(
+        schema="dm",
+        table=table,
+        reason=reason,
+        confidence=confidence,
+        evidence=[],
+    )
+
+
+def test_h2_helper_returns_tied_sources_within_gap():
+    from core.catalog_grounding import _detect_ambiguous_strong_sources
+    tied = _detect_ambiguous_strong_sources([
+        _binding("fact_outflow", 0.86),
+        _binding("sale_funnel", 0.80),
+        _binding("misc", 0.40),  # below floor
+    ])
+    assert {s.table for s in tied} == {"fact_outflow", "sale_funnel"}
+
+
+def test_h2_helper_returns_empty_when_one_table_dominates():
+    from core.catalog_grounding import _detect_ambiguous_strong_sources
+    # 0.86 vs 0.50 → 42% gap > 15% — no ambiguity.
+    tied = _detect_ambiguous_strong_sources([
+        _binding("fact_a", 0.86),
+        _binding("fact_b", 0.50),
+    ])
+    assert tied == []
+
+
+def test_h2_helper_skips_dimension_quality_enrichment_sidekicks():
+    """Dimension sidekicks added via JOIN enrichment are not alternatives —
+    they coexist with the main fact, so H2 must not treat them as a tie.
+    """
+    from core.catalog_grounding import _detect_ambiguous_strong_sources
+    tied = _detect_ambiguous_strong_sources([
+        _binding("fact_sales", 0.81),
+        _binding("org_dict", 0.95, reason="dimension_quality_enrichment"),
+    ])
+    assert tied == []
+
+
+def test_h2_helper_skips_explicit_source_constraint():
+    """User-pinned sources should never trigger ambiguity — the user already
+    chose.
+    """
+    from core.catalog_grounding import _detect_ambiguous_strong_sources
+    tied = _detect_ambiguous_strong_sources([
+        _binding("fact_a", 0.90, reason="explicit_source_constraint"),
+        _binding("fact_b", 0.85),
+    ])
+    assert tied == []
+
+
+def test_h2_grounder_skips_clarification_when_join_constraints_present(tmp_path):
+    """If QuerySpec carries join_constraints, multi-source is intentional —
+    H2 must not emit a clarification.
+    """
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm"],
+        "table_name": ["fact_a", "fact_b"],
+        "description": ["Факт A", "Факт B"],
+        "grain": ["event", "event"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm", "dm"],
+        "table_name": ["fact_a", "fact_b"],
+        "column_name": ["x", "y"],
+        "dType": ["text", "text"],
+        "description": ["X col", "Y col"],
+        "is_primary_key": [False, False],
+        "unique_perc": [50.0, 50.0],
+        "not_null_perc": [100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    # Build a QuerySpec that pins both tables via join_constraints — the
+    # ambiguity guard must bail.
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": None, "distinct_policy": "auto", "confidence": 0.8}],
+        "dimensions": [],
+        "filters": [],
+        "source_constraints": [
+            {"table": "fact_a", "schema": "dm", "required": True, "confidence": 0.9},
+            {"table": "fact_b", "schema": "dm", "required": True, "confidence": 0.9},
+        ],
+        "join_constraints": [
+            {"left": "dm.fact_a", "right": "dm.fact_b", "key": "x", "confidence": 0.9},
+        ],
+        "clarification_needed": False,
+        "confidence": 0.8,
+    })
+    assert spec is not None, errors
+
+    result = ground_query_spec(
+        query_spec=spec,
+        schema_loader=loader,
+        user_input="join fact_a and fact_b",
+    )
+    # Either we get both sources without clarification, or an unrelated
+    # clarification — but never the H2 ambiguity reason.
+    if result.clarification is not None:
+        assert result.clarification.reason != "catalog_grounding_ambiguous_strong_sources"

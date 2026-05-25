@@ -856,3 +856,170 @@ def test_f2_spec_is_cleared_by_business_event_suppression(tmp_path):
     )
     assert result["clarification_message"] == ""
     assert not result["clarification_spec"]
+
+
+# ---------------------------------------------------------------------------
+# H1: G1 must NOT fold boolean_true / flag / explicit_filter intents even
+# when the subject word matches stems in the chosen table's description.
+# ---------------------------------------------------------------------------
+
+
+def _outflow_with_task_in_description(tmp_path):
+    """Loader fixture where the fact_outflow table description *does* contain
+    «задач» — earlier G1 would have folded the boolean_true intent for «задача».
+    """
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["outflow_with_tasks"],
+        "description": ["Снимок фактических оттоков с поставленными задачами"],
+        "grain": ["snapshot"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["outflow_with_tasks"] * 3,
+        "column_name": ["report_dt", "inn", "is_task"],
+        "dType": ["date", "text", "boolean"],
+        "description": ["Отчетная дата", "ИНН клиента", "Признак выставленной задачи"],
+        "is_primary_key": [False, False, False],
+        "unique_perc": [0.5, 90.0, 0.02],
+        "not_null_perc": [100.0, 100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+    return loader
+
+
+def test_h1_boolean_true_intent_not_folded_when_table_mentions_subject(tmp_path):
+    """H1 regression: when the subject word «задача» appears in the table's
+    description/column descriptions, the boolean_true intent (is_task = true)
+    must still resolve to a SQL condition — G1 must not silently fold it.
+    """
+    loader = _outflow_with_task_in_description(tmp_path)
+    frame = derive_semantic_frame("Сколько задач", schema_loader=loader)
+    result = resolve_where(
+        user_input="Сколько задач",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.outflow_with_tasks": {"select": ["inn"], "aggregate": ["inn"]}},
+        selected_tables=["dm.outflow_with_tasks"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+    )
+    assert result["needs_clarification"] is False
+    assert any("is_task = true" == cond for cond in result["conditions"]), (
+        f"Expected is_task=true; got conditions={result['conditions']}, "
+        f"implicit={result.get('implicit_filters')}, reasoning={result['reasoning']}"
+    )
+    # The intent must NOT have been folded into implicit_filters.
+    assert not any(
+        item.get("applied_via") == "table_name_encoding"
+        for item in result.get("implicit_filters") or []
+    )
+
+
+def test_h1_explicit_filter_intent_not_folded_by_g1(tmp_path):
+    """H1 regression: explicit_filter intents (from user-pinned filter_conditions)
+    are structural — they must never be folded by G1 even if the value's stems
+    happen to match the chosen table.
+    """
+    loader = _outflow_with_task_in_description(tmp_path)
+    # Use a fake intent stream — we want full control over the kind/value pair.
+    import core.where_resolver as wr
+    original = wr.rank_filter_candidates
+
+    def fake_rank(**_):
+        return {
+            "explicit:0": [
+                {
+                    "request_id": "explicit:0",
+                    "column": "is_task",
+                    "score": 80.0,
+                    "confidence": "high",
+                    "semantic_class": "flag",
+                    "condition": "is_task = true",
+                    "table_key": "dm.outflow_with_tasks",
+                    "value": True,
+                    "schema": "dm",
+                    "table": "outflow_with_tasks",
+                    "evidence": [],
+                },
+            ]
+        }
+
+    wr.rank_filter_candidates = fake_rank
+    try:
+        result = wr.resolve_where(
+            user_input="Сколько задач",
+            intent={"filter_conditions": []},
+            selected_columns={"dm.outflow_with_tasks": {"select": ["inn"], "aggregate": ["inn"]}},
+            selected_tables=["dm.outflow_with_tasks"],
+            schema_loader=loader,
+            semantic_frame={
+                "filter_intents": [
+                    {
+                        "request_id": "explicit:0",
+                        "kind": "explicit_filter",
+                        "query_text": "задача",
+                        "value": True,
+                        "column_key": "dm.outflow_with_tasks.is_task",
+                    }
+                ]
+            },
+            base_conditions=[],
+        )
+    finally:
+        wr.rank_filter_candidates = original
+    # explicit_filter must produce a real condition, not be folded silently.
+    assert "is_task = true" in result["conditions"]
+    assert not any(
+        item.get("applied_via") == "table_name_encoding"
+        for item in result.get("implicit_filters") or []
+    )
+
+
+def test_h1_text_search_intent_still_folded_when_value_encoded(tmp_path):
+    """H1 must not regress G1's happy path: text_search intent for a value
+    that's semantically encoded in the chosen table should still be folded.
+    """
+    loader = _loader(tmp_path)
+    tables_df = pd.read_csv(tmp_path / "tables_list.csv")
+    tables_df = pd.concat([
+        tables_df,
+        pd.DataFrame({
+            "schema_name": ["dm"],
+            "table_name": ["uzp_dwh_fact_outflow"],
+            "description": ["Информация по фактическим оттокам для УЗП"],
+            "grain": ["snapshot"],
+        }),
+    ], ignore_index=True)
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+    frame = {
+        "business_event": "фактический отток",
+        "filter_intents": [
+            {
+                "request_id": "text:dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+                "kind": "text_search",
+                "query_text": "фактический отток",
+                "value": "фактический отток",
+                "column_key": "dm.uzp_data_split_mzp_sale_funnel.task_subtype",
+            }
+        ],
+    }
+    result = resolve_where(
+        user_input="Сколько задач по фактическому оттоку",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.uzp_dwh_fact_outflow": {"select": ["inn"], "aggregate": ["inn"]}},
+        selected_tables=["dm.uzp_dwh_fact_outflow"],
+        schema_loader=loader,
+        semantic_frame=frame,
+        base_conditions=[],
+    )
+    assert result["needs_clarification"] is False
+    assert any(
+        item.get("applied_via") == "table_name_encoding"
+        for item in result.get("implicit_filters") or []
+    )

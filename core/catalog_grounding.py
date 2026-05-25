@@ -387,6 +387,23 @@ _AMBIGUITY_EXCLUDED_REASONS = {
 }
 
 
+def _is_weak_tfidf_only_candidate(src: SourceBinding) -> bool:
+    """True when a binding came from the TF-IDF/catalog_search fallback path
+    with no slot-score signal AND a sub-strong confidence — these tables show
+    up because their description shares loose token overlap with the query,
+    but they are not a meaningful answer for the user. Letting them through
+    H2 floods the clarification with unknown-type noise.
+    """
+    if float(getattr(src, "score", 0.0) or 0.0) > 0:
+        return False
+    if float(src.confidence or 0.0) >= 0.7:
+        return False
+    for ev in src.evidence or []:
+        if str(getattr(ev, "source", "")).lower() == "catalog_search":
+            return True
+    return False
+
+
 def _detect_ambiguous_strong_sources(
     sources: list[SourceBinding],
     *,
@@ -424,6 +441,7 @@ def _detect_ambiguous_strong_sources(
     candidates = [
         s for s in sources
         if s.reason not in _AMBIGUITY_EXCLUDED_REASONS
+        and not _is_weak_tfidf_only_candidate(s)
         and _discriminator(s) >= score_floor
     ]
     if len(candidates) < 2:

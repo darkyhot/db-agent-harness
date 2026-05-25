@@ -863,6 +863,36 @@ def test_h2_helper_returns_empty_when_one_table_dominates():
     assert tied == []
 
 
+def test_h2_excludes_weak_tfidf_only_candidates():
+    """Step M: a SourceBinding from the catalog_search/TF-IDF path with no
+    slot-score and sub-strong confidence is hidden from H2 options. These
+    bindings show up because their description loosely overlaps the query,
+    but they aren't a useful answer for the user.
+    """
+    from core.catalog_grounding import _detect_ambiguous_strong_sources
+    from core.query_ir import Evidence, SourceBinding
+    strong = SourceBinding(
+        schema="dm",
+        table="fact_a",
+        reason="query_spec_slot_score",
+        confidence=0.85,
+        score=4.0,
+        evidence=[Evidence(source="catalog_slot_score", text="x", confidence=0.85)],
+    )
+    weak_tfidf = SourceBinding(
+        schema="dm",
+        table="data_epk_consolidation",
+        reason="catalog_search_fallback",
+        confidence=0.6,  # < 0.7 strong threshold
+        score=0.0,       # no slot signal
+        evidence=[Evidence(source="catalog_search", text="x", confidence=0.6)],
+    )
+    tied = _detect_ambiguous_strong_sources([strong, weak_tfidf])
+    assert all(s.table != "data_epk_consolidation" for s in tied), (
+        "weak TF-IDF-only binding must not appear among H2 options"
+    )
+
+
 def test_h2_helper_triggers_for_close_fact_tables():
     """Real-world regression (agent log 2026-05-25): scores 3.0 vs 1.7
     (gap≈43%) must surface H2 — these are the typical competing fact tables

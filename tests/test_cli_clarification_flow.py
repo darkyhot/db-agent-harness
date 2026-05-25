@@ -1,7 +1,12 @@
 """Регресс: после ответа пользователя на clarification CLI не должен
 запустить граф ещё раз с тем же вопросом."""
 
-from cli.interface import _interpret_filter_clarification, _match_clarification_to_choice
+from cli.interface import (
+    _interpret_filter_clarification,
+    _match_clarification_to_choice,
+    _normalize_clarification_options,
+    _parse_clarification_choice,
+)
 
 
 def test_match_clarification_by_column_name():
@@ -80,3 +85,76 @@ def test_interpret_confirm_rejects_no_reply():
     accepted, rejected = _interpret_filter_clarification("нет", where_resolution)
     assert accepted == {}
     assert rejected == {"text:dm.t.task_subtype": ["task_subtype"]}
+
+
+# ---------------------------------------------------------------------------
+# Iteration 3: Step K — option normalisation + numbered rendering helpers.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_h2_string_options():
+    """H2 (catalog_grounding) emits `options: list[str]` shaped as
+    "name — description". The normalizer splits value/label correctly.
+    """
+    spec = {"options": [
+        "dm.sale_funnel_task — Воронка продаж по задачам",
+        "dm.fact_outflow — Информация по фактическим оттокам",
+    ]}
+    normalized = _normalize_clarification_options(spec)
+    assert normalized == [
+        ("dm.sale_funnel_task", "dm.sale_funnel_task — Воронка продаж по задачам"),
+        ("dm.fact_outflow", "dm.fact_outflow — Информация по фактическим оттокам"),
+    ]
+
+
+def test_normalize_h4_dict_options():
+    """H4 (where_resolver fallback) emits `options: list[dict]` with
+    `value`/`label` keys. The normalizer handles both shapes uniformly.
+    """
+    spec = {"options": [
+        {"value": "dm.fact_outflow", "label": "dm.fact_outflow — Факты"},
+        {"column": "task_type", "label": "task_type (Тип задачи)"},
+    ]}
+    normalized = _normalize_clarification_options(spec)
+    assert normalized == [
+        ("dm.fact_outflow", "dm.fact_outflow — Факты"),
+        ("task_type", "task_type (Тип задачи)"),
+    ]
+
+
+def test_parse_clarification_choice_by_number():
+    options = [
+        ("dm.foo", "dm.foo — desc 1"),
+        ("dm.bar", "dm.bar — desc 2"),
+        ("dm.baz", "dm.baz — desc 3"),
+    ]
+    assert _parse_clarification_choice("2", options) == "dm.bar"
+
+
+def test_parse_clarification_choice_by_substring():
+    options = [
+        ("dm.sale_funnel_task", "Воронка задач"),
+        ("dm.fact_outflow", "Отток"),
+    ]
+    # Unique substring on the value → matched.
+    assert _parse_clarification_choice("outflow", options) == "dm.fact_outflow"
+    # Unique substring on the label → matched.
+    assert _parse_clarification_choice("воронка", options) == "dm.sale_funnel_task"
+
+
+def test_parse_clarification_choice_ambiguous_returns_none():
+    options = [
+        ("dm.fact_outflow", "Отток (fact)"),
+        ("dm.fact_outflow_history", "Отток история"),
+    ]
+    # Both contain "отток" → ambiguous → None (the CLI falls back to the
+    # free-form clarification flow).
+    assert _parse_clarification_choice("отток", options) is None
+
+
+def test_parse_clarification_choice_empty_or_unknown():
+    options = [("dm.foo", "dm.foo — desc")]
+    assert _parse_clarification_choice("", options) is None
+    assert _parse_clarification_choice("nonexistent", options) is None
+    # Out-of-range number → None.
+    assert _parse_clarification_choice("99", options) is None

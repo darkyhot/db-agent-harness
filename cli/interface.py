@@ -240,6 +240,72 @@ def _log_clarification_prompt(memory: MemoryManager, question: str) -> None:
     memory.add_message("assistant", f"Уточняющий вопрос: {normalized}")
 
 
+def _normalize_clarification_options(
+    clarification_spec: dict | None,
+) -> list[tuple[str, str]]:
+    """Normalize clarification_spec.options into list of (value, label) pairs.
+
+    Two upstream shapes coexist:
+      - H2 (catalog_grounding): `options: list[str]` like
+        ``"dm.foo — Description text"`` — split on the em-dash for value.
+      - H4 (where_resolver fallback): `options: list[dict]` with keys
+        ``value``/``label`` (or ``column``/``label`` for column choices).
+    """
+    if not clarification_spec:
+        return []
+    raw = clarification_spec.get("options") or []
+    normalized: list[tuple[str, str]] = []
+    for opt in raw:
+        if isinstance(opt, str):
+            label = opt.strip()
+            if not label:
+                continue
+            value = label.split(" — ", 1)[0].strip()
+            normalized.append((value, label))
+        elif isinstance(opt, dict):
+            value = (
+                str(opt.get("value") or opt.get("column") or "")
+                .strip()
+            )
+            label = str(opt.get("label") or value).strip()
+            if not value:
+                continue
+            normalized.append((value, label))
+    return normalized
+
+
+def _parse_clarification_choice(
+    answer: str,
+    options: list[tuple[str, str]],
+) -> str | None:
+    """Resolve a user's answer to one of the rendered options.
+
+    Accepts: (1) the option's 1-based number, (2) an exact value match,
+    (3) a unique case-insensitive substring of the label or value.
+    Returns the chosen *value*, or None when ambiguous/unrecognised.
+    """
+    if not options:
+        return None
+    text = (answer or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        idx = int(text) - 1
+        if 0 <= idx < len(options):
+            return options[idx][0]
+    lowered = text.lower()
+    for value, _label in options:
+        if value.lower() == lowered:
+            return value
+    matches: list[str] = []
+    for value, label in options:
+        if lowered in value.lower() or lowered in label.lower():
+            matches.append(value)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def _build_augmented_clarification_input(
     original_user_input: str,
     clarification_question: str,
@@ -1375,9 +1441,40 @@ LLM-проверка SQL: {"ВКЛ" if self.llm_verifier_enabled else "ВЫКЛ"
                 )
                 _log_clarification_prompt(self.memory, msg)
                 print(f"\n{msg}")
+                # Step K: render structured options when present.
+                clarification_spec = result.get("clarification_spec") or {}
+                rendered_options = _normalize_clarification_options(clarification_spec)
+                if rendered_options:
+                    print("\nВарианты:")
+                    for i, (_value, label) in enumerate(rendered_options, start=1):
+                        print(f"  {i}. {label}")
                 clarification = input("\nУточнение: ").strip()
                 if clarification:
                     self.memory.add_message("user", f"Уточнение пользователя: {clarification}")
+
+                    # Step L: when this is a source-level clarification (H2),
+                    # pin the chosen table via augmented_input so the next
+                    # grounder pass treats it as an explicit source constraint.
+                    reason = str(clarification_spec.get("reason") or "")
+                    is_source_clarification = (
+                        reason == "catalog_grounding_ambiguous_strong_sources"
+                        or clarification_spec.get("field") == "source_constraints"
+                    )
+                    if is_source_clarification and rendered_options:
+                        chosen_value = _parse_clarification_choice(clarification, rendered_options)
+                        if chosen_value:
+                            print(f"\n✓ Выбрана таблица: {chosen_value}")
+                            self.memory.add_message("user", f"Выбрана таблица: {chosen_value}")
+                            augmented_input = (
+                                f"{user_input} (использовать таблицу {chosen_value})"
+                            )
+                            self._process_query(
+                                augmented_input,
+                                user_filter_choices=user_filter_choices,
+                                rejected_filter_choices=rejected_filter_choices,
+                            )
+                            return
+
                     where_resolution = result.get("where_resolution", {}) or {}
                     filter_candidates = where_resolution.get("filter_candidates", {}) or {}
                     prev_choices = dict(

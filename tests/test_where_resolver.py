@@ -790,6 +790,46 @@ def test_f2_flag_column_guard_keeps_entity_filter_unresolved(tmp_path):
     )
 
 
+def test_f2_does_not_fold_value_matching_query_entity(tmp_path):
+    """H7: a filter value that IS a QuerySpec entity must never be folded
+    into implicit_filters via F2 — the entity is the WHAT-is-counted, not
+    a filter the table choice can subsume.
+
+    This is a cross-lingual-safe guard: no LLM/embeddings/synonym tables
+    needed, just direct stem comparison between `value` and entity_names
+    surfaced by the query_ir node.
+    """
+    loader = _bool_loader(
+        tmp_path,
+        table_name="fact_outflow",
+        description="Информация по фактическим оттокам, включая задачи",
+    )
+    loader.ensure_value_profiles()
+    result = resolve_where(
+        user_input="Сколько задач",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.fact_outflow": {"select": ["is_task"]}},
+        selected_tables=["dm.fact_outflow"],
+        schema_loader=loader,
+        semantic_frame={
+            "entity_names": ["задача"],
+            "filter_intents": [
+                {
+                    "request_id": "text:dm.fact_outflow.entity",
+                    "query_text": "Задача",
+                    "value": "Задача",
+                    "kind": "text_search",
+                }
+            ],
+        },
+        base_conditions=[],
+    )
+    implicit = result.get("implicit_filters") or []
+    assert not any(item.get("value") == "Задача" for item in implicit), (
+        "H7 violation: value matching a QuerySpec entity got folded as implicit"
+    )
+
+
 def test_f2_falls_back_to_table_choice_when_no_plausible_candidate():
     """H4: when every column candidate is identifier/low/sub-threshold, F2
     must NOT emit the generic «уточните признак» message — instead it

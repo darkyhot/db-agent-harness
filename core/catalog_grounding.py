@@ -391,7 +391,7 @@ def _detect_ambiguous_strong_sources(
     sources: list[SourceBinding],
     *,
     score_floor: float = 1.5,
-    min_gap_pct: float = 0.40,
+    min_gap_pct: float = 0.55,
     max_options: int = 3,
 ) -> list[SourceBinding]:
     """Return the set of sources tied for "best" within `min_gap_pct` of the

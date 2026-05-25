@@ -1217,6 +1217,7 @@ def build_blueprint(
     filter_specs: list[dict] | None = None,
     time_range: dict | None = None,
     primary_source: str | None = None,
+    grounder_tables: list[str] | None = None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -1440,6 +1441,7 @@ def build_blueprint(
         filter_tiebreaker=filter_tiebreaker,
         filter_specs=filter_specs,
         time_range=time_range,
+        grounder_tables=grounder_tables,
     )
     where_conditions = where_resolution.get("conditions", base_where_conditions)
 

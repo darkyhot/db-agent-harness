@@ -263,6 +263,13 @@ def derive_entity_flag_filters(
         entity_name = (entity.canonical or entity.name or "").strip()
         if not entity_name:
             continue
+        resolved_table: str | None = None
+        resolved_column: str | None = None
+        resolved_confidence: float = 0.9
+        resolution_source: str = ""
+
+        # Pass 1: semantic match via entity_resolver (cross-lingual via LLM
+        # tiebreak when available, embeddings otherwise).
         try:
             resolution = resolve_entity_to_columns(
                 entity_term=entity_name,
@@ -277,43 +284,144 @@ def derive_entity_flag_filters(
                 "ColumnBinding: entity_flag resolver failed for %r: %s",
                 entity_name, exc,
             )
-            continue
-        if not resolution.matched or not resolution.column or not resolution.table_key:
-            continue
-        if not _column_is_boolean_flag(
-            schema_loader=schema_loader,
-            table_key=resolution.table_key,
-            column=resolution.column,
+            resolution = None  # type: ignore[assignment]
+        if (
+            resolution is not None
+            and resolution.matched
+            and resolution.column
+            and resolution.table_key
+            and _column_is_boolean_flag(
+                schema_loader=schema_loader,
+                table_key=resolution.table_key,
+                column=resolution.column,
+            )
         ):
+            resolved_table = resolution.table_key
+            resolved_column = resolution.column
+            resolved_confidence = float(resolution.confidence or 0.9)
+            resolution_source = "entity_resolver"
+
+        # Pass 2: description-based fallback. The entity_resolver can miss
+        # cross-lingual cases (e.g. «Задача» ↔ `is_task` with English column
+        # name + Russian description). We walk boolean columns directly and
+        # match the entity stem against the column's description text —
+        # robust without requiring synonym tables or LLM calls.
+        if resolved_column is None:
+            fallback = _find_flag_column_by_description(
+                entity_name=entity_name,
+                table_keys=table_keys,
+                schema_loader=schema_loader,
+            )
+            if fallback is not None:
+                resolved_table, resolved_column = fallback
+                resolved_confidence = 0.8
+                resolution_source = "description_match"
+
+        if resolved_table is None or resolved_column is None:
             continue
-        col_key = (resolution.table_key, resolution.column.lower())
+        col_key = (resolved_table, resolved_column.lower())
         if col_key in seen_cols:
             continue
-        if resolution.column.lower() in existing_filter_targets:
+        if resolved_column.lower() in existing_filter_targets:
             continue
         seen_cols.add(col_key)
-        roles = selected_columns.setdefault(resolution.table_key, {})
+        roles = selected_columns.setdefault(resolved_table, {})
         roles.setdefault("filter", [])
-        if resolution.column not in roles["filter"]:
-            roles["filter"].append(resolution.column)
+        if resolved_column not in roles["filter"]:
+            roles["filter"].append(resolved_column)
         synthetic.append({
-            "target": resolution.column,
+            "target": resolved_column,
             "operator": "=",
             "value": True,
             "value_kind": "literal",
             "evidence": [{
                 "source": "column_binding",
-                "text": f"entity «{entity_name}» → flag column {resolution.column}",
-                "confidence": float(resolution.confidence or 0.9),
+                "text": (
+                    f"entity «{entity_name}» → flag column {resolved_column} "
+                    f"(via {resolution_source})"
+                ),
+                "confidence": resolved_confidence,
             }],
-            "confidence": float(resolution.confidence or 0.9),
+            "confidence": resolved_confidence,
         })
-        existing_filter_targets.add(resolution.column.lower())
+        existing_filter_targets.add(resolved_column.lower())
         logger.info(
-            "ColumnBinding: entity «%s» → synthetic filter %s.%s = TRUE",
-            entity_name, resolution.table_key, resolution.column,
+            "ColumnBinding: entity «%s» → synthetic filter %s.%s = TRUE (via %s)",
+            entity_name, resolved_table, resolved_column, resolution_source,
         )
     return synthetic
+
+
+_RU_STEM_SUFFIXES = (
+    "ами", "ями", "ого", "ему", "ыми", "его", "ой", "ом",
+    "ам", "ям", "ах", "ях", "ев", "ов", "ью", "ия", "ие",
+    "ый", "ий", "ая", "яя", "ое", "ее",
+    "ы", "и", "а", "я", "е", "у", "ю", "о",
+)
+
+
+def _stem_token(token: str) -> str:
+    """Tiny Russian-friendly stemmer: strip one common suffix, keep ≥3 chars."""
+    t = token.lower()
+    for suffix in _RU_STEM_SUFFIXES:
+        if len(t) > len(suffix) + 2 and t.endswith(suffix):
+            return t[: -len(suffix)]
+    return t
+
+
+def _find_flag_column_by_description(
+    *,
+    entity_name: str,
+    table_keys: list[str],
+    schema_loader: Any,
+) -> tuple[str, str] | None:
+    """Walk boolean columns across the given tables; return (table_key,
+    column) when the column's description shares a ≥4-char stem with the
+    entity name. Used as a cross-lingual fallback when the embedding-based
+    entity_resolver misses (e.g. «Задача» vs English `is_task`).
+    """
+    entity_stems = {
+        _stem_token(tok) for tok in re.findall(r"\w+", entity_name.lower())
+        if len(tok) >= 3
+    }
+    entity_stems = {s for s in entity_stems if s and len(s) >= 4}
+    if not entity_stems:
+        return None
+    for table_key in table_keys:
+        if "." not in table_key:
+            continue
+        schema, table = table_key.split(".", 1)
+        try:
+            cols_df = schema_loader.get_table_columns(schema, table)
+        except Exception:  # noqa: BLE001
+            continue
+        if cols_df is None or getattr(cols_df, "empty", True):
+            continue
+        for _, row in cols_df.iterrows():
+            col_name = str(row.get("column_name") or "").strip()
+            if not col_name:
+                continue
+            col_lower = col_name.lower()
+            dtype = str(row.get("data_type") or "").lower()
+            is_flag = ("bool" in dtype) or col_lower.startswith(_ENTITY_FLAG_PREFIXES)
+            if not is_flag:
+                continue
+            description = str(row.get("description") or "").lower()
+            if not description:
+                continue
+            desc_tokens = re.findall(r"\w+", description)
+            desc_stems = {_stem_token(tok) for tok in desc_tokens if len(tok) >= 3}
+            for left in entity_stems:
+                for right in desc_stems:
+                    if not right or len(right) < 4:
+                        continue
+                    if left == right:
+                        return table_key, col_name
+                    if min(len(left), len(right)) >= 4 and (
+                        left.startswith(right) or right.startswith(left)
+                    ):
+                        return table_key, col_name
+    return None
 
 
 def _column_is_boolean_flag(

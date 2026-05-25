@@ -95,6 +95,17 @@ class QueryIRNodes:
             schema_loader=self.schema,
             user_hints=legacy_hints,
         )
+        # H7: surface QuerySpec entity names so downstream F2/where_resolver
+        # can refuse to fold a value that *is* the entity being counted
+        # (e.g. value=«Задача» when entity=«задача»). Without this the
+        # F2 short-circuit silently dissolves the discriminative filter.
+        entity_names = [
+            str(e.canonical or e.name or "").strip()
+            for e in spec.entities
+            if str(e.canonical or e.name or "").strip()
+        ]
+        if entity_names:
+            semantic_frame["entity_names"] = entity_names
 
         return {
             "query_spec": spec.to_dict(),

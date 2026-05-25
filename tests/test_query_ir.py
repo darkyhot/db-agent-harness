@@ -855,12 +855,25 @@ def test_h2_helper_returns_tied_sources_within_gap():
 
 def test_h2_helper_returns_empty_when_one_table_dominates():
     from core.catalog_grounding import _detect_ambiguous_strong_sources
-    # 3.0 vs 1.6 → 47% gap > 40% — no ambiguity.
+    # 3.0 vs 1.0 → 67% gap > 55% — clear dominance, no ambiguity.
     tied = _detect_ambiguous_strong_sources([
         _binding("fact_a", 3.0),
-        _binding("fact_b", 1.6),
+        _binding("fact_b", 1.0),
     ])
     assert tied == []
+
+
+def test_h2_helper_triggers_for_close_fact_tables():
+    """Real-world regression (agent log 2026-05-25): scores 3.0 vs 1.7
+    (gap≈43%) must surface H2 — these are the typical competing fact tables
+    H2 was designed for. A 40% threshold was too narrow.
+    """
+    from core.catalog_grounding import _detect_ambiguous_strong_sources
+    tied = _detect_ambiguous_strong_sources([
+        _binding("sale_funnel_task", 3.0),
+        _binding("fact_outflow", 1.7),
+    ])
+    assert {s.table for s in tied} == {"sale_funnel_task", "fact_outflow"}
 
 
 def test_h2_helper_skips_dimension_quality_enrichment_sidekicks():
@@ -1036,3 +1049,60 @@ def test_derive_entity_flag_filters_skips_when_no_flag_column(tmp_path):
         schema_loader=loader,
     )
     assert synthetic == []
+
+
+def test_derive_entity_flag_filters_via_description_match(tmp_path):
+    """Cross-lingual fallback (Step I): entity «Задача» (Russian) must match
+    boolean column `is_task` (English name) via its Russian description
+    «Признак выставленной задачи», even when the embedding-based
+    entity_resolver can't bridge the language gap (e.g. no LLM available).
+    """
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["fact_outflow"],
+        "description": ["Факты"],
+        "grain": ["row"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["fact_outflow"] * 3,
+        "column_name": ["report_dt", "is_task", "amount"],
+        "dType": ["date", "bool", "int8"],
+        "description": [
+            "Отчётная дата",
+            "Признак выставленной задачи",  # Russian description bridges «Задача» → is_task
+            "Сумма",
+        ],
+        "is_primary_key": [False] * 3,
+        "unique_perc": [0.5, 50.0, 80.0],
+        "not_null_perc": [99.0, 99.0, 99.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    spec, _errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "entities": [{"name": "Задача", "canonical": "задача", "confidence": 1.0}],
+        "metrics": [{"operation": "count", "target": "задача", "confidence": 1.0}],
+        "filters": [],
+        "confidence": 0.9,
+    })
+    assert spec is not None
+
+    selected_columns: dict[str, dict] = {
+        "dm.fact_outflow": {"select": ["report_dt"], "aggregate": ["*"], "filter": ["report_dt"]}
+    }
+    # llm_invoker=None → forces the entity_resolver to fall back to
+    # embeddings (which may or may not bridge RU↔EN). Step I's description
+    # match must catch this case regardless.
+    synthetic = derive_entity_flag_filters(
+        query_spec=spec,
+        selected_columns=selected_columns,
+        schema_loader=loader,
+        llm_invoker=None,
+    )
+    assert synthetic, "expected synthetic filter via description match"
+    assert synthetic[0]["target"] == "is_task"
+    assert synthetic[0]["value"] is True
+    assert "is_task" in selected_columns["dm.fact_outflow"]["filter"]

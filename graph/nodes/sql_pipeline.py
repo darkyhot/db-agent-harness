@@ -789,13 +789,15 @@ class SqlPipelineNodes:
 
         # --- grounder-primary для main_table override (H5) ---
         primary_source: str | None = None
+        grounder_tables_list: list[str] = []
         selected_tables_list = state.get("selected_tables") or []
-        if selected_tables_list:
-            first = selected_tables_list[0]
-            if isinstance(first, (list, tuple)) and len(first) >= 2:
-                primary_source = f"{first[0]}.{first[1]}"
-            elif isinstance(first, str):
-                primary_source = first
+        for entry in selected_tables_list:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                grounder_tables_list.append(f"{entry[0]}.{entry[1]}")
+            elif isinstance(entry, str):
+                grounder_tables_list.append(entry)
+        if grounder_tables_list:
+            primary_source = grounder_tables_list[0]
 
         # --- Детерминированное построение blueprint (без LLM) ---
         blueprint = _deterministic_blueprint(
@@ -815,6 +817,7 @@ class SqlPipelineNodes:
             filter_specs=list((state.get("query_spec") or {}).get("filters") or []),
             time_range=(state.get("query_spec") or {}).get("time_range") or {},
             primary_source=primary_source,
+            grounder_tables=grounder_tables_list or None,
         )
         _apply_query_spec_blueprint_overrides(blueprint, state.get("query_spec") or {})
 

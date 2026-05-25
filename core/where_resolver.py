@@ -76,6 +76,44 @@ def _business_event_is_already_encoded_in_table(
     )
 
 
+def _value_matches_query_entity(
+    value: Any,
+    semantic_frame: dict[str, Any] | None,
+) -> bool:
+    """True if `value` (case-insensitive stem) matches any QuerySpec entity
+    name surfaced via `semantic_frame["entity_names"]`.
+
+    This is the F2/H7 guard rationale: when the user asks "how many <X>?",
+    `X` is the entity being counted, never a filter value the table choice
+    can "cover". Folding such a value into implicit_filters silently drops
+    the discriminative filter the user meant (e.g. is_task=TRUE).
+
+    No LLM/embeddings/synonym tables required — direct stem comparison.
+    """
+    if not value or not semantic_frame:
+        return False
+    entity_names = semantic_frame.get("entity_names") or []
+    if not entity_names:
+        return False
+    value_stems = {_stem(tok) for tok in _tokenize(str(value)) if len(tok) >= 3}
+    value_stems = {s for s in value_stems if s and len(s) >= 3}
+    if not value_stems:
+        return False
+    for name in entity_names:
+        name_stems = {_stem(tok) for tok in _tokenize(str(name)) if len(tok) >= 3}
+        for left in value_stems:
+            for right in name_stems:
+                if not right:
+                    continue
+                if left == right:
+                    return True
+                if min(len(left), len(right)) >= 4 and (
+                    left.startswith(right) or right.startswith(left)
+                ):
+                    return True
+    return False
+
+
 def _filter_value_encoded_in_table(
     *,
     schema_loader,
@@ -528,6 +566,7 @@ def resolve_where(
     filter_tiebreaker=None,
     filter_specs: list[FilterSpec | dict[str, Any]] | None = None,
     time_range: dict[str, Any] | None = None,
+    grounder_tables: list[str] | None = None,
 ) -> dict[str, Any]:
     """Достроить WHERE доменными правилами и value profiles.
 
@@ -848,6 +887,15 @@ def resolve_where(
             value = intent.get("value") or intent.get("query_text")
             if value in (None, ""):
                 continue
+            # H7: never fold a value that IS the QuerySpec entity. The user
+            # is asking "how many <X>?" — X is the thing being counted, not
+            # a filter the table choice can subsume.
+            if _value_matches_query_entity(value, effective_semantic_frame):
+                logger.info(
+                    "WhereResolver: F2 NOT folding %r — matches QuerySpec entity",
+                    value,
+                )
+                continue
             intent_column_key = str(intent.get("column_key") or "").strip().lower()
             intent_table_key = ".".join(intent_column_key.split(".")[:2]) if intent_column_key else ""
             if intent_table_key and intent_table_key in selected_lower:
@@ -985,8 +1033,13 @@ def resolve_where(
                 v = str(i.get("value") or i.get("query_text") or "").strip()
                 if v and v not in value_texts:
                     value_texts.append(v)
+            # H4/J: prefer the grounder's original source list — by the time
+            # we land here, column-binding may have already dropped some
+            # sources from `selected_tables`. Showing only what survived
+            # binding hides the very dichotomy the user needs to resolve.
+            tables_for_options = list(grounder_tables or []) or list(selected_tables or [])
             table_options = []
-            for tk in selected_tables or []:
+            for tk in tables_for_options:
                 try:
                     schema_part, table_part = str(tk).split(".", 1)
                     info = (schema_loader.get_table_info(schema_part, table_part) or "") if schema_loader else ""
@@ -1098,6 +1151,15 @@ def resolve_where(
                 or (selected_tables[0] if selected_tables else "")
             )
             value = item.get("value")
+            # H7: same entity-membership guard as the first F2 pass.
+            if _value_matches_query_entity(value, effective_semantic_frame):
+                logger.info(
+                    "WhereResolver: F2(unresolved) NOT folding %r — matches "
+                    "QuerySpec entity",
+                    value,
+                )
+                survivors.append(item)
+                continue
             covered = False
             tables_to_check = (
                 [primary_table] if primary_table else list(selected_tables)

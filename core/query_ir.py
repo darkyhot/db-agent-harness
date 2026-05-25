@@ -411,6 +411,7 @@ class SourceBinding(StrictModel):
     table: str
     reason: str = ""
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    score: float = 0.0
     evidence: list[Evidence] = Field(default_factory=list)
 
     @property

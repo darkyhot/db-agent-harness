@@ -223,6 +223,127 @@ def _filter_is_calendar_literal(flt: Any) -> bool:
     return bool(_parse_calendar_period(value) and _target_looks_calendar(f"{target} {value}"))
 
 
+_ENTITY_FLAG_PREFIXES = ("is_", "has_", "flag_")
+
+
+def derive_entity_flag_filters(
+    *,
+    query_spec: QuerySpec | dict[str, Any],
+    selected_columns: dict[str, dict[str, list[str]]],
+    schema_loader: Any,
+    llm_invoker: Any = None,
+) -> list[dict[str, Any]]:
+    """When the user's entity (e.g. «Задача») resolves to a boolean flag on
+    the main table (e.g. `is_task`), emit a synthetic `target=column,
+    value=True` filter spec so the query semantics ("count tasks") are
+    preserved.
+
+    Uses the existing entity_resolver for semantic matching (cross-lingual,
+    embedding-based) and then checks whether the resolved column is a
+    boolean/flag type. Empty when no entity-flag match is found.
+
+    Why this is needed: without it, the boolean column gets pulled into the
+    WHERE pipeline only via filter_intents — and if the intent's value is a
+    text literal like "фактический отток", a dtype-check kills the
+    condition, silently dropping `is_task = TRUE`. Surfacing the entity →
+    flag match here keeps the structural filter independent of any text
+    filter on the same row.
+    """
+    spec = _coerce_spec(query_spec)
+    if spec is None or not spec.entities or not selected_columns:
+        return []
+    existing_filter_targets = {
+        str(f.target or "").strip().lower()
+        for f in (spec.filters or [])
+    }
+    table_keys = list(selected_columns.keys())
+    synthetic: list[dict[str, Any]] = []
+    seen_cols: set[tuple[str, str]] = set()
+    for entity in spec.entities:
+        entity_name = (entity.canonical or entity.name or "").strip()
+        if not entity_name:
+            continue
+        try:
+            resolution = resolve_entity_to_columns(
+                entity_term=entity_name,
+                user_input="",
+                candidate_table_keys=table_keys,
+                schema_loader=schema_loader,
+                llm_invoker=llm_invoker,
+                role_hint="filter",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "ColumnBinding: entity_flag resolver failed for %r: %s",
+                entity_name, exc,
+            )
+            continue
+        if not resolution.matched or not resolution.column or not resolution.table_key:
+            continue
+        if not _column_is_boolean_flag(
+            schema_loader=schema_loader,
+            table_key=resolution.table_key,
+            column=resolution.column,
+        ):
+            continue
+        col_key = (resolution.table_key, resolution.column.lower())
+        if col_key in seen_cols:
+            continue
+        if resolution.column.lower() in existing_filter_targets:
+            continue
+        seen_cols.add(col_key)
+        roles = selected_columns.setdefault(resolution.table_key, {})
+        roles.setdefault("filter", [])
+        if resolution.column not in roles["filter"]:
+            roles["filter"].append(resolution.column)
+        synthetic.append({
+            "target": resolution.column,
+            "operator": "=",
+            "value": True,
+            "value_kind": "literal",
+            "evidence": [{
+                "source": "column_binding",
+                "text": f"entity «{entity_name}» → flag column {resolution.column}",
+                "confidence": float(resolution.confidence or 0.9),
+            }],
+            "confidence": float(resolution.confidence or 0.9),
+        })
+        existing_filter_targets.add(resolution.column.lower())
+        logger.info(
+            "ColumnBinding: entity «%s» → synthetic filter %s.%s = TRUE",
+            entity_name, resolution.table_key, resolution.column,
+        )
+    return synthetic
+
+
+def _column_is_boolean_flag(
+    *,
+    schema_loader: Any,
+    table_key: str,
+    column: str,
+) -> bool:
+    if not column or "." not in table_key:
+        return False
+    schema, table = table_key.split(".", 1)
+    try:
+        cols_df = schema_loader.get_table_columns(schema, table)
+    except Exception:  # noqa: BLE001
+        return False
+    if cols_df is None or getattr(cols_df, "empty", True):
+        return False
+    col_lower = column.lower()
+    for _, row in cols_df.iterrows():
+        if str(row.get("column_name") or "").strip().lower() != col_lower:
+            continue
+        dtype = str(row.get("data_type") or "").lower()
+        if "bool" in dtype:
+            return True
+        if col_lower.startswith(_ENTITY_FLAG_PREFIXES):
+            return True
+        return False
+    return False
+
+
 def _choose_column_across_tables(
     *,
     table_structures: dict[str, str],

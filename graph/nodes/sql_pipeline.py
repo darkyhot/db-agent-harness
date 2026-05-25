@@ -787,6 +787,16 @@ class SqlPipelineNodes:
                 missing_from_columns,
             )
 
+        # --- grounder-primary для main_table override (H5) ---
+        primary_source: str | None = None
+        selected_tables_list = state.get("selected_tables") or []
+        if selected_tables_list:
+            first = selected_tables_list[0]
+            if isinstance(first, (list, tuple)) and len(first) >= 2:
+                primary_source = f"{first[0]}.{first[1]}"
+            elif isinstance(first, str):
+                primary_source = first
+
         # --- Детерминированное построение blueprint (без LLM) ---
         blueprint = _deterministic_blueprint(
             intent=intent,
@@ -804,6 +814,7 @@ class SqlPipelineNodes:
             filter_tiebreaker=self._tiebreak_filter_candidates_llm,
             filter_specs=list((state.get("query_spec") or {}).get("filters") or []),
             time_range=(state.get("query_spec") or {}).get("time_range") or {},
+            primary_source=primary_source,
         )
         _apply_query_spec_blueprint_overrides(blueprint, state.get("query_spec") or {})
 

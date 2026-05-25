@@ -745,10 +745,56 @@ def test_f2_filters_out_identifier_and_low_confidence_candidates():
     assert "event_label" in cols, "plausible enum_like candidate must remain"
 
 
-def test_f2_falls_back_to_generic_message_when_no_plausible_candidate():
-    """G2: when every candidate is identifier/low/sub-threshold, F2 should
-    emit the generic message and an EMPTY clarification_spec (no implausible
-    options shown to the user).
+def test_f2_flag_column_guard_keeps_entity_filter_unresolved(tmp_path):
+    """H3: F2 must NOT fold a value like «Задача» into implicit_filters when
+    the selected table carries a boolean column (`is_task`) for the same
+    concept — that column discriminates, so the filter is structural and
+    can't be «covered by the table name».
+    """
+    from core.query_ir import FilterSpec
+    # Table description mentions "задача" → _filter_value_encoded_in_table
+    # would normally fire. But the table also has `is_task` boolean →
+    # H3 must keep the filter alive.
+    loader = _bool_loader(
+        tmp_path,
+        table_name="fact_outflow",
+        description="Информация по фактическим оттокам, включая задачи",
+    )
+    loader.ensure_value_profiles()
+    result = resolve_where(
+        user_input="Сколько задач",
+        intent={"filter_conditions": []},
+        selected_columns={"dm.fact_outflow": {"select": ["is_task"]}},
+        selected_tables=["dm.fact_outflow"],
+        schema_loader=loader,
+        semantic_frame={
+            "filter_intents": [
+                {
+                    "request_id": "text:dm.fact_outflow.entity",
+                    "query_text": "Задача",
+                    "value": "Задача",
+                    "kind": "text_search",
+                }
+            ]
+        },
+        base_conditions=[],
+        filter_specs=[
+            FilterSpec(target="some_unrelated_target", operator="=", value="Задача"),
+        ],
+    )
+    # The value «Задача» must NOT be silently folded — the flag column on
+    # the table is the discriminator the user expects to see.
+    implicit = result.get("implicit_filters") or []
+    assert not any(item.get("value") == "Задача" for item in implicit), (
+        "H3 violation: «Задача» got folded as implicit despite is_task column"
+    )
+
+
+def test_f2_falls_back_to_table_choice_when_no_plausible_candidate():
+    """H4: when every column candidate is identifier/low/sub-threshold, F2
+    must NOT emit the generic «уточните признак» message — instead it
+    surfaces a concrete clarification asking the user to pick which table
+    holds the value, so the user has something actionable to choose.
     """
     import core.where_resolver as wr
 
@@ -808,9 +854,16 @@ def test_f2_falls_back_to_generic_message_when_no_plausible_candidate():
         wr.rank_filter_candidates = original
 
     assert result["needs_clarification"] is True
-    # No structured options surface implausible columns to the user.
-    assert not result["clarification_spec"]
-    assert "Нашёл несколько возможных способов" in result["clarification_message"]
+    # Implausible columns are NOT exposed; instead we offer table choices.
+    spec = result["clarification_spec"]
+    assert spec, "expected a structured clarification_spec (H4)"
+    assert spec["type"] == "choice"
+    table_values = [opt["value"] for opt in spec["options"]]
+    assert "dm.t" in table_values, "selected_table must be listed as an option"
+    assert "Не нашёл подходящих колонок" in result["clarification_message"]
+    assert "«X»" in result["clarification_message"], (
+        "user's value must be quoted in the question"
+    )
 
 
 def test_f2_spec_is_cleared_by_business_event_suppression(tmp_path):

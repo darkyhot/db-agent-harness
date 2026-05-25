@@ -119,6 +119,90 @@ def _filter_value_encoded_in_table(
     return False
 
 
+_FLAG_COLUMN_PREFIXES = ("is_", "has_", "flag_")
+
+
+def _table_has_flag_column_for(
+    *,
+    schema_loader,
+    table_key: str,
+    value: Any,
+) -> bool:
+    """True if the table has a boolean/flag column that semantically matches
+    `value` (e.g. value="Задача" + column `is_task` on uzp_dwh_fact_outflow).
+
+    Cross-lingual matching: tries stem overlap first (cheap, catches «отток»
+    vs `is_outflow`), then falls back to the entity_resolver semantic match
+    (catches «задача» vs `is_task` via embeddings). Without this guard,
+    folding `value` into implicit_filters silently drops a discriminative
+    filter the user almost certainly meant.
+    """
+    if schema_loader is None or value is None or "." not in str(table_key):
+        return False
+    schema, table = str(table_key).split(".", 1)
+    try:
+        cols_df = schema_loader.get_table_columns(schema, table)
+    except Exception:  # noqa: BLE001
+        return False
+    if cols_df is None or getattr(cols_df, "empty", True):
+        return False
+
+    # Pass 1: cheap stem overlap (works for same-language matches like
+    # «отток» ↔ `is_outflow_confirmed`).
+    value_stems = _event_stems(str(value)) | {
+        _stem(tok) for tok in _tokenize(str(value)) if len(tok) >= 4
+    }
+    value_stems = {s for s in value_stems if s and len(s) >= 4}
+    flag_columns: list[str] = []
+    for _, row in cols_df.iterrows():
+        col_name = str(row.get("column_name") or row.get("name") or "").lower()
+        if not col_name:
+            continue
+        dtype = str(row.get("data_type") or row.get("dtype") or "").lower()
+        is_flag_dtype = ("bool" in dtype) or col_name.startswith(_FLAG_COLUMN_PREFIXES)
+        if not is_flag_dtype:
+            continue
+        flag_columns.append(col_name)
+        col_stems = {_stem(tok) for tok in _tokenize(col_name) if len(tok) >= 3}
+        for left in value_stems:
+            for right in col_stems:
+                if not right:
+                    continue
+                if left == right:
+                    return True
+                if min(len(left), len(right)) >= 4 and (
+                    left.startswith(right) or right.startswith(left)
+                ):
+                    return True
+
+    # Pass 2: semantic match via entity_resolver. Bail out if no flag columns
+    # exist or import fails (resolver pulls heavier deps; keep optional).
+    if not flag_columns:
+        return False
+    try:
+        from core.entity_resolver import resolve_entity_to_columns
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        resolution = resolve_entity_to_columns(
+            entity_term=str(value),
+            user_input="",
+            candidate_table_keys=[table_key],
+            schema_loader=schema_loader,
+            llm_invoker=None,
+            role_hint="filter",
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    if (
+        resolution.matched
+        and resolution.column
+        and resolution.column.lower() in flag_columns
+    ):
+        return True
+    return False
+
+
 def _event_stems(business_event: str) -> set[str]:
     stems = {_stem(tok) for tok in _tokenize(business_event) if len(tok) >= 4}
     normalized = _normalize_text(business_event)
@@ -770,13 +854,29 @@ def resolve_where(
                 continue
             covered_by: str | None = None
             for table_key in selected_tables or []:
-                if _filter_value_encoded_in_table(
+                if not _filter_value_encoded_in_table(
                     schema_loader=schema_loader,
                     table_key=table_key,
                     value=value,
                 ):
-                    covered_by = table_key
-                    break
+                    continue
+                # H3: even if the value stem appears in the table description,
+                # don't fold when the table has a boolean/flag column for that
+                # same concept — that column *discriminates* and the user's
+                # filter is structural, not "covered by table choice".
+                if _table_has_flag_column_for(
+                    schema_loader=schema_loader,
+                    table_key=table_key,
+                    value=value,
+                ):
+                    logger.info(
+                        "WhereResolver: F2 NOT folding %r — table %s has a "
+                        "flag-column for that concept; keeping as filter",
+                        value, table_key,
+                    )
+                    continue
+                covered_by = table_key
+                break
             if covered_by:
                 implicit_filters.append({
                     "target": intent.get("column_hint") or intent.get("query_text"),
@@ -868,19 +968,71 @@ def resolve_where(
                 [opt["column"] for opt in options],
             )
         else:
-            clarification_message = (
-                "Нашёл несколько возможных способов применить фильтр, "
-                "но уверенности недостаточно. Уточните, пожалуйста, желаемый признак или значение."
-            )
-            logger.info(
-                "WhereResolver: не удалось привязать filter_intents автоматически "
-                "(ranked_candidates=%s, intents=%s)",
-                {k: [c.get('column') for c in v[:3]] for k, v in ranked_candidates.items()},
-                [
-                    {"request_id": i.get("request_id"), "value": i.get("value")}
-                    for i in filter_intents
-                ],
-            )
+            # H4: no intent had plausible candidates (typical when ranked
+            # candidates are identifier-noise like login/fio that G2 filters
+            # out). Surface the user's actual value(s) plus the selected
+            # tables so the user can disambiguate — beats the generic
+            # "уточните признак" wording that hid the regression.
+            valued_intents = [
+                i for i in filter_intents
+                if str(i.get("request_id") or "") not in (
+                    table_encoded_request_ids | all_rejected_request_ids
+                )
+                and (i.get("value") or i.get("query_text"))
+            ]
+            value_texts: list[str] = []
+            for i in valued_intents:
+                v = str(i.get("value") or i.get("query_text") or "").strip()
+                if v and v not in value_texts:
+                    value_texts.append(v)
+            table_options = []
+            for tk in selected_tables or []:
+                try:
+                    schema_part, table_part = str(tk).split(".", 1)
+                    info = (schema_loader.get_table_info(schema_part, table_part) or "") if schema_loader else ""
+                except Exception:  # noqa: BLE001
+                    info = ""
+                info = info.strip().replace("\n", " ")
+                label = tk if not info else (
+                    f"{tk} — {info[:77].rstrip()}…" if len(info) > 80 else f"{tk} — {info}"
+                )
+                table_options.append({"value": tk, "label": label})
+            if value_texts and table_options:
+                joined_values = ", ".join(f"«{v}»" for v in value_texts[:3])
+                clarification_message = (
+                    f"Не нашёл подходящих колонок для значения {joined_values}. "
+                    "Уточните, в какой таблице/колонке искать."
+                )
+                clarification_spec = {
+                    "type": "choice",
+                    "request_id": str(valued_intents[0].get("request_id") or "filter_fallback"),
+                    "message": clarification_message,
+                    "options": table_options,
+                    "values": value_texts,
+                }
+                reasoning.append(
+                    "fallback_clarify_tables:"
+                    + ",".join(opt["value"] for opt in table_options)
+                )
+                logger.info(
+                    "WhereResolver: fallback clarification by table — values=%s, tables=%s",
+                    value_texts,
+                    [opt["value"] for opt in table_options],
+                )
+            else:
+                clarification_message = (
+                    "Нашёл несколько возможных способов применить фильтр, "
+                    "но уверенности недостаточно. Уточните, пожалуйста, желаемый признак или значение."
+                )
+                logger.info(
+                    "WhereResolver: не удалось привязать filter_intents автоматически "
+                    "(ranked_candidates=%s, intents=%s)",
+                    {k: [c.get('column') for c in v[:3]] for k, v in ranked_candidates.items()},
+                    [
+                        {"request_id": i.get("request_id"), "value": i.get("value")}
+                        for i in filter_intents
+                    ],
+                )
 
     if (
         clarification_message
@@ -926,9 +1078,21 @@ def resolve_where(
     # uzp_dwh_fact_outflow), переезжают в implicit_filters. Summarizer
     # упомянет их в финальном ответе ("учтён в таблице X").
     # (G1 may already have populated implicit_filters from the F2 short-circuit.)
+    # H1/H3 guards (mirror the first F2 pass on filter_intents):
+    #   - kind-eligibility: only text-style filters can be "covered by table";
+    #     boolean/flag/explicit intents stay as unresolved (the user pinned
+    #     them explicitly).
+    #   - flag-column guard: if the table has a boolean column for the same
+    #     concept (e.g. `is_task` for "Задача"), don't fold — the column
+    #     discriminates and the filter is structural.
+    _F2_ELIGIBLE_KINDS = {"text_search", "phrase_filter", ""}
     if unresolved_filters and selected_tables:
         survivors: list[dict[str, Any]] = []
         for item in unresolved_filters:
+            kind = str(item.get("kind") or "").strip().lower()
+            if kind and kind not in _F2_ELIGIBLE_KINDS:
+                survivors.append(item)
+                continue
             primary_table = (
                 str(item.get("candidate_table") or "")
                 or (selected_tables[0] if selected_tables else "")
@@ -939,22 +1103,34 @@ def resolve_where(
                 [primary_table] if primary_table else list(selected_tables)
             )
             for tk in tables_to_check:
-                if _filter_value_encoded_in_table(
+                if not _filter_value_encoded_in_table(
                     schema_loader=schema_loader,
                     table_key=tk,
                     value=value,
                 ):
-                    implicit_filters.append({
-                        "target": item.get("target"),
-                        "value": value,
-                        "applied_via": "table_name_encoding",
-                        "table": tk,
-                    })
-                    reasoning.append(
-                        f"implicit_filter:{tk}:{value}"
+                    continue
+                if _table_has_flag_column_for(
+                    schema_loader=schema_loader,
+                    table_key=tk,
+                    value=value,
+                ):
+                    logger.info(
+                        "WhereResolver: F2(unresolved) NOT folding %r — table %s "
+                        "has a flag-column for that concept; keeping as filter",
+                        value, tk,
                     )
-                    covered = True
-                    break
+                    continue
+                implicit_filters.append({
+                    "target": item.get("target"),
+                    "value": value,
+                    "applied_via": "table_name_encoding",
+                    "table": tk,
+                })
+                reasoning.append(
+                    f"implicit_filter:{tk}:{value}"
+                )
+                covered = True
+                break
             if not covered:
                 survivors.append(item)
         unresolved_filters = survivors

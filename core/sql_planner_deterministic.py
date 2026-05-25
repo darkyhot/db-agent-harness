@@ -1216,6 +1216,7 @@ def build_blueprint(
     filter_tiebreaker=None,
     filter_specs: list[dict] | None = None,
     time_range: dict | None = None,
+    primary_source: str | None = None,
 ) -> dict:
     """Построить SQL Blueprint детерминированно, без LLM.
 
@@ -1243,6 +1244,26 @@ def build_blueprint(
     }
     table_types = effective_table_types
     strategy, main_table = _determine_strategy(effective_table_types, join_spec)
+
+    # H5: respect the grounder's primary source. If the grounder ranked
+    # table A first but column-selection only bound columns on table B,
+    # _determine_strategy returns main_table=B silently. That flip drops
+    # the entity coverage the grounder confirmed. Two cases:
+    #   - primary_source is in selected_columns → use it as main_table.
+    #   - primary_source is missing from selected_columns → warn loudly
+    #     so reviewers see the silent flip in logs.
+    if primary_source and primary_source in selected_columns and main_table != primary_source:
+        logger.info(
+            "DeterministicPlanner: overriding main_table %s → %s (grounder primary)",
+            main_table, primary_source,
+        )
+        main_table = primary_source
+    elif primary_source and primary_source not in selected_columns:
+        logger.warning(
+            "DeterministicPlanner: main_table flipped from grounder primary %s to %s — "
+            "grounder primary not in selected_columns",
+            primary_source, main_table,
+        )
     aggregations = _compute_aggregations(
         intent,
         selected_columns,

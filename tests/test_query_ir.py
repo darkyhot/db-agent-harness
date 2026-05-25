@@ -3,7 +3,7 @@ import logging
 import pandas as pd
 
 from core.catalog_grounding import ground_query_spec
-from core.column_binding import bind_columns
+from core.column_binding import bind_columns, derive_entity_flag_filters
 from core.join_analysis import detect_table_type
 from core.query_ir import FilterSpec, QuerySpec, query_spec_json_schema
 from core.schema_loader import SchemaLoader
@@ -533,11 +533,15 @@ def test_catalog_grounding_uses_metadata_filters_and_prunes_unrelated_helpers(tm
 
     # H2: when two strong fact-table candidates remain after pruning and
     # neither is a user-pinned explicit source, the grounder asks instead
-    # of silently picking one. Both candidates appear in the options.
+    # of silently picking one. Both candidates appear in the options
+    # (rendered as "schema.table — description...").
     assert result.needs_clarification is True
     assert result.clarification is not None
     assert result.clarification.reason == "catalog_grounding_ambiguous_strong_sources"
-    assert set(result.clarification.options or []) == {"dm.sale_funnel", "dm.fact_outflow"}
+    option_prefixes = {
+        (str(opt).split(" — ", 1)[0]) for opt in (result.clarification.options or [])
+    }
+    assert option_prefixes == {"dm.sale_funnel", "dm.fact_outflow"}
 
 
 def test_catalog_grounding_logs_table_scores(tmp_path, caplog):
@@ -811,37 +815,50 @@ def test_where_resolver_skips_exact_date_filter_when_calendar_range_exists(tmp_p
 
 # ---------------------------------------------------------------------------
 # H2: _detect_ambiguous_strong_sources — pick a clarification when 2+ tables
-# tie within 15% of the top confidence; skip otherwise.
+# tie within `min_gap_pct` of the top raw score; skip otherwise.
 # ---------------------------------------------------------------------------
 
 
-def _binding(table: str, confidence: float, reason: str = "query_spec_slot_score"):
+def _binding(
+    table: str,
+    score: float,
+    *,
+    reason: str = "query_spec_slot_score",
+    confidence: float | None = None,
+):
     from core.query_ir import SourceBinding
+    # Confidence is clamped to [0.35, 0.95] in production; default it to a
+    # plausible mid-range value when callers don't care, so the dataclass
+    # stays valid.
+    if confidence is None:
+        confidence = max(0.35, min(0.95, score / 12.0))
     return SourceBinding(
         schema="dm",
         table=table,
         reason=reason,
         confidence=confidence,
+        score=score,
         evidence=[],
     )
 
 
 def test_h2_helper_returns_tied_sources_within_gap():
     from core.catalog_grounding import _detect_ambiguous_strong_sources
+    # Raw scores 3.0 vs 2.0 → 33% gap < 40% threshold — both surface.
     tied = _detect_ambiguous_strong_sources([
-        _binding("fact_outflow", 0.86),
-        _binding("sale_funnel", 0.80),
-        _binding("misc", 0.40),  # below floor
+        _binding("fact_outflow", 3.0),
+        _binding("sale_funnel", 2.0),
+        _binding("misc", 1.0),  # below score_floor
     ])
     assert {s.table for s in tied} == {"fact_outflow", "sale_funnel"}
 
 
 def test_h2_helper_returns_empty_when_one_table_dominates():
     from core.catalog_grounding import _detect_ambiguous_strong_sources
-    # 0.86 vs 0.50 → 42% gap > 15% — no ambiguity.
+    # 3.0 vs 1.6 → 47% gap > 40% — no ambiguity.
     tied = _detect_ambiguous_strong_sources([
-        _binding("fact_a", 0.86),
-        _binding("fact_b", 0.50),
+        _binding("fact_a", 3.0),
+        _binding("fact_b", 1.6),
     ])
     assert tied == []
 
@@ -852,8 +869,8 @@ def test_h2_helper_skips_dimension_quality_enrichment_sidekicks():
     """
     from core.catalog_grounding import _detect_ambiguous_strong_sources
     tied = _detect_ambiguous_strong_sources([
-        _binding("fact_sales", 0.81),
-        _binding("org_dict", 0.95, reason="dimension_quality_enrichment"),
+        _binding("fact_sales", 3.0),
+        _binding("org_dict", 4.0, reason="dimension_quality_enrichment"),
     ])
     assert tied == []
 
@@ -864,8 +881,8 @@ def test_h2_helper_skips_explicit_source_constraint():
     """
     from core.catalog_grounding import _detect_ambiguous_strong_sources
     tied = _detect_ambiguous_strong_sources([
-        _binding("fact_a", 0.90, reason="explicit_source_constraint"),
-        _binding("fact_b", 0.85),
+        _binding("fact_a", 4.0, reason="explicit_source_constraint"),
+        _binding("fact_b", 3.5),
     ])
     assert tied == []
 
@@ -922,3 +939,100 @@ def test_h2_grounder_skips_clarification_when_join_constraints_present(tmp_path)
     # clarification — but never the H2 ambiguity reason.
     if result.clarification is not None:
         assert result.clarification.reason != "catalog_grounding_ambiguous_strong_sources"
+
+
+# ---------------------------------------------------------------------------
+# H6: derive_entity_flag_filters — entity «Задача» → is_task = TRUE
+# ---------------------------------------------------------------------------
+
+
+def test_derive_entity_flag_filters_emits_synthetic_boolean(tmp_path):
+    """When the user's entity resolves to a boolean column on the main table
+    (e.g. «Задача» → is_task), the helper emits a synthetic FilterSpec dict
+    so the WHERE pipeline picks it up as direct_filter_specs and we don't
+    lose the structural filter to a dtype mismatch on a parallel text intent.
+    """
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["fact_outflow"],
+        "description": ["Факты по фактическому оттоку, включая задачи"],
+        "grain": ["row"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["fact_outflow"] * 3,
+        "column_name": ["report_dt", "is_task", "amount"],
+        "dType": ["date", "bool", "int8"],
+        "description": ["Дата", "Признак: задача", "Сумма"],
+        "is_primary_key": [False] * 3,
+        "unique_perc": [0.5, 50.0, 80.0],
+        "not_null_perc": [99.0, 99.0, 99.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    spec, _errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "entities": [{"name": "Задача", "canonical": "Задача", "confidence": 1.0}],
+        "metrics": [{"operation": "count", "target": "Задача", "confidence": 1.0}],
+        "filters": [],
+        "confidence": 0.9,
+    })
+    assert spec is not None
+
+    selected_columns: dict[str, dict] = {
+        "dm.fact_outflow": {"select": ["report_dt"], "aggregate": ["*"], "filter": ["report_dt"]}
+    }
+    synthetic = derive_entity_flag_filters(
+        query_spec=spec,
+        selected_columns=selected_columns,
+        schema_loader=loader,
+    )
+    assert synthetic, "expected a synthetic flag filter for entity «Задача»"
+    assert synthetic[0]["target"] == "is_task"
+    assert synthetic[0]["value"] is True
+    # The flag column is wired into the table's filter role so
+    # _apply_exact_filter_specs can find it.
+    assert "is_task" in selected_columns["dm.fact_outflow"]["filter"]
+
+
+def test_derive_entity_flag_filters_skips_when_no_flag_column(tmp_path):
+    """When the main table has no boolean column for the entity, the helper
+    returns [] — no synthetic noise.
+    """
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["orders"],
+        "description": ["Заказы клиентов"],
+        "grain": ["row"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm", "dm"],
+        "table_name": ["orders", "orders"],
+        "column_name": ["order_id", "amount"],
+        "dType": ["int8", "int8"],
+        "description": ["ID заказа", "Сумма"],
+        "is_primary_key": [True, False],
+        "unique_perc": [100.0, 80.0],
+        "not_null_perc": [100.0, 99.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    spec, _errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "entities": [{"name": "Заказ", "canonical": "Заказ", "confidence": 1.0}],
+        "metrics": [{"operation": "count", "target": "Заказ", "confidence": 1.0}],
+        "filters": [],
+        "confidence": 0.9,
+    })
+    assert spec is not None
+
+    synthetic = derive_entity_flag_filters(
+        query_spec=spec,
+        selected_columns={"dm.orders": {"select": ["order_id"], "aggregate": ["*"]}},
+        schema_loader=loader,
+    )
+    assert synthetic == []

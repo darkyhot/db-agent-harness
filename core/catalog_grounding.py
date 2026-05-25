@@ -280,7 +280,48 @@ def ground_query_spec(
         )
 
     best_conf = max((source.confidence for source in sources), default=0.0)
-    if sources and best_conf < min_confidence:
+
+    # H2: when 2+ candidates survived pruning with comparable raw score and
+    # none of them is a user-pinned explicit source, surface a clarification
+    # instead of silently picking the top one. H2 runs BEFORE the
+    # low-confidence gate because it provides a more informative prompt
+    # (named alternatives with descriptions vs. generic "weak candidates").
+    if (
+        query_spec.task == "answer_data"
+        and not query_spec.join_constraints
+        and not any(s.reason == "explicit_source_constraint" for s in sources)
+    ):
+        ambiguous_strong = _detect_ambiguous_strong_sources(sources)
+        if ambiguous_strong:
+            options = [
+                _ambiguous_source_label(s, schema_loader) for s in ambiguous_strong
+            ]
+            clarification = ClarificationSpec(
+                question=(
+                    "Запрос подходит к нескольким таблицам с близкой релевантностью. "
+                    "Уточните, какую использовать."
+                ),
+                reason="catalog_grounding_ambiguous_strong_sources",
+                field="source_constraints",
+                options=options,
+                evidence=[Evidence(source="catalog_grounder", text=user_input, confidence=best_conf)],
+            )
+            logger.info(
+                "CatalogGrounder: ambiguous strong sources detected — options=%s "
+                "(scores=%s, confidences=%s)",
+                [s.full_name for s in ambiguous_strong],
+                [round(float(s.score or 0.0), 3) for s in ambiguous_strong],
+                [round(s.confidence, 3) for s in ambiguous_strong],
+            )
+            return GroundingResult(
+                query_spec=query_spec,
+                sources=sources,
+                clarification=clarification,
+                warnings=warnings,
+                confidence=best_conf,
+            )
+
+    if sources and best_conf <= min_confidence:
         options = [source.full_name for source in sources[:max_sources]]
         clarification = ClarificationSpec(
             question="Я нашёл несколько слабых кандидатов на источник данных. Уточните, какую таблицу использовать.",
@@ -296,42 +337,6 @@ def ground_query_spec(
             warnings=warnings,
             confidence=best_conf,
         )
-
-    # H2: when 2+ candidates survived pruning with comparable confidence and
-    # none of them is a user-pinned explicit source, surface a clarification
-    # instead of silently picking the top one. Without this guard the agent
-    # would choose unstably between equally-valid fact tables across runs.
-    if (
-        query_spec.task == "answer_data"
-        and not query_spec.join_constraints
-        and not any(s.reason == "explicit_source_constraint" for s in sources)
-    ):
-        ambiguous_strong = _detect_ambiguous_strong_sources(sources)
-        if ambiguous_strong:
-            options = [s.full_name for s in ambiguous_strong]
-            clarification = ClarificationSpec(
-                question=(
-                    "Запрос подходит к нескольким таблицам с близкой уверенностью. "
-                    "Уточните, какую использовать."
-                ),
-                reason="catalog_grounding_ambiguous_strong_sources",
-                field="source_constraints",
-                options=options,
-                evidence=[Evidence(source="catalog_grounder", text=user_input, confidence=best_conf)],
-            )
-            logger.info(
-                "CatalogGrounder: ambiguous strong sources detected — options=%s "
-                "(confidences=%s)",
-                options,
-                [round(s.confidence, 3) for s in ambiguous_strong],
-            )
-            return GroundingResult(
-                query_spec=query_spec,
-                sources=sources,
-                clarification=clarification,
-                warnings=warnings,
-                confidence=best_conf,
-            )
 
     if sources:
         primary = _main_source_with_required_priority(sources)
@@ -385,37 +390,74 @@ _AMBIGUITY_EXCLUDED_REASONS = {
 def _detect_ambiguous_strong_sources(
     sources: list[SourceBinding],
     *,
-    confidence_floor: float = 0.65,
-    min_gap_pct: float = 0.15,
+    score_floor: float = 1.5,
+    min_gap_pct: float = 0.40,
     max_options: int = 3,
 ) -> list[SourceBinding]:
-    """Return the set of sources that are tied for "best" within `min_gap_pct`
-    of the top confidence, all above `confidence_floor`. When the result has
-    ≥2 entries, the caller should surface a clarification instead of silently
+    """Return the set of sources tied for "best" within `min_gap_pct` of the
+    top discriminator, all above `score_floor`. When the result has ≥2
+    entries, the caller should surface a clarification instead of silently
     picking sources[0].
+
+    Discriminator: prefer raw `score` when set (sources from
+    `_score_catalog_bindings` carry it); otherwise fall back to
+    `confidence * 12` so non-scored paths (lexicon anchors, semantic search,
+    rank-based) still produce a comparable magnitude. Both `score_floor`
+    and `min_gap_pct` are calibrated against raw score.
+
+    Why we don't just use confidence: `_score_catalog_bindings` clamps it to
+    [0.35, 0.95] via `min(0.95, max(0.35, score/12))`. Typical competing
+    fact tables score 1.5–3.0, all clamped to confidence=0.35 — a confidence
+    gate could never distinguish them. Raw score preserves the signal.
 
     Excludes: explicit/required sources (user pinned) and dimension-quality
     enrichment sidekicks (they exist to JOIN with a fact, not compete with it).
     """
+
+    def _discriminator(src: SourceBinding) -> float:
+        raw = float(getattr(src, "score", 0.0) or 0.0)
+        if raw > 0:
+            return raw
+        # Inverse of the slot-score formula: score = confidence * 12.
+        return float(src.confidence or 0.0) * 12.0
+
     candidates = [
         s for s in sources
         if s.reason not in _AMBIGUITY_EXCLUDED_REASONS
-        and float(s.confidence or 0.0) >= confidence_floor
+        and _discriminator(s) >= score_floor
     ]
     if len(candidates) < 2:
         return []
-    candidates.sort(key=lambda s: float(s.confidence or 0.0), reverse=True)
-    top_conf = float(candidates[0].confidence or 0.0)
-    if top_conf <= 0.0:
+    candidates.sort(key=_discriminator, reverse=True)
+    top_score = _discriminator(candidates[0])
+    if top_score <= 0.0:
         return []
     tied: list[SourceBinding] = [candidates[0]]
     for cand in candidates[1:]:
-        gap = (top_conf - float(cand.confidence or 0.0)) / top_conf
+        gap = (top_score - _discriminator(cand)) / top_score
         if gap < min_gap_pct:
             tied.append(cand)
     if len(tied) < 2:
         return []
     return tied[:max_options]
+
+
+def _ambiguous_source_label(source: SourceBinding, schema_loader: Any) -> str:
+    """Render a source label for H2 clarification UI: name + short description.
+
+    Falls back to the bare full_name when no table_info is available.
+    """
+    name = source.full_name
+    try:
+        info = (schema_loader.get_table_info(source.schema_name, source.table) or "") if schema_loader else ""
+    except Exception:  # noqa: BLE001
+        info = ""
+    info = info.strip().replace("\n", " ")
+    if not info:
+        return name
+    if len(info) > 80:
+        info = info[:77].rstrip() + "…"
+    return f"{name} — {info}"
 
 
 def _primary_source_covers_entities(
@@ -856,6 +898,7 @@ def _score_catalog_bindings(
             table=table,
             reason="query_spec_slot_score",
             confidence=confidence,
+            score=float(score),
             evidence=[Evidence(source="catalog_slot_score", text=", ".join(all_terms), confidence=confidence)],
         )
         scored.append((score, binding))

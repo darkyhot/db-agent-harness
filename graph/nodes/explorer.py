@@ -11,7 +11,7 @@ import re
 import time
 from typing import Any
 
-from core.column_binding import bind_columns
+from core.column_binding import bind_columns, derive_entity_flag_filters
 from core.join_analysis import detect_table_type, format_join_analysis
 from core.join_selection import normalize_join_spec
 from core.query_ir import QuerySpec
@@ -568,7 +568,36 @@ class ExplorerNodes:
                 f"[column_binding] таблиц: {len(bound_result['selected_columns'])}, "
                 f"join-ключей: {len(bound_result.get('join_spec') or [])}",
             )
-            return {
+
+            # H6: extract entity → boolean-flag filters (e.g. «Задача» →
+            # is_task = TRUE). Append them to query_spec.filters so the
+            # WHERE pipeline picks them up as direct_filter_specs and
+            # they don't get killed by dtype-mismatch with a parallel
+            # text filter on the same row.
+            updated_query_spec = None
+            try:
+                synthetic = derive_entity_flag_filters(
+                    query_spec=spec,
+                    selected_columns=bound_result["selected_columns"],
+                    schema_loader=self.schema,
+                    llm_invoker=self,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("derive_entity_flag_filters failed: %s", exc)
+                synthetic = []
+            if synthetic:
+                qs_dict = dict(state.get("query_spec") or raw_query_spec or {})
+                qs_filters = list(qs_dict.get("filters") or [])
+                qs_filters.extend(synthetic)
+                qs_dict["filters"] = qs_filters
+                updated_query_spec = qs_dict
+                logger.info(
+                    "ColumnSelector: added %d synthetic flag filter(s): %s",
+                    len(synthetic),
+                    [f["target"] for f in synthetic],
+                )
+
+            update: dict[str, Any] = {
                 "selected_columns": bound_result["selected_columns"],
                 "join_spec": bound_result.get("join_spec") or [],
                 "column_selector_hint": "",
@@ -583,6 +612,9 @@ class ExplorerNodes:
                 ],
                 "graph_iterations": state.get("graph_iterations", 0) + 1,
             }
+            if updated_query_spec is not None:
+                update["query_spec"] = updated_query_spec
+            return update
         if spec_errors:
             logger.warning("ColumnSelector: QuerySpec invalid for binding: %s", "; ".join(spec_errors))
         logger.info("ColumnSelector: запускаем LLM column selector")

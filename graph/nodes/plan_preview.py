@@ -238,7 +238,7 @@ class PlanPreviewNodes:
         """
         # Если план уже подтверждён — транзит
         if state.get("plan_preview_approved"):
-            logger.debug("plan_preview: approved — транзит")
+            logger.info("plan_preview: транзит — план уже подтверждён пользователем")
             return {
                 "plan_preview_pending": False,
                 "plan_preview_approved": False,
@@ -246,13 +246,17 @@ class PlanPreviewNodes:
 
         show_plan: bool = getattr(self, "show_plan", False)
         explicit_mode: bool = bool(state.get("explicit_mode"))
+        iteration = state.get("plan_preview_iteration", 0)
 
         # plan_preview активируется только если show_plan=True в конфиге.
         # explicit_mode=True усиливает эффект (конфидентность и strict-хинты),
         # но не форсирует показ плана при show_plan=False — это обеспечивает
         # стабильность golden-тестов (acceptance 2.1: show_plan=false → тесты не ломаются).
         if not show_plan:
-            logger.debug("plan_preview: show_plan=False — транзит")
+            logger.info(
+                "plan_preview: транзит — show_plan=False (explicit_mode=%s, iteration=%d)",
+                explicit_mode, iteration,
+            )
             return {}
 
         # Собираем данные для рендера
@@ -266,7 +270,10 @@ class PlanPreviewNodes:
 
         # Если blueprint пуст — транзит (нечего показывать)
         if not sql_blueprint:
-            logger.warning("plan_preview: sql_blueprint пуст — транзит")
+            logger.warning(
+                "plan_preview: транзит — sql_blueprint пуст (explicit_mode=%s, iteration=%d)",
+                explicit_mode, iteration,
+            )
             return {}
 
         sql_preview, sql_preview_note, static_check_failed = _build_deterministic_sql_preview(
@@ -277,8 +284,6 @@ class PlanPreviewNodes:
             schema_loader=getattr(self, "schema", None),
             allowed_tables=allowed_tables,
         )
-
-        iteration = state.get("plan_preview_iteration", 0)
 
         # Fix A: если deterministic SQL не прошёл статическую проверку — НЕ
         # показываем план пользователю (иначе он видит фильтры с

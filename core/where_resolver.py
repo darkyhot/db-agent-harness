@@ -532,11 +532,49 @@ def resolve_where(
         semantic_frame=effective_semantic_frame,
     )
 
-    for request_id, candidates in ranked_candidates.items():
+    # Order request_ids so explicit/user-driven filters resolve first, then
+    # text: lexicon rules. This lets us skip a text: rule when an *explicit*
+    # rule has already covered the same table, preventing the redundant
+    # double-filter the LLM was hedging around (see 2026-05-25 regression).
+    # We still allow multiple text: rules on one table — those typically
+    # represent independent filter_intents (e.g. subject vs value).
+    def _rule_priority(req_id: str) -> int:
+        prefix = str(req_id).split(":", 1)[0]
+        if prefix in ("explicit", "query_spec"):
+            return 0
+        if prefix in ("phrase", "flag"):
+            return 1
+        if prefix == "text":
+            return 2
+        return 1
+    ranked_items = sorted(
+        ranked_candidates.items(),
+        key=lambda kv: _rule_priority(kv[0]),
+    )
+    explicit_applied_table_keys: set[str] = set()
+
+    for request_id, candidates in ranked_items:
         if str(request_id) in set(direct_applied):
             continue
         if not candidates:
             continue
+        # F6: skip text-lexicon rules when an explicit/query_spec rule already
+        # applied to the same table — prevents the LLM from emitting redundant
+        # double filters (e.g. task_type ILIKE '%X%' on top of task_subtype = 'X').
+        # Multiple text: rules on one table are still allowed because they
+        # usually represent distinct intents (subject vs value).
+        if str(request_id).startswith("text:") and explicit_applied_table_keys:
+            top_table_key = str((candidates[0] or {}).get("table_key") or "")
+            if top_table_key and top_table_key in explicit_applied_table_keys:
+                reasoning.append(
+                    f"skipped_text_rule:{request_id}:already_covered_by_explicit"
+                )
+                logger.info(
+                    "WhereResolver: skip text rule %s — table %s already covered "
+                    "by an explicit/query_spec rule",
+                    request_id, top_table_key,
+                )
+                continue
         compatible_candidates = []
         for candidate in candidates:
             schema = candidate.get("schema")
@@ -679,6 +717,9 @@ def resolve_where(
                 continue
         _add_unique(conditions, best_condition)
         applied_rules.append(str(request_id))
+        rule_prefix = str(request_id).split(":", 1)[0]
+        if best_table_key and rule_prefix in ("explicit", "query_spec"):
+            explicit_applied_table_keys.add(best_table_key)
         evidence = ", ".join(best.get("evidence", []) or [])
         reasoning.append(
             f"{best.get('table_key')}: {best.get('column')} -> {best.get('condition')}"
@@ -697,11 +738,72 @@ def resolve_where(
         and not clarification_message
         and len(all_rejected_request_ids) < len(filter_intents)
     ):
-        clarification_message = (
-            "Нашёл несколько возможных способов применить фильтр, "
-            "но уверенности недостаточно. Уточните, пожалуйста, желаемый признак или значение."
-        )
-        logger.info("WhereResolver: не удалось привязать filter_intents автоматически")
+        # Find the first unbound intent that has candidates we can offer the user.
+        # We surface the user's value verbatim + the top candidate columns; the
+        # generic «уточните признак» wording (without choices) is the regression
+        # we fix here.
+        offered_intent: dict[str, Any] | None = None
+        offered_candidates: list[dict[str, Any]] = []
+        for intent in filter_intents:
+            req_id = str(intent.get("request_id") or "")
+            if req_id in all_rejected_request_ids:
+                continue
+            intent_candidates = list(ranked_candidates.get(req_id) or [])
+            if intent_candidates:
+                offered_intent = intent
+                offered_candidates = intent_candidates[:3]
+                break
+
+        if offered_intent is not None and offered_candidates:
+            value_text = str(
+                offered_intent.get("value")
+                or offered_intent.get("query_text")
+                or offered_intent.get("column_hint")
+                or ""
+            ).strip()
+            options = [
+                {
+                    "column": str(cand.get("column") or ""),
+                    "label": candidate_label(cand),
+                }
+                for cand in offered_candidates
+                if cand.get("column")
+            ]
+            labels = " или ".join(opt["label"] for opt in options)
+            value_clause = f" для значения «{value_text}»" if value_text else ""
+            clarification_message = (
+                f"Нашёл несколько подходящих колонок{value_clause}: {labels}. "
+                "Уточните, пожалуйста, по какой фильтровать."
+            )
+            clarification_spec = {
+                "type": "choice",
+                "request_id": str(offered_intent.get("request_id") or ""),
+                "message": clarification_message,
+                "options": options,
+            }
+            reasoning.append(
+                f"fallback_clarify:{offered_intent.get('request_id')}:"
+                + ",".join(opt["column"] for opt in options)
+            )
+            logger.info(
+                "WhereResolver: fallback clarification — value=%r, candidates=%s",
+                value_text,
+                [opt["column"] for opt in options],
+            )
+        else:
+            clarification_message = (
+                "Нашёл несколько возможных способов применить фильтр, "
+                "но уверенности недостаточно. Уточните, пожалуйста, желаемый признак или значение."
+            )
+            logger.info(
+                "WhereResolver: не удалось привязать filter_intents автоматически "
+                "(ranked_candidates=%s, intents=%s)",
+                {k: [c.get('column') for c in v[:3]] for k, v in ranked_candidates.items()},
+                [
+                    {"request_id": i.get("request_id"), "value": i.get("value")}
+                    for i in filter_intents
+                ],
+            )
 
     if (
         clarification_message

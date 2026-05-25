@@ -197,6 +197,44 @@ def _has_join_condition(on_text: str, left_col: str, right_col: str) -> bool:
     return bool(re.search(direct, on_text) or re.search(reverse, on_text))
 
 
+def _count_sql_where_predicates(sql: str) -> int:
+    """Best-effort count of conjunctive predicates in the WHERE clause of the
+    top-level SELECT. Used for "blueprint vs LLM" sanity logging — not for
+    correctness checks, so a regex-based approach is good enough.
+    """
+    if not sql:
+        return 0
+    upper = sql.upper()
+    where_idx = upper.find(" WHERE ")
+    if where_idx < 0:
+        return 0
+    tail = sql[where_idx + len(" WHERE "):]
+    # Truncate at the next top-level clause keyword.
+    upper_tail = tail.upper()
+    cut = len(tail)
+    for kw in (" GROUP BY ", " HAVING ", " ORDER BY ", " LIMIT ", ";"):
+        idx = upper_tail.find(kw)
+        if idx >= 0:
+            cut = min(cut, idx)
+    where_clause = tail[:cut]
+    # Mask parenthesised sub-expressions so we count top-level ANDs only.
+    masked = []
+    depth = 0
+    for ch in where_clause:
+        if ch == "(":
+            depth += 1
+            masked.append(" ")
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            masked.append(" ")
+        else:
+            masked.append(" " if depth > 0 else ch)
+    flat = "".join(masked)
+    # Split on top-level AND (case-insensitive); empty splits = no clause.
+    pieces = [p for p in re.split(r"(?i)\s+AND\s+", flat) if p.strip()]
+    return len(pieces) if pieces else (1 if where_clause.strip() else 0)
+
+
 def _composite_join_issues(sql: str, join_spec: list[dict[str, Any]]) -> list[str]:
     """Return missing ON conditions for composite joins from join_spec."""
     if not sql or not join_spec:
@@ -1180,6 +1218,10 @@ class SqlPipelineNodes:
             "- DISTINCT на внешнем SELECT — ЗАПРЕЩЁН\n"
             "- Составной JOIN: если join_keys содержит несколько пар для одной пары таблиц — "
             "объединяй ВСЕ условия через AND в одном ON-клаузе\n"
+            "- WHERE = в точности условия из blueprint.where_conditions. "
+            "НЕ добавляй дополнительные ILIKE/= условия на ту же колонку «на всякий случай» "
+            "(дублирующий фильтр на один столбец вида `task_subtype ILIKE '%X%' AND task_subtype = 'X'` "
+            "запрещён). Если в blueprint нет условия — не выдумывай его из текста запроса.\n"
             f"{_allowed_section}"
             f"{_required_section}"
             f"{join_subquery_warning}\n"
@@ -1318,12 +1360,22 @@ class SqlPipelineNodes:
                         {"role": "assistant", "content": error_msg}
                     ],
                 }
-            logger.info("SqlWriter: SQL готов, отправляю на валидацию")
+            blueprint_where_count = len(blueprint.get("where_conditions") or [])
+            sql_where_count = _count_sql_where_predicates(sql)
+            logger.info(
+                "SqlWriter: SQL готов, отправляю на валидацию "
+                "(blueprint.where_conditions=%d, sql.where_predicates=%d%s)",
+                blueprint_where_count,
+                sql_where_count,
+                " — LLM добавил/убрал условие" if blueprint_where_count != sql_where_count else "",
+            )
             step_idx = state["current_step"]
             evidence_trace["sql_generation"] = {
                 "mode": "llm_fallback",
                 "strategy": strategy,
                 "fallback_policy": fallback_policy,
+                "blueprint_where_count": blueprint_where_count,
+                "sql_where_predicates": sql_where_count,
             }
             return {
                 "sql_to_validate": sql,

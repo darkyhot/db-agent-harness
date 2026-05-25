@@ -130,8 +130,8 @@ class QueryIRNodes:
         logger.info(
             "CatalogGrounder: input source_constraints=%s, excluded_in_spec=%s, "
             "state.must_keep=%s, state.allowed=%s",
-            [(s.schema, s.table) for s in spec.source_constraints],
-            [(s.schema, s.table) for s in spec.excluded_source_constraints],
+            [(s.schema, s.table, getattr(s, "semantic", None)) for s in spec.source_constraints],
+            [(s.schema, s.table, getattr(s, "semantic", None)) for s in spec.excluded_source_constraints],
             (state.get("user_hints") or {}).get("must_keep_tables") or [],
             state.get("allowed_tables") or [],
         )

@@ -684,6 +684,7 @@ def _compute_aggregations(
     if main_table in selected_columns:
         table_order = [main_table] + [t for t in table_order if t != main_table]
 
+    auto_distinct_on_identifier = False
     for table_key in table_order:
         roles = selected_columns.get(table_key, {})
         agg_cols = list(roles.get("aggregate", []) or [])
@@ -702,21 +703,73 @@ def _compute_aggregations(
             )
         ):
             distinct = True
+            auto_distinct_on_identifier = _column_is_pk_or_identifier(
+                table_key, col, schema_loader=schema_loader,
+            )
         key = (func, col, distinct)
         if key in seen:
             continue
         seen.add(key)
         results.append(_build_aggregation_result(func, col, distinct=distinct, source_table=table_key))
+        logger.info(
+            "DeterministicPlanner: COUNT choice — column=%s.%s, distinct=%s, "
+            "is_pk_or_identifier=%s, strategy=%s",
+            table_key, col, distinct, auto_distinct_on_identifier, strategy,
+        )
         break
 
     if not results and hint == "count":
         results.append(_build_aggregation_result("COUNT", "*", distinct=False, source_table=main_table))
+        logger.info(
+            "DeterministicPlanner: COUNT choice — fallback to COUNT(*) (no aggregate column resolved)"
+        )
 
-    if strategy == "simple_select" and func == "COUNT" and not preserve_distinct:
+    # simple_select normally strips DISTINCT (cheap mode for plain counts),
+    # but we keep it when the column is a PK/identifier — otherwise we silently
+    # turn "сколько X" into a row-count that double-counts when the FROM/WHERE
+    # produces duplicates (e.g. snapshot fact tables).
+    if (
+        strategy == "simple_select"
+        and func == "COUNT"
+        and not preserve_distinct
+        and not auto_distinct_on_identifier
+    ):
         for item in results:
             item.pop("distinct", None)
 
     return results
+
+
+def _column_is_pk_or_identifier(
+    table_key: str, column: str, schema_loader=None,
+) -> bool:
+    """True if the column is a PK or semantic_class=identifier in the catalog.
+
+    Used to decide whether COUNT(DISTINCT col) is meaningful enough to keep
+    even on simple_select strategy.
+    """
+    if not column or column == "*" or schema_loader is None:
+        return False
+    if "." not in str(table_key):
+        return False
+    schema_name, table_name = str(table_key).split(".", 1)
+    try:
+        cols_df = schema_loader.get_table_columns(schema_name, table_name)
+    except Exception:  # noqa: BLE001
+        return False
+    if cols_df.empty:
+        return False
+    matched = cols_df[cols_df["column_name"].astype(str).str.lower() == column.lower()]
+    if matched.empty:
+        return False
+    row = matched.iloc[0]
+    if bool(row.get("is_primary_key", False)):
+        return True
+    try:
+        semantics = schema_loader.get_column_semantics(schema_name, table_name, column)
+    except Exception:  # noqa: BLE001
+        return False
+    return str(semantics.get("semantic_class", "") or "").lower() == "identifier"
 
 
 # ---------------------------------------------------------------------------

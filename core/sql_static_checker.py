@@ -29,14 +29,16 @@ _AGGREGATE_FUNCS = frozenset({
 })
 
 _SQL_KEYWORDS = frozenset({
-    "add", "all", "alter", "and", "any", "as", "asc", "between", "by",
+    "add", "all", "alter", "and", "any", "as", "asc", "asymmetric",
+    "between", "by",
     "case", "cast", "cross", "current", "current_date", "current_timestamp",
-    "date", "delete", "desc", "distinct", "else", "end", "except", "exists", "false",
-    "following", "from", "full", "group", "having", "in", "inner", "insert",
-    "intersect", "into", "is", "join", "left", "like", "limit", "not", "now",
+    "date", "delete", "desc", "distinct", "else", "end", "escape", "except", "exists", "false",
+    "following", "from", "full", "group", "having", "ilike", "in", "inner", "insert",
+    "intersect", "into", "is", "isnull", "join", "left", "like", "limit",
+    "natural", "not", "notnull", "now",
     "null", "on", "or", "order", "outer", "over", "partition", "preceding",
-    "range", "right", "rows", "select", "set", "then", "timestamp", "true",
-    "unbounded", "union", "update", "when", "where", "with",
+    "range", "right", "rows", "select", "set", "similar", "symmetric", "then", "timestamp", "true",
+    "unbounded", "union", "update", "using", "when", "where", "with",
 })
 
 _BUILTIN_FUNCTIONS = _AGGREGATE_FUNCS | frozenset({
@@ -483,6 +485,12 @@ def _extract_contextual_unqualified_identifiers(sql: str) -> set[str]:
                     continue
                 if clause[end:].lstrip().startswith("("):
                     continue
+                if name not in identifiers:
+                    logger.debug(
+                        "StaticChecker: flagged bare identifier %r (clause-context=%r)",
+                        name,
+                        clause[max(0, token_match.start() - 20):token_match.end() + 20].strip(),
+                    )
                 identifiers.add(name)
     return identifiers
 

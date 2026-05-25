@@ -297,6 +297,26 @@ def ground_query_spec(
             confidence=best_conf,
         )
 
+    if sources:
+        primary = _main_source_with_required_priority(sources)
+        if primary is not None:
+            entity_match = _primary_source_covers_entities(
+                primary, query_spec, schema_loader,
+            )
+            if entity_match is False:
+                warning_text = (
+                    f"primary source {primary.full_name} does not appear to cover "
+                    f"any QuerySpec entity — possible wrong-table pick (entities="
+                    f"{[e.name for e in query_spec.entities]})"
+                )
+                warnings.append(warning_text)
+                logger.warning(
+                    "CatalogGrounder: entity-binding sanity check failed for %s "
+                    "(entities=%s)",
+                    primary.full_name,
+                    [e.name for e in query_spec.entities],
+                )
+
     plan_ir = PlanIR(
         main_source=_main_source_with_required_priority(sources) if sources else None,
         sources=sources,
@@ -320,11 +340,85 @@ def ground_query_spec(
     )
 
 
+def _primary_source_covers_entities(
+    source: SourceBinding,
+    query_spec: QuerySpec,
+    schema_loader,
+) -> bool | None:
+    """Sanity-check: does the chosen primary source have any column that touches
+    QuerySpec.entities or the leading filter target?
+
+    Returns:
+        True  — at least one entity/business-event token appears in a column
+                name or description on the primary source.
+        False — entities exist in the QuerySpec but none of their tokens appear
+                in any column on the source (likely wrong-table pick).
+        None  — no entities to check against (cannot judge), or schema_loader
+                is unavailable.
+    """
+    if source is None or schema_loader is None:
+        return None
+    entities = list(getattr(query_spec, "entities", []) or [])
+    if not entities:
+        return None
+    try:
+        cols_df = schema_loader.get_table_columns(source.schema, source.table)
+    except Exception:  # noqa: BLE001
+        return None
+    if cols_df.empty:
+        return None
+
+    haystack_parts = []
+    for _, row in cols_df.iterrows():
+        haystack_parts.append(str(row.get("column_name", "") or "").lower())
+        haystack_parts.append(str(row.get("description", "") or "").lower())
+    try:
+        table_info = schema_loader.get_table_info(source.schema, source.table) or ""
+    except Exception:  # noqa: BLE001
+        table_info = ""
+    haystack_parts.append(str(table_info).lower())
+    haystack = " ".join(haystack_parts)
+
+    tokens: set[str] = set()
+    for entity in entities:
+        for raw in (
+            getattr(entity, "name", None),
+            getattr(entity, "canonical", None),
+            getattr(entity, "target_column_hint", None),
+        ):
+            if not raw:
+                continue
+            for tok in re.split(r"[^\w]+", str(raw).lower()):
+                if len(tok) >= 3:
+                    tokens.add(tok)
+    if not tokens:
+        return None
+
+    for token in tokens:
+        if token in haystack:
+            return True
+    return False
+
+
+def _explicit_constraint_name(constraint) -> tuple[str | None, str | None]:
+    """Extract (schema, table) from a SourceConstraint, supporting `.semantic`
+    when `.table` is not set (the LLM frequently puts a bare table name into
+    the semantic field). Splits "schema.table" out of either field.
+    """
+    schema = getattr(constraint, "schema", None)
+    table = getattr(constraint, "table", None)
+    semantic = getattr(constraint, "semantic", None)
+    raw = table or semantic
+    if not raw:
+        return schema, None
+    raw = str(raw).strip()
+    if "." in raw and not schema:
+        schema, raw = raw.split(".", 1)
+    return schema, raw
+
+
 def _bind_explicit_source(constraint, schema_loader) -> SourceBinding | None:
-    schema = constraint.schema
-    table = constraint.table
-    if table and "." in table and not schema:
-        schema, table = table.split(".", 1)
+    schema, table = _explicit_constraint_name(constraint)
     if not table:
         return None
     df = schema_loader.tables_df
@@ -336,22 +430,27 @@ def _bind_explicit_source(constraint, schema_loader) -> SourceBinding | None:
     else:
         mask = table_mask
     matches = df[mask]
-    if matches.empty or len(matches) > 1:
+    if matches.empty:
+        return None
+    if len(matches) > 1:
+        # Multiple schemas contain this base name — let the caller surface
+        # an ambiguous-required clarification via _explicit_source_options.
         return None
     row = matches.iloc[0]
     logger.info(
         "CatalogTableScore: table=%s.%s score=1.000 confidence=%.2f type=explicit "
-        "reason=explicit_source_constraint",
+        "reason=explicit_source_constraint (bare_name=%s)",
         str(row["schema_name"]),
         str(row["table_name"]),
         max(0.95, constraint.confidence),
+        not bool(schema),
     )
     return SourceBinding(
         schema=str(row["schema_name"]),
         table=str(row["table_name"]),
         reason="explicit_source_constraint",
         confidence=max(0.95, constraint.confidence),
-        evidence=constraint.evidence or [Evidence(source="query_spec", text=f"{schema}.{table}", confidence=1.0)],
+        evidence=constraint.evidence or [Evidence(source="query_spec", text=f"{schema or ''}.{table}".lstrip("."), confidence=1.0)],
     )
 
 
@@ -368,10 +467,7 @@ def _source_constraint_text(constraint) -> str:
 
 
 def _explicit_source_options(constraint, schema_loader) -> list[str]:
-    schema = constraint.schema
-    table = constraint.table
-    if table and "." in table and not schema:
-        schema, table = table.split(".", 1)
+    schema, table = _explicit_constraint_name(constraint)
     if not table:
         return []
     df = schema_loader.tables_df

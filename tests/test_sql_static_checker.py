@@ -464,6 +464,34 @@ class TestUnqualifiedCatalogColumns:
         assert any("неоднозначные unqualified-колонки" in e for e in result.errors)
         assert any("inserted_dttm" in e for e in result.errors)
 
+    def test_ilike_operator_is_not_flagged_as_unqualified_column(self):
+        """Регрессия (agent log от 2026-05-25): ILIKE — это оператор Postgres,
+        не колонка. Раньше _SQL_KEYWORDS не содержал 'ilike' и токен попадал
+        в identifiers, ломая correction-loop.
+        """
+        loader = _FakeSchemaLoader({
+            ("dm", "uzp_dwh_sale_funnel_task"): [
+                {"column_name": "task_subtype", "dType": "text"},
+                {"column_name": "report_dt", "dType": "date"},
+            ]
+        })
+        sql = (
+            "SELECT COUNT(*) AS cnt FROM dm.uzp_dwh_sale_funnel_task "
+            "WHERE report_dt >= '2026-02-01'::date "
+            "AND task_subtype ILIKE '%Фактический отток%'"
+        )
+        result = check_sql(sql, schema_loader=loader)
+        assert result.is_valid, f"ILIKE wrongly flagged: {result.errors}"
+        assert not any("ilike" in e.lower() for e in result.errors)
+
+    def test_isnull_notnull_operators_not_flagged(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "t"): [{"column_name": "name", "dType": "text"}]
+        })
+        sql = "SELECT COUNT(*) AS cnt FROM dm.t WHERE name ISNULL OR name NOTNULL"
+        result = check_sql(sql, schema_loader=loader)
+        assert result.is_valid, f"ISNULL/NOTNULL wrongly flagged: {result.errors}"
+
     def test_cte_projection_alias_is_not_flagged_as_missing_column(self):
         loader = _FakeSchemaLoader({
             ("dm", "sales"): [

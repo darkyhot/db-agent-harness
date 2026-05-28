@@ -1,0 +1,11 @@
+# Зависимости только для тестов (интеграционных). Прод-код не зависит от них.
+pytest>=8.0
+pytest-dotenv>=0.5.2
+python-dotenv>=1.0.0
+Faker>=24.0
+pyyaml>=6.0
+# tabulate нужен tools/db_tools.execute_query для markdown-форматирования
+# результатов SQL в pipeline. В прод-среде ставится через системный путь.
+tabulate>=0.9
+# Альтернативный LLM-бэкенд для дешёвой итерации тестов (DeepSeek / OpenAI-совм.)
+openai>=1.30

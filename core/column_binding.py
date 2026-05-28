@@ -13,6 +13,7 @@ from typing import Any
 
 from core.entity_resolver import resolve_entity_to_columns
 from core.join_analysis import detect_table_type
+from core.join_selection import _norm_col_name
 from core.query_ir import QuerySpec, _parse_calendar_period, _target_looks_calendar
 
 logger = logging.getLogger(__name__)
@@ -34,13 +35,26 @@ def bind_columns(
     if spec is None:
         return None
     if spec.strategy != "count_attributes":
-        return _bind_metric_dimension_columns(
+        result = _bind_metric_dimension_columns(
             spec=spec,
             table_structures=table_structures,
             table_types=table_types,
             schema_loader=schema_loader,
             llm_invoker=llm_invoker,
         )
+        # bind_columns сам по себе не строит join_spec. Для fact↔dim с составным
+        # PK достраиваем его детерминированно из PK dim-таблицы — иначе ON-клаузу
+        # пишет LLM sql_writer и теряет вторую пару составного ключа (tb_id).
+        if (
+            result
+            and result.get("selected_columns")
+            and len(result["selected_columns"]) >= 2
+            and not result.get("join_spec")
+        ):
+            result["join_spec"] = _derive_join_spec_from_pk(
+                result["selected_columns"], table_types, schema_loader
+            )
+        return result
 
     targets = _count_attribute_targets(spec)
     if len(targets) < 2:
@@ -117,6 +131,83 @@ def bind_columns(
     }
 
 
+def _derive_join_spec_from_pk(
+    selected_columns: dict[str, dict[str, list[str]]],
+    table_types: dict[str, str],
+    schema_loader: Any,
+) -> list[dict[str, Any]]:
+    """Построить составной join_spec для пар fact↔dim из PK dim-таблицы.
+
+    Якоримся на PRIMARY KEY справочника, а не на ранжированном кандидате: это
+    однозначно выбирает правильный FK-таргет. Пример: dim PK (tb_id, old_gosb_id)
+    маппится на fact (tb_id, gosb_id), и НИКОГДА на non-PK new_gosb_id (который
+    нормализуется в тот же стем gosb_id и путает ранжирующий выбор).
+
+    safe=True ставим, только когда пары покрывают ВЕСЬ PK справочника — тогда
+    join к dim по полному уникальному ключу не размножает строки. Это вывод из
+    метаданных (is_primary_key), без обращения к БД.
+    """
+    tables = list(selected_columns.keys())
+    join_spec: list[dict[str, Any]] = []
+    for i, t1 in enumerate(tables):
+        for t2 in tables[i + 1:]:
+            ty1 = (table_types or {}).get(t1, "unknown")
+            ty2 = (table_types or {}).get(t2, "unknown")
+            if ty1 == "fact" and ty2 in {"dim", "ref"}:
+                fact, dim = t1, t2
+            elif ty2 == "fact" and ty1 in {"dim", "ref"}:
+                fact, dim = t2, t1
+            else:
+                continue
+            ds = dim.split(".", 1)
+            fs = fact.split(".", 1)
+            if len(ds) != 2 or len(fs) != 2:
+                continue
+            try:
+                dim_cols = schema_loader.get_table_columns(ds[0], ds[1])
+                fact_cols = schema_loader.get_table_columns(fs[0], fs[1])
+            except Exception:  # noqa: BLE001
+                continue
+            if dim_cols is None or dim_cols.empty or "is_primary_key" not in dim_cols.columns:
+                continue
+            pk_cols = dim_cols.loc[
+                dim_cols["is_primary_key"].astype(bool), "column_name"
+            ].tolist()
+            if not pk_cols:
+                continue
+            fact_names = (
+                fact_cols["column_name"].tolist()
+                if fact_cols is not None and not fact_cols.empty
+                else []
+            )
+            pairs: list[tuple[str, str]] = []
+            for pk in pk_cols:
+                if pk in fact_names:
+                    fact_col: str | None = pk
+                else:
+                    norm_pk = _norm_col_name(pk)
+                    fact_col = next(
+                        (f for f in fact_names if _norm_col_name(f) == norm_pk), None
+                    )
+                if fact_col:
+                    pairs.append((fact_col, pk))
+            if not pairs:
+                continue
+            safe = len(pairs) == len(pk_cols)
+            for fact_col, pk in pairs:
+                join_spec.append({
+                    "left": f"{fact}.{fact_col}",
+                    "right": f"{dim}.{pk}",
+                    "safe": safe,
+                    "strategy": "fact_dim_join",
+                })
+            logger.info(
+                "ColumnBinding: составной join_spec из PK %s → %s (%d пар, safe=%s)",
+                dim, fact, len(pairs), safe,
+            )
+    return join_spec
+
+
 def _bind_metric_dimension_columns(
     *,
     spec: QuerySpec,
@@ -163,13 +254,19 @@ def _bind_metric_dimension_columns(
             roles["aggregate"].append(col)
 
     for dim in spec.dimensions:
+        # Структурный hint резолверу: календарные dimension-таргеты идут как
+        # "date" (отсекает не-date dtypes), всё остальное — как "label"
+        # (отсекает system_timestamp / metric / id и принуждает резолвер
+        # выбирать именно label-колонки в dim/ref).
+        dim_target_str = str(dim.target or "")
+        dim_role = "date" if _target_looks_calendar(dim_target_str) else "label"
         choice = _choose_column_across_tables(
             table_structures=table_structures,
             table_types=table_types,
             schema_loader=schema_loader,
             target=dim.target,
             prefer_fact=False,
-            role_hint="any",
+            role_hint=dim_role,
             llm_invoker=llm_invoker,
         )
         if not choice:
@@ -232,6 +329,7 @@ def derive_entity_flag_filters(
     selected_columns: dict[str, dict[str, list[str]]],
     schema_loader: Any,
     llm_invoker: Any = None,
+    user_input: str = "",
 ) -> list[dict[str, Any]]:
     """When the user's entity (e.g. «Задача») resolves to a boolean flag on
     the main table (e.g. `is_task`), emit a synthetic `target=column,
@@ -259,10 +357,30 @@ def derive_entity_flag_filters(
     table_keys = list(selected_columns.keys())
     synthetic: list[dict[str, Any]] = []
     seen_cols: set[tuple[str, str]] = set()
+    # Защита от галлюцинаций LLM: если entity ВООБЩЕ не упомянут в
+    # исходном запросе (ни через стем, ни буквально), не используем его
+    # для synthetic flag-filter. DeepSeek иногда добавляет «задача» в
+    # entities для запроса про отток — без проверки это вешает is_task=TRUE.
+    user_input_stems = {
+        _stem_token(tok) for tok in re.findall(r"\w+", (user_input or "").lower())
+        if len(tok) >= 3
+    }
     for entity in spec.entities:
         entity_name = (entity.canonical or entity.name or "").strip()
         if not entity_name:
             continue
+        if user_input_stems:
+            entity_stems = {
+                _stem_token(tok) for tok in re.findall(r"\w+", entity_name.lower())
+                if len(tok) >= 3
+            }
+            if entity_stems and not (entity_stems & user_input_stems):
+                logger.debug(
+                    "ColumnBinding: entity «%s» отсутствует в user_input — "
+                    "пропускаем synthetic flag-filter",
+                    entity_name,
+                )
+                continue
         resolved_table: str | None = None
         resolved_column: str | None = None
         resolved_confidence: float = 0.9
@@ -409,6 +527,11 @@ def _find_flag_column_by_description(
             description = str(row.get("description") or "").lower()
             if not description:
                 continue
+            # Содержимое скобок — контекстная сноска, не основная семантика.
+            # «Признак ОКТМО (принадлежит ГОСБ эмиссии карт)» не должен
+            # матчиться по entity «ГОСБ» — это даст ложный фильтр. Срезаем
+            # parenthetical content универсально.
+            description = re.sub(r"\([^)]*\)", " ", description)
             desc_tokens = re.findall(r"\w+", description)
             desc_stems = {_stem_token(tok) for tok in desc_tokens if len(tok) >= 3}
             for left in entity_stems:
@@ -485,7 +608,13 @@ def _choose_column_across_tables(
         if prefer_fact and t_type == "fact":
             score += 120.0
         if not prefer_fact and t_type in {"dim", "ref"}:
-            score += 120.0
+            # Для label/dimension-целей канонический справочник должен побеждать
+            # денормализованную копию колонки внутри факта (часто fact-таблицы
+            # дублируют label-колонки ради удобства аналитики, но source of truth —
+            # это dim/ref). Бонус выбран больше, чем максимальная разница
+            # text_overlap × 1000 между exact-match (1.0) и substring (0.85) ≈ 150,
+            # с запасом на структурные бонусы (PK, not_null).
+            score += 250.0
         score += (table_count - idx) * 0.01
         candidate = (score, table_key, col)
         if best is None or candidate > best:

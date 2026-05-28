@@ -1,0 +1,10 @@
+{
+    "user_id": "test",
+    "host": "localhost",
+    "port": 55432,
+    "database": "agent_test",
+    "llm_model": "GigaChat-2-Max",
+    "debug_prompt": false,
+    "show_plan": false,
+    "llm_verifier_enabled": false
+}

@@ -66,7 +66,7 @@ def ground_query_spec(
     query_spec: QuerySpec,
     schema_loader,
     user_input: str,
-    max_sources: int = 3,
+    max_sources: int = 4,
     min_confidence: float = 0.35,
 ) -> GroundingResult:
     """Bind QuerySpec sources to real catalog tables.
@@ -291,7 +291,9 @@ def ground_query_spec(
         and not query_spec.join_constraints
         and not any(s.reason == "explicit_source_constraint" for s in sources)
     ):
-        ambiguous_strong = _detect_ambiguous_strong_sources(sources)
+        ambiguous_strong = _detect_ambiguous_strong_sources(
+            sources, schema_loader=schema_loader, query_spec=query_spec,
+        )
         if ambiguous_strong:
             options = [
                 _ambiguous_source_label(s, schema_loader) for s in ambiguous_strong
@@ -320,6 +322,196 @@ def ground_query_spec(
                 warnings=warnings,
                 confidence=best_conf,
             )
+
+    # Sources cleanup: если запрос имеет метрику и среди sources есть факты,
+    # один из которых уникально содержит колонку-метрику, прочие факты
+    # без поддержки метрики могут мисливать downstream (column_selector
+    # выберет денормализованный label из фактового снимка). Чистим явно.
+    if query_spec.metrics:
+        metric_terms_for_cleanup = _extract_metric_terms(query_spec)
+        # Считаем, что метрика sum/avg/min/max обязательно требует НУМЕРИЧЕСКОЙ
+        # колонки. Для count target может быть label/id, поэтому строгая
+        # numeric-проверка применяется только когда среди metrics есть
+        # хотя бы один не-count агрегат.
+        require_numeric_metric = any(
+            str(getattr(m, "operation", "") or "").lower() in {"sum", "avg", "min", "max"}
+            for m in query_spec.metrics
+        )
+        if metric_terms_for_cleanup:
+            from core.entity_resolver import resolve_entity_to_columns
+
+            _NUMERIC_DTYPE_KEYWORDS = (
+                "int", "numeric", "decimal", "float", "double", "real", "money", "number",
+            )
+
+            def _is_numeric_column(table_key: str, col: str) -> bool:
+                if "." not in table_key:
+                    return False
+                sch, tbl = table_key.split(".", 1)
+                try:
+                    cdf = schema_loader.get_table_columns(sch, tbl)
+                except Exception:  # noqa: BLE001
+                    return False
+                if cdf is None or cdf.empty:
+                    return False
+                row = cdf[cdf["column_name"].astype(str).str.lower() == col.lower()]
+                if row.empty:
+                    return False
+                dtype = str(row.iloc[0].get("dType") or "").lower()
+                return any(kw in dtype for kw in _NUMERIC_DTYPE_KEYWORDS)
+
+            facts_with_numeric_metric: list[SourceBinding] = []
+            facts_with_textual_metric: list[SourceBinding] = []
+            facts_without_metric: list[SourceBinding] = []
+            non_facts: list[SourceBinding] = []
+            unknowns_without_metric: list[SourceBinding] = []
+
+            def _supplies_metric(table_key: str) -> tuple[bool, bool]:
+                supplies_numeric_local = False
+                supplies_textual_local = False
+                for t in metric_terms_for_cleanup:
+                    for role in ("metric", "any"):
+                        res = resolve_entity_to_columns(
+                            entity_term=t,
+                            user_input="",
+                            candidate_table_keys=[table_key],
+                            schema_loader=schema_loader,
+                            llm_invoker=None,
+                            role_hint=role,
+                        )
+                        if not (res.matched and res.confidence >= 0.4):
+                            continue
+                        chosen_col = getattr(res, "column", "") or ""
+                        chosen_table = getattr(res, "table_key", "") or table_key
+                        if _is_numeric_column(chosen_table, chosen_col):
+                            supplies_numeric_local = True
+                        else:
+                            supplies_textual_local = True
+                return supplies_numeric_local, supplies_textual_local
+
+            for s in sources:
+                try:
+                    cols_df = schema_loader.get_table_columns(s.schema, s.table)
+                except Exception:  # noqa: BLE001
+                    cols_df = None
+                try:
+                    ttype = detect_table_type(s.table, cols_df) if cols_df is not None else "unknown"
+                except Exception:  # noqa: BLE001
+                    ttype = "unknown"
+                if ttype != "fact":
+                    non_facts.append(s)
+                    # Также отмечаем unknown-таблицы (не fact, не dim, не ref),
+                    # которые не предоставляют метрики. Они часто это
+                    # консолидированные витрины с FK на много измерений —
+                    # высокий join-score втягивает их в sources, но они
+                    # уводят column_selector от канонического факта.
+                    if ttype not in {"fact", "dim", "ref"}:
+                        sup_num, sup_txt = _supplies_metric(s.full_name)
+                        if not (sup_num or sup_txt):
+                            unknowns_without_metric.append(s)
+                    continue
+                supplies_numeric, supplies_textual = _supplies_metric(s.full_name)
+                if supplies_numeric:
+                    facts_with_numeric_metric.append(s)
+                elif supplies_textual:
+                    facts_with_textual_metric.append(s)
+                else:
+                    facts_without_metric.append(s)
+
+            # Если хотя бы один факт имеет ЧИСЛОВУЮ колонку, отвечающую за
+            # метрику — он каноничен. Прочие факты (только текстовый матч
+            # или вообще без матча) дропаем: они дают денормализованный
+            # лейбл или вообще не отвечают на метрический вопрос.
+            if facts_with_numeric_metric and (
+                facts_with_textual_metric or facts_without_metric or unknowns_without_metric
+            ):
+                pruned = facts_with_textual_metric + facts_without_metric
+                # unknown-таблицу можно дропать только если её исчезновение
+                # не оставляет dimension без источника. Иначе она каноничный
+                # joinable провайдер для измерения (типа консолидированной
+                # витрины с колонкой `segment`, которой нет в fact).
+                droppable_unknowns: list[SourceBinding] = []
+                kept_unknowns: list[SourceBinding] = []
+                dim_targets = [
+                    str(getattr(d, "target", "") or "").strip()
+                    for d in query_spec.dimensions
+                ]
+                dim_targets = [t for t in dim_targets if t]
+                kept_after_drop_facts = facts_with_numeric_metric + [
+                    s for s in non_facts if s not in unknowns_without_metric
+                ]
+                kept_keys = [s.full_name for s in kept_after_drop_facts]
+                from core.entity_resolver import resolve_entity_to_columns
+                from core.query_ir import _target_looks_calendar
+
+                for unk in unknowns_without_metric:
+                    # unknown-таблицу оставляем, если она даёт label/date-колонку
+                    # под какой-то dimension с разумной уверенностью. Канонический
+                    # справочник (даже unknown-типа) предпочтительнее
+                    # денормализованной копии в факте — но дроп нужен, когда
+                    # она ВООБЩЕ не отвечает ни на одну ось запроса.
+                    unk_provides_dim = False
+                    for dim_t in dim_targets:
+                        role = "date" if _target_looks_calendar(dim_t) else "label"
+                        unk_res = resolve_entity_to_columns(
+                            entity_term=dim_t, user_input="",
+                            candidate_table_keys=[unk.full_name],
+                            schema_loader=schema_loader,
+                            llm_invoker=None, role_hint=role,
+                        )
+                        if unk_res.matched and float(unk_res.confidence or 0.0) >= 0.5:
+                            unk_provides_dim = True
+                            break
+                    if unk_provides_dim:
+                        kept_unknowns.append(unk)
+                    else:
+                        droppable_unknowns.append(unk)
+                kept_non_facts = [
+                    s for s in non_facts if s not in droppable_unknowns
+                ]
+                sources = facts_with_numeric_metric + kept_non_facts
+                if droppable_unknowns:
+                    logger.info(
+                        "CatalogGrounder: dropped unknown-type sources without metric support: %s",
+                        [s.full_name for s in droppable_unknowns],
+                    )
+                if kept_unknowns:
+                    logger.info(
+                        "CatalogGrounder: kept unknown-type sources as unique dimension providers: %s",
+                        [s.full_name for s in kept_unknowns],
+                    )
+                if pruned:
+                    logger.info(
+                        "CatalogGrounder: kept facts with numeric metric column %s; "
+                        "dropped %s (textual-only or no metric match)",
+                        [s.full_name for s in facts_with_numeric_metric],
+                        [s.full_name for s in pruned],
+                    )
+                else:
+                    logger.info(
+                        "CatalogGrounder: kept facts with numeric metric column %s",
+                        [s.full_name for s in facts_with_numeric_metric],
+                    )
+            elif (
+                not require_numeric_metric
+                and facts_with_textual_metric
+                and facts_without_metric
+            ):
+                # Чистый count без числовой метрики: дропаем только те факты,
+                # которые вообще не отвечают на entity.
+                sources = facts_with_textual_metric + non_facts
+                logger.info(
+                    "CatalogGrounder: dropped fact sources without metric support: %s",
+                    [s.full_name for s in facts_without_metric],
+                )
+            elif (
+                require_numeric_metric
+                and not facts_with_numeric_metric
+                and (facts_with_textual_metric or facts_without_metric)
+            ):
+                # Для sum/avg/min/max нет ни одного факта с числовой колонкой —
+                # оставляем как есть (не повышаем энтропию ещё больше).
+                pass
 
     if sources and best_conf <= min_confidence:
         options = [source.full_name for source in sources[:max_sources]]
@@ -381,6 +573,35 @@ def ground_query_spec(
     )
 
 
+def _extract_metric_terms(query_spec: QuerySpec) -> list[str]:
+    """Извлечь термы для матча метрики против каталога.
+
+    Основной сигнал — `metric.target` (физическое имя). Когда LLM не заполнил
+    target (например, на «count of X» без явного физического имени),
+    подбираем содержательные токены из `label`/`evidence` — это сохраняет
+    связь «о чём метрика» с каталогом без хардкода доменных слов.
+    """
+    from core.semantic_registry import _tokenize as _content_tokens
+
+    terms: list[str] = []
+    for m in query_spec.metrics:
+        if m.target:
+            target_str = str(m.target).strip()
+            if target_str and target_str not in terms:
+                terms.append(target_str)
+            continue
+        fallback_text = " ".join(
+            str(piece) for piece in (
+                m.label,
+                *(ev.text for ev in (m.evidence or []) if getattr(ev, "text", None)),
+            ) if piece
+        )
+        for tok in _content_tokens(fallback_text):
+            if tok not in terms:
+                terms.append(tok)
+    return terms
+
+
 _AMBIGUITY_EXCLUDED_REASONS = {
     "explicit_source_constraint",       # user-pinned
     "dimension_quality_enrichment",     # JOIN sidekick, not an alternative
@@ -407,6 +628,8 @@ def _is_weak_tfidf_only_candidate(src: SourceBinding) -> bool:
 def _detect_ambiguous_strong_sources(
     sources: list[SourceBinding],
     *,
+    schema_loader=None,
+    query_spec: QuerySpec | None = None,
     score_floor: float = 1.5,
     min_gap_pct: float = 0.55,
     max_options: int = 3,
@@ -429,6 +652,9 @@ def _detect_ambiguous_strong_sources(
 
     Excludes: explicit/required sources (user pinned) and dimension-quality
     enrichment sidekicks (they exist to JOIN with a fact, not compete with it).
+    Dim/ref tables are also dropped from the candidate set when at least one
+    fact is present — a dim is a JOIN complement, not an alternative answer
+    for a metric request.
     """
 
     def _discriminator(src: SourceBinding) -> float:
@@ -446,6 +672,67 @@ def _detect_ambiguous_strong_sources(
     ]
     if len(candidates) < 2:
         return []
+
+    # If candidates mix fact and dim/ref tables, drop the dim/ref ones —
+    # they are JOIN-complements of the fact (e.g. metric in fact_outflow +
+    # label in dim_gosb), not competing alternatives. Only ask the user to
+    # disambiguate when actual peers are present (fact vs fact, or all dims
+    # if no fact is in the set).
+    if schema_loader is not None:
+        type_for: dict[str, str] = {}
+        for cand in candidates:
+            try:
+                cols_df = schema_loader.get_table_columns(cand.schema, cand.table)
+            except Exception:  # noqa: BLE001
+                cols_df = None
+            try:
+                ttype = detect_table_type(cand.table, cols_df) if cols_df is not None else "unknown"
+            except Exception:  # noqa: BLE001
+                ttype = "unknown"
+            type_for[cand.full_name] = ttype
+        if any(t == "fact" for t in type_for.values()):
+            candidates = [
+                c for c in candidates
+                if type_for.get(c.full_name) not in ("dim", "ref")
+            ]
+        if len(candidates) < 2:
+            return []
+
+        # Among the remaining (fact) candidates: if the query asks for a
+        # specific metric and only some facts actually carry a column that
+        # resolves to that metric, the others are not real alternatives.
+        # They tied on dimension/entity match (e.g. shared `gosb_name`
+        # column), but cannot answer the metric question. Drop them.
+        if query_spec is not None and query_spec.metrics:
+            # Используем общий extractor: target + fallback на label/evidence,
+            # если LLM оставил target=null. Это критерий «таблица отвечает
+            # на суть метрики», а не «таблица содержит числовую колонку».
+            metric_targets = _extract_metric_terms(query_spec)
+            if metric_targets:
+                from core.entity_resolver import resolve_entity_to_columns
+
+                def _supplies_metric(binding: SourceBinding) -> bool:
+                    for target in metric_targets:
+                        # Для count разрешаем любую релевантную колонку (label/id);
+                        # для sum/avg — нужна метрическая (числовая) колонка.
+                        for role in ("metric", "any"):
+                            res = resolve_entity_to_columns(
+                                entity_term=target,
+                                user_input="",
+                                candidate_table_keys=[binding.full_name],
+                                schema_loader=schema_loader,
+                                llm_invoker=None,
+                                role_hint=role,
+                            )
+                            if res.matched and res.confidence >= 0.4:
+                                return True
+                    return False
+
+                supplies = [c for c in candidates if _supplies_metric(c)]
+                if supplies and len(supplies) < len(candidates):
+                    candidates = supplies
+                if len(candidates) < 2:
+                    return []
     candidates.sort(key=_discriminator, reverse=True)
     top_score = _discriminator(candidates[0])
     if top_score <= 0.0:
@@ -781,7 +1068,7 @@ def _score_catalog_bindings(
     if df is None or df.empty:
         return []
 
-    metric_terms = [m.target for m in query_spec.metrics if m.target]
+    metric_terms = _extract_metric_terms(query_spec)
     entity_terms = _entity_terms(query_spec)
     dimension_terms = [d.target for d in query_spec.dimensions if d.target]
     filter_terms = [f.target for f in query_spec.filters if f.target]
@@ -1013,6 +1300,17 @@ def _best_attribute_column_score(row: Any, term: str) -> float:
     if col_name.lower().endswith("_id"):
         score += 0.8
     return score
+
+
+# Общие SQL-суффиксы/префиксы: не должны самостоятельно задавать
+# subtoken-match (см. `_score_text`). Это не доменные термины, а
+# структурные роли колонок.
+_GENERIC_SQL_SUFFIXES = {
+    "name", "label", "title", "id", "code", "key", "type", "kind",
+    "category", "status", "flag", "dt", "date", "dttm", "ts", "timestamp",
+    "value", "amount", "qty", "count", "num", "number", "desc",
+    "description", "comment", "note",
+}
 
 
 def _score_text(name: str, description: str, terms: list[str], weight: float) -> float:
@@ -1318,6 +1616,18 @@ def _search_terms(query_spec: QuerySpec, user_input: str) -> list[str]:
     terms.extend(dim.target for dim in query_spec.dimensions if dim.target)
     terms.extend(item.target for item in query_spec.filters if item.target)
     terms.append(user_input)
+    # When QuerySpec is sparse (no entities/dimensions/source hints) the only
+    # signal we have is `user_input` as a whole sentence. `search_tables`
+    # matches by token overlap, not substring, so a long sentence with
+    # mostly stopwords yields no hits. Add individual content tokens from
+    # the user input so single-word matches (e.g. "оттока") can still bind
+    # to the relevant fact table.
+    try:
+        from core.semantic_registry import _tokenize as _content_tokens
+        for tok in _content_tokens(user_input):
+            terms.append(tok)
+    except Exception:  # noqa: BLE001
+        pass
     clean_terms: list[str] = []
     for term in terms:
         text = str(term or "").strip()

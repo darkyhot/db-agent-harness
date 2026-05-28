@@ -20,3 +20,7 @@ workspace/*
 
 # Embeddings cache (строится автоматически, не коммитится)
 data_for_agent/embeddings.npz
+
+# Integration test secrets / local config (не коммитятся)
+tests/integration/.env.test
+tests/integration/test_config.json

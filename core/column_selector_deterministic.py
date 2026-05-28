@@ -1526,7 +1526,10 @@ def select_columns(
                 cols = roles.get(role, [])
                 if not cols:
                     continue
-                protected = set(roles.get('aggregate', [])) if role != 'filter' else set()
+                # Aggregate columns belong in SELECT (you select SUM(x)), but
+                # must never appear in GROUP BY — grouping by a metric column
+                # is a semantic bug. Only protect aggregates in the SELECT clause.
+                protected = set(roles.get('aggregate', [])) if role == 'select' else set()
                 pruned = [
                     c for c in cols
                     if (table_key, c) in allowed_refs or c in protected
@@ -1535,6 +1538,17 @@ def select_columns(
                     roles[role] = pruned
                 else:
                     roles.pop(role, None)
+            # Final guard: a metric column may have been added to group_by
+            # during the per-table candidate pass (entity match on the metric
+            # name) and protected as a dimension by allowed_refs. Remove any
+            # overlap with aggregate so we never GROUP BY the metric.
+            agg_cols_final = set(roles.get('aggregate', []))
+            if agg_cols_final:
+                gb_clean = [c for c in roles.get('group_by', []) if c not in agg_cols_final]
+                if gb_clean:
+                    roles['group_by'] = gb_clean
+                else:
+                    roles.pop('group_by', None)
             if not roles:
                 selected_columns.pop(table_key, None)
 

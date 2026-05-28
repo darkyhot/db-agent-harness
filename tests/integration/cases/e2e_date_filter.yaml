@@ -1,0 +1,10 @@
+query: "Покажи количество строк оттока за март 2025 года"
+intent_must_be: analytics
+sql_must_contain:
+  - "COUNT"
+  - "REPORT_DT"
+  - "UZP_DWH_FACT_OUTFLOW"
+should_reach_node: sql_validator
+execute_succeeds: true
+expected_rowcount: {min: 1, max: 1}
+max_retries: 1

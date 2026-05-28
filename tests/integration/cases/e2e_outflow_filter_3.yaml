@@ -1,0 +1,23 @@
+# Кейс 2: "Посчитай отток по дате и названию госб где отток от 3 человек"
+# Ожидание: case 1 + WHERE outflow_qty >= 3 (или > 2; LLM может выбрать строгое или нестрогое).
+query: "Посчитай отток по дате и названию госб где отток от 3 человек"
+intent_must_be: analytics
+sql_must_contain:
+  - "REPORT_DT"
+  - "NEW_GOSB_NAME"
+  - "SUM"
+  - "OUTFLOW_QTY"
+  - "UZP_DWH_FACT_OUTFLOW"
+  - "UZP_DIM_GOSB"
+  - "JOIN"
+  - "GROUP BY"
+  - "WHERE"
+  - "3"
+sql_must_not_contain:
+  - "SELECT *"
+sql_alias_no_cyrillic: true
+should_reach_node: sql_validator
+execute_succeeds: true
+# Не фиксируем min — синтетика рандомизирует outflow_qty, фильтр >= 3 почти
+# всегда пропустит большинство строк, но контракт не от этого.
+max_retries: 1

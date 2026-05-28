@@ -197,7 +197,7 @@ class CorrectionNodes:
         Returns:
             Обновления состояния с диагнозом ошибки.
         """
-        error = state.get("last_error", "")
+        error = state.get("last_error") or ""
         retry_count = state.get("retry_count", 0)
         step_idx = state["current_step"]
         plan = state["plan"]
@@ -262,7 +262,9 @@ class CorrectionNodes:
         if recent_calls:
             last_args = recent_calls[-1].get("args", {})
             if isinstance(last_args, dict):
-                last_sql = last_args.get("sql", "")
+                # Защита от случая, когда args["sql"] явно None (а не отсутствует):
+                # dict.get(..., default) не подменяет None, поэтому используем `or ""`.
+                last_sql = last_args.get("sql") or ""
 
         seen_fingerprints = list(state.get("correction_error_fingerprints") or [])
         seen_sql_hashes = list(state.get("correction_sql_hashes") or [])
@@ -390,7 +392,7 @@ class CorrectionNodes:
         # --- Автозагрузка метаданных колонок для таблиц из SQL ---
         column_metadata = ""
         tbl_pattern = re.compile(r'\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b')
-        scan_text = (last_sql or "") + " " + error
+        scan_text = (last_sql or "") + " " + (error or "")
         found_tables: set[tuple[str, str]] = set()
         for m in tbl_pattern.finditer(scan_text):
             s, t = m.group(1).lower(), m.group(2).lower()

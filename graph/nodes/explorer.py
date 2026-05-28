@@ -20,6 +20,70 @@ from graph.state import AgentState
 logger = logging.getLogger(__name__)
 
 
+_LEGACY_COL_PREFIXES = ("old_", "legacy_", "prev_")
+_CANONICAL_COL_PREFIXES = ("new_", "current_", "actual_")
+_LEGACY_USER_HINTS = ("стар", "прежн", "old", "legacy", "previous")
+
+
+_LABEL_SUFFIXES = ("_name", "_label", "_title", "_descr", "_description")
+
+
+def _canonical_replacement_for(col: str, real_col_names: set[str]) -> str | None:
+    """Найти каноническую альтернативу `old_X`/`legacy_X`/`prev_X` в той же
+    таблице. Канонический вариант — это `X` без префикса либо `X` с
+    префиксом из `_CANONICAL_COL_PREFIXES` (`new_/current_/actual_`).
+
+    Применяется только к LABEL-колонкам (`*_name`/`*_label`/etc.) — для
+    ID/ключевых колонок замена опасна, поскольку JOIN-ключи фиксированы
+    каталогом (`old_gosb_id` ≠ `new_gosb_id`, это разные сущности).
+
+    Возвращает имя альтернативной колонки или None, если такой нет.
+    """
+    lower = col.lower()
+    if not lower.endswith(_LABEL_SUFFIXES):
+        return None
+    for prefix in _LEGACY_COL_PREFIXES:
+        if lower.startswith(prefix):
+            suffix = lower[len(prefix):]
+            if not suffix:
+                return None
+            if suffix in real_col_names:
+                return suffix
+            for canon in _CANONICAL_COL_PREFIXES:
+                cand = f"{canon}{suffix}"
+                if cand in real_col_names:
+                    return cand
+            return None
+    return None
+
+
+def _prefer_canonical_over_legacy(
+    roles: dict[str, list[str]],
+    real_col_names: set[str],
+    user_input: str,
+) -> dict[str, list[str]]:
+    """Заменить в `select/group_by` колонки с префиксом `old_/legacy_/prev_`
+    на каноническую альтернативу из той же таблицы, если пользователь не
+    запросил историческое представление."""
+    user_text = (user_input or "").lower()
+    if any(marker in user_text for marker in _LEGACY_USER_HINTS):
+        return roles
+    out: dict[str, list[str]] = {}
+    for role, cols in roles.items():
+        if role not in ("select", "group_by"):
+            out[role] = list(cols)
+            continue
+        new_cols: list[str] = []
+        for c in cols:
+            replacement = _canonical_replacement_for(str(c), real_col_names)
+            if replacement is not None and replacement not in new_cols:
+                new_cols.append(replacement)
+            elif replacement is None and c not in new_cols:
+                new_cols.append(c)
+        out[role] = new_cols
+    return out
+
+
 def _apply_explicit_join_override(
     join_spec: list[dict[str, Any]],
     selected_columns: dict[str, Any],
@@ -549,11 +613,36 @@ class ExplorerNodes:
             and spec.metrics
             and all(metric.operation == "count" for metric in spec.metrics)
         )
-        if spec is not None and (spec.strategy == "count_attributes" or scalar_count_spec):
+        # Также применяем детерминированный binder, когда задача — простая
+        # агрегация по label-измерениям с одним метрик-таргетом, и среди
+        # allowed_tables есть и fact, и dim/ref. В этой конфигурации LLM
+        # column_selector часто берёт денормализованный label из факта
+        # или промахивается с new/old, а binder построен на каталоге и
+        # стабильнее. Это не «всё через binder» — только когда сигнатура
+        # запроса предсказуема (см. условия ниже).
+        table_types_state = state.get("table_types", {}) or {}
+        has_fact_and_dim = (
+            any(t in {"fact"} for t in table_types_state.values())
+            and any(t in {"dim", "ref"} for t in table_types_state.values())
+        )
+        deterministic_aggregate_spec = bool(
+            spec is not None
+            and spec.task == "answer_data"
+            and spec.strategy in {"aggregate", ""}
+            and spec.metrics
+            and len(spec.metrics) == 1
+            and spec.dimensions
+            and has_fact_and_dim
+        )
+        if spec is not None and (
+            spec.strategy == "count_attributes"
+            or scalar_count_spec
+            or deterministic_aggregate_spec
+        ):
             bound_result = bind_columns(
                 query_spec=spec,
                 table_structures=table_structures,
-                table_types=state.get("table_types", {}) or {},
+                table_types=table_types_state,
                 schema_loader=self.schema,
                 llm_invoker=self,
             )
@@ -581,6 +670,7 @@ class ExplorerNodes:
                     selected_columns=bound_result["selected_columns"],
                     schema_loader=self.schema,
                     llm_invoker=self,
+                    user_input=state.get("user_input", "") or "",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("derive_entity_flag_filters failed: %s", exc)
@@ -836,6 +926,15 @@ class ExplorerNodes:
                     validated_roles[role] = validated
 
             if validated_roles:
+                # Если LLM выбрал колонку с префиксом «historical» (old_/legacy_/prev_)
+                # и в той же таблице есть канонический вариант с тем же суффиксом
+                # (без префикса либо с new_/current_/actual_), а пользователь
+                # не запросил «старое» — подменяем. Это общая SQL-конвенция
+                # версионирования колонок, не доменное правило.
+                if real_col_names is not None:
+                    validated_roles = _prefer_canonical_over_legacy(
+                        validated_roles, real_col_names, user_input
+                    )
                 selected_columns[table_key] = validated_roles
 
         # --- JOIN-спецификация ---

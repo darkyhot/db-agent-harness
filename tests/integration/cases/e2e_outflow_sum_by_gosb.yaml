@@ -1,0 +1,23 @@
+# Кейс 1: "Посчитай отток по дате и названию госб"
+# Ожидание: SUM(outflow_qty) + INNER JOIN fact↔dim по (tb_id, gosb_id↔old_gosb_id) + GROUP BY (report_dt, new_gosb_name)
+query: "Посчитай отток по дате и названию госб"
+intent_must_be: analytics
+sql_must_contain:
+  - "REPORT_DT"
+  - "NEW_GOSB_NAME"
+  - "SUM"
+  - "OUTFLOW_QTY"
+  - "UZP_DWH_FACT_OUTFLOW"
+  - "UZP_DIM_GOSB"
+  - "JOIN"
+  - "GROUP BY"
+  - "TB_ID"
+  - "GOSB_ID"
+  - "OLD_GOSB_ID"
+sql_must_not_contain:
+  - "SELECT *"
+sql_alias_no_cyrillic: true
+should_reach_node: sql_validator
+execute_succeeds: true
+expected_rowcount: {min: 1}
+max_retries: 1

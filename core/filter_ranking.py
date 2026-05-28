@@ -272,6 +272,12 @@ def _collect_implicit_subject_flag_requests(
     subject = str((semantic_frame or {}).get("subject") or "").strip().lower()
     subject_stems = _subject_alias_stems(subject, schema_loader)
     relevant_stems = set(subject_stems) | set(query_stems)
+    # Снимок ДО транзитивного расширения ниже. Расширение через alias-облако
+    # лексикона бриджит несвязанные subjects (например «отток»→«task» через
+    # общие токены имён таблиц/описаний), из-за чего на запрос про отток
+    # навешивается is_task=TRUE. Поэтому implicit flag дополнительно гейтим
+    # ПРЯМЫМ пересечением алиасов конкретного flag-субъекта с этими base-стемами.
+    base_subject_stems = set(relevant_stems)
     # Если query/subject стем перекликается с любым subject из metadata-lexicon —
     # добавляем aliases этого subject в relevant_stems. Это заменяет старое
     # «расширение через _BUILTIN_SUBJECT_ALIASES» и работает универсально:
@@ -289,13 +295,54 @@ def _collect_implicit_subject_flag_requests(
     for k, v in (lexicon.get("flag_subjects") or {}).items():
         if k not in combined_subjects:
             combined_subjects[k] = v
+    # Считаем частоту стем-токенов по subjects. Токены, встречающиеся в
+    # нескольких subjects (типа имени схемы «узп»/«uzp» или общих
+    # description-слов), не различают subjects и не должны связывать
+    # один subject с другим через alias-chain. Исключаем их из
+    # subject-resolution универсально (без хардкод-стоп-листа).
+    # Собираем infra-stems из ИМЁН СХЕМ субъектов: schema встречается у
+    # многих subjects и её токены — инфраструктурные, не семантические
+    # (например, «узп»/«uzp»). Удаляем только их — не трогаем имена
+    # таблиц, чтобы сохранить семантику типа «outflow»/«task».
+    schema_token_doc_freq: dict[str, int] = {}
     for subj_key, meta in combined_subjects.items():
-        alias_stems: set[str] = set()
-        alias_stems.update(_stem_set(str(subj_key)))
+        schema_set: set[str] = set()
+        for tbl in (meta or {}).get("tables", []) or []:
+            parts = str(tbl).split(".")
+            if len(parts) >= 2:
+                # Первая часть = имя схемы.
+                for part in re.split(r"[_\s]+", parts[0]):
+                    schema_set.update(_stem_set(part))
+        for st in schema_set:
+            schema_token_doc_freq[st] = schema_token_doc_freq.get(st, 0) + 1
+    infra_schema_stems = {st for st, n in schema_token_doc_freq.items() if n >= 2}
+
+    per_subject_stems: dict[str, set[str]] = {}
+    stem_doc_freq: dict[str, int] = {}
+    for subj_key, meta in combined_subjects.items():
+        s: set[str] = set()
+        s.update(_stem_set(str(subj_key)))
         for alias in (meta or {}).get("aliases", []) or []:
-            alias_stems.update(_stem_set(str(alias)))
-        if alias_stems & relevant_stems:
-            relevant_stems.update(alias_stems)
+            s.update(_stem_set(str(alias)))
+        # Удаляем только schema-токены, общие между ≥2 subjects.
+        s -= infra_schema_stems
+        per_subject_stems[subj_key] = s
+        for st in s:
+            stem_doc_freq[st] = stem_doc_freq.get(st, 0) + 1
+    # Для lexicons с ≥3 subjects дропаем токены, встречающиеся в ≥3 из
+    # них (description-derived общие слова). Для маленьких lexicons
+    # (<3 subjects) ничего не дропаем — поведение unit-fixtures сохранено.
+    n_subjects = len(per_subject_stems)
+    if n_subjects >= 3:
+        shared_stems = {st for st, n in stem_doc_freq.items() if n >= 3}
+    else:
+        shared_stems = set()
+    for subj_key, alias_stems in per_subject_stems.items():
+        distinguishing = alias_stems - shared_stems
+        # Связываем subject с relevant_stems только если совпало через
+        # ДИФФЕРЕНЦИРУЮЩИЙ стем (а не через общий «узп» и т.п.).
+        if distinguishing & relevant_stems:
+            relevant_stems.update(distinguishing)
     if not relevant_stems:
         return []
 
@@ -359,6 +406,21 @@ def _collect_implicit_subject_flag_requests(
                 continue
             if not _column_looks_like_subject_flag(column, relevant_stems):
                 continue
+            # Justification-гейт: если у токена флага есть запись в flag_subjects
+            # лексикона — его алиасы должны ПРЯМО пересекаться с base-стемами
+            # запроса. Иначе совпадение прошло только через alias-облако
+            # расширения (ложный мост «отток»→is_task). Для запросов, реально
+            # упоминающих субъект флага («задач» → is_task через alias «задач»),
+            # пересечение есть и фильтр сохраняется.
+            flag_token_match = re.match(r"^(?:is|has|flag)_(.+)$", column.lower())
+            flag_token = flag_token_match.group(1).strip() if flag_token_match else ""
+            token_meta = (lexicon.get("flag_subjects") or {}).get(flag_token)
+            if token_meta:
+                alias_stems: set[str] = set()
+                for alias in [flag_token] + list(token_meta.get("aliases") or []):
+                    alias_stems |= _stem_set(str(alias))
+                if alias_stems and not (alias_stems & base_subject_stems):
+                    continue
 
             score = 100.0 + _text_score(subject or " ".join(sorted(query_stems)), column, str(row.get("description", "") or ""))
             candidate = (score, column_key)

@@ -1,8 +1,73 @@
 {
-  "schema.uzp_dwh_fact_outflow.report_dt": {
-    "schema": "schema",
-    "table": "uzp_dwh_fact_outflow",
-    "column": "report_dt",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.client_type_id": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "client_type_id",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "enum_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.0,
+    "distinct_pct": 0.01,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.client_type_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "client_type_name",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "enum_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.0,
+    "distinct_pct": 0.01,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.company_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "company_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.0,
+    "distinct_pct": 93.94,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.epk_create_dttm": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "epk_create_dttm",
     "semantic_class": "date",
     "semantic_tags": [
       "dense",
@@ -19,16 +84,264 @@
     "supports_exact_match": true,
     "supports_pattern_match": false,
     "null_pct": 0.0,
-    "distinct_pct": 0.5,
-    "known_terms": [
-      "Задача"
-    ],
+    "distinct_pct": 91.18,
+    "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_dwh_fact_outflow.segment_name": {
-    "schema": "schema",
-    "table": "uzp_dwh_fact_outflow",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.head_holding_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "head_holding_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 84.85,
+    "distinct_pct": 13.47,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.holding_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "holding_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 84.85,
+    "distinct_pct": 13.53,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.industry_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "industry_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 47.53,
+    "distinct_pct": 0.02,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.is_educational": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "is_educational",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.is_key_client": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "is_key_client",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.is_military": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "is_military",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.is_parent": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "is_parent",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.priority_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "priority_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 45.02,
+    "distinct_pct": 0.02,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.reference_head_holding_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "reference_head_holding_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 84.85,
+    "distinct_pct": 13.47,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.reference_holding_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "reference_holding_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 84.85,
+    "distinct_pct": 13.53,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.segment_id": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "segment_id",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "enum_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.06,
+    "distinct_pct": 0.01,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.segment_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
     "column": "segment_name",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "enum_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.06,
+    "distinct_pct": 0.01,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.status_id": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "status_id",
     "semantic_class": "enum_like",
     "semantic_tags": [
       "categorical",
@@ -41,103 +354,38 @@
     ],
     "supports_exact_match": true,
     "supports_pattern_match": true,
-    "null_pct": 98.39,
-    "distinct_pct": 0.04,
-    "known_terms": [
-      "сервисная задача по юр-лицу"
-    ],
+    "null_pct": 5.02,
+    "distinct_pct": 0.01,
+    "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_dwh_fact_outflow.is_force": {
-    "schema": "schema",
-    "table": "uzp_dwh_fact_outflow",
-    "column": "is_force",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [
-      "фактический отток"
-    ],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_fact_outflow.mzp_fio": {
-    "schema": "schema",
-    "table": "uzp_dwh_fact_outflow",
-    "column": "mzp_fio",
-    "semantic_class": "label",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_data_epk_consolidation.status_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_data_epk_consolidation",
+    "column": "status_name",
+    "semantic_class": "enum_like",
     "semantic_tags": [
       "categorical",
       "filter_candidate"
     ],
-    "value_mode": "dictionary_like",
+    "value_mode": "enum_like",
     "allowed_operators": [
       "=",
       "ILIKE"
     ],
     "supports_exact_match": true,
     "supports_pattern_match": true,
-    "null_pct": 72.79,
-    "distinct_pct": 11.53,
+    "null_pct": 5.02,
+    "distinct_pct": 0.01,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_dwh_fact_outflow.is_task": {
-    "schema": "schema",
-    "table": "uzp_dwh_fact_outflow",
-    "column": "is_task",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_fact_outflow.is_oktmo": {
-    "schema": "schema",
-    "table": "uzp_dwh_fact_outflow",
-    "column": "is_oktmo",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dim_gosb.tb_short_name": {
-    "schema": "schema",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dim_gosb.isu_branch_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
     "table": "uzp_dim_gosb",
-    "column": "tb_short_name",
+    "column": "isu_branch_name",
     "semantic_class": "label",
     "semantic_tags": [
-      "categorical",
       "dense",
       "filter_candidate"
     ],
@@ -149,12 +397,96 @@
     "supports_exact_match": true,
     "supports_pattern_match": true,
     "null_pct": 0.0,
-    "distinct_pct": 6.63,
+    "distinct_pct": 57.46,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_dim_gosb.tb_full_name": {
-    "schema": "schema",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dim_gosb.new_gosb_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dim_gosb",
+    "column": "new_gosb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.0,
+    "distinct_pct": 57.46,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dim_gosb.old_gosb_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dim_gosb",
+    "column": "old_gosb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.0,
+    "distinct_pct": 84.53,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dim_gosb.pirs_gosb_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dim_gosb",
+    "column": "pirs_gosb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.0,
+    "distinct_pct": 52.49,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dim_gosb.region_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dim_gosb",
+    "column": "region_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.0,
+    "distinct_pct": 45.86,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dim_gosb.tb_full_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
     "table": "uzp_dim_gosb",
     "column": "tb_full_name",
     "semantic_class": "label",
@@ -175,12 +507,13 @@
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_dim_gosb.old_gosb_name": {
-    "schema": "schema",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dim_gosb.tb_short_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
     "table": "uzp_dim_gosb",
-    "column": "old_gosb_name",
+    "column": "tb_short_name",
     "semantic_class": "label",
     "semantic_tags": [
+      "categorical",
       "dense",
       "filter_candidate"
     ],
@@ -192,16 +525,77 @@
     "supports_exact_match": true,
     "supports_pattern_match": true,
     "null_pct": 0.0,
-    "distinct_pct": 84.53,
+    "distinct_pct": 6.63,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_dim_gosb.new_gosb_name": {
-    "schema": "schema",
-    "table": "uzp_dim_gosb",
-    "column": "new_gosb_name",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_fact_outflow.is_force": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "is_force",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_fact_outflow.is_oktmo": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "is_oktmo",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_fact_outflow.is_task": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "is_task",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_fact_outflow.mzp_fio": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_fact_outflow",
+    "column": "mzp_fio",
     "semantic_class": "label",
     "semantic_tags": [
+      "categorical",
       "dense",
       "filter_candidate"
     ],
@@ -213,75 +607,13 @@
     "supports_exact_match": true,
     "supports_pattern_match": true,
     "null_pct": 0.0,
-    "distinct_pct": 57.46,
+    "distinct_pct": 2.19,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_dim_gosb.isu_branch_name": {
-    "schema": "schema",
-    "table": "uzp_dim_gosb",
-    "column": "isu_branch_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 57.46,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dim_gosb.pirs_gosb_name": {
-    "schema": "schema",
-    "table": "uzp_dim_gosb",
-    "column": "pirs_gosb_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 52.49,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dim_gosb.region_name": {
-    "schema": "schema",
-    "table": "uzp_dim_gosb",
-    "column": "region_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 38.67,
-    "distinct_pct": 45.3,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.report_dt": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_fact_outflow.report_dt": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_fact_outflow",
     "column": "report_dt",
     "semantic_class": "date",
     "semantic_tags": [
@@ -299,247 +631,13 @@
     "supports_exact_match": true,
     "supports_pattern_match": false,
     "null_pct": 0.0,
-    "distinct_pct": 0.39,
+    "distinct_pct": 0.05,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_data_split_mzp_sale_funnel.tb_name": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "tb_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 0.11,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.gosb_name": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "gosb_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 0.91,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.department_manager_saphr_fio": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "department_manager_saphr_fio",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 86.22,
-    "distinct_pct": 0.93,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.task_manager_saphr_fio": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "task_manager_saphr_fio",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 39.4,
-    "distinct_pct": 2.18,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.manager_saphr_fio": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "manager_saphr_fio",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 98.66,
-    "distinct_pct": 0.2,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.fio": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "fio",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 20.72,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.km_fio": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "km_fio",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 100.0,
-    "distinct_pct": 0.0,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.post_name": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "post_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 0.04,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.task_role_name": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "task_role_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 5.75,
-    "distinct_pct": 0.04,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.task_leader_fio": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "task_leader_fio",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 79.42,
-    "distinct_pct": 12.37,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_task_leader": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_task_leader",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.segment_name": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_fact_outflow.segment_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_fact_outflow",
     "column": "segment_name",
     "semantic_class": "enum_like",
     "semantic_tags": [
@@ -554,14 +652,14 @@
     ],
     "supports_exact_match": true,
     "supports_pattern_match": true,
-    "null_pct": 0.01,
-    "distinct_pct": 0.08,
+    "null_pct": 0.0,
+    "distinct_pct": 0.01,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_data_split_mzp_sale_funnel.company_name": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.company_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
     "column": "company_name",
     "semantic_class": "label",
     "semantic_tags": [
@@ -575,15 +673,142 @@
     ],
     "supports_exact_match": true,
     "supports_pattern_match": true,
+    "null_pct": 0.63,
+    "distinct_pct": 87.68,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.emp_fio": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "emp_fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.06,
+    "distinct_pct": 4.11,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.fact_close_task_dttm": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "fact_close_task_dttm",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "filter_candidate",
+      "time_axis"
+    ],
+    "value_mode": "date_range",
+    "allowed_operators": [
+      "=",
+      ">=",
+      "<=",
+      "<"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 34.56,
+    "distinct_pct": 60.26,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.gosb_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "gosb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.03,
+    "distinct_pct": 0.1,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.is_task_closed": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "is_task_closed",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
     "null_pct": 0.0,
-    "distinct_pct": 91.2,
+    "distinct_pct": 0.0,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_data_split_mzp_sale_funnel.task_plan_closed_dt": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "task_plan_closed_dt",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.is_task_closed_success": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "is_task_closed_success",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.is_task_in_progress": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "is_task_in_progress",
+    "semantic_class": "flag",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "boolean_like",
+    "allowed_operators": [
+      "="
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.last_active_dttm": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "last_active_dttm",
     "semantic_class": "date",
     "semantic_tags": [
       "filter_candidate",
@@ -598,17 +823,83 @@
     ],
     "supports_exact_match": true,
     "supports_pattern_match": false,
-    "null_pct": 9.78,
-    "distinct_pct": 50.02,
+    "null_pct": 34.74,
+    "distinct_pct": 47.21,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_data_split_mzp_sale_funnel.task_fact_closed_dt": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "task_fact_closed_dt",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.last_active_status": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "last_active_status",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "enum_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 4.07,
+    "distinct_pct": 0.01,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.last_active_type": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "last_active_type",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ],
+    "value_mode": "enum_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 34.46,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.manager_fio": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "manager_fio",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 4.17,
+    "distinct_pct": 0.56,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.plan_close_task_dttm": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "plan_close_task_dttm",
     "semantic_class": "date",
     "semantic_tags": [
+      "dense",
       "filter_candidate",
       "time_axis"
     ],
@@ -621,14 +912,84 @@
     ],
     "supports_exact_match": true,
     "supports_pattern_match": false,
-    "null_pct": 20.6,
-    "distinct_pct": 78.71,
+    "null_pct": 0.06,
+    "distinct_pct": 12.65,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_data_split_mzp_sale_funnel.task_category": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.report_dt": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "report_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ],
+    "value_mode": "date_range",
+    "allowed_operators": [
+      "=",
+      ">=",
+      "<=",
+      "<"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.03,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.segment_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "segment_name",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "enum_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.63,
+    "distinct_pct": 0.01,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.src_update_dttm": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "src_update_dttm",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ],
+    "value_mode": "date_range",
+    "allowed_operators": [
+      "=",
+      ">=",
+      "<=",
+      "<"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.0,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.task_category": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
     "column": "task_category",
     "semantic_class": "enum_like",
     "semantic_tags": [
@@ -644,13 +1005,80 @@
     "supports_exact_match": true,
     "supports_pattern_match": true,
     "null_pct": 0.0,
-    "distinct_pct": 0.02,
+    "distinct_pct": 0.0,
     "known_terms": [],
     "source": "metadata"
   },
-  "schema.uzp_data_split_mzp_sale_funnel.task_type": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.task_create_dt": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "task_create_dt",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ],
+    "value_mode": "date_range",
+    "allowed_operators": [
+      "=",
+      ">=",
+      "<=",
+      "<"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
+    "null_pct": 0.0,
+    "distinct_pct": 0.55,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.task_subtype": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "task_subtype",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "filter_candidate"
+    ],
+    "value_mode": "enum_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 24.63,
+    "distinct_pct": 0.49,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.task_text_status": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "task_text_status",
+    "semantic_class": "enum_like",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "enum_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.0,
+    "distinct_pct": 0.01,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.task_type": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
     "column": "task_type",
     "semantic_class": "enum_like",
     "semantic_tags": [
@@ -665,1244 +1093,54 @@
     ],
     "supports_exact_match": true,
     "supports_pattern_match": true,
+    "null_pct": 0.06,
+    "distinct_pct": 0.02,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.tb_name": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "tb_name",
+    "semantic_class": "label",
+    "semantic_tags": [
+      "categorical",
+      "dense",
+      "filter_candidate"
+    ],
+    "value_mode": "dictionary_like",
+    "allowed_operators": [
+      "=",
+      "ILIKE"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": true,
+    "null_pct": 0.03,
+    "distinct_pct": 0.01,
+    "known_terms": [],
+    "source": "metadata"
+  },
+  "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dwh_sale_funnel_task.update_dttm": {
+    "schema": "s_grnplm_ld_salesntwrk_pcap_sn_uzp",
+    "table": "uzp_dwh_sale_funnel_task",
+    "column": "update_dttm",
+    "semantic_class": "date",
+    "semantic_tags": [
+      "dense",
+      "filter_candidate",
+      "time_axis"
+    ],
+    "value_mode": "date_range",
+    "allowed_operators": [
+      "=",
+      ">=",
+      "<=",
+      "<"
+    ],
+    "supports_exact_match": true,
+    "supports_pattern_match": false,
     "null_pct": 0.0,
-    "distinct_pct": 0.11,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.task_subtype": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "task_subtype",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 62.94,
-    "distinct_pct": 2.62,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.reason_comment": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "reason_comment",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 100.0,
     "distinct_pct": 0.0,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.last_activity_type": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "last_activity_type",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 9.73,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.last_activity_dt": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "last_activity_dt",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 9.86,
-    "distinct_pct": 85.17,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.last_activity_status": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "last_activity_status",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 0.09,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_closed": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_closed",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_success_closed": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_success_closed",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_worked": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_worked",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_np_task": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_np_task",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.01,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_overdue_task": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_overdue_task",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_required_task": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_required_task",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_deal_created": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_deal_created",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_interest_offer": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_interest_offer",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.01,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.is_outflow": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "is_outflow",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.01,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.holding_name": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "holding_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 35.25,
-    "distinct_pct": 35.97,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_split_mzp_sale_funnel.deal_m_dt": {
-    "schema": "schema",
-    "table": "uzp_data_split_mzp_sale_funnel",
-    "column": "deal_m_dt",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 73.16,
-    "distinct_pct": 0.39,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.acc_open_dt": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "acc_open_dt",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.62,
-    "distinct_pct": 44.17,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.acc_subtype": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "acc_subtype",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 21.8,
-    "distinct_pct": 0.2,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.acc_type": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "acc_type",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 21.8,
-    "distinct_pct": 0.16,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.client_category": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "client_category",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 37.28,
-    "distinct_pct": 0.1,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.company_name": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "company_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.01,
-    "distinct_pct": 54.91,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.agrmnt_dt": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "agrmnt_dt",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 6.6,
-    "distinct_pct": 25.06,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.enrollment_type": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "enrollment_type",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 0.55,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.ipt_name": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "ipt_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 22.83,
-    "distinct_pct": 0.04,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.card_type": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "card_type",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 22.83,
-    "distinct_pct": 0.36,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.report_dt": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "report_dt",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.98,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.is_security_force": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "is_security_force",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 92.8,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.segment_name": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "segment_name",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 92.8,
-    "distinct_pct": 0.08,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.market_share_flag_name": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "market_share_flag_name",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 92.8,
-    "distinct_pct": 0.07,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_payroll_m.src_system_name": {
-    "schema": "schema",
-    "table": "uzp_data_payroll_m",
-    "column": "src_system_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 92.8,
-    "distinct_pct": 0.06,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_emp_epk_assignment.start_dttm": {
-    "schema": "schema",
-    "table": "uzp_data_emp_epk_assignment",
-    "column": "start_dttm",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 98.62,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_emp_epk_assignment.end_dttm": {
-    "schema": "schema",
-    "table": "uzp_data_emp_epk_assignment",
-    "column": "end_dttm",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 26.91,
-    "distinct_pct": 72.06,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.epk_create_dttm": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "epk_create_dttm",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 98.91,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.client_type_id": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "client_type_id",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 0.06,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.client_type_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "client_type_name",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 0.06,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.industry_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "industry_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 67.9,
-    "distinct_pct": 0.23,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.segment_id": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "segment_id",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.02,
-    "distinct_pct": 0.08,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.segment_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "segment_name",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.02,
-    "distinct_pct": 0.08,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.priority_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "priority_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 70.6,
-    "distinct_pct": 0.17,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.company_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "company_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 99.26,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.holding_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "holding_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 92.16,
-    "distinct_pct": 7.42,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.reference_holding_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "reference_holding_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 92.16,
-    "distinct_pct": 7.31,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.head_holding_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "head_holding_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 92.16,
-    "distinct_pct": 7.39,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.reference_head_holding_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "reference_head_holding_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 92.16,
-    "distinct_pct": 7.28,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.is_parent": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "is_parent",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.is_key_client": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "is_key_client",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.status_id": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "status_id",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 23.6,
-    "distinct_pct": 0.05,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.status_name": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "status_name",
-    "semantic_class": "enum_like",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "enum_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 23.6,
-    "distinct_pct": 0.05,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.is_educational": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "is_educational",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.01,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_data_epk_consolidation.is_military": {
-    "schema": "schema",
-    "table": "uzp_data_epk_consolidation",
-    "column": "is_military",
-    "semantic_class": "flag",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "boolean_like",
-    "allowed_operators": [
-      "="
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 0.02,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_sap_staff_emp.report_dt": {
-    "schema": "schema",
-    "table": "uzp_dwh_sap_staff_emp",
-    "column": "report_dt",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 11.62,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_sap_staff_emp.fio": {
-    "schema": "schema",
-    "table": "uzp_dwh_sap_staff_emp",
-    "column": "fio",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 3.65,
-    "distinct_pct": 36.56,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_sap_staff_emp.post_name": {
-    "schema": "schema",
-    "table": "uzp_dwh_sap_staff_emp",
-    "column": "post_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 0.18,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_sap_staff_emp.pos_name": {
-    "schema": "schema",
-    "table": "uzp_dwh_sap_staff_emp",
-    "column": "pos_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "dense",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 0.0,
-    "distinct_pct": 0.19,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_sap_staff_emp.pos_vacancy_dt": {
-    "schema": "schema",
-    "table": "uzp_dwh_sap_staff_emp",
-    "column": "pos_vacancy_dt",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 96.35,
-    "distinct_pct": 1.88,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_sap_staff_emp.post_start_dt": {
-    "schema": "schema",
-    "table": "uzp_dwh_sap_staff_emp",
-    "column": "post_start_dt",
-    "semantic_class": "date",
-    "semantic_tags": [
-      "dense",
-      "filter_candidate",
-      "time_axis"
-    ],
-    "value_mode": "date_range",
-    "allowed_operators": [
-      "=",
-      ">=",
-      "<=",
-      "<"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": false,
-    "null_pct": 0.0,
-    "distinct_pct": 2.69,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_name": {
-    "schema": "schema",
-    "table": "uzp_dwh_sap_staff_emp",
-    "column": "manager_lvl_1_name",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 10.21,
-    "distinct_pct": 0.15,
-    "known_terms": [],
-    "source": "metadata"
-  },
-  "schema.uzp_dwh_sap_staff_emp.manager_lvl_1_fio": {
-    "schema": "schema",
-    "table": "uzp_dwh_sap_staff_emp",
-    "column": "manager_lvl_1_fio",
-    "semantic_class": "label",
-    "semantic_tags": [
-      "categorical",
-      "filter_candidate"
-    ],
-    "value_mode": "dictionary_like",
-    "allowed_operators": [
-      "=",
-      "ILIKE"
-    ],
-    "supports_exact_match": true,
-    "supports_pattern_match": true,
-    "null_pct": 10.84,
-    "distinct_pct": 5.89,
     "known_terms": [],
     "source": "metadata"
   }

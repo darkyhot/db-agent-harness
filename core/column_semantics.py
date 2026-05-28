@@ -22,7 +22,11 @@ def classify_column(row: dict[str, Any]) -> dict[str, Any]:
         semantic_class = "system_timestamp" if any(token in lower for token in ("modified", "created", "updated", "inserted")) else "date"
     elif any(token in dtype for token in ("date",)):
         semantic_class = "date"
-    elif is_pk or lower.endswith(("_id", "_code", "_key")) and unique_pct >= 70.0:
+    elif is_pk or lower.endswith(("_id", "_code", "_key")):
+        # FK-колонки на фактовых таблицах малоуникальны (много строк на один
+        # ключ), поэтому НЕ гейтим по unique_pct — иначе fact.tb_id уходит в
+        # metric и выпадает из join. Уникальность лишь различает identifier
+        # (PK-подобная, высокая) и join_key (FK-подобная, низкая).
         semantic_class = "join_key" if unique_pct < 98.0 else "identifier"
     elif lower.startswith("is_") or "признак" in description or "flag" in lower:
         semantic_class = "flag"

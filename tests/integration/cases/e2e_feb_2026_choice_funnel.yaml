@@ -1,0 +1,21 @@
+# Кейс 3 (turn 2A): пользователь выбрал uzp_dwh_sale_funnel_task.
+# Ожидание: COUNT(*) с фильтрами report_dt в феврале 2026
+# и ilike по task_type / task_subtype.
+query: "Сколько задач по фактическому оттоку поставили в феврале 2026 (использовать таблицу uzp_dwh_sale_funnel_task)"
+intent_must_be: analytics
+sql_must_contain:
+  - "COUNT"
+  - "UZP_DWH_SALE_FUNNEL_TASK"
+  - "REPORT_DT"
+  - "2026-02"
+  - "TASK_TYPE"
+  - "TASK_SUBTYPE"
+sql_must_not_contain:
+  - "UZP_DWH_FACT_OUTFLOW"
+should_reach_node: sql_validator
+execute_succeeds: true
+# Синтетика генерит random text для task_type/task_subtype, поэтому
+# ilike '%Задача%' / '%Фактический отток%' вернёт 0 строк. SQL должен
+# выполниться без ошибок, но строк не ожидаем.
+expected_rowcount: {min: 0, max: 1}
+max_retries: 2

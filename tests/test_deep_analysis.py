@@ -741,7 +741,8 @@ def test_table_analysis_context_uses_schema_metadata():
         "is_key_client": [0, 1] * 100,
     })
     plan = LoadPlan(
-        schema="schema", table="uzp_dwh_fact_outflow", total_rows=len(df),
+        schema="s_grnplm_ld_salesntwrk_pcap_sn_uzp", table="uzp_dwh_fact_outflow",
+        total_rows=len(df),
         kept_columns=list(df.columns), dropped_wide_text=[],
         strategy="full", sample_rows=None,
         est_bytes_per_row=40, est_full_bytes=40 * len(df),

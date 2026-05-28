@@ -195,7 +195,12 @@ def build_semantic_lexicon(
             if flag_subject_match and sem_class in {"flag", "enum_like"}:
                 subject_token = flag_subject_match.group(1).strip()
                 if subject_token and subject_token not in _STOPWORDS:
-                    subject_aliases = _collect_aliases(subject_token, description)
+                    # Срезаем скобочное содержимое описания: это контекстная
+                    # сноска, а не семантика флага. Иначе «Признак ОКТМО
+                    # (принадлежит ГОСБ ...)» добавляет alias «госб» к flag_subject
+                    # «oktmo» → ложный implicit is_oktmo на запросах про ГОСБ.
+                    flag_description = re.sub(r"\([^)]*\)", " ", description)
+                    subject_aliases = _collect_aliases(subject_token, flag_description)
                     if subject_aliases:
                         flag_subjects = lexicon.setdefault("flag_subjects", {})
                         entry = flag_subjects.setdefault(

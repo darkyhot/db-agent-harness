@@ -143,6 +143,11 @@ def _structural_role_pass(cand: Candidate, role_hint: str) -> bool:
             return True
         return name_lower.endswith(("_id", "_code"))
     if role == "date":
+        # system_timestamp — служебная мета-колонка вставки/изменения,
+        # а не пользовательская временная ось. Отсекаем структурно,
+        # чтобы dimension-резолвер не выбрал её вместо отчётной даты.
+        if sem == "system_timestamp":
+            return False
         return _is_date_dtype(dtype) or sem in {"date"}
     if role == "filter":
         return sem != "system_timestamp"
@@ -241,13 +246,45 @@ def _apply_embedding_scores(
     return True
 
 
-def _combine_scores(candidates: list[Candidate], have_embeddings: bool) -> None:
+_LEGACY_COL_PREFIXES = ("old_", "legacy_", "prev_")
+_CANONICAL_COL_PREFIXES = ("new_", "current_", "actual_")
+_LEGACY_USER_HINTS = ("стар", "прежн", "old", "legacy", "preview", "previous")
+_CANONICAL_USER_HINTS = ("нов", "актуальн", "текущ", "new", "current", "actual")
+
+
+def _user_asked_for_legacy(entity_term: str) -> bool:
+    """True если в запросе пользователя явно фигурирует «старый/прежний/legacy»."""
+    text = (entity_term or "").lower()
+    return any(marker in text for marker in _LEGACY_USER_HINTS)
+
+
+def _user_asked_for_canonical(entity_term: str) -> bool:
+    """True если в запросе пользователя явно фигурирует «новый/текущий/current»."""
+    text = (entity_term or "").lower()
+    return any(marker in text for marker in _CANONICAL_USER_HINTS)
+
+
+def _combine_scores(
+    candidates: list[Candidate],
+    have_embeddings: bool,
+    *,
+    entity_term: str = "",
+) -> None:
     """Заполняет combined_score: embedding (если есть) + text overlap + лёгкие структурные.
 
     Структурные бонусы (PK, not_null) применяются ТОЛЬКО при наличии семантического
     сигнала — иначе кандидат с нулевой релевантностью получал бы ненулевой score
     и проходил вместо честного no_match.
+
+    Колонки с префиксами `old_/legacy_/prev_` мягко деранкируются, если
+    пользователь не запросил «старое»/«legacy» в entity_term: это общая SQL-
+    конвенция (исторические/устаревшие версии канонической колонки), не
+    доменное правило. Деранк применяется как лёгкий штраф к base, чтобы не
+    выбивать кандидата с сильным семантическим сигналом, но решать ничью
+    в пользу канонической колонки.
     """
+    user_wants_legacy = _user_asked_for_legacy(entity_term)
+    user_wants_canonical = _user_asked_for_canonical(entity_term)
     for cand in candidates:
         if have_embeddings:
             base = cand.embedding_score * 0.7 + cand.text_score * 0.3
@@ -260,6 +297,32 @@ def _combine_scores(candidates: list[Candidate], have_embeddings: bool) -> None:
                 base += 0.05
             if cand.not_null_perc >= 95.0:
                 base += 0.02
+            col_lower = cand.column.lower()
+            if not user_wants_legacy and col_lower.startswith(_LEGACY_COL_PREFIXES):
+                base -= 0.20
+            # Симметрично: явный «current/new/actual»-префикс получает
+            # bonus, если пользователь не запросил противоположного.
+            # Размер выбран больше high_confidence_gap (0.15) с запасом,
+            # чтобы тай-брейк не уходил в LLM (нестабилен на DeepSeek).
+            if not user_wants_legacy and col_lower.startswith(_CANONICAL_COL_PREFIXES):
+                base += 0.20
+            # Derived ratio/percent-метрики мягко деранкируются: между
+            # `outflow_qty` и `outflow_perc` каноническая «сумма/количество»
+            # должна побеждать долю. SQL-конвенция: `*_perc/*_pct/*_rate/
+            # *_ratio` — это derived measure, она не складывается аддитивно
+            # и редко является дефолтным таргетом для агрегатного запроса.
+            # Доменная семантика не используется — только суффикс имени.
+            if col_lower.endswith(("_perc", "_pct", "_rate", "_ratio")):
+                base -= 0.10
+            # Если пользователь явно сказал «старое» — бонус для legacy и
+            # derank для new (чтобы LLM/детерминированно ушли в нужную ветку).
+            if user_wants_legacy:
+                if col_lower.startswith(_LEGACY_COL_PREFIXES):
+                    base += 0.05
+                elif col_lower.startswith(_CANONICAL_COL_PREFIXES):
+                    base -= 0.20
+            elif user_wants_canonical and col_lower.startswith(_CANONICAL_COL_PREFIXES):
+                base += 0.05
         cand.combined_score = base if has_signal else 0.0
 
 
@@ -432,7 +495,7 @@ def resolve_entity_to_columns(
         return result
 
     have_embeddings = _apply_embedding_scores(candidates, entity_term, schema_loader)
-    _combine_scores(candidates, have_embeddings)
+    _combine_scores(candidates, have_embeddings, entity_term=entity_term)
     candidates.sort(key=lambda c: c.combined_score, reverse=True)
     top = candidates[: max(top_k_embeddings, 2)]
 

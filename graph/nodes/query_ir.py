@@ -8,7 +8,7 @@ from typing import Any
 
 from core.catalog_grounding import ground_query_spec
 from core.log_safety import summarize_dict_keys, summarize_text
-from core.query_ir import QuerySpec, query_spec_json_schema
+from core.query_ir import QuerySpec, SourceConstraint, query_spec_json_schema
 from core.semantic_frame import derive_semantic_frame
 from graph.state import AgentState
 
@@ -81,6 +81,32 @@ class QueryIRNodes:
             }
 
         _strip_unstated_physical_hints(spec, user_input)
+
+        # Если пользователь явно назвал таблицу каталога в запросе (например
+        # «использовать таблицу uzp_dwh_sale_funnel_task»), источник однозначен —
+        # детерминированно фиксируем его и снимаем clarification, даже если LLM
+        # ушёл в уточнение под влиянием семантики ("по фактическому оттоку").
+        explicit_sources = _detect_explicit_sources(user_input, self.schema)
+        if len(explicit_sources) == 1:
+            sch, tbl = explicit_sources[0]
+            already = any(
+                str(sc.table or "").lower() == tbl.lower()
+                for sc in spec.source_constraints
+            )
+            if not already:
+                spec.source_constraints.append(
+                    SourceConstraint(table=tbl, schema=sch, required=True, confidence=0.95)
+                )
+            if spec.clarification_needed or spec.task == "clarify":
+                logger.info(
+                    "QueryInterpreter: явная таблица %s.%s в запросе → "
+                    "снимаем clarification, фиксируем источник",
+                    sch, tbl,
+                )
+                spec.clarification_needed = False
+                spec.clarification = None
+                if spec.task == "clarify":
+                    spec.task = "answer_data"
 
         logger.info(
             "QueryInterpreter: QuerySpec=%s",
@@ -212,11 +238,22 @@ class QueryIRNodes:
         if result.sources:
             selected = [source.to_tuple() for source in result.sources]
             canonical_query_spec = _canonicalize_query_spec_sources(spec.to_dict(), result.sources)
+            canonical_query_spec = _canonicalize_query_spec_metrics(
+                canonical_query_spec, result.sources, self.schema,
+            )
             canonical_spec, _canonical_errors = QuerySpec.from_dict(canonical_query_spec)
             canonical_hints = (
                 canonical_spec.to_legacy_user_hints()
                 if canonical_spec is not None
                 else spec.to_legacy_user_hints()
+            )
+            # Если canonicalizer изменил metrics (count→sum), нужно также
+            # обновить legacy intent.aggregation_hint, который читает
+            # deterministic sql_planner для построения blueprint.
+            canonical_intent = (
+                canonical_spec.to_legacy_intent()
+                if canonical_spec is not None
+                else None
             )
             update.update({
                 "query_spec": canonical_query_spec,
@@ -230,6 +267,12 @@ class QueryIRNodes:
                     + ", ".join(source.full_name for source in result.sources)
                 ],
             })
+            if canonical_intent is not None:
+                # Не перезаписываем intent целиком — мерджим только семантические
+                # поля, которые мог изменить canonicalizer.
+                prev_intent = dict(state.get("intent") or {})
+                prev_intent["aggregation_hint"] = canonical_intent.get("aggregation_hint")
+                update["intent"] = prev_intent
 
         update.update({
             "needs_clarification": False,
@@ -238,7 +281,12 @@ class QueryIRNodes:
         return update
 
     def _get_query_ir_catalog_context(self, user_input: str, top_n: int = 12) -> str:
-        """Compact catalog context for QuerySpec interpretation."""
+        """Compact catalog context for QuerySpec interpretation.
+
+        Включает имена таблиц + grain + description, и для каждой таблицы —
+        ключевые колонки (только semantic-классы: date, label, metric, flag,
+        enum_like, join_key). Это даёт LLM словарь домена без перегруза.
+        """
         lines: list[str] = []
         try:
             df = self.schema.search_tables(user_input, top_n=top_n)
@@ -249,6 +297,12 @@ class QueryIRNodes:
         if df is None or df.empty:
             df = self.schema.tables_df.head(top_n)
 
+        # Семантические классы, которые попадают в краткий обзор колонок —
+        # все, что LLM может реально использовать в QuerySpec.
+        _IMPORTANT_SEM_CLASSES = {
+            "date", "label", "metric", "measure", "flag", "enum_like", "join_key",
+        }
+
         for _, row in df.iterrows():
             schema = str(row.get("schema_name") or "")
             table = str(row.get("table_name") or "")
@@ -257,9 +311,71 @@ class QueryIRNodes:
             if not schema or not table:
                 continue
             lines.append(
-                f"- {schema}.{table}; grain={grain or 'unknown'}; desc={desc[:220]}"
+                f"- {schema}.{table}; grain={grain or 'unknown'}; desc={desc[:200]}"
             )
+            try:
+                cols_df = self.schema.get_table_columns(schema, table)
+            except Exception:  # noqa: BLE001
+                continue
+            if cols_df is None or cols_df.empty:
+                continue
+            col_entries: list[str] = []
+            for _, crow in cols_df.iterrows():
+                col_name = str(crow.get("column_name") or "").strip()
+                if not col_name:
+                    continue
+                try:
+                    sem = self.schema.get_column_semantics(schema, table, col_name) or {}
+                except Exception:  # noqa: BLE001
+                    sem = {}
+                sem_class = str(sem.get("semantic_class") or "").lower()
+                if sem_class not in _IMPORTANT_SEM_CLASSES:
+                    continue
+                col_desc = str(crow.get("description") or "").strip()
+                dtype = str(crow.get("dType") or crow.get("dtype") or "").strip()
+                # Компактная строка: имя [class/dtype] описание
+                hint = f"{col_name} [{sem_class}"
+                if dtype:
+                    hint += f"/{dtype}"
+                hint += "]"
+                if col_desc:
+                    hint += f" {col_desc[:80]}"
+                col_entries.append(hint)
+            if col_entries:
+                # Ограничиваем до 25 колонок на таблицу, чтобы не раздувать промпт
+                # на широких витринах. Грундер всё равно увидит полный каталог.
+                shown = col_entries[:25]
+                lines.append("    cols: " + "; ".join(shown))
+                if len(col_entries) > len(shown):
+                    lines.append(f"    (+{len(col_entries) - len(shown)} more)")
         return "\n".join(lines)
+
+def _detect_explicit_sources(user_input: str, schema_loader: Any) -> list[tuple[str, str]]:
+    """Найти таблицы каталога, названные дословно в запросе пользователя.
+
+    Возвращает [(schema, table), ...]. Имена короче 6 символов игнорируем,
+    чтобы случайное слово не сматчило таблицу. Используется для снятия ложной
+    кларификации, когда источник указан явно («использовать таблицу X»).
+    """
+    text = (user_input or "").lower()
+    if not text:
+        return []
+    found: list[tuple[str, str]] = []
+    try:
+        df = schema_loader.tables_df
+    except Exception:  # noqa: BLE001
+        return []
+    if df is None or df.empty:
+        return []
+    for _, row in df.iterrows():
+        table = str(row.get("table_name") or "").strip()
+        schema = str(row.get("schema_name") or "").strip()
+        if len(table) >= 6 and table.lower() in text:
+            pair = (schema, table)
+            if pair not in found:
+                found.append(pair)
+    return found
+
 
 def _build_query_interpreter_system_prompt() -> str:
     schema = json.dumps(query_spec_json_schema(), ensure_ascii=False)
@@ -271,6 +387,20 @@ def _build_query_interpreter_system_prompt() -> str:
         "clarification_needed=true и заполняй clarification.\n"
         "Детерминированный код после тебя будет только проверять и связывать "
         "с каталогом, поэтому все смысловые решения должны быть в QuerySpec.\n\n"
+        "Использование catalog-контекста (он передаётся в user-сообщении):\n"
+        "- Каталог дан, чтобы ты говорил на ЯЗЫКЕ существующих сущностей: "
+        "если видишь колонку `report_dt` в каталоге — пиши filter.target='report_dt', "
+        "а не выдумывай 'дата постановки задачи'.\n"
+        "- Если видишь boolean-колонку `is_X` — это flag для соответствующей сущности; "
+        "соответствующий filter оформляй target='<имя_колонки>', value=true.\n"
+        "- НЕ заполняй source_constraints на основе каталога. Выбор таблицы и "
+        "disambiguation делает детерминированный grounder после тебя. "
+        "Заполняй source_constraints ТОЛЬКО если пользователь явно назвал "
+        "имя таблицы в запросе (типа 'использовать uzp_dwh_X').\n"
+        "- Если запрос подходит к нескольким таблицам каталога — оставь "
+        "source_constraints пустым; grounder предложит пользователю выбор.\n"
+        "- entities — это сущности, явно упомянутые в запросе. НЕ добавляй entities, "
+        "которых нет в тексте пользователя, даже если каталог намекает на них.\n\n"
         "Правила:\n"
         "- Верни ТОЛЬКО JSON-объект без markdown.\n"
         "- task='answer_data' для расчётов/выборок; 'inspect_schema' для вопросов о каталоге; "
@@ -364,6 +494,109 @@ def _canonicalize_query_spec_sources(
             item["table"] = source.table
         normalized_sources.append(item)
     canonical["source_constraints"] = normalized_sources
+    return canonical
+
+
+def _canonicalize_query_spec_metrics(
+    query_spec: dict[str, Any],
+    sources,
+    schema_loader,
+) -> dict[str, Any]:
+    """Convert `count(target=X)` to `sum(target=X)` when X resolves to a numeric
+    metric column in the chosen fact source.
+
+    Rationale: «Посчитай X» в русском бизнес-языке часто означает «суммировать
+    X», когда X — это числовая метрика (qty/amount/percent). Дословный
+    `COUNT(X)` будет считать только non-null rows, что для метрик
+    бессмысленно. Когда target однозначно резолвится в числовую
+    non-PK колонку с semantic_class='metric' или с числовым типом — это
+    сигнал, что пользователь хочет сумму, не подсчёт строк.
+
+    Это общая семантическая нормализация, не доменное правило: применяется
+    к любым числовым метрикам каталога.
+    """
+    canonical = dict(query_spec or {})
+    metrics = canonical.get("metrics")
+    if not metrics or not sources:
+        return canonical
+
+    from core.entity_resolver import resolve_entity_to_columns
+
+    candidate_tables = [s.full_name for s in sources]
+    new_metrics: list[dict[str, Any]] = []
+    changed = False
+    for raw in metrics:
+        if not isinstance(raw, dict):
+            new_metrics.append(raw)
+            continue
+        item = dict(raw)
+        if str(item.get("operation") or "").lower() != "count":
+            new_metrics.append(item)
+            continue
+        target = str(item.get("target") or "").strip()
+        if not target:
+            new_metrics.append(item)
+            continue
+        # Resolve target against candidate tables; switch to SUM if it lands
+        # on a numeric non-PK column whose semantic_class hints at metric.
+        try:
+            res = resolve_entity_to_columns(
+                entity_term=target,
+                user_input="",
+                candidate_table_keys=candidate_tables,
+                schema_loader=schema_loader,
+                llm_invoker=None,
+                role_hint="metric",
+            )
+        except Exception:  # noqa: BLE001
+            res = None
+        if not res or not getattr(res, "matched", False):
+            new_metrics.append(item)
+            continue
+        chosen = getattr(res, "column", "") or ""
+        chosen_table = getattr(res, "table_key", "") or ""
+        if not chosen or not chosen_table or "." not in chosen_table:
+            new_metrics.append(item)
+            continue
+        schema_part, table_part = chosen_table.split(".", 1)
+        try:
+            cols_df = schema_loader.get_table_columns(schema_part, table_part)
+        except Exception:  # noqa: BLE001
+            cols_df = None
+        if cols_df is None or cols_df.empty:
+            new_metrics.append(item)
+            continue
+        row = cols_df[cols_df["column_name"].astype(str).str.lower() == chosen.lower()]
+        if row.empty:
+            new_metrics.append(item)
+            continue
+        is_pk = bool(row.iloc[0].get("is_primary_key", False))
+        dtype = str(row.iloc[0].get("dType") or "").lower()
+        is_numeric = any(
+            keyword in dtype for keyword in ("int", "numeric", "decimal", "float", "double", "real", "money", "number")
+        )
+        if is_pk or not is_numeric:
+            new_metrics.append(item)
+            continue
+        # Semantic class hint (best signal) — if available, require metric.
+        sem_class = ""
+        try:
+            sem = schema_loader.get_column_semantics(schema_part, table_part, chosen) or {}
+            sem_class = str(sem.get("semantic_class") or "").lower()
+        except Exception:  # noqa: BLE001
+            sem_class = ""
+        if sem_class and sem_class not in ("metric", "measure"):
+            new_metrics.append(item)
+            continue
+        item["operation"] = "sum"
+        changed = True
+        logger.info(
+            "QuerySpec canonicalizer: count(%s) → sum(%s) for numeric metric column %s.%s",
+            target, target, chosen_table, chosen,
+        )
+        new_metrics.append(item)
+    if changed:
+        canonical["metrics"] = new_metrics
     return canonical
 
 

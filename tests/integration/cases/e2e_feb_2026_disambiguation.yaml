@@ -1,0 +1,11 @@
+# Кейс 3 (turn 1): неоднозначность таблицы.
+# "Сколько задач по фактическому оттоку поставили в феврале 2026"
+# Пайплайн должен предложить выбор между двумя витринами:
+#   - uzp_dwh_sale_funnel_task (где задача = запись с task_type/task_subtype)
+#   - uzp_dwh_fact_outflow      (где задача = is_task = TRUE)
+query: "Сколько задач по фактическому оттоку поставили в феврале 2026"
+expect_disambiguation: true
+disambiguation_tables_must_include:
+  - "uzp_dwh_sale_funnel_task"
+  - "uzp_dwh_fact_outflow"
+max_retries: 2

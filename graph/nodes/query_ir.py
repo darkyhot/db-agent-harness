@@ -36,28 +36,36 @@ class QueryIRNodes:
         user_input = state.get("user_input", "") or ""
         logger.info("QueryInterpreter: запрос: %s", summarize_text(user_input, label="user_input"))
 
-        system_prompt = _build_query_interpreter_system_prompt()
-        user_prompt = _build_query_interpreter_user_prompt(
-            user_input=user_input,
-            catalog_context=self._get_query_ir_catalog_context(user_input),
-            prev_sql=state.get("prev_sql", ""),
-            prev_summary=state.get("prev_result_summary", ""),
-        )
-        system_prompt, user_prompt = self._trim_to_budget(system_prompt, user_prompt)
-
-        if self.debug_prompt:
-            print(
-                f"\n{'='*80}\n[DEBUG PROMPT — query_interpreter]\n{'='*80}\n"
-                f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n"
+        # Programmatic fast-path: caller may pin a fully-formed QuerySpec to skip
+        # language interpretation entirely (deterministic pipeline runs, тесты
+        # grounder/planner/SQL-gen без недетерминизма LLM-интерпретатора).
+        pinned_spec = state.get("pinned_query_spec")
+        if isinstance(pinned_spec, dict) and pinned_spec.get("task"):
+            logger.info("QueryInterpreter: pinned QuerySpec fast-path (LLM skipped)")
+            parsed = pinned_spec
+        else:
+            system_prompt = _build_query_interpreter_system_prompt()
+            user_prompt = _build_query_interpreter_user_prompt(
+                user_input=user_input,
+                catalog_context=self._get_query_ir_catalog_context(user_input),
+                prev_sql=state.get("prev_sql", ""),
+                prev_summary=state.get("prev_result_summary", ""),
             )
+            system_prompt, user_prompt = self._trim_to_budget(system_prompt, user_prompt)
 
-        parsed = self._llm_json_with_retry(
-            system_prompt,
-            user_prompt,
-            temperature=0.0,
-            failure_tag="query_interpreter",
-            expect="object",
-        )
+            if self.debug_prompt:
+                print(
+                    f"\n{'='*80}\n[DEBUG PROMPT — query_interpreter]\n{'='*80}\n"
+                    f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n{'='*80}\n"
+                )
+
+            parsed = self._llm_json_with_retry(
+                system_prompt,
+                user_prompt,
+                temperature=0.0,
+                failure_tag="query_interpreter",
+                expect="object",
+            )
         if not isinstance(parsed, dict) or "task" not in parsed:
             logger.warning("QueryInterpreter: LLM did not return QuerySpec.task")
             return {
@@ -228,11 +236,37 @@ class QueryIRNodes:
         }
 
         if result.needs_clarification and result.clarification:
+            clar = result.clarification
+            message = clar.question
+            disambiguation_options: list[dict[str, Any]] = []
+            # Когда clarification несёт варианты (H2: несколько таблиц с близкой
+            # релевантностью; ambiguous required source), сами варианты должны
+            # дойти до пользователя: иначе сообщение «уточните, какую таблицу»
+            # не называет альтернатив. Вшиваем их в текст и дублируем в
+            # структурный disambiguation_options (CLI/clients рендерят выбор).
+            if clar.options:
+                lines = [message, ""]
+                for idx, opt in enumerate(clar.options, 1):
+                    lines.append(f"{idx}. {opt}")
+                    # Лейбл имеет вид "schema.table — описание"; вытаскиваем
+                    # ведущий schema.table для структурного варианта.
+                    head = str(opt).split(" — ", 1)[0].strip()
+                    if head.count(".") == 1:
+                        opt_schema, opt_table = head.split(".", 1)
+                        disambiguation_options.append({
+                            "schema": opt_schema,
+                            "table": opt_table,
+                            "description": str(opt).split(" — ", 1)[1].strip() if " — " in str(opt) else "",
+                        })
+                message = "\n".join(lines)
             update.update({
                 "needs_clarification": True,
-                "clarification_message": result.clarification.question,
-                "clarification_spec": result.clarification.to_dict(),
+                "clarification_message": message,
+                "clarification_spec": clar.to_dict(),
             })
+            if disambiguation_options:
+                update["needs_disambiguation"] = True
+                update["disambiguation_options"] = disambiguation_options
             return update
 
         if result.sources:

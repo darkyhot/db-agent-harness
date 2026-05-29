@@ -56,6 +56,9 @@ class AgentState(TypedDict):
     # Primary semantic contract. Старые intent/user_hints/semantic_frame ниже
     # остаются compatibility projection до полного удаления legacy pipeline.
     query_spec: dict[str, Any]
+    # Программно закреплённый QuerySpec: если задан, query_interpreter пропускает
+    # LLM-интерпретацию и использует его напрямую (детерминированные прогоны).
+    pinned_query_spec: dict[str, Any]
     query_spec_validation_errors: list[str]
     use_legacy_interpreter: bool
 

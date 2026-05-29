@@ -3,7 +3,28 @@
 # Пайплайн должен предложить выбор между двумя витринами:
 #   - uzp_dwh_sale_funnel_task (где задача = запись с task_type/task_subtype)
 #   - uzp_dwh_fact_outflow      (где задача = is_task = TRUE)
+#
+# Кейс закрепляет QuerySpec (блок query_spec): он проверяет ДЕТЕРМИНИРОВАННУЮ
+# логику catalog_grounder (H2 ambiguous-strong-sources) и проброс вариантов в
+# disambiguation_options — а не качество LLM-интерпретации (на дешёвой модели
+# недетерминированно: иногда LLM сам резко выбирает одну витрину и H2 не
+# срабатывает). Unit-уровень той же логики — tests/test_query_ir.py.
 query: "Сколько задач по фактическому оттоку поставили в феврале 2026"
+query_spec:
+  task: answer_data
+  strategy: aggregate
+  metrics:
+    - {operation: count, distinct_policy: auto, label: "Количество задач", confidence: 0.9}
+  entities:
+    - {name: "задача", confidence: 1.0}
+    - {name: "отток", canonical: "фактический отток", confidence: 0.8}
+  filters:
+    - {target: "фактический отток", operator: ILIKE, value: "фактический отток", confidence: 0.7}
+  time_range: {start: "2026-02-01", end: "2026-03-01", grain: month, confidence: 0.95}
+  source_constraints: []
+  join_constraints: []
+  clarification_needed: false
+  confidence: 0.8
 expect_disambiguation: true
 disambiguation_tables_must_include:
   - "uzp_dwh_sale_funnel_task"

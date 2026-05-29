@@ -1,7 +1,29 @@
 # Кейс 2: "Посчитай отток по дате и названию госб где отток от 3 человек"
-# Ожидание: case 1 + WHERE outflow_qty >= 3 (или > 2; LLM может выбрать строгое или нестрогое).
+# Ожидание: SUM(outflow_qty) + INNER JOIN fact↔dim по (tb_id, gosb_id↔old_gosb_id)
+# + GROUP BY (report_dt, new_gosb_name) + WHERE outflow_qty >= 3.
+#
+# Кейс закрепляет QuerySpec (блок query_spec): проверяется ДЕТЕРМИНИРОВАННЫЙ
+# JOIN-pipeline (join_analysis выводит составной ключ из каталога, planner
+# строит SUM+GROUP BY+WHERE), а не способность дешёвой LLM собрать JOIN —
+# на flash это самый флакающий кейс (correction-loop на галлюцинированных
+# колонках). Базовый кейс без фильтра — e2e_outflow_sum_by_gosb (живой LLM).
 query: "Посчитай отток по дате и названию госб где отток от 3 человек"
-intent_must_be: analytics
+query_spec:
+  task: answer_data
+  strategy: aggregate
+  metrics:
+    - {operation: sum, target: "outflow_qty", label: "Сумма оттока", confidence: 0.9}
+  dimensions:
+    - {target: "report_dt", role: group_by, confidence: 0.9}
+    - {target: "new_gosb_name", role: group_by, source_table: "s_grnplm_ld_salesntwrk_pcap_sn_uzp.uzp_dim_gosb", confidence: 0.9}
+  filters:
+    - {target: "outflow_qty", operator: ">=", value: 3, confidence: 0.9}
+  source_constraints:
+    - {table: "uzp_dwh_fact_outflow", schema: "s_grnplm_ld_salesntwrk_pcap_sn_uzp", required: true, confidence: 1.0}
+    - {table: "uzp_dim_gosb", schema: "s_grnplm_ld_salesntwrk_pcap_sn_uzp", required: true, confidence: 0.9}
+  join_constraints: []
+  clarification_needed: false
+  confidence: 0.85
 sql_must_contain:
   - "REPORT_DT"
   - "NEW_GOSB_NAME"

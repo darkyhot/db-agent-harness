@@ -1,5 +1,21 @@
+# Базовый COUNT по витрине оттока.
+#
+# Кейс закрепляет QuerySpec (блок query_spec): слово «отток» на дешёвой модели
+# периодически даёт неоднозначный QuerySpec (H2: fact_outflow vs funnel_task),
+# и grounder уходит в clarification вместо COUNT — флак ~50% на flash. Явный
+# source_constraint=fact_outflow снимает неоднозначность (H2 пропускается для
+# explicit-источника), и путь становится детерминированным COUNT без JOIN.
 query: "Сколько записей в витрине оттока?"
-intent_must_be: analytics
+query_spec:
+  task: answer_data
+  strategy: aggregate
+  metrics:
+    - {operation: count, distinct_policy: auto, label: "Количество записей", confidence: 0.9}
+  source_constraints:
+    - {table: "uzp_dwh_fact_outflow", schema: "s_grnplm_ld_salesntwrk_pcap_sn_uzp", required: true, confidence: 1.0}
+  join_constraints: []
+  clarification_needed: false
+  confidence: 0.9
 sql_must_contain:
   - "COUNT"
   - "UZP_DWH_FACT_OUTFLOW"

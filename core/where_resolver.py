@@ -810,6 +810,34 @@ def resolve_where(
         best_condition = str(best.get("condition") or "")
         best_column = str(best.get("column") or "")
         best_table_key = str(best.get("table_key") or "")
+        # Guard: оператор сравнения (`>`,`>=`,`<`,`<=`) имеет смысл только для
+        # numeric/date колонок. Если ранжирование привязало числовой порог к
+        # текстовой label-колонке (например `new_gosb_name >= 3` под «от 3
+        # человек»), такое условие невалидно (text >= 3) и ломает SQL — дропаем.
+        _parsed_cond = _parse_condition(best_condition)
+        if (
+            _parsed_cond is not None
+            and _parsed_cond[1] in {">", ">=", "<", "<="}
+            and best_column
+            and best_table_key
+            and schema_loader is not None
+            and "." in best_table_key
+        ):
+            _sch, _tbl = best_table_key.split(".", 1)
+            try:
+                _dt = str(schema_loader.get_column_dtype(_sch, _tbl, best_column) or "")
+            except Exception:  # noqa: BLE001
+                _dt = ""
+            if _dt and _dtype_bucket(_dt) not in {"numeric", "date", "datetime"}:
+                logger.info(
+                    "WhereResolver: пропущен ranked-фильтр %s %s — оператор сравнения "
+                    "на нечисловой колонке (dtype=%s)",
+                    best_column, _parsed_cond[1], _dt,
+                )
+                reasoning.append(
+                    f"comparison_on_nonnumeric:{request_id}:{best_column} ({_dt})"
+                )
+                continue
         # Direction: dtype-check. Извлекаем литерал из condition и проверяем
         # его на совместимость с dtype выбранной колонки. Если не подходит —
         # фильтр уходит в unresolved_filters, condition в SQL не попадает.

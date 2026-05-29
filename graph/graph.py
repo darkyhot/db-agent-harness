@@ -728,6 +728,7 @@ def create_initial_state(
         needs_replan=False,
         replan_context="",
         query_spec=dict(ctx.get("query_spec") or {}),
+        pinned_query_spec=dict(ctx.get("pinned_query_spec") or {}),
         query_spec_validation_errors=list(ctx.get("query_spec_validation_errors") or []),
         use_legacy_interpreter=bool(ctx.get("use_legacy_interpreter", False)),
         query_grounding=dict(ctx.get("query_grounding") or {}),

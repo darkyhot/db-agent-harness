@@ -544,6 +544,105 @@ def test_catalog_grounding_uses_metadata_filters_and_prunes_unrelated_helpers(tm
     assert option_prefixes == {"dm.sale_funnel", "dm.fact_outflow"}
 
 
+def test_catalog_grounder_node_surfaces_disambiguation_options(tmp_path):
+    """Узел catalog_grounder должен пробросить варианты H2-неоднозначности.
+
+    Регрессия: ground_query_spec корректно строит clarification.options с
+    обеими таблицами, но узел клал в clarification_message только generic
+    вопрос («уточните, какую таблицу») без перечня вариантов и не заполнял
+    структурный disambiguation_options. CLI/тесты не видели альтернатив.
+    """
+    from graph.nodes.query_ir import QueryIRNodes
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm", "dm"],
+        "table_name": ["fact_outflow", "sale_funnel", "employee_assignment"],
+        "description": [
+            "Информация по фактическим оттокам",
+            "Воронка продаж по задачам",
+            "Данные по закреплению сотрудников за организациями",
+        ],
+        "grain": ["event", "task", "employee"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 7,
+        "table_name": [
+            "fact_outflow", "fact_outflow", "fact_outflow",
+            "sale_funnel", "sale_funnel", "sale_funnel",
+            "employee_assignment",
+        ],
+        "column_name": [
+            "report_dt", "inn", "is_task",
+            "report_dt", "task_subtype", "task_category",
+            "end_dttm",
+        ],
+        "dType": ["date", "text", "boolean", "date", "text", "text", "timestamp"],
+        "description": [
+            "Отчетная дата", "ИНН", "Признак выставленной задачи",
+            "Отчетная дата", "Подтип задачи", "Категория задачи",
+            "Дата окончания закрепления",
+        ],
+        "is_primary_key": [False] * 7,
+        "unique_perc": [1.0, 90.0, 2.0, 1.0, 10.0, 2.0, 5.0],
+        "not_null_perc": [100.0] * 7,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader._rule_registry = {
+        "rules": [
+            {
+                "rule_id": "text:dm.sale_funnel.task_subtype",
+                "column_key": "dm.sale_funnel.task_subtype",
+                "semantic_class": "enum_like",
+                "match_kind": "text_search",
+                "match_phrases": ["подтип задачи"],
+                "value_candidates": ["фактический отток"],
+            },
+            {
+                "rule_id": "text:dm.sale_funnel.task_category",
+                "column_key": "dm.sale_funnel.task_category",
+                "semantic_class": "enum_like",
+                "match_kind": "text_search",
+                "match_phrases": ["категория задачи"],
+                "value_candidates": ["Задача"],
+            },
+        ]
+    }
+
+    raw_spec = {
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": "задачи", "distinct_policy": "auto", "confidence": 0.8}],
+        "dimensions": [],
+        "filters": [{"target": "фактический отток", "operator": "ILIKE", "value": "фактический отток", "confidence": 0.8}],
+        "time_range": {"start": "2026-02-01", "end": "2026-03-01", "grain": "month", "confidence": 0.9},
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 0.8,
+    }
+
+    # Узел использует только self.schema — собираем без тяжёлой инициализации.
+    node = QueryIRNodes.__new__(QueryIRNodes)
+    node.schema = loader
+
+    update = node.catalog_grounder({
+        "query_spec": raw_spec,
+        "graph_iterations": 0,
+        "user_input": "Сколько задач по фактическому оттоку поставили в феврале 2026",
+    })
+
+    assert update.get("needs_clarification") is True
+    # Структурный путь: обе таблицы перечислены как варианты выбора.
+    opts = update.get("disambiguation_options") or []
+    opt_names = {f"{o['schema']}.{o['table']}" for o in opts}
+    assert update.get("needs_disambiguation") is True
+    assert {"dm.fact_outflow", "dm.sale_funnel"} <= opt_names, opt_names
+    # Free-text путь: имена таблиц попали в человекочитаемое сообщение.
+    msg = update.get("clarification_message", "")
+    assert "fact_outflow" in msg and "sale_funnel" in msg, msg
+
+
 def test_catalog_grounding_logs_table_scores(tmp_path, caplog):
     tables_df = pd.DataFrame({
         "schema_name": ["dm", "dm"],

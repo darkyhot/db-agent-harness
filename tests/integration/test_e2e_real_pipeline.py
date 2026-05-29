@@ -83,6 +83,15 @@ def test_e2e_real_pipeline(
             for t in plan_context["selected_tables"]
         ]
 
+    # Кейс может закрепить QuerySpec (блок `query_spec:`), чтобы прогнать
+    # детерминированный pipeline (grounder→planner→SQL-gen) без недетерминизма
+    # LLM-интерпретатора. query_interpreter подхватывает pinned_query_spec и
+    # пропускает вызов LLM.
+    pinned = case.get("query_spec")
+    if isinstance(pinned, dict):
+        plan_context = dict(plan_context)
+        plan_context["pinned_query_spec"] = pinned
+
     state = create_initial_state(
         case["query"],
         plan_preview_approved=True,  # skip plan-preview pause

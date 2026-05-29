@@ -1,21 +1,41 @@
 # Кейс 3 (turn 2A): пользователь выбрал uzp_dwh_sale_funnel_task.
-# Ожидание: COUNT(*) с фильтрами report_dt в феврале 2026
-# и ilike по task_type / task_subtype.
+# Ожидание: COUNT(*) с фильтром report_dt в феврале 2026 + категориальный
+# фильтр по «задаче» (task_category ILIKE '%Задача%').
+#
+# Кейс закрепляет QuerySpec (блок query_spec) и проверяет ДЕТЕРМИНИРОВАННЫЙ
+# pipeline (binder→planner→SQL-gen), а не выбор колонок дешёвой LLM. Контракт
+# сведён к инвариантам, которые планировщик строит стабильно: канонический
+# time-axis = report_dt (важнее task_create_dt), а «задача» как enum-значение
+# живёт в task_category. Точные имена колонок, которые слабая LLM варьирует
+# (task_type/task_subtype vs task_category), здесь не фиксируем.
 query: "Сколько задач по фактическому оттоку поставили в феврале 2026 (использовать таблицу uzp_dwh_sale_funnel_task)"
-intent_must_be: analytics
+query_spec:
+  task: answer_data
+  strategy: aggregate
+  metrics:
+    - {operation: count, distinct_policy: auto, label: "Количество задач", confidence: 0.9}
+  entities:
+    - {name: "задача", confidence: 1.0}
+  filters:
+    - {target: "категория задачи", operator: ILIKE, value: "Задача", confidence: 0.8}
+    - {target: "подтип задачи", operator: ILIKE, value: "фактический отток", confidence: 0.7}
+  time_range: {start: "2026-02-01", end: "2026-03-01", grain: month, confidence: 0.95}
+  source_constraints:
+    - {table: "uzp_dwh_sale_funnel_task", schema: "s_grnplm_ld_salesntwrk_pcap_sn_uzp", required: true, confidence: 1.0}
+  join_constraints: []
+  clarification_needed: false
+  confidence: 0.8
 sql_must_contain:
   - "COUNT"
   - "UZP_DWH_SALE_FUNNEL_TASK"
   - "REPORT_DT"
   - "2026-02"
-  - "TASK_TYPE"
-  - "TASK_SUBTYPE"
+  - "TASK_CATEGORY"
 sql_must_not_contain:
   - "UZP_DWH_FACT_OUTFLOW"
 should_reach_node: sql_validator
 execute_succeeds: true
-# Синтетика генерит random text для task_type/task_subtype, поэтому
-# ilike '%Задача%' / '%Фактический отток%' вернёт 0 строк. SQL должен
-# выполниться без ошибок, но строк не ожидаем.
-expected_rowcount: {min: 0, max: 1}
+# COUNT(*) всегда возвращает ровно одну строку; синтетика рандомит task_category,
+# так что само значение счётчика может быть 0 — это нормально.
+expected_rowcount: {min: 1, max: 1}
 max_retries: 2

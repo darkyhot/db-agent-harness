@@ -64,6 +64,51 @@ def test_query_spec_count_attributes_contract():
     ]
 
 
+def test_salvage_downgrades_single_count_mislabeled_as_count_attributes():
+    """Регрессия на падение из agent (17).txt: LLM пометил одиночный счёт
+    'Сколько задач ...' как strategy=count_attributes с одной entity и count-
+    метрикой без target. Контракт справедливо отверг spec, но салваж в узле
+    должен понизить стратегию до aggregate вместо ухода в уточнение."""
+    from graph.nodes.query_ir import _salvage_invalid_query_spec
+
+    payload = {
+        "task": "answer_data",
+        "strategy": "count_attributes",
+        "entities": [{"name": "задача", "canonical": "задача", "confidence": 1.0}],
+        "metrics": [{"operation": "count", "target": None, "label": "Количество задач", "confidence": 1.0}],
+        "filters": [
+            {"target": "is_task", "operator": "=", "value": True, "confidence": 1.0},
+            {"target": "report_dt", "operator": "=", "value": "2026-02-01", "confidence": 1.0},
+        ],
+        "confidence": 1.0,
+    }
+    spec, errors = QuerySpec.from_dict(payload)
+    assert spec is None
+    assert any("count_attributes" in e for e in errors)
+
+    salvaged = _salvage_invalid_query_spec(payload, errors)
+    assert salvaged is not None
+    assert salvaged.strategy == "aggregate"
+    assert salvaged.to_legacy_intent()["aggregation_hint"] == "count"
+
+
+def test_salvage_keeps_empty_count_attributes_invalid():
+    """Пустой count_attributes (нет ни entities, ни метрик) салважу не
+    поддаётся — уточнение здесь оправдано."""
+    from graph.nodes.query_ir import _salvage_invalid_query_spec
+
+    payload = {
+        "task": "answer_data",
+        "strategy": "count_attributes",
+        "entities": [],
+        "metrics": [],
+        "confidence": 0.9,
+    }
+    spec, errors = QuerySpec.from_dict(payload)
+    assert spec is None
+    assert _salvage_invalid_query_spec(payload, errors) is None
+
+
 def test_query_spec_rejects_count_attributes_without_targets():
     spec, errors = QuerySpec.from_dict({
         "task": "answer_data",

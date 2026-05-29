@@ -77,13 +77,22 @@ class QueryIRNodes:
 
         spec, errors = QuerySpec.from_dict(parsed)
         if spec is None:
+            salvaged = _salvage_invalid_query_spec(parsed, errors)
+            if salvaged is not None:
+                logger.info(
+                    "QueryInterpreter: salvaged invalid QuerySpec "
+                    "(strategy downgrade) after errors: %s",
+                    "; ".join(errors),
+                )
+                spec, errors = salvaged, []
+        if spec is None:
             logger.warning(
                 "QueryInterpreter: QuerySpec invalid: %s",
                 "; ".join(errors),
             )
             return {
                 "needs_clarification": True,
-                "clarification_message": "QuerySpec получился невалидным. Уточните запрос или укажите нужные метрики/измерения.",
+                "clarification_message": _humanize_query_spec_errors(errors),
                 "query_spec_validation_errors": errors,
                 "graph_iterations": iterations,
             }
@@ -411,6 +420,69 @@ def _detect_explicit_sources(user_input: str, schema_loader: Any) -> list[tuple[
     return found
 
 
+def _salvage_invalid_query_spec(
+    payload: dict[str, Any],
+    errors: list[str],
+) -> "QuerySpec | None":
+    """Recover from common LLM strategy mislabels instead of forcing clarification.
+
+    Самый частый промах слабой модели — strategy='count_attributes' на обычном
+    одиночном счёте («Сколько X ...»): модель выбирает мульти-атрибутную
+    стратегию, но кладёт лишь одну entity / единственную count-метрику без
+    target. Контракт count_attributes (нужно ≥2 атрибута) это справедливо
+    отвергает, но семантически это простой aggregate-COUNT, поэтому понижаем
+    стратегию, а не отправляем пользователя в уточнение.
+
+    Возвращаем None, если payload по-настоящему пустой/неоднозначный
+    (нет ни entities, ни метрик) — тогда уточнение оправдано.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if not any("count_attributes" in err for err in errors):
+        return None
+    if str(payload.get("strategy") or "").strip().lower() != "count_attributes":
+        return None
+
+    entities = payload.get("entities") or []
+    metrics = payload.get("metrics") or []
+    has_count_metric = any(
+        isinstance(m, dict) and str(m.get("operation") or "").lower() == "count"
+        for m in metrics
+    )
+    # Понижаем стратегию только при наличии полезного count-сигнала; иначе
+    # (пустой spec) оставляем невалидным и уходим в уточнение.
+    if not entities and not has_count_metric:
+        return None
+
+    repaired = dict(payload)
+    repaired["strategy"] = "aggregate"
+    if not metrics:
+        repaired["metrics"] = [
+            {"operation": "count", "label": "Количество", "confidence": 0.6}
+        ]
+    spec, _repaired_errors = QuerySpec.from_dict(repaired)
+    return spec
+
+
+def _humanize_query_spec_errors(errors: list[str]) -> str:
+    """Перевести технические ошибки валидации QuerySpec в понятное пользователю
+    сообщение. Сырые строки валидатора оседают в query_spec_validation_errors
+    (лог/trace), а пользователь видит подсказку на бизнес-языке."""
+    joined = " ".join(errors).lower()
+    if "count_attributes" in joined:
+        return (
+            "Не удалось однозначно понять, что именно посчитать. "
+            "Уточните, пожалуйста: какой показатель нужен "
+            "(например, «количество задач» или «сумма оттока») и по каким "
+            "разрезам или фильтрам его посчитать."
+        )
+    return (
+        "Не удалось разобрать запрос до конкретного расчёта. "
+        "Переформулируйте, пожалуйста: укажите показатель "
+        "(что считаем), при необходимости — период и фильтры."
+    )
+
+
 def _build_query_interpreter_system_prompt() -> str:
     schema = json.dumps(query_spec_json_schema(), ensure_ascii=False)
     return (
@@ -439,10 +511,12 @@ def _build_query_interpreter_system_prompt() -> str:
         "- Верни ТОЛЬКО JSON-объект без markdown.\n"
         "- task='answer_data' для расчётов/выборок; 'inspect_schema' для вопросов о каталоге; "
         "'edit_plan' для правки прошлого плана; 'clarify' для неоднозначности.\n"
-        "- strategy выбирай явно: 'count_attributes' для вопросов вида "
+        "- strategy выбирай явно: 'count_attributes' ТОЛЬКО для вопросов вида "
         "'сколько есть X и Y' / 'сколько всего X и Y', где нужно посчитать "
-        "кардинальности нескольких атрибутов; 'aggregate' для обычных агрегатов; "
-        "'list' для перечислений.\n"
+        "кардинальности НЕСКОЛЬКИХ (≥2) атрибутов. Одиночный счёт "
+        "('Сколько X ...', 'Сколько задач ...') — это 'aggregate' с одной "
+        "count-метрикой, НЕ 'count_attributes'. 'aggregate' для обычных "
+        "агрегатов; 'list' для перечислений.\n"
         "- Для strategy='count_attributes' заполняй entities смысловыми именами "
         "из запроса, например entities=[{'name':'ТБ'}, {'name':'госб'}]. "
         "Не маппь их на физические колонки и не выбирай таблицу, если пользователь "

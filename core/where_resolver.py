@@ -335,6 +335,10 @@ def _parse_condition(condition: str) -> tuple[str, str, str] | None:
         value_norm = "true"
     elif low in {"false", "0"}:
         value_norm = "false"
+    elif op in {"ILIKE", "LIKE"}:
+        # ILIKE регистронезависим — '%фактический отток%' и '%Фактический отток%'
+        # это один фильтр. Нормализуем регистр, чтобы _add_unique их схлопнул.
+        value_norm = low
     return column, op, value_norm
 
 
@@ -357,6 +361,24 @@ def _dtype_bucket(dtype: str) -> str:
     if "date" in d:
         return "date"
     return "text"
+
+
+def _is_categorical_filter_column(schema_loader, table_key: str, column: str) -> bool:
+    """True когда колонка фильтра — КАТЕГОРИАЛЬНАЯ (text/enum/label), а не дата,
+    булев флаг или число. Только такой explicit/query_spec-фильтр должен затенять
+    параллельные text-lexicon правила в F6: дата (`report_dt`) или флаг
+    (`is_task*`) — независимое измерение и не должны глушить, напр., различающий
+    `task_subtype ILIKE '%фактический отток%'`."""
+    if not schema_loader or not column or "." not in (table_key or ""):
+        return False
+    schema, table = table_key.split(".", 1)
+    try:
+        dtype = str(schema_loader.get_column_dtype(schema, table, column) or "")
+    except Exception:  # noqa: BLE001
+        dtype = ""
+    if not dtype:
+        return False
+    return _dtype_bucket(dtype) == "text"
 
 
 def _value_bucket(value: Any) -> str:
@@ -870,7 +892,14 @@ def resolve_where(
         _add_unique(conditions, best_condition)
         applied_rules.append(str(request_id))
         rule_prefix = str(request_id).split(":", 1)[0]
-        if best_table_key and rule_prefix in ("explicit", "query_spec"):
+        # F6 coverage: таблицу «закрывает» (и тем глушит параллельные text-правила)
+        # только КАТЕГОРИАЛЬНЫЙ explicit/query_spec-фильтр. Дата/флаг/число —
+        # независимые измерения и НЕ должны затенять, напр., task_subtype ILIKE.
+        if (
+            best_table_key
+            and rule_prefix in ("explicit", "query_spec")
+            and _is_categorical_filter_column(schema_loader, best_table_key, best_column)
+        ):
             explicit_applied_table_keys.add(best_table_key)
         evidence = ", ".join(best.get("evidence", []) or [])
         reasoning.append(

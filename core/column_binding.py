@@ -413,6 +413,11 @@ def derive_entity_flag_filters(
                 table_key=resolution.table_key,
                 column=resolution.column,
             )
+            # Grain-guard (тот же критерий, что в Pass 2): если сущность матчит
+            # ≥2 флаг-колонки на таблице — это зерно (напр. «задача» на витрине
+            # задач), а не различающий флаг. Не эмитим synthetic flag, иначе
+            # повесим случайный is_task_in_progress/_closed.
+            and not _entity_is_table_grain(entity_name, resolution.table_key, schema_loader)
         ):
             resolved_table = resolution.table_key
             resolved_column = resolution.column
@@ -487,16 +492,15 @@ def _stem_token(token: str) -> str:
     return t
 
 
-def _find_flag_column_by_description(
-    *,
+def _entity_flag_match_columns(
     entity_name: str,
     table_keys: list[str],
     schema_loader: Any,
-) -> tuple[str, str] | None:
-    """Walk boolean columns across the given tables; return (table_key,
-    column) when the column's description shares a ≥4-char stem with the
-    entity name. Used as a cross-lingual fallback when the embedding-based
-    entity_resolver misses (e.g. «Задача» vs English `is_task`).
+) -> list[tuple[str, str]]:
+    """Все булевы флаг-колонки на таблицах, чьё описание делит ≥4-символьный
+    стем с именем сущности. Несколько совпадений на одной таблице ⇒ сущность —
+    это ЗЕРНО таблицы (напр. «задача» на витрине задач цепляет is_task_closed /
+    is_task_closed_success / is_task_in_progress), а не различающий признак.
     """
     entity_stems = {
         _stem_token(tok) for tok in re.findall(r"\w+", entity_name.lower())
@@ -504,7 +508,7 @@ def _find_flag_column_by_description(
     }
     entity_stems = {s for s in entity_stems if s and len(s) >= 4}
     if not entity_stems:
-        return None
+        return []
     matches: list[tuple[str, str]] = []
     for table_key in table_keys:
         if "." not in table_key:
@@ -550,12 +554,32 @@ def _find_flag_column_by_description(
                     break
             if matched:
                 matches.append((table_key, col_name))
-    # Уникальный матч → это РАЗЛИЧАЮЩИЙ флаг (напр. «задача» → is_task на
-    # fact_outflow, где зерно — отток). Несколько матчей → entity является
-    # зерном таблицы: на sale_funnel_task «задач» цепляет сразу is_task_closed
-    # / is_task_closed_success / is_task_in_progress — булев флаг не различает
-    # сущность (over-filter), фильтр не нужен (а различающее «отток» уйдёт в
-    # text-правило по task_subtype, которое больше не затеняется F6).
+    return matches
+
+
+def _entity_is_table_grain(
+    entity_name: str,
+    table_key: str,
+    schema_loader: Any,
+) -> bool:
+    """True когда сущность матчит ≥2 булевых флаг-колонки на таблице — признак
+    того, что сущность является зерном таблицы, а не различающим флагом."""
+    return len(_entity_flag_match_columns(entity_name, [table_key], schema_loader)) >= 2
+
+
+def _find_flag_column_by_description(
+    *,
+    entity_name: str,
+    table_keys: list[str],
+    schema_loader: Any,
+) -> tuple[str, str] | None:
+    """Cross-lingual fallback (Pass 2): return (table_key, column) when exactly
+    ONE boolean flag column's description shares a ≥4-char stem with the entity.
+    Уникальный матч → различающий флаг (напр. «задача» → is_task на fact_outflow).
+    Несколько матчей → entity это зерно таблицы → None (различающее уйдёт в
+    text-правило по категориальной колонке, которое больше не затеняется F6).
+    """
+    matches = _entity_flag_match_columns(entity_name, table_keys, schema_loader)
     if len(matches) == 1:
         return matches[0]
     if len(matches) >= 2:

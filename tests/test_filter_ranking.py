@@ -1,8 +1,61 @@
+import re
+
 import pandas as pd
 
 from core.filter_ranking import _column_looks_like_subject_flag, _subject_alias_stems, rank_filter_candidates
 from core.schema_loader import SchemaLoader
 from core.semantic_frame import derive_semantic_frame
+
+
+def _loader_with_meta_columns(tmp_path):
+    """Витрина задач со служебной меткой (system_timestamp) и бизнес-датой
+    (не-anchor) — для проверки Fix D/E."""
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["sale_funnel_task"],
+        "description": ["Воронка продаж по задачам"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 4,
+        "table_name": ["sale_funnel_task"] * 4,
+        "column_name": ["report_dt", "task_subtype", "fact_close_task_dttm", "src_update_dttm"],
+        "dType": ["date", "varchar", "timestamp", "timestamp"],
+        "description": [
+            "Отчётная дата", "Подтип задачи",
+            "Дата фактического закрытия задачи", "Дата обновления записи в источнике",
+        ],
+        "is_primary_key": [False, False, False, False],
+        "unique_perc": [1.0, 5.0, 30.0, 50.0],
+        "not_null_perc": [100.0, 100.0, 90.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.ensure_value_profiles()
+    return loader
+
+
+def test_system_timestamp_and_nonanchor_date_not_auto_filtered(tmp_path):
+    """Fix D/E: служебная метка src_update_dttm не становится фильтром авто-выводом;
+    бизнес-дата fact_close_task_dttm не получает календарный литерал."""
+    loader = _loader_with_meta_columns(tmp_path)
+    q = "Сколько задач по фактическому оттоку поставили в феврале 2026"
+    frame = derive_semantic_frame(q, schema_loader=loader)
+    ranked = rank_filter_candidates(
+        user_input=q,
+        intent={"filter_conditions": [{"column_hint": "дата", "operator": "=", "value": "2026-02-01"}]},
+        selected_tables=["dm.sale_funnel_task"],
+        schema_loader=loader,
+        semantic_frame=frame,
+    )
+    for cands in ranked.values():
+        for c in cands:
+            assert c["column"] != "src_update_dttm", f"system_timestamp не должен автофильтроваться: {c}"
+            if c["column"] == "fact_close_task_dttm":
+                assert not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(c.get("value") or "").strip()), (
+                    f"календарный литерал не должен садиться на не-anchor дату: {c}"
+                )
 
 
 def _loader(tmp_path):

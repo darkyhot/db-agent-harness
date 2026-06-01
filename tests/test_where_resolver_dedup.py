@@ -9,8 +9,49 @@ from core.where_resolver import (
     _apply_exact_filter_specs,
     _column_has_range_predicate,
     _drop_system_timestamp_when_time_axis_present,
+    _is_categorical_filter_column,
     _parse_condition,
 )
+
+
+def test_add_unique_dedupes_ilike_case_insensitive():
+    """Fix F: ILIKE регистронезависим — '%фактический отток%' и '%Фактический
+    отток%' это один фильтр, не два."""
+    conditions: list[str] = []
+    _add_unique(conditions, "task_subtype ILIKE '%фактический отток%'")
+    _add_unique(conditions, "task_subtype ILIKE '%Фактический отток%'")
+    assert len(conditions) == 1
+
+
+def _funnel_loader_for_categorical(tmp_path):
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["sale_funnel_task"],
+        "description": ["Воронка задач"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["sale_funnel_task"] * 3,
+        "column_name": ["report_dt", "task_subtype", "is_task_closed"],
+        "dType": ["date", "varchar", "boolean"],
+        "description": ["Отчётная дата", "Подтип задачи", "Признак закрытия задачи"],
+        "is_primary_key": [False, False, False],
+        "unique_perc": [1.0, 5.0, 2.0],
+        "not_null_perc": [100.0, 100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_is_categorical_filter_column(tmp_path):
+    """Fix G: только text-колонка «покрывает» таблицу для F6; дата и булев флаг —
+    нет (иначе report_dt/is_task затеняют task_subtype)."""
+    loader = _funnel_loader_for_categorical(tmp_path)
+    assert _is_categorical_filter_column(loader, "dm.sale_funnel_task", "task_subtype") is True
+    assert _is_categorical_filter_column(loader, "dm.sale_funnel_task", "report_dt") is False
+    assert _is_categorical_filter_column(loader, "dm.sale_funnel_task", "is_task_closed") is False
 
 
 def test_exact_point_date_skipped_when_same_column_range_exists():

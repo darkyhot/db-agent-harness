@@ -38,7 +38,9 @@ sql_must_contain:
   - "ILIKE"
 sql_must_not_contain:
   - "IS_TASK_CLOSED"
+  - "IS_TASK_IN_PROGRESS"
   - "FACT_CLOSE_TASK_DTTM"
+  - "SRC_UPDATE_DTTM"
 should_reach_node: sql_validator
 execute_succeeds: true
 expected_rowcount: {min: 1, max: 1}

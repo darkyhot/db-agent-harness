@@ -896,6 +896,28 @@ class SqlPipelineNodes:
         )
         _apply_query_spec_blueprint_overrides(blueprint, state.get("query_spec") or {})
 
+        # Fix B (persistent backstop): фильтры, которые пользователь ЯВНО убрал в
+        # предыдущих правках, не должны возвращаться при полном пересчёте плана.
+        # Вырезаем их из where_conditions по подстроке имени колонки — тем же
+        # критерием, что remove_filter. Набор переживает ребилд (см. plan_edit).
+        removed_filter_columns = [
+            str(c).strip().lower()
+            for c in (state.get("removed_filter_columns") or [])
+            if str(c).strip()
+        ]
+        if removed_filter_columns:
+            _orig_where = blueprint.get("where_conditions") or []
+            _kept = [
+                cond for cond in _orig_where
+                if not any(col in str(cond).lower() for col in removed_filter_columns)
+            ]
+            if len(_kept) != len(_orig_where):
+                logger.info(
+                    "SqlPlanner: scrub removed-filter backstop — выкинуто %d условие(й) по %s",
+                    len(_orig_where) - len(_kept), removed_filter_columns,
+                )
+            blueprint["where_conditions"] = _kept
+
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
 
         required_tables = _collect_required_tables(

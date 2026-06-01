@@ -493,6 +493,13 @@ def rank_filter_candidates(
                 request_column_key = str(request.get("column_key") or "").strip().lower()
                 if request_column_key and key != request_column_key:
                     continue
+                explicit_column_request = bool(request_column_key) and key == request_column_key
+                # Fix D: system_timestamp (служебные метки вставки/обновления,
+                # напр. src_update_dttm) — НИКОГДА не аналитический фильтр. Не
+                # порождаем кандидата при авто-выводе; только по явному запросу
+                # именно этой колонки.
+                if semantic_class == "system_timestamp" and not explicit_column_request:
+                    continue
                 query_text = str(request.get("query_text") or request.get("value") or "")
                 if not query_text:
                     continue
@@ -577,6 +584,18 @@ def rank_filter_candidates(
 
                 score += filter_friendliness * 20.0
                 if score <= 0 or candidate_value in (None, ""):
+                    continue
+
+                # Fix E: лексикон-ранжирование НЕ должно привязывать календарный
+                # литерал даты (YYYY-MM-DD) ни к какой колонке — даты обрабатывает
+                # QuerySpec/планировщик (report_dt идёт прямым путём). Иначе литерал
+                # периода садится на произвольную date-колонку (fact_close_task_dttm)
+                # или даже на text (task_subtype). Явный запрос именно этой колонки
+                # сохраняем.
+                if (
+                    not explicit_column_request
+                    and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(candidate_value or "").strip())
+                ):
                     continue
 
                 explicit_column_choice = _column_reference_score(user_input, column, description) >= 120.0

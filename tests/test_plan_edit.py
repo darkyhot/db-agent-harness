@@ -311,6 +311,64 @@ def test_structured_remove_filter_routes_to_patch_and_drops_conditions(node):
     assert any("report_dt >=" in c for c in where)
 
 
+def test_remove_filter_records_removed_columns(node):
+    """Fix B: remove_filter копит removed_filter_columns в state (для backstop)."""
+    state = _state()
+    state["removed_filter_columns"] = ["foo"]
+    parsed = {"action": "remove_filter", "filters": [{"target": "is_task_in_progress"}], "confidence": 1.0}
+    routed = node._apply_structured_plan_edit_action(state, "убери is_task_in_progress", parsed)
+    assert set(routed["removed_filter_columns"]) == {"foo", "is_task_in_progress"}
+
+
+def test_structured_add_filter_appends_incrementally_without_rebuild(node):
+    """Fix A: add_filter идёт через kind=patch → plan_patcher дописывает условие в
+    ТЕКУЩИЙ blueprint (без реранна), не возвращая ранее убранные фильтры. Снимает
+    target с removed-набора."""
+    state = _state()
+    # blueprint уже «почищен» (как после remove на прошлом тёрне)
+    state["sql_blueprint"]["where_conditions"] = [
+        "report_dt >= '2026-02-01'::date",
+        "report_dt < '2026-03-01'::date",
+    ]
+    state["removed_filter_columns"] = ["is_task_in_progress", "task_subtype"]
+    parsed = {
+        "action": "add_filter",
+        "filters": [{"target": "task_subtype", "operator": "ILIKE", "value": "%фактический отток%"}],
+        "confidence": 1.0,
+    }
+    routed = node._apply_structured_plan_edit_action(
+        state, "Добавь фильтр task_subtype ilike '%фактический отток%'", parsed,
+    )
+    assert routed is not None
+    assert routed["plan_edit_kind"] == "patch"
+    assert {"op": "add_filter", "column": "task_subtype", "operator": "ILIKE", "value": "%фактический отток%"} in \
+        routed["plan_edit_payload"]["operations"]
+    # task_subtype снят с removed-набора (пользователь осознанно вернул), is_task_in_progress остался
+    assert routed["removed_filter_columns"] == ["is_task_in_progress"]
+
+    patched = node.plan_patcher({**state, **routed})
+    where = patched["sql_blueprint"]["where_conditions"]
+    assert any("task_subtype ILIKE '%фактический отток%'" in c for c in where)
+    # ранее убранный is_task_in_progress НЕ вернулся (не было реранна)
+    assert not any("is_task_in_progress" in c for c in where)
+    assert any("report_dt >=" in c for c in where)
+
+
+def test_add_filter_dedups_case_insensitive(node):
+    """Fix A/F: повторный ILIKE в другом регистре не плодит дубль в where_conditions."""
+    state = _state()
+    state["sql_blueprint"]["where_conditions"] = ["task_subtype ILIKE '%Фактический отток%'"]
+    parsed = {
+        "action": "add_filter",
+        "filters": [{"target": "task_subtype", "operator": "ILIKE", "value": "%фактический отток%"}],
+        "confidence": 1.0,
+    }
+    routed = node._apply_structured_plan_edit_action(state, "add", parsed)
+    patched = node.plan_patcher({**state, **routed})
+    where = [c for c in patched["sql_blueprint"]["where_conditions"] if "task_subtype" in c.lower()]
+    assert len(where) == 1
+
+
 def test_router_rebind_replace_table(node):
     result = node.plan_edit_router(_state(plan_edit_text="я передумал использовать эту таблицу и хочу таблицу schema_a.alt_fact"))
     assert result["plan_edit_kind"] == "rebind"

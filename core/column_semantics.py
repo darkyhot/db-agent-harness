@@ -19,7 +19,9 @@ def classify_column(row: dict[str, Any]) -> dict[str, Any]:
     tags: set[str] = set()
 
     if any(token in dtype for token in ("timestamp", "datetime")) or lower.endswith("_dttm"):
-        semantic_class = "system_timestamp" if any(token in lower for token in ("modified", "created", "updated", "inserted")) else "date"
+        # «update» (а не только «updated») ловит src_update_dttm/load_update_dttm —
+        # это служебные метки загрузки, не аналитическая ось.
+        semantic_class = "system_timestamp" if any(token in lower for token in ("modified", "created", "update", "inserted", "load")) else "date"
     elif any(token in dtype for token in ("date",)):
         semantic_class = "date"
     elif is_pk or lower.endswith(("_id", "_code", "_key")):
@@ -47,7 +49,7 @@ def classify_column(row: dict[str, Any]) -> dict[str, Any]:
         tags.add("categorical")
     if semantic_class in {"identifier", "join_key"}:
         tags.add("join_candidate")
-    if semantic_class == "date" and not any(token in lower for token in ("created", "updated", "inserted", "modified")):
+    if semantic_class == "date" and not any(token in lower for token in ("created", "update", "inserted", "modified", "load")):
         tags.add("time_axis")
     if semantic_class == "metric" and not is_pk:
         tags.add("aggregate_candidate")

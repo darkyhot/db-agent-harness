@@ -168,6 +168,23 @@ def _format_aggregation_expr(agg: dict[str, Any]) -> str:
     return expr
 
 
+def _build_filter_predicate(column: str, operator: str, value: Any) -> str:
+    """Собрать SQL-предикат `column op literal` для add_filter-правки. bool →
+    TRUE/FALSE, числа — без кавычек, строки — в одинарных кавычках с экранированием."""
+    col = str(column or "").strip()
+    op = (str(operator or "=").strip() or "=").upper()
+    if not col:
+        return ""
+    if isinstance(value, bool):
+        lit = "TRUE" if value else "FALSE"
+    elif isinstance(value, (int, float)):
+        lit = str(value)
+    else:
+        s = str(value if value is not None else "")
+        lit = "'" + s.replace("'", "''") + "'"
+    return f"{col} {op} {lit}"
+
+
 def _sync_legacy_aggregation_fields(blueprint: dict[str, Any]) -> dict[str, Any]:
     bp = copy.deepcopy(blueprint)
     aggs = [dict(item) for item in (_iter_blueprint_aggregations(bp)) if item]
@@ -1070,14 +1087,17 @@ class PlanEditNodes:
             "Получишь текущий QuerySpec, preview/blueprint и текст правки пользователя. "
             "Если пользователь просит убрать источник/JOIN или оставить только часть источников, "
             "верни JSON action по схеме: "
-            '{"action":"remove_source|remove_join|replace_source|set_sources_only|remove_filter|clarify",'
+            '{"action":"remove_source|remove_join|replace_source|set_sources_only|remove_filter|add_filter|clarify",'
             '"tables":["schema.table или table"],"joins":[{"left":"...","right":"..."}],'
-            '"filters":[{"target":"имя_колонки"}],'
+            '"filters":[{"target":"имя_колонки","operator":"=|ILIKE|>|...","value":<значение>}],'
             '"replacement_table":"schema.table","question":"...","confidence":0.0}. '
             "Если пользователь говорит, что достаточно одного справочника/источника, "
             "используй action=set_sources_only с tables=[...]. "
             "Если пользователь просит убрать фильтр/условие WHERE — action=remove_filter "
             "с filters=[{target:имя_колонки}] (target — имя колонки из условия, напр. is_task_closed). "
+            "Если пользователь просит ДОБАВИТЬ фильтр/условие WHERE — action=add_filter с "
+            "filters=[{target:имя_колонки, operator:оператор, value:значение}] "
+            "(напр. {target:task_subtype, operator:ILIKE, value:'%фактический отток%'}). "
             "Для остальных смысловых правок верни ПОЛНЫЙ обновлённый QuerySpec JSON по схеме, без markdown. "
             "Не пиши SQL. Не удаляй существующие метрики, фильтры, даты, источники и "
             "измерения, если пользователь явно не попросил удалить или заменить их. "
@@ -1183,6 +1203,9 @@ class PlanEditNodes:
             "join_spec": [],
             "where_resolution": {},
             "sql_blueprint": {},
+            # Fix B: набор удалённых пользователем фильтров переживает ребилд,
+            # чтобы scrub в sql_planner не дал им вернуться при полном пересчёте.
+            "removed_filter_columns": list(state.get("removed_filter_columns") or []),
             "previous_sql_blueprint": copy.deepcopy(state.get("sql_blueprint") or {}),
             "plan_diff": {},
             "plan_diff_summary": "",
@@ -1374,6 +1397,13 @@ class PlanEditNodes:
                     "graph_iterations": iterations,
                 }
             operations = [{"op": "remove_filter", "column": t} for t in targets]
+            # Fix B: персистентно запоминаем удалённые колонки — чтобы любой
+            # последующий ребилд не вернул их (scrub в sql_planner-узле).
+            removed_acc = list(state.get("removed_filter_columns") or [])
+            for t in targets:
+                tl = t.strip().lower()
+                if tl and tl not in removed_acc:
+                    removed_acc.append(tl)
             resolution = self._build_plan_edit_resolution(
                 edit_goal="patch",
                 requested_changes=[{"action": "remove_filter", "targets": targets}],
@@ -1388,6 +1418,54 @@ class PlanEditNodes:
                 "plan_edit_needs_clarification": False,
                 "needs_clarification": False,
                 "clarification_message": "",
+                "removed_filter_columns": removed_acc,
+                "graph_iterations": iterations,
+            }
+        if action == "add_filter":
+            specs: list[tuple[str, str, Any]] = []
+            for f in (parsed.get("filters") or []):
+                if not isinstance(f, dict):
+                    continue
+                t = str(f.get("target") or f.get("column") or "").strip()
+                if not t:
+                    continue
+                op = str(f.get("operator") or "=").strip().upper()
+                specs.append((t, op, f.get("value")))
+            if not specs:
+                return {
+                    "plan_edit_kind": "clarify",
+                    "plan_edit_confidence": float(parsed.get("confidence", 0.0) or 0.0),
+                    "plan_edit_payload": parsed,
+                    "plan_edit_needs_clarification": True,
+                    "needs_clarification": True,
+                    "clarification_message": "Какой именно фильтр нужно добавить (колонка, оператор, значение)?",
+                    "graph_iterations": iterations,
+                }
+            operations = [
+                {"op": "add_filter", "column": t, "operator": op, "value": v}
+                for (t, op, v) in specs
+            ]
+            # Пользователь осознанно вернул фильтр → снимаем его с removed-набора.
+            added_cols = {t.strip().lower() for (t, _, _) in specs}
+            removed_acc = [
+                c for c in (state.get("removed_filter_columns") or [])
+                if str(c).strip().lower() not in added_cols
+            ]
+            resolution = self._build_plan_edit_resolution(
+                edit_goal="patch",
+                requested_changes=[{"action": "add_filter", "targets": [t for (t, _, _) in specs]}],
+                confidence=float(parsed.get("confidence", 0.85) or 0.85),
+            )
+            return {
+                "plan_edit_kind": "patch",
+                "plan_edit_confidence": float(parsed.get("confidence", 0.85) or 0.85),
+                "plan_edit_payload": {"operations": operations, "resolution": resolution},
+                "plan_edit_resolution": resolution,
+                "plan_edit_explanation": "LLM add_filter action",
+                "plan_edit_needs_clarification": False,
+                "needs_clarification": False,
+                "clarification_message": "",
+                "removed_filter_columns": removed_acc,
                 "graph_iterations": iterations,
             }
         if action not in {"remove_source", "remove_join", "replace_source", "set_sources_only"}:
@@ -1729,6 +1807,7 @@ class PlanEditNodes:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         commands: list[dict[str, Any]] = []
         filters_to_remove: list[str] = []
+        filters_to_add: list[str] = []
         pending_date_range: dict[str, Any] = {"command": "set_date_range", "from": "", "to": ""}
         for op in operations:
             if not isinstance(op, dict):
@@ -1765,6 +1844,16 @@ class PlanEditNodes:
                 column = str(op.get("column") or "").strip().lower()
                 if column:
                     filters_to_remove.append(column)
+            elif action == "add_filter":
+                column = str(op.get("column") or "").strip()
+                if column:
+                    predicate = _build_filter_predicate(
+                        column,
+                        str(op.get("operator") or "=").strip(),
+                        op.get("value"),
+                    )
+                    if predicate:
+                        filters_to_add.append(predicate)
         if pending_date_range["from"] or pending_date_range["to"]:
             commands.append({
                 "command": "set_date_range",
@@ -1772,15 +1861,23 @@ class PlanEditNodes:
                 "to": pending_date_range["to"] or "",
             })
         new_blueprint, patch_meta = self._apply_patch_commands(blueprint, commands, selected_columns)
-        if filters_to_remove:
+        if filters_to_remove or filters_to_add:
             # Удаляем ВСЕ запрошенные фильтры (не только первый) — подстрочное
             # совпадение по where_conditions. Работает и для derived-фильтров
             # (is_task_closed, fact_close_task_dttm), которых нет в QuerySpec.filters.
             new_blueprint = copy.deepcopy(new_blueprint)
-            new_blueprint["where_conditions"] = [
+            conds = [
                 cond for cond in (new_blueprint.get("where_conditions") or [])
                 if not any(col in str(cond).lower() for col in filters_to_remove)
             ]
+            # Добавляем новые предикаты инкрементально (без реранна pipeline),
+            # дедуп case-insensitive — чтобы не плодить task_subtype в разных регистрах.
+            existing_norm = {" ".join(str(c).lower().split()) for c in conds}
+            for pred in filters_to_add:
+                if " ".join(pred.lower().split()) not in existing_norm:
+                    conds.append(pred)
+                    existing_norm.add(" ".join(pred.lower().split()))
+            new_blueprint["where_conditions"] = conds
         return new_blueprint, patch_meta
 
     def plan_patcher(self, state: AgentState) -> dict[str, Any]:

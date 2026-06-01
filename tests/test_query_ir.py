@@ -1480,6 +1480,16 @@ def test_derive_entity_flag_filters_no_synthetic_on_grain_table(tmp_path):
     assert "is_task_closed" not in selected_columns["dm.sale_funnel_task"]["filter"]
 
 
+def test_entity_is_table_grain_detects_multi_flag(tmp_path):
+    """Fix C: общий grain-критерий (≥2 флаг-колонки) для обоих Pass. Сущность
+    «задача» на витрине задач — зерно (3 task-флага), а не различающий флаг."""
+    from core.column_binding import _entity_is_table_grain
+
+    loader = _funnel_task_loader(tmp_path)
+    assert _entity_is_table_grain("задача", "dm.sale_funnel_task", loader) is True
+    assert _entity_is_table_grain("задача по оттоку", "dm.sale_funnel_task", loader) is True
+
+
 def test_ambiguous_source_label_shows_name_once_and_description(tmp_path):
     """Регрессия agent(20) UI: лейбл развилки = «schema.table — описание», имя
     один раз, реальное описание (а не блок get_table_info с дублем имени)."""

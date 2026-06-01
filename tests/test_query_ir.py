@@ -544,6 +544,98 @@ def test_catalog_grounding_uses_metadata_filters_and_prunes_unrelated_helpers(tm
     assert option_prefixes == {"dm.sale_funnel", "dm.fact_outflow"}
 
 
+def test_catalog_grounding_reopens_disambiguation_when_survivor_misses_entity(tmp_path):
+    """Регрессия фикса #3: «живой» LLM пред-разрешает запрос в физические колонки
+    одной витрины (filter is_task + точечная дата, единственная сущность), и
+    minimal-covering prune схлопывает развилку на fact_outflow — хотя та не
+    покрывает сущность «задача». Grounder не должен молча выбирать неподходящую
+    витрину: prune откатывается, выбор уходит в H2/score.
+    """
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm", "dm"],
+        "table_name": ["fact_outflow", "sale_funnel", "employee_assignment"],
+        "description": [
+            "Информация по фактическим оттокам",
+            "Воронка продаж по задачам",
+            "Данные по закреплению сотрудников за организациями",
+        ],
+        "grain": ["event", "task", "employee"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 7,
+        "table_name": [
+            "fact_outflow", "fact_outflow", "fact_outflow",
+            "sale_funnel", "sale_funnel", "sale_funnel",
+            "employee_assignment",
+        ],
+        "column_name": [
+            "report_dt", "inn", "is_task",
+            "report_dt", "task_subtype", "task_category",
+            "end_dttm",
+        ],
+        "dType": ["date", "text", "boolean", "date", "text", "text", "timestamp"],
+        "description": [
+            "Отчетная дата", "ИНН", "Признак выставленной задачи",
+            "Отчетная дата", "Подтип задачи", "Категория задачи",
+            "Дата окончания закрепления",
+        ],
+        "is_primary_key": [False] * 7,
+        "unique_perc": [1.0, 90.0, 2.0, 1.0, 10.0, 2.0, 5.0],
+        "not_null_perc": [100.0] * 7,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    # Pre-resolved (живой) spec: одна сущность + физический фильтр is_task,
+    # который существует ТОЛЬКО в fact_outflow → prune соблазняется схлопнуть.
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": None, "distinct_policy": "auto", "confidence": 1.0}],
+        "entities": [{"name": "задача", "canonical": "задача", "confidence": 1.0}],
+        "filters": [
+            {"target": "is_task", "operator": "=", "value": True, "value_kind": "literal", "confidence": 1.0},
+            {"target": "report_dt", "operator": "=", "value": "2026-02-01", "value_kind": "literal", "confidence": 1.0},
+        ],
+        "time_range": None,
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 1.0,
+    })
+    assert spec is not None, errors
+
+    result = ground_query_spec(
+        query_spec=spec,
+        schema_loader=loader,
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 2026",
+        max_sources=3,
+    )
+
+    # Главный инвариант: grounder НЕ выбирает молча fact_outflow (которая не
+    # покрывает сущность «задача»). Допустимо: развилка H2 либо выбор
+    # entity-покрывающей витрины — но не тихий неверный pick.
+    main = (
+        result.plan_ir.main_source.full_name
+        if result.plan_ir and result.plan_ir.main_source
+        else None
+    )
+    silently_picked_wrong = (
+        not result.needs_clarification and main == "dm.fact_outflow"
+    )
+    assert not silently_picked_wrong, (
+        f"grounder молча выбрал fact_outflow: needs_clar={result.needs_clarification}, "
+        f"main={main}, sources={[s.full_name for s in (result.sources or [])]}"
+    )
+    # В синтетике скоры близки → ожидаем именно H2-развилку с обеими витринами.
+    assert result.needs_clarification is True
+    assert result.clarification.reason == "catalog_grounding_ambiguous_strong_sources"
+    option_prefixes = {
+        str(opt).split(" — ", 1)[0] for opt in (result.clarification.options or [])
+    }
+    assert {"dm.sale_funnel", "dm.fact_outflow"} <= option_prefixes
+
+
 def test_catalog_grounder_node_surfaces_disambiguation_options(tmp_path):
     """Узел catalog_grounder должен пробросить варианты H2-неоднозначности.
 

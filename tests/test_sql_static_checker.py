@@ -386,6 +386,28 @@ class TestTypeCompatibility:
         result = check_sql(sql, schema_loader=loader, check_columns=False)
         assert not any("Несовместимые" in e for e in result.errors)
 
+    def test_bool_col_vs_quoted_true_ok(self):
+        """Регрессия: is_task = 'True' (bool vs text-литерал) — Postgres кастит
+        текст в bool, так что static checker не должен глушить план."""
+        loader = _FakeSchemaLoader({
+            ("dm", "fact_outflow"): [
+                {"column_name": "is_task", "dType": "boolean"},
+            ]
+        })
+        sql = "SELECT COUNT(*) FROM dm.fact_outflow f WHERE f.is_task = 'True'"
+        result = check_sql(sql, schema_loader=loader, check_columns=False)
+        assert not any("Несовместимые" in e for e in result.errors)
+
+    def test_bool_col_vs_unquoted_true_ok(self):
+        loader = _FakeSchemaLoader({
+            ("dm", "fact_outflow"): [
+                {"column_name": "is_task", "dType": "boolean"},
+            ]
+        })
+        sql = "SELECT COUNT(*) FROM dm.fact_outflow f WHERE f.is_task = TRUE"
+        result = check_sql(sql, schema_loader=loader, check_columns=False)
+        assert not any("Несовместимые" in e for e in result.errors)
+
 
 class TestUnqualifiedCatalogColumns:
     def test_missing_unqualified_column_in_count_distinct_errors(self):

@@ -1068,7 +1068,7 @@ def _check_type_compatibility(
             ("num", "int"), ("num", "num"),
             ("text", "text"),
             ("date", "date"), ("date", "text"),  # '2024-01-01' → date
-            ("bool", "bool"),
+            ("bool", "bool"), ("bool", "text"),  # is_task = 'True' → Postgres text→bool cast
         }
         if (col_b, lit_b) not in compatible_pairs:
             issues.append(

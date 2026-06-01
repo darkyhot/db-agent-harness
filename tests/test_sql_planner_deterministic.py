@@ -13,7 +13,30 @@ from core.sql_planner_deterministic import (
     _compute_where_from_intent,
     _find_date_column,
     _apply_time_granularity,
+    _quote_value,
 )
+
+
+class TestQuoteValueBoolean:
+    """Регрессия: boolean-колонка должна получать литерал TRUE/FALSE без кавычек,
+    иначе `is_task = 'True'` ломает static checker и хрупок на части СУБД."""
+
+    @pytest.mark.parametrize("raw", ["True", "true", "t", "1", "TRUE"])
+    def test_bool_truthy_to_TRUE(self, raw):
+        assert _quote_value(raw, "=", "boolean") == "TRUE"
+
+    @pytest.mark.parametrize("raw", ["False", "false", "f", "0"])
+    def test_bool_falsy_to_FALSE(self, raw):
+        assert _quote_value(raw, "=", "bool") == "FALSE"
+
+    def test_no_dtype_keeps_text_quoting(self):
+        assert _quote_value("True", "=") == "'True'"
+
+    def test_text_dtype_unaffected(self):
+        assert _quote_value("Москва", "=", "text") == "'Москва'"
+
+    def test_numeric_unaffected(self):
+        assert _quote_value("42", "=", "integer") == "42"
 
 
 # ---------------------------------------------------------------------------

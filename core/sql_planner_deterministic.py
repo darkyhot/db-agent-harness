@@ -781,10 +781,12 @@ _SAFE_OPERATORS = frozenset({"=", "!=", "<>", "<", ">", "<=", ">=", "LIKE", "IN"
 _OPERATOR_RE = re.compile(r"^(=|!=|<>|<=|>=|<|>|LIKE|NOT\s+IN|IN)$", re.IGNORECASE)
 
 
-def _quote_value(value: str, operator: str) -> str:
+def _quote_value(value: str, operator: str, dtype: str = "") -> str:
     """Процитировать значение для SQL WHERE-условия.
 
     Числа оставляем без кавычек, строки — в одинарных.
+    Для boolean-колонок отдаём литерал TRUE/FALSE без кавычек (иначе
+    `bool = 'True'` ломает static checker и хрупок на части СУБД).
     IN/NOT IN ожидают список вида (v1, v2).
     """
     op = operator.strip().upper()
@@ -796,6 +798,14 @@ def _quote_value(value: str, operator: str) -> str:
             items = [f"'{v.strip()}'" for v in val.split(",")]
             return f"({', '.join(items)})"
         return val
+
+    # Boolean-колонка: нормализуем true/false/t/f/0/1 в SQL-литерал TRUE/FALSE
+    if dtype and any(b in dtype.lower() for b in _BOOL_DTYPES):
+        norm = val.strip("'\"").lower()
+        if norm in {"true", "t", "1"}:
+            return "TRUE"
+        if norm in {"false", "f", "0"}:
+            return "FALSE"
 
     # Число? Только если нет ведущих нулей (иначе это код/строка)
     if not (val.startswith("0") and len(val) > 1):
@@ -966,7 +976,7 @@ def _compute_where_from_intent(
                         matched_col, op_upper, value, reason,
                     )
                     continue
-                quoted = _quote_value(value, operator)
+                quoted = _quote_value(value, operator, dtype or "")
                 conditions.append(f"{matched_col} {op_upper} {quoted}")
                 logger.debug(
                     "DeterministicPlanner: filter_condition %s %s %s (dtype=%s) → %s",

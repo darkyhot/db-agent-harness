@@ -249,12 +249,43 @@ def ground_query_spec(
         schema_loader=schema_loader,
     )
 
+    sources_before_minimal = list(sources)
     sources = _prune_sources_to_minimal_covering_table(
         sources,
         query_spec=query_spec,
         schema_loader=schema_loader,
         user_input=user_input,
     )
+
+    # Guard против преждевременного схлопывания развилки: minimal-covering
+    # prune мог собрать всё в одну витрину по физическим фильтрам (напр. LLM
+    # пред-разрешил запрос в колонку is_task витрины fact_outflow), хотя
+    # выживший источник вообще не покрывает ни одной сущности QuerySpec — то
+    # есть prune отбросил кандидатов, которые отвечают на суть запроса, по
+    # признаку наличия конкретной фильтр-колонки. В этом случае откатываем
+    # prune и возвращаем выбор скор-порядку источников и H2-развилке (они учтут
+    # каталожный score и тип таблицы), вместо тихого выбора неподходящей витрины.
+    if (
+        len(sources_before_minimal) > 1
+        and len(sources) == 1
+        and query_spec.task == "answer_data"
+        and query_spec.entities
+        and not query_spec.join_constraints
+        and not any(
+            s.reason == "explicit_source_constraint" for s in sources_before_minimal
+        )
+    ):
+        survivor = sources[0]
+        if _primary_source_covers_entities(survivor, query_spec, schema_loader) is False:
+            logger.info(
+                "CatalogGrounder: minimal-covering prune отменён — survivor %s "
+                "не покрывает сущности %s; восстанавливаем %d кандидата(ов) для "
+                "выбора по score/H2",
+                survivor.full_name,
+                [e.name for e in query_spec.entities],
+                len(sources_before_minimal),
+            )
+            sources = sources_before_minimal
 
     sources = _prune_unrequested_helper_sources(
         sources,

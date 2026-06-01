@@ -235,6 +235,81 @@ def _count_sql_where_predicates(sql: str) -> int:
     return len(pieces) if pieces else (1 if where_clause.strip() else 0)
 
 
+_DATE_LIT = r"'?\d{4}-\d{2}-\d{2}'?(?:::date)?"
+
+
+def _blueprint_date_ranges(blueprint: dict[str, Any]) -> dict[str, list[str]]:
+    """Map date-column → list of range condition strings from the blueprint.
+
+    A "range" condition uses >=/<=/>/< against a YYYY-MM-DD literal. Point
+    equality (=) is intentionally excluded — that's exactly what we guard against.
+    """
+    ranges: dict[str, list[str]] = {}
+    for cond in blueprint.get("where_conditions") or []:
+        c = str(cond).strip()
+        m = re.match(
+            r"^(?:\w+\.)?(\w+)\s*(?:>=|<=|>|<)\s*" + _DATE_LIT + r"\s*$",
+            c,
+            re.IGNORECASE,
+        )
+        if m:
+            ranges.setdefault(m.group(1).lower(), []).append(c)
+    return ranges
+
+
+def _strip_conjunct(sql: str, predicate_text: str) -> str:
+    """Remove a single conjunctive predicate (with its connecting AND) from SQL."""
+    esc = re.escape(predicate_text)
+    for pat in (r"\s+AND\s+" + esc, esc + r"\s+AND\s+", esc):
+        new_sql = re.sub(pat, " ", sql, count=1, flags=re.IGNORECASE)
+        if new_sql != sql:
+            return re.sub(r"\s{2,}", " ", new_sql)
+    return sql
+
+
+def _enforce_blueprint_date_range(sql: str, blueprint: dict[str, Any]) -> tuple[str, str]:
+    """Guard against an LLM narrowing a month/period date range to a single day.
+
+    The deterministic planner deliberately emits a calendar range
+    (col >= start AND col < end) and drops any point `col = 'YYYY-MM-DD'`
+    literal from the QuerySpec. LLM SqlWriter / self-corrector sometimes
+    re-introduce that point filter (and even drop the range), collapsing
+    "в феврале" down to a single day. Here we re-assert the blueprint's range:
+      - point present, range absent  → restore range in place of the point;
+      - point present, range present → drop the redundant point predicate.
+
+    Returns (sql, note); note is "" when nothing changed.
+    """
+    if not sql:
+        return sql, ""
+    bp_ranges = _blueprint_date_ranges(blueprint)
+    if not bp_ranges:
+        return sql, ""
+    note = ""
+    for col, range_conds in bp_ranges.items():
+        col_pat = r"(?:\w+\.)?" + re.escape(col)
+        point_re = re.compile(
+            r"(?<![\w.])" + col_pat + r"\s*=\s*" + _DATE_LIT, re.IGNORECASE
+        )
+        range_re = re.compile(
+            r"(?<![\w.])" + col_pat + r"\s*(?:>=|<=|>|<)\s*" + _DATE_LIT, re.IGNORECASE
+        )
+        point_match = point_re.search(sql)
+        if not point_match:
+            continue
+        point_text = point_match.group(0)
+        if range_re.search(sql):
+            new_sql = _strip_conjunct(sql, point_text)
+            if new_sql != sql:
+                sql = new_sql
+                note = (f"{note}; " if note else "") + f"удалён избыточный точечный фильтр {point_text}"
+        else:
+            replacement = " AND ".join(range_conds)
+            sql = sql.replace(point_text, replacement, 1)
+            note = (f"{note}; " if note else "") + f"точечный фильтр {point_text} → диапазон {replacement}"
+    return sql, note
+
+
 def _composite_join_issues(sql: str, join_spec: list[dict[str, Any]]) -> list[str]:
     """Return missing ON conditions for composite joins from join_spec."""
     if not sql or not join_spec:
@@ -1723,6 +1798,17 @@ class SqlPipelineNodes:
         evidence_trace["sql_self_correction"] = correction
 
         if verdict == "pass":
+            sql, _range_note = _enforce_blueprint_date_range(sql, blueprint)
+            if _range_note:
+                sql = _format_sql(sql)
+                logger.info(
+                    "SqlSelfCorrector: восстановлен диапазон дат blueprint (pass) — %s",
+                    _range_note,
+                )
+                pending_call = dict(pending_call or {})
+                _pc_args = dict(pending_call.get("args") or {})
+                _pc_args["sql"] = sql
+                pending_call["args"] = _pc_args
             return {
                 "sql_to_validate": sql,
                 "pending_sql_tool_call": pending_call,
@@ -1754,6 +1840,15 @@ class SqlPipelineNodes:
                 verdict = "reject"
             else:
                 corrected_sql = _format_sql(corrected_sql)
+                corrected_sql, _range_note = _enforce_blueprint_date_range(
+                    corrected_sql, blueprint
+                )
+                if _range_note:
+                    corrected_sql = _format_sql(corrected_sql)
+                    logger.info(
+                        "SqlSelfCorrector: восстановлен диапазон дат blueprint — %s",
+                        _range_note,
+                    )
                 corrected_composite_issues = _composite_join_issues(
                     corrected_sql,
                     state.get("join_spec") or [],

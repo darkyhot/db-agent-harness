@@ -877,6 +877,57 @@ def _lookup_column_dtype(
     return ""
 
 
+def _intent_has_explicit_date_range(intent: dict, selected_columns: dict[str, dict]) -> bool:
+    """True когда в intent.filter_conditions уже есть диапазонный предикат
+    (оператор >=/<=/>/<) с date-литералом YYYY-MM-DD по той же колонке, что
+    выберет `_find_date_column`. Тогда текстовый месячный диапазон не нужен —
+    QuerySpec авторитетен (иначе дубль report_dt-границ)."""
+    date_col = _find_date_column(selected_columns)
+    if not date_col:
+        return False
+    dcl = str(date_col).strip().lower()
+    for fc in (intent.get("filter_conditions") or []):
+        if not isinstance(fc, dict):
+            continue
+        op = str(fc.get("operator") or "").strip()
+        if op not in {">=", "<=", ">", "<"}:
+            continue
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(fc.get("value") or "").strip()):
+            continue
+        hint = str(fc.get("column_hint") or "").strip().lower()
+        if hint and (hint == dcl or hint in dcl or dcl in hint):
+            return True
+    return False
+
+
+def _dedup_conditions_cast_insensitive(conditions: list[str]) -> list[str]:
+    """Снять дубликаты where-условий по ключу (col, op, literal-без-`::date`),
+    сохраняя порядок. Схлопывает `report_dt >= '..'::date` и `report_dt >= '..'`."""
+    seen: set[tuple[str, str, str]] = set()
+    out: list[str] = []
+    for cond in conditions:
+        m = _CONDITION_PARSE_RE.match(str(cond).strip()) if cond else None
+        if m is None:
+            if cond not in out:
+                out.append(cond)
+            continue
+        col = m.group(1).strip().lower()
+        op = m.group(2).strip().upper()
+        val = m.group(3).strip().replace("::date", "").replace("::timestamp", "")
+        key = (col, op, val)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cond)
+    return out
+
+
+_CONDITION_PARSE_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*(>=|<=|!=|<>|=|<|>|ILIKE|LIKE|IN|NOT IN|IS NOT|IS)\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
+
+
 def _compute_where_from_intent(
     intent: dict,
     selected_columns: dict[str, dict],
@@ -899,7 +950,12 @@ def _compute_where_from_intent(
     date_from = date_filters.get("from")
     date_to   = date_filters.get("to")
 
-    if date_from or date_to:
+    # Если QuerySpec уже даёт ЯВНЫЙ date-диапазон (>=/<=/>/<) по той же колонке —
+    # не добавляем текстовый месячный диапазон, иначе получим дубль/перекрытие
+    # (report_dt >= ..::date AND < ..::date  И  report_dt >= .. AND <= ..).
+    # Точечный фильтр (=) диапазоном НЕ считается: для него месячный диапазон из
+    # текста по-прежнему нужен (а точка гасится ниже).
+    if (date_from or date_to) and not _intent_has_explicit_date_range(intent, selected_columns):
         date_col = _find_date_column(selected_columns)
         if date_col:
             if date_from and date_from != "NEEDS_YEAR":
@@ -990,7 +1046,7 @@ def _compute_where_from_intent(
                     hint,
                 )
 
-    return conditions
+    return _dedup_conditions_cast_insensitive(conditions)
 
 
 def _derive_date_filters_from_text(user_input: str) -> dict[str, str | None]:

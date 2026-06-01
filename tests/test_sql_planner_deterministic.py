@@ -564,6 +564,57 @@ class TestComputeWhereFromIntent:
         assert any("2024-01-01" in w for w in where)
         assert any("region" in w for w in where)
 
+    def _cols_report_dt(self):
+        return {"dm.fact_outflow": {"select": [], "filter": ["report_dt"], "aggregate": [], "group_by": []}}
+
+    def test_querySpec_date_range_suppresses_text_range(self):
+        """Регрессия agent(23): QuerySpec уже дал диапазон report_dt >= / <= —
+        текстовый месячный диапазон НЕ добавляется (нет дубля/перекрытия)."""
+        intent = {
+            "date_filters": {"from": None, "to": None},
+            "filter_conditions": [
+                {"column_hint": "report_dt", "operator": ">=", "value": "2026-02-01"},
+                {"column_hint": "report_dt", "operator": "<=", "value": "2026-02-28"},
+            ],
+        }
+        where = _compute_where_from_intent(
+            intent, self._cols_report_dt(),
+            user_input="Сколько задач по фактическому оттоку в феврале 2026",
+        )
+        # ровно две границы из QuerySpec, без текстового < '2026-03-01'
+        assert any("report_dt >= '2026-02-01'" in w for w in where)
+        assert any("report_dt <= '2026-02-28'" in w for w in where)
+        assert not any("2026-03-01" in w for w in where)
+        report_dt_conds = [w for w in where if "report_dt" in w]
+        assert len(report_dt_conds) == 2, report_dt_conds
+
+    def test_querySpec_point_date_keeps_text_month_range(self):
+        """Точечный report_dt = '2026-02-01' + «в феврале 2026» → месячный
+        диапазон из текста, точка погашена (регресс round-5 жив)."""
+        intent = {
+            "date_filters": {"from": None, "to": None},
+            "filter_conditions": [
+                {"column_hint": "report_dt", "operator": "=", "value": "2026-02-01"},
+            ],
+        }
+        where = _compute_where_from_intent(
+            intent, self._cols_report_dt(),
+            user_input="Сколько задач по фактическому оттоку в феврале 2026",
+        )
+        assert any("report_dt >= '2026-02-01'::date" in w for w in where)
+        assert any("report_dt < '2026-03-01'::date" in w for w in where)
+        # точечное равенство не должно остаться
+        assert not any(w.strip() == "report_dt = '2026-02-01'" for w in where)
+
+    def test_cast_insensitive_dedup(self):
+        from core.sql_planner_deterministic import _dedup_conditions_cast_insensitive
+        deduped = _dedup_conditions_cast_insensitive([
+            "report_dt >= '2026-02-01'::date",
+            "report_dt >= '2026-02-01'",
+            "is_task = TRUE",
+        ])
+        assert deduped == ["report_dt >= '2026-02-01'::date", "is_task = TRUE"]
+
 
 # ---------------------------------------------------------------------------
 # build_blueprint (интеграционные тесты)

@@ -1,0 +1,37 @@
+# Кейс agent(23): fact_outflow, «живой» QuerySpec с ЯВНЫМ диапазоном report_dt
+# (>= 2026-02-01 AND <= 2026-02-28). Деттерминированный планировщик НЕ должен
+# добавлять второй (текстовый месячный) диапазон report_dt — иначе дубль:
+#   report_dt >= '2026-02-01'::date AND report_dt < '2026-03-01'::date
+#   AND report_dt >= '2026-02-01' AND report_dt <= '2026-02-28'
+# Прогон на DeepSeek. Контракт: ровно ОДИН диапазон report_dt + is_task; без
+# текстового верхнего края '2026-03-01'.
+query: "Сколько задач по фактическому оттоку поставили в феврале 2026 (использовать таблицу uzp_dwh_fact_outflow)"
+query_spec:
+  task: answer_data
+  strategy: aggregate
+  metrics:
+    - {operation: count, target: null, distinct_policy: auto, label: "Количество задач", confidence: 0.9}
+  entities:
+    - {name: "задача", canonical: "задача по фактическому оттоку", confidence: 1.0}
+  filters:
+    - {target: "is_task", operator: "=", value: true, value_kind: literal, confidence: 1.0}
+    - {target: "report_dt", operator: ">=", value: "2026-02-01", value_kind: literal, confidence: 1.0}
+    - {target: "report_dt", operator: "<=", value: "2026-02-28", value_kind: literal, confidence: 1.0}
+  time_range: null
+  source_constraints:
+    - {table: "uzp_dwh_fact_outflow", schema: "s_grnplm_ld_salesntwrk_pcap_sn_uzp", required: true, confidence: 1.0}
+  join_constraints: []
+  clarification_needed: false
+  confidence: 1.0
+sql_must_contain:
+  - "COUNT"
+  - "UZP_DWH_FACT_OUTFLOW"
+  - "REPORT_DT"
+  - "2026-02"
+  - "IS_TASK"
+sql_must_not_contain:
+  - "2026-03-01"
+should_reach_node: sql_validator
+execute_succeeds: true
+expected_rowcount: {min: 1, max: 1}
+max_retries: 2

@@ -39,6 +39,7 @@ sql_must_contain:
 sql_must_not_contain:
   - "IS_TASK_CLOSED"
   - "IS_TASK_IN_PROGRESS"
+  - "IS_TASK_CLOSED_SUCCESS"
   - "FACT_CLOSE_TASK_DTTM"
   - "SRC_UPDATE_DTTM"
 should_reach_node: sql_validator

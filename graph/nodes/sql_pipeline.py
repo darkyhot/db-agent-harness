@@ -22,6 +22,7 @@ from core.confidence import (
 from core.log_safety import summarize_sql, summarize_text
 from core.sql_static_checker import check_sql
 from core.sql_planner_deterministic import build_blueprint as _deterministic_blueprint
+from core.sql_planner_deterministic import _CONDITION_PARSE_RE as _COND_RE
 from core.sql_builder import SqlBuilder as _SqlBuilder
 from core.sql_formatter import format_sql_safe as _format_sql
 from core.where_resolver import candidate_label as _candidate_label
@@ -255,6 +256,107 @@ def _blueprint_date_ranges(blueprint: dict[str, Any]) -> dict[str, list[str]]:
         if m:
             ranges.setdefault(m.group(1).lower(), []).append(c)
     return ranges
+
+
+def _flag_root(col: str) -> str:
+    """Корень булева флага после `is_`: is_task_in_progress → 'task'."""
+    c = str(col or "").lower()
+    if c.startswith("is_"):
+        c = c[3:]
+    m = re.match(r"([a-zа-яё0-9]+)", c)
+    return m.group(1) if m else c
+
+
+def _flag_in_grain_set(col: str, table_key: str, schema_loader: Any) -> bool:
+    """True когда на таблице ≥2 булевых флаг-колонки с общим корнем (после `is_`),
+    что и есть `col` — признак, что флаг принадлежит grain-набору (напр.
+    is_task_closed / is_task_closed_success / is_task_in_progress), а не одиночный
+    различающий признак (is_task на fact_outflow)."""
+    if not schema_loader or "." not in (table_key or ""):
+        return False
+    schema, table = table_key.split(".", 1)
+    try:
+        cols_df = schema_loader.get_table_columns(schema, table)
+    except Exception:  # noqa: BLE001
+        return False
+    if cols_df is None or getattr(cols_df, "empty", True):
+        return False
+    root = _flag_root(col)
+    if not root:
+        return False
+    cnt = 0
+    for _, row in cols_df.iterrows():
+        name = str(row.get("column_name") or "").lower()
+        dtype = str(row.get("dType") or row.get("data_type") or "").lower()
+        is_flag = "bool" in dtype or name.startswith("is_")
+        if is_flag and root in name:
+            cnt += 1
+    return cnt >= 2
+
+
+def _scrub_auto_derived_where(
+    blueprint: dict[str, Any], query_spec: dict[str, Any], schema_loader: Any,
+) -> list[str]:
+    """Финальный path-независимый scrub авто-выведенных «левых» условий из
+    blueprint.where_conditions. Мусор втекает из многих путей (synthetic flag,
+    fuzzy entity_resolver, where_resolver tiebreaker, value-profile сэмплы) —
+    режем на одном чокпоинте.
+
+    Оставляем: условия на колонку, ТОЧНО совпадающую с QuerySpec-target (явный
+    запрос); диапазоны по дате (>=/<=/>/<); категориальные text/ILIKE.
+    Дропаем (если колонка НЕ явный QuerySpec-target):
+      A) boolean-флаг из grain-набора (is_task_in_progress/is_task_closed);
+      B) точечная дата/таймстемп `=` (fact_close_task_dttm='...', сэмплы).
+    """
+    conds = blueprint.get("where_conditions") or []
+    if not conds or schema_loader is None:
+        return conds
+    qs_targets: set[str] = set()
+    for f in ((query_spec or {}).get("filters") or []):
+        t = str((f or {}).get("target") or "").strip().lower()
+        if t:
+            qs_targets.add(t.split(".")[-1])
+    table_keys = list((blueprint.get("selected_columns") or {}).keys())
+    main = blueprint.get("main_table")
+    if main and main not in table_keys:
+        table_keys.append(main)
+
+    def _semantics_for(col: str) -> tuple[str, str | None]:
+        for tk in table_keys:
+            if "." not in str(tk):
+                continue
+            sch, tbl = str(tk).split(".", 1)
+            try:
+                sem = schema_loader.get_column_semantics(sch, tbl, col) or {}
+            except Exception:  # noqa: BLE001
+                sem = {}
+            if sem:
+                return str(sem.get("semantic_class") or "").lower(), tk
+        return "", None
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for cond in conds:
+        m = _COND_RE.match(str(cond).strip())
+        if not m:
+            kept.append(cond)
+            continue
+        col = m.group(1).split(".")[-1].strip().lower()
+        op = m.group(2).strip().upper()
+        if col in qs_targets:
+            kept.append(cond)  # явный QuerySpec-фильтр — не трогаем
+            continue
+        sclass, tk = _semantics_for(col)
+        if sclass == "flag" and tk and _flag_in_grain_set(col, tk, schema_loader):
+            dropped.append(cond)
+            continue
+        if sclass in {"date", "datetime", "system_timestamp"} and op in {"=", "=="}:
+            dropped.append(cond)
+            continue
+        kept.append(cond)
+    if dropped:
+        logger.info("SqlPlanner: scrub авто-выведенных фильтров: %s", dropped)
+    return kept
 
 
 def _strip_conjunct(sql: str, predicate_text: str) -> str:
@@ -917,6 +1019,12 @@ class SqlPipelineNodes:
                     len(_orig_where) - len(_kept), removed_filter_columns,
                 )
             blueprint["where_conditions"] = _kept
+
+        # Финальный рубеж: вырезаем авто-выведенные «левые» условия (grain-флаги,
+        # точечные даты/таймстемпы из сэмплов), которые втекают из разных путей.
+        blueprint["where_conditions"] = _scrub_auto_derived_where(
+            blueprint, state.get("query_spec") or {}, self.schema,
+        )
 
         logger.info("SqlPlanner: стратегия=%s (детерминировано)", blueprint.get("strategy"))
 

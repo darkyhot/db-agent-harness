@@ -456,7 +456,21 @@ def ground_query_spec(
             if facts_with_numeric_metric and (
                 facts_with_textual_metric or facts_without_metric or unknowns_without_metric
             ):
-                pruned = facts_with_textual_metric + facts_without_metric
+                # Числовая колонка делает факт каноничным ТОЛЬКО для sum/avg/min/max.
+                # Для чистого count (require_numeric_metric=False) она не привилегирует
+                # факт: entity-витрина (напр. sale_funnel_task) обязана дожить до
+                # entity-split/H2 развилки, иначе планировщик молча выберет неверную
+                # витрину и слепит лишний join. Дроп unknown-витрин ниже сохраняем.
+                if require_numeric_metric:
+                    pruned = facts_with_textual_metric + facts_without_metric
+                    kept_facts = list(facts_with_numeric_metric)
+                else:
+                    pruned = []
+                    kept_facts = (
+                        facts_with_numeric_metric
+                        + facts_with_textual_metric
+                        + facts_without_metric
+                    )
                 # unknown-таблицу можно дропать только если её исчезновение
                 # не оставляет dimension без источника. Иначе она каноничный
                 # joinable провайдер для измерения (типа консолидированной
@@ -500,7 +514,7 @@ def ground_query_spec(
                 kept_non_facts = [
                     s for s in non_facts if s not in droppable_unknowns
                 ]
-                sources = facts_with_numeric_metric + kept_non_facts
+                sources = kept_facts + kept_non_facts
                 if droppable_unknowns:
                     logger.info(
                         "CatalogGrounder: dropped unknown-type sources without metric support: %s",
@@ -560,6 +574,44 @@ def ground_query_spec(
             warnings=warnings,
             confidence=best_conf,
         )
+
+    # Entity-coverage invariant: когда среди равноправных fact-кандидатов одни
+    # покрывают сущность QuerySpec, а другие нет (напр. sale_funnel_task vs
+    # fact_outflow), не выбираем молча и не сшиваем их в join — поднимаем
+    # развилку выбора витрины. Это последний рубеж: он ловит неоднозначность,
+    # которую score-разрыв H2 (порог 55%) пропускает.
+    if (
+        sources
+        and query_spec.task == "answer_data"
+        and not query_spec.join_constraints
+        and not any(s.reason == "explicit_source_constraint" for s in sources)
+    ):
+        split = _detect_entity_coverage_split(
+            sources, schema_loader=schema_loader, query_spec=query_spec,
+        )
+        if len(split) >= 2:
+            options = [_ambiguous_source_label(s, schema_loader) for s in split]
+            clarification = ClarificationSpec(
+                question=(
+                    "Запрос подходит к нескольким таблицам с разной трактовкой "
+                    "сущности. Уточните, какую использовать."
+                ),
+                reason="catalog_grounding_entity_coverage_split",
+                field="source_constraints",
+                options=options,
+                evidence=[Evidence(source="catalog_grounder", text=user_input, confidence=best_conf)],
+            )
+            logger.info(
+                "CatalogGrounder: entity-coverage split — options=%s (covers vs not)",
+                [s.full_name for s in split],
+            )
+            return GroundingResult(
+                query_spec=query_spec,
+                sources=sources,
+                clarification=clarification,
+                warnings=warnings,
+                confidence=best_conf,
+            )
 
     if sources:
         primary = _main_source_with_required_priority(sources)
@@ -776,6 +828,78 @@ def _detect_ambiguous_strong_sources(
     if len(tied) < 2:
         return []
     return tied[:max_options]
+
+
+def _detect_entity_coverage_split(
+    sources: list[SourceBinding],
+    *,
+    schema_loader=None,
+    query_spec: QuerySpec | None = None,
+    max_options: int = 3,
+) -> list[SourceBinding]:
+    """Return competing peer sources when fact candidates *split* on entity
+    coverage: at least one covers a QuerySpec entity and at least one does not.
+
+    This is a score-independent ambiguity signal that complements
+    `_detect_ambiguous_strong_sources` (which keys off the raw score gap). A
+    wide score gap can hide a genuine table choice — e.g. «сколько задач по
+    фактическому оттоку»: sale_funnel_task (entity «задача» as task rows) scores
+    far above fact_outflow (entity as the is_task flag), yet both legitimately
+    answer the question. When the leading table and a peer disagree on whether
+    they contain the entity, the caller must surface a choice instead of
+    silently picking — and never stitch them into a fact↔dim join.
+
+    Excludes user-pinned/required sources and dimension sidekicks (a dim is a
+    JOIN complement, not an alternative answer). Returns [] when there is no
+    split (all peers cover, or none does) or fewer than 2 peers remain.
+    """
+    if schema_loader is None or query_spec is None:
+        return []
+    if not getattr(query_spec, "entities", None):
+        return []
+
+    candidates = [
+        s for s in sources
+        if s.reason not in _AMBIGUITY_EXCLUDED_REASONS
+        and not _is_weak_tfidf_only_candidate(s)
+    ]
+    if len(candidates) < 2:
+        return []
+
+    type_for: dict[str, str] = {}
+    for cand in candidates:
+        try:
+            cols_df = schema_loader.get_table_columns(cand.schema, cand.table)
+        except Exception:  # noqa: BLE001
+            cols_df = None
+        try:
+            ttype = detect_table_type(cand.table, cols_df) if cols_df is not None else "unknown"
+        except Exception:  # noqa: BLE001
+            ttype = "unknown"
+        type_for[cand.full_name] = ttype
+    if any(t == "fact" for t in type_for.values()):
+        candidates = [
+            c for c in candidates
+            if type_for.get(c.full_name) not in ("dim", "ref")
+        ]
+    if len(candidates) < 2:
+        return []
+
+    covering: list[SourceBinding] = []
+    non_covering: list[SourceBinding] = []
+    for cand in candidates:
+        covers = _primary_source_covers_entities(cand, query_spec, schema_loader)
+        if covers is True:
+            covering.append(cand)
+        elif covers is False:
+            non_covering.append(cand)
+    if not covering or not non_covering:
+        return []
+
+    # Covering tables first (more likely the intended answer), then the
+    # non-covering peers that nonetheless scored into contention.
+    ordered = covering + non_covering
+    return ordered[:max_options]
 
 
 def _ambiguous_source_label(source: SourceBinding, schema_loader: Any) -> str:

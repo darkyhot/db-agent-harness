@@ -1,0 +1,35 @@
+# Кейс 3 (turn 1, вариант «живого» LLM): неоднозначность таблицы при ОДНОЙ
+# сущности + пред-разрешённом физическом фильтре is_task.
+#
+# В отличие от e2e_feb_2026_disambiguation.yaml (две сущности задача+отток →
+# score сближается → H2 срабатывает), здесь LLM свернул «фактический отток» в
+# фильтр is_task=TRUE и оставил единственную сущность «задача». В реальном
+# каталоге это даёт широкий разрыв score (sale_funnel_task ≫ fact_outflow), H2
+# (порог 55%) молчит, а прошлая metric-cleanup-ветка добивала sale_funnel_task —
+# агент молча брал fact_outflow + dim_gosb и лепил fact↔dim JOIN (ROW EXPLOSION).
+#
+# Контракт: pipeline всё равно обязан предложить выбор между двумя витринами
+# (score-независимый entity-coverage split в catalog_grounder), а не выбирать
+# молча и не строить join. Unit-уровень той же логики:
+# tests/test_query_ir.py::test_detect_entity_coverage_split_*.
+query: "Сколько задач по фактическому оттоку поставили в феврале 2026"
+query_spec:
+  task: answer_data
+  strategy: aggregate
+  metrics:
+    - {operation: count, target: null, distinct_policy: auto, label: "Количество задач", confidence: 0.9}
+  entities:
+    - {name: "задача", canonical: "задача", confidence: 1.0}
+  filters:
+    - {target: "is_task", operator: "=", value: true, value_kind: literal, confidence: 1.0}
+    - {target: "report_dt", operator: "=", value: "2026-02-01", value_kind: literal, confidence: 1.0}
+  time_range: null
+  source_constraints: []
+  join_constraints: []
+  clarification_needed: false
+  confidence: 1.0
+expect_disambiguation: true
+disambiguation_tables_must_include:
+  - "uzp_dwh_sale_funnel_task"
+  - "uzp_dwh_fact_outflow"
+max_retries: 2

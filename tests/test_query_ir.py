@@ -636,6 +636,96 @@ def test_catalog_grounding_reopens_disambiguation_when_survivor_misses_entity(tm
     assert {"dm.sale_funnel", "dm.fact_outflow"} <= option_prefixes
 
 
+def _entity_split_loader(tmp_path):
+    """Каталог с двумя fact-витринами: только sale_funnel содержит токен
+    «задача» (task_category), fact_outflow трактует задачу как is_task флаг.
+    """
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm"],
+        "table_name": ["fact_outflow", "sale_funnel"],
+        "description": [
+            "Информация по фактическим оттокам",
+            "Воронка продаж по задачам",
+        ],
+        "grain": ["event", "task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": [
+            "fact_outflow", "fact_outflow",
+            "sale_funnel", "sale_funnel", "sale_funnel",
+        ],
+        "column_name": [
+            "report_dt", "is_task",
+            "report_dt", "task_subtype", "task_category",
+        ],
+        "dType": ["date", "boolean", "date", "text", "text"],
+        "description": [
+            "Отчетная дата", "Признак выставленной задачи",
+            "Отчетная дата", "Подтип задачи", "Категория задачи",
+        ],
+        "is_primary_key": [False] * 5,
+        "unique_perc": [1.0, 2.0, 1.0, 10.0, 2.0],
+        "not_null_perc": [100.0] * 5,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_detect_entity_coverage_split_flags_disagreeing_fact_peers(tmp_path):
+    """Score-независимый детектор: когда среди равноправных fact-витрин одна
+    покрывает сущность «задача» (sale_funnel), а другая нет (fact_outflow),
+    helper возвращает обе — покрывающую первой. Это и есть «выбор из 2 таблиц»,
+    который score-разрыв H2 (66 vs 22) в реальном каталоге пропускает.
+    """
+    from core.catalog_grounding import _detect_entity_coverage_split
+    from core.query_ir import SourceBinding
+
+    loader = _entity_split_loader(tmp_path)
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": None, "confidence": 1.0}],
+        "entities": [{"name": "задача", "canonical": "задача", "confidence": 1.0}],
+        "filters": [],
+        "confidence": 1.0,
+    })
+    assert spec is not None, errors
+
+    sources = [
+        SourceBinding(schema="dm", table="fact_outflow", reason="catalog_score", confidence=0.95, score=66.0),
+        SourceBinding(schema="dm", table="sale_funnel", reason="catalog_score", confidence=0.95, score=22.0),
+    ]
+    split = _detect_entity_coverage_split(
+        sources, schema_loader=loader, query_spec=spec,
+    )
+    assert [s.full_name for s in split] == ["dm.sale_funnel", "dm.fact_outflow"]
+
+
+def test_detect_entity_coverage_split_silent_when_all_peers_cover(tmp_path):
+    """Нет расщепления (обе витрины покрывают сущность) → детектор молчит,
+    выбор остаётся за score/H2."""
+    from core.catalog_grounding import _detect_entity_coverage_split
+    from core.query_ir import SourceBinding
+
+    loader = _entity_split_loader(tmp_path)
+    spec, _errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": None, "confidence": 1.0}],
+        # «отчет» есть в обеих витринах (report_dt) → обе покрывают.
+        "entities": [{"name": "отчет", "canonical": "отчет", "confidence": 1.0}],
+        "filters": [],
+        "confidence": 1.0,
+    })
+    sources = [
+        SourceBinding(schema="dm", table="fact_outflow", reason="catalog_score", confidence=0.95, score=66.0),
+        SourceBinding(schema="dm", table="sale_funnel", reason="catalog_score", confidence=0.95, score=22.0),
+    ]
+    assert _detect_entity_coverage_split(
+        sources, schema_loader=loader, query_spec=spec,
+    ) == []
+
+
 def test_catalog_grounder_node_surfaces_disambiguation_options(tmp_path):
     """Узел catalog_grounder должен пробросить варианты H2-неоднозначности.
 

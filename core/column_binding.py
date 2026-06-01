@@ -505,6 +505,7 @@ def _find_flag_column_by_description(
     entity_stems = {s for s in entity_stems if s and len(s) >= 4}
     if not entity_stems:
         return None
+    matches: list[tuple[str, str]] = []
     for table_key in table_keys:
         if "." not in table_key:
             continue
@@ -534,16 +535,35 @@ def _find_flag_column_by_description(
             description = re.sub(r"\([^)]*\)", " ", description)
             desc_tokens = re.findall(r"\w+", description)
             desc_stems = {_stem_token(tok) for tok in desc_tokens if len(tok) >= 3}
+            matched = False
             for left in entity_stems:
                 for right in desc_stems:
                     if not right or len(right) < 4:
                         continue
-                    if left == right:
-                        return table_key, col_name
-                    if min(len(left), len(right)) >= 4 and (
-                        left.startswith(right) or right.startswith(left)
+                    if left == right or (
+                        min(len(left), len(right)) >= 4
+                        and (left.startswith(right) or right.startswith(left))
                     ):
-                        return table_key, col_name
+                        matched = True
+                        break
+                if matched:
+                    break
+            if matched:
+                matches.append((table_key, col_name))
+    # Уникальный матч → это РАЗЛИЧАЮЩИЙ флаг (напр. «задача» → is_task на
+    # fact_outflow, где зерно — отток). Несколько матчей → entity является
+    # зерном таблицы: на sale_funnel_task «задач» цепляет сразу is_task_closed
+    # / is_task_closed_success / is_task_in_progress — булев флаг не различает
+    # сущность (over-filter), фильтр не нужен (а различающее «отток» уйдёт в
+    # text-правило по task_subtype, которое больше не затеняется F6).
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) >= 2:
+        logger.debug(
+            "ColumnBinding: entity «%s» матчит %d флаг-колонок %s — вероятно "
+            "зерно таблицы, synthetic flag не эмитим",
+            entity_name, len(matches), [m[1] for m in matches],
+        )
     return None
 
 

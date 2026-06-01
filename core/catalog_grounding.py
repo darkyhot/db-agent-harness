@@ -909,7 +909,10 @@ def _ambiguous_source_label(source: SourceBinding, schema_loader: Any) -> str:
     """
     name = source.full_name
     try:
-        info = (schema_loader.get_table_info(source.schema_name, source.table) or "") if schema_loader else ""
+        # Только описание (не get_table_info: тот возвращает блок
+        # «Таблица: <name> Описание: … Колонки: …» — имя дублируется, а
+        # описание тонет в перечне колонок при обрезке).
+        info = (schema_loader.get_table_description(source.schema_name, source.table) or "") if schema_loader else ""
     except Exception:  # noqa: BLE001
         info = ""
     info = info.strip().replace("\n", " ")

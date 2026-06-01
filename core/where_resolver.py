@@ -1550,6 +1550,7 @@ def _apply_exact_filter_specs(
             spec=spec,
             schema_loader=schema_loader,
             time_range=time_range,
+            conditions=conditions,
         ):
             continue
         # Direction: dtype-check. Не выпускаем условие, у которого значение
@@ -1658,6 +1659,20 @@ def _drop_system_timestamp_when_time_axis_present(
     return [cond for idx, cond in enumerate(conditions) if idx not in drop_indices]
 
 
+def _column_has_range_predicate(conditions: list[str] | None, column: str) -> bool:
+    """True когда среди условий уже есть диапазонный предикат (>=/<=/>/<) на той
+    же date-колонке. Бэр-имя колонки как отдельный идентификатор (не подстрока,
+    не часть alias.col)."""
+    col = str(column or "").strip().lower()
+    if not col:
+        return False
+    pattern = r"(?:^|[^\w.])" + re.escape(col) + r"\s*(?:>=|<=|>|<)\s*"
+    for cond in conditions or []:
+        if re.search(pattern, str(cond).lower()):
+            return True
+    return False
+
+
 def _should_skip_exact_calendar_date_filter(
     *,
     column: str,
@@ -1665,9 +1680,8 @@ def _should_skip_exact_calendar_date_filter(
     spec: FilterSpec,
     schema_loader=None,
     time_range: dict[str, Any] | None = None,
+    conditions: list[str] | None = None,
 ) -> bool:
-    if not time_range or not time_range.get("start") or not time_range.get("end"):
-        return False
     if str(spec.operator or "=").strip().upper() not in {"=", "=="}:
         return False
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(spec.value or "")):
@@ -1680,17 +1694,15 @@ def _should_skip_exact_calendar_date_filter(
     if not date_like:
         return False
 
-    if schema_loader is not None and "." in table_key:
-        schema, table = table_key.split(".", 1)
-        semantics = schema_loader.get_column_semantics(schema, table, column)
-        semantic_class = str(semantics.get("semantic_class") or "").lower()
-        if semantic_class == "system_timestamp":
-            return True
-
-    # A calendar period already became a range predicate. A second equality on
-    # a date column usually comes from over-binding the natural-language date
-    # to an arbitrary physical column and would narrow a month to one day.
-    return True
+    # Диапазон уже покрывает эту дату-ось: либо задан time_range, либо в условиях
+    # уже есть диапазонный предикат на той же колонке (его строит планировщик из
+    # «в феврале 2026» в base_conditions). Точечное равенство `report_dt =
+    # '2026-02-01'` поверх диапазона — редундантно и сужает месяц до одного дня,
+    # поэтому пропускаем его в пользу диапазона.
+    has_time_range = bool(time_range and time_range.get("start") and time_range.get("end"))
+    if has_time_range or _column_has_range_predicate(conditions, column):
+        return True
+    return False
 
 
 def _condition_from_filter_spec(column: str, spec: FilterSpec) -> str:

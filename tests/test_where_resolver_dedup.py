@@ -2,12 +2,47 @@
 
 import pandas as pd
 
+from core.query_ir import FilterSpec
 from core.schema_loader import SchemaLoader
 from core.where_resolver import (
     _add_unique,
+    _apply_exact_filter_specs,
+    _column_has_range_predicate,
     _drop_system_timestamp_when_time_axis_present,
     _parse_condition,
 )
+
+
+def test_exact_point_date_skipped_when_same_column_range_exists():
+    """Регрессия agent(20): точечный `report_dt = '2026-02-01'` поверх уже
+    построенного месячного диапазона редундантен и сужает месяц до одного дня —
+    пропускаем его в пользу диапазона (даже когда time_range=None, т.к. диапазон
+    пришёл из текста в base_conditions)."""
+    conditions = [
+        "report_dt >= '2026-02-01'::date",
+        "report_dt < '2026-03-01'::date",
+    ]
+    selected_columns = {"dm.sale_funnel_task": {"filter": ["report_dt"]}}
+    specs = [FilterSpec(target="report_dt", operator="=", value="2026-02-01")]
+    applied = _apply_exact_filter_specs(
+        conditions, selected_columns, specs, schema_loader=None, time_range=None,
+    )
+    assert applied == []  # точка пропущена
+    assert "report_dt = '2026-02-01'" not in " ".join(conditions)
+    assert _column_has_range_predicate(conditions, "report_dt") is True
+
+
+def test_exact_point_date_applied_when_no_range():
+    """Без диапазона и без time_range точечный date-фильтр остаётся (никакого
+    over-suppress)."""
+    conditions: list[str] = []
+    selected_columns = {"dm.sale_funnel_task": {"filter": ["report_dt"]}}
+    specs = [FilterSpec(target="report_dt", operator="=", value="2026-02-01")]
+    applied = _apply_exact_filter_specs(
+        conditions, selected_columns, specs, schema_loader=None, time_range=None,
+    )
+    assert applied == ["query_spec:0"]
+    assert any("report_dt = '2026-02-01'" in c for c in conditions)
 
 
 def _loader_with_outflow(tmp_path):

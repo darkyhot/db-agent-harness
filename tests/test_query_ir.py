@@ -1417,3 +1417,97 @@ def test_derive_entity_flag_filters_via_description_match(tmp_path):
     assert synthetic[0]["target"] == "is_task"
     assert synthetic[0]["value"] is True
     assert "is_task" in selected_columns["dm.fact_outflow"]["filter"]
+
+
+def _funnel_task_loader(tmp_path):
+    """Витрина задач: каждая строка — задача (grain=task). Несколько task-флагов
+    (is_task_closed / _closed_success / _in_progress), различающее свойство
+    «отток» живёт в text-колонке task_subtype, не в булевом флаге."""
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["sale_funnel_task"],
+        "description": ["Воронка продаж по задачам"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": ["sale_funnel_task"] * 5,
+        "column_name": [
+            "report_dt", "task_subtype",
+            "is_task_closed", "is_task_closed_success", "is_task_in_progress",
+        ],
+        "dType": ["date", "varchar", "bool", "bool", "bool"],
+        "description": [
+            "Отчётная дата", "Подтип задачи",
+            "Признак закрытия задачи", "Признак успешного закрытия задачи",
+            "Признак - задача выполняется",
+        ],
+        "is_primary_key": [False] * 5,
+        "unique_perc": [1.0, 5.0, 2.0, 2.0, 2.0],
+        "not_null_perc": [100.0] * 5,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_derive_entity_flag_filters_no_synthetic_on_grain_table(tmp_path):
+    """Регрессия agent(20): entity «задача по оттоку» на витрине задач НЕ должна
+    вешать `is_task_closed = TRUE` — слово «задач» это зерно таблицы и цепляет
+    сразу несколько task-флагов (closed / closed_success / in_progress).
+    Различающее «отток» уйдёт в text-правило по task_subtype (которое больше не
+    затеняется F6). Пользователь не спрашивал про закрытые задачи.
+    """
+    loader = _funnel_task_loader(tmp_path)
+    spec, _errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "entities": [{"name": "задача", "canonical": "задача по оттоку", "confidence": 1.0}],
+        "metrics": [{"operation": "count", "target": None, "confidence": 1.0}],
+        "filters": [],
+        "confidence": 1.0,
+    })
+    assert spec is not None
+    selected_columns: dict[str, dict] = {
+        "dm.sale_funnel_task": {"select": ["report_dt"], "aggregate": ["*"], "filter": ["report_dt"]}
+    }
+    synthetic = derive_entity_flag_filters(
+        query_spec=spec,
+        selected_columns=selected_columns,
+        schema_loader=loader,
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 2026",
+    )
+    assert synthetic == [], f"не должно быть synthetic flag, получили {synthetic}"
+    assert "is_task_closed" not in selected_columns["dm.sale_funnel_task"]["filter"]
+
+
+def test_ambiguous_source_label_shows_name_once_and_description(tmp_path):
+    """Регрессия agent(20) UI: лейбл развилки = «schema.table — описание», имя
+    один раз, реальное описание (а не блок get_table_info с дублем имени)."""
+    from core.catalog_grounding import _ambiguous_source_label
+    from core.query_ir import SourceBinding
+
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["fact_outflow"],
+        "description": ["Информация по фактическим оттокам клиентов"],
+        "grain": ["row"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["fact_outflow"],
+        "column_name": ["report_dt"],
+        "dType": ["date"],
+        "description": ["Отчётная дата"],
+        "is_primary_key": [False],
+        "unique_perc": [1.0],
+        "not_null_perc": [100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    binding = SourceBinding(schema="dm", table="fact_outflow", reason="catalog_score", confidence=0.9)
+    label = _ambiguous_source_label(binding, loader)
+    assert label == "dm.fact_outflow — Информация по фактическим оттокам клиентов"
+    assert label.count("dm.fact_outflow") == 1
+    assert "Таблица:" not in label and "Колонки:" not in label

@@ -1359,3 +1359,16 @@ class SchemaLoader:
             lines.append(f"  {row['column_name']} {row['dType']}{pk}{nn}{col_desc}")
 
         return "\n".join(lines)
+
+    def get_table_description(self, schema: str, table: str) -> str:
+        """Вернуть ТОЛЬКО описание таблицы (одной строкой), без блока
+        «Таблица:/Колонки:». Для коротких лейблов (напр. развилка выбора
+        витрины), где `get_table_info` дублирует имя и тонет в перечне колонок.
+        """
+        tdf = self.tables_df
+        t_mask = (tdf["schema_name"] == schema) & (tdf["table_name"] == table)
+        t_rows = tdf[t_mask]
+        if t_rows.empty:
+            return ""
+        desc = t_rows["description"].iloc[0]
+        return str(desc).strip() if pd.notna(desc) else ""

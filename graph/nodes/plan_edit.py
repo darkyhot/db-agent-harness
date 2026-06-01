@@ -1070,11 +1070,14 @@ class PlanEditNodes:
             "Получишь текущий QuerySpec, preview/blueprint и текст правки пользователя. "
             "Если пользователь просит убрать источник/JOIN или оставить только часть источников, "
             "верни JSON action по схеме: "
-            '{"action":"remove_source|remove_join|replace_source|set_sources_only|clarify",'
+            '{"action":"remove_source|remove_join|replace_source|set_sources_only|remove_filter|clarify",'
             '"tables":["schema.table или table"],"joins":[{"left":"...","right":"..."}],'
+            '"filters":[{"target":"имя_колонки"}],'
             '"replacement_table":"schema.table","question":"...","confidence":0.0}. '
             "Если пользователь говорит, что достаточно одного справочника/источника, "
             "используй action=set_sources_only с tables=[...]. "
+            "Если пользователь просит убрать фильтр/условие WHERE — action=remove_filter "
+            "с filters=[{target:имя_колонки}] (target — имя колонки из условия, напр. is_task_closed). "
             "Для остальных смысловых правок верни ПОЛНЫЙ обновлённый QuerySpec JSON по схеме, без markdown. "
             "Не пиши SQL. Не удаляй существующие метрики, фильтры, даты, источники и "
             "измерения, если пользователь явно не попросил удалить или заменить их. "
@@ -1343,6 +1346,48 @@ class PlanEditNodes:
                 "plan_edit_needs_clarification": True,
                 "needs_clarification": True,
                 "clarification_message": question,
+                "graph_iterations": iterations,
+            }
+        if action == "remove_filter":
+            targets: list[str] = []
+            for f in (parsed.get("filters") or []):
+                if isinstance(f, dict):
+                    t = str(f.get("target") or f.get("column") or "").strip()
+                else:
+                    t = str(f or "").strip()
+                if t:
+                    targets.append(t)
+            for key in ("columns", "targets"):
+                for t in (parsed.get(key) or []):
+                    t = str(t or "").strip()
+                    if t:
+                        targets.append(t)
+            targets = list(dict.fromkeys(targets))
+            if not targets:
+                return {
+                    "plan_edit_kind": "clarify",
+                    "plan_edit_confidence": float(parsed.get("confidence", 0.0) or 0.0),
+                    "plan_edit_payload": parsed,
+                    "plan_edit_needs_clarification": True,
+                    "needs_clarification": True,
+                    "clarification_message": "Какой именно фильтр нужно убрать из плана?",
+                    "graph_iterations": iterations,
+                }
+            operations = [{"op": "remove_filter", "column": t} for t in targets]
+            resolution = self._build_plan_edit_resolution(
+                edit_goal="patch",
+                requested_changes=[{"action": "remove_filter", "targets": targets}],
+                confidence=float(parsed.get("confidence", 0.85) or 0.85),
+            )
+            return {
+                "plan_edit_kind": "patch",
+                "plan_edit_confidence": float(parsed.get("confidence", 0.85) or 0.85),
+                "plan_edit_payload": {"operations": operations, "resolution": resolution},
+                "plan_edit_resolution": resolution,
+                "plan_edit_explanation": "LLM remove_filter action",
+                "plan_edit_needs_clarification": False,
+                "needs_clarification": False,
+                "clarification_message": "",
                 "graph_iterations": iterations,
             }
         if action not in {"remove_source", "remove_join", "replace_source", "set_sources_only"}:
@@ -1683,6 +1728,7 @@ class PlanEditNodes:
         selected_columns: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         commands: list[dict[str, Any]] = []
+        filters_to_remove: list[str] = []
         pending_date_range: dict[str, Any] = {"command": "set_date_range", "from": "", "to": ""}
         for op in operations:
             if not isinstance(op, dict):
@@ -1716,20 +1762,26 @@ class PlanEditNodes:
             elif action == "replace" and path == "where.date.to":
                 pending_date_range["to"] = str(value or "")
             elif action == "remove_filter":
-                column = str(op.get("column") or "").lower()
-                new_blueprint = copy.deepcopy(blueprint)
-                new_blueprint["where_conditions"] = [
-                    cond for cond in (new_blueprint.get("where_conditions") or [])
-                    if column not in cond.lower()
-                ]
-                return new_blueprint, {"metrics_changed": False}
+                column = str(op.get("column") or "").strip().lower()
+                if column:
+                    filters_to_remove.append(column)
         if pending_date_range["from"] or pending_date_range["to"]:
             commands.append({
                 "command": "set_date_range",
                 "from": pending_date_range["from"] or "",
                 "to": pending_date_range["to"] or "",
             })
-        return self._apply_patch_commands(blueprint, commands, selected_columns)
+        new_blueprint, patch_meta = self._apply_patch_commands(blueprint, commands, selected_columns)
+        if filters_to_remove:
+            # Удаляем ВСЕ запрошенные фильтры (не только первый) — подстрочное
+            # совпадение по where_conditions. Работает и для derived-фильтров
+            # (is_task_closed, fact_close_task_dttm), которых нет в QuerySpec.filters.
+            new_blueprint = copy.deepcopy(new_blueprint)
+            new_blueprint["where_conditions"] = [
+                cond for cond in (new_blueprint.get("where_conditions") or [])
+                if not any(col in str(cond).lower() for col in filters_to_remove)
+            ]
+        return new_blueprint, patch_meta
 
     def plan_patcher(self, state: AgentState) -> dict[str, Any]:
         iterations = state.get("graph_iterations", 0) + 1

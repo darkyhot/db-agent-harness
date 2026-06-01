@@ -258,6 +258,59 @@ def test_router_patch_date_shift(node):
     assert {"command": "set_date_range", "from": "2026-02-02", "to": "2026-03-02"} in patch
 
 
+def test_apply_legacy_patch_operations_removes_all_requested_filters(node):
+    """Регрессия agent(20): _apply_legacy_patch_operations должен удалять ВСЕ
+    запрошенные remove_filter (раньше возвращал после первого)."""
+    state = _state()
+    blueprint = state["sql_blueprint"]
+    blueprint["where_conditions"] = [
+        "report_dt >= '2026-02-01'::date",
+        "is_task_closed = TRUE",
+        "fact_close_task_dttm = '2026-02-01'::date",
+    ]
+    ops = [
+        {"op": "remove_filter", "column": "is_task_closed"},
+        {"op": "remove_filter", "column": "fact_close_task_dttm"},
+    ]
+    new_bp, _meta = node._apply_legacy_patch_operations(blueprint, ops, state["selected_columns"])
+    assert new_bp["where_conditions"] == ["report_dt >= '2026-02-01'::date"]
+
+
+def test_structured_remove_filter_routes_to_patch_and_drops_conditions(node):
+    """Регрессия agent(20): LLM-экшен remove_filter должен применяться (раньше
+    падал в «Не удалось применить правку»). Идёт через kind=patch → plan_patcher,
+    патчит where_conditions на месте, в т.ч. derived-фильтры (нет в QuerySpec)."""
+    state = _state()
+    state["sql_blueprint"]["where_conditions"] = [
+        "report_dt >= '2026-02-01'::date",
+        "report_dt < '2026-03-01'::date",
+        "is_task_closed = TRUE",
+        "fact_close_task_dttm = '2026-02-01'::date",
+        "task_subtype ILIKE '%фактический отток%'",
+    ]
+    parsed = {
+        "action": "remove_filter",
+        "filters": [{"target": "is_task_closed"}, {"target": "fact_close_task_dttm"}],
+        "confidence": 1.0,
+    }
+    routed = node._apply_structured_plan_edit_action(
+        state, "убери фильтры is_task_closed и fact_close_task_dttm", parsed,
+    )
+    assert routed is not None
+    assert routed["plan_edit_kind"] == "patch"
+    assert routed["needs_clarification"] is False
+    ops = routed["plan_edit_payload"]["operations"]
+    assert {"op": "remove_filter", "column": "is_task_closed"} in ops
+    assert {"op": "remove_filter", "column": "fact_close_task_dttm"} in ops
+
+    patched = node.plan_patcher({**state, **routed})
+    where = patched["sql_blueprint"]["where_conditions"]
+    assert not any("is_task_closed" in c for c in where)
+    assert not any("fact_close_task_dttm" in c for c in where)
+    assert any("task_subtype" in c for c in where)
+    assert any("report_dt >=" in c for c in where)
+
+
 def test_router_rebind_replace_table(node):
     result = node.plan_edit_router(_state(plan_edit_text="я передумал использовать эту таблицу и хочу таблицу schema_a.alt_fact"))
     assert result["plan_edit_kind"] == "rebind"

@@ -1,0 +1,45 @@
+# Кейс agent(20): после выбора витрины sale_funnel_task SQL должен быть валидным.
+#
+# «Живой» QuerySpec turn-2 (как его выдал LLM): единственная сущность с
+# canonical «задача по оттоку» (без task_subtype-фильтра — LLM свернул «отток» в
+# сущность), точечный report_dt = '2026-02-01', явный source_constraint на
+# sale_funnel_task. Прогон на DeepSeek (не GigaChat) — текущий интеграционный
+# сетап.
+#
+# Эталон валидного SQL: COUNT по sale_funnel_task, report_dt как МЕСЯЧНЫЙ
+# диапазон (февраль) и фильтр task_subtype ILIKE '%фактический отток%'. НЕ должно
+# быть синтетического is_task_closed = TRUE (зерно таблицы — задача), лишнего
+# fact_close_task_dttm и точечного report_dt = '2026-02-01'.
+#
+# Контракт намеренно агрегатный (точные имена task_subtype vs task_category
+# слабая LLM варьирует) — фиксируем инварианты, а не дословный SQL.
+query: "Сколько задач по фактическому оттоку поставили в феврале 2026 (использовать таблицу uzp_dwh_sale_funnel_task)"
+query_spec:
+  task: answer_data
+  strategy: aggregate
+  metrics:
+    - {operation: count, target: null, distinct_policy: auto, label: "Количество задач по оттоку", confidence: 0.9}
+  entities:
+    - {name: "задача", canonical: "задача по оттоку", confidence: 1.0}
+  filters:
+    - {target: "report_dt", operator: "=", value: "2026-02-01", value_kind: literal, confidence: 1.0}
+  time_range: null
+  source_constraints:
+    - {table: "uzp_dwh_sale_funnel_task", schema: "s_grnplm_ld_salesntwrk_pcap_sn_uzp", required: true, confidence: 1.0}
+  join_constraints: []
+  clarification_needed: false
+  confidence: 1.0
+sql_must_contain:
+  - "COUNT"
+  - "UZP_DWH_SALE_FUNNEL_TASK"
+  - "REPORT_DT"
+  - "2026-02"
+  - "TASK_SUBTYPE"
+  - "ILIKE"
+sql_must_not_contain:
+  - "IS_TASK_CLOSED"
+  - "FACT_CLOSE_TASK_DTTM"
+should_reach_node: sql_validator
+execute_succeeds: true
+expected_rowcount: {min: 1, max: 1}
+max_retries: 2

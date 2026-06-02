@@ -489,7 +489,23 @@ def ground_query_spec(
                 from core.entity_resolver import resolve_entity_to_columns
                 from core.query_ir import _target_looks_calendar
 
+                pinned_dim_tables = {
+                    str(getattr(d, "source_table", "") or "").strip().lower()
+                    for d in query_spec.dimensions
+                    if getattr(d, "source_table", None)
+                }
                 for unk in unknowns_without_metric:
+                    # Явный источник, который пользователь назвал, и/или таблица,
+                    # к которой явно привязано измерение («segment возьми в T по
+                    # инн»), не дропаем — иначе теряется join, ради которого
+                    # таблица и добавлена.
+                    unk_name_l = unk.full_name.lower()
+                    if unk.reason == "explicit_source_constraint" or (
+                        unk_name_l in pinned_dim_tables
+                        or unk.table.lower() in {t.rsplit(".", 1)[-1] for t in pinned_dim_tables}
+                    ):
+                        kept_unknowns.append(unk)
+                        continue
                     # unknown-таблицу оставляем, если она даёт label/date-колонку
                     # под какой-то dimension с разумной уверенностью. Канонический
                     # справочник (даже unknown-типа) предпочтительнее

@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from core.column_binding import bind_columns
 from core.column_selector_deterministic import select_columns
 from core.catalog_grounding import ground_query_spec
 from core.join_analysis import detect_table_type
@@ -122,6 +123,132 @@ def test_column_selector_and_planner_build_fact_dim_outflow_epk_join():
     assert blueprint["aggregation"]["column"] == "outflow_qty"
     assert blueprint["group_by"] == ["report_dt", "segment_name"]
     assert blueprint["where_resolution"]["needs_clarification"] is False
+
+
+def test_pin_dimension_sources_from_entity_and_join():
+    """«сегмент возьми в uzp_data_epk_consolidation по инн» → dim.source_table=epk."""
+    from graph.nodes.query_ir import _pin_dimension_sources, _strip_unstated_physical_hints
+
+    loader = _loader()
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "strategy": "aggregate",
+        "metrics": [{"operation": "sum", "target": "outflow_qty", "confidence": 1.0}],
+        "entities": [
+            {"name": "отток", "canonical": "uzp_dwh_fact_outflow", "confidence": 1.0},
+            {
+                "name": "сегмент",
+                "canonical": "uzp_data_epk_consolidation",
+                "target_column_hint": "segment_name",
+                "confidence": 1.0,
+            },
+        ],
+        "dimensions": [
+            {"target": "report_dt", "confidence": 1.0},
+            {"target": "segment_name", "confidence": 1.0},
+        ],
+        "join_constraints": [
+            {"left": FACT_OUTFLOW, "right": EPK, "key": "inn", "confidence": 1.0}
+        ],
+        "clarification_needed": False,
+        "confidence": 1.0,
+    })
+    assert spec is not None, errors
+
+    _pin_dimension_sources(spec, loader)
+    seg = next(d for d in spec.dimensions if d.target == "segment_name")
+    assert seg.source_table == EPK
+    assert seg.join_key == "inn"
+
+    # Пин переживает strip, т.к. имя таблицы и инн есть в тексте.
+    _strip_unstated_physical_hints(spec, QUERY)
+    seg = next(d for d in spec.dimensions if d.target == "segment_name")
+    assert seg.source_table == EPK
+
+
+def test_dimension_target_alias_prefix_sanitized():
+    """plan-edit «надо s.segment_name» → target очищается до segment_name."""
+    from graph.nodes.query_ir import _sanitize_dimension_target_aliases
+
+    loader = _loader()
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "strategy": "aggregate",
+        "metrics": [{"operation": "sum", "target": "outflow_qty", "confidence": 1.0}],
+        "dimensions": [
+            {"target": "report_dt", "confidence": 1.0},
+            {"target": "s.segment_name", "confidence": 1.0},
+        ],
+        "clarification_needed": False,
+        "confidence": 1.0,
+    })
+    assert spec is not None, errors
+
+    _sanitize_dimension_target_aliases(spec, loader)
+    targets = {d.target for d in spec.dimensions}
+    assert "segment_name" in targets
+    assert "s.segment_name" not in targets
+
+
+def test_explicit_dim_source_binds_segment_from_epk_not_fact():
+    """agent(28): fact_outflow ТОЖЕ содержит денормализованный segment_name.
+
+    Пользователь явно сказал «сегмент возьми в uzp_data_epk_consolidation по инн»
+    → dim.source_table=epk. Биндер обязан взять segment_name из EPK, а не из факта,
+    иначе JOIN бессмыслен. Проверяем продовый путь bind_columns.
+    """
+    loader = _loader()
+    # Sanity: обе таблицы реально содержат segment_name (иначе тест не репро-кейс).
+    assert "segment_name" in set(
+        loader.get_table_columns(SCHEMA, "uzp_dwh_fact_outflow")["column_name"]
+    )
+    assert "segment_name" in set(
+        loader.get_table_columns(SCHEMA, "uzp_data_epk_consolidation")["column_name"]
+    )
+
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "strategy": "aggregate",
+        "metrics": [{"operation": "sum", "target": "outflow_qty", "confidence": 1.0}],
+        "dimensions": [
+            {"target": "report_dt", "confidence": 1.0},
+            {
+                "target": "segment_name",
+                "source_table": EPK,          # явный пин пользователя
+                "join_key": "inn",
+                "confidence": 1.0,
+            },
+        ],
+        "filters": [],
+        "join_constraints": [
+            {"left": FACT_OUTFLOW, "right": EPK, "key": "inn", "confidence": 1.0}
+        ],
+        "clarification_needed": False,
+        "confidence": 1.0,
+    })
+    assert spec is not None, errors
+
+    tables = [FACT_OUTFLOW, EPK]
+    table_structures = {t: loader.get_table_info(*t.split(".", 1)) for t in tables}
+    table_types = {
+        t: detect_table_type(t.split(".", 1)[1], loader.get_table_columns(*t.split(".", 1)))
+        for t in tables
+    }
+
+    bound = bind_columns(
+        query_spec=spec,
+        table_structures=table_structures,
+        table_types=table_types,
+        schema_loader=loader,
+    )
+    assert bound is not None
+    selected = bound["selected_columns"]
+
+    # segment_name — из EPK, и НЕ из факта.
+    epk_group_by = selected.get(EPK, {}).get("group_by", [])
+    fact_group_by = selected.get(FACT_OUTFLOW, {}).get("group_by", [])
+    assert "segment_name" in epk_group_by, selected
+    assert "segment_name" not in fact_group_by, selected
 
 
 def test_implicit_outflow_segment_uses_more_complete_joinable_dimension_source():

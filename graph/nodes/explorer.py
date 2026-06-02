@@ -84,6 +84,61 @@ def _prefer_canonical_over_legacy(
     return out
 
 
+def _enforce_dim_source_pins(
+    selected_columns: dict[str, Any],
+    spec: Any,
+    schema_loader: Any,
+) -> None:
+    """Backstop: keep a user-pinned dimension column on its source table only.
+
+    When the user said «<X> возьми в <T> по <key>», ``dim.source_table`` is set.
+    The LLM column selector often also puts the column on the fact (which carries a
+    denormalized copy), making the JOIN pointless. Here we move each pinned
+    dimension column onto its source table's ``select``+``group_by`` and strip it
+    from every other table's ``select``/``group_by`` in place.
+    """
+    if spec is None or not getattr(spec, "dimensions", None):
+        return
+
+    def _match_table_key(source_table: str | None) -> str | None:
+        pin = str(source_table or "").strip().lower()
+        if not pin:
+            return None
+        pin_table = pin.rsplit(".", 1)[-1]
+        for key in selected_columns:
+            key_l = str(key).lower()
+            if key_l == pin or key_l.rsplit(".", 1)[-1] == pin_table:
+                return key
+        return None
+
+    for dim in spec.dimensions:
+        source_key = _match_table_key(getattr(dim, "source_table", None))
+        if not source_key:
+            continue
+        column = str(dim.target or "").strip()
+        if not column:
+            continue
+        column_l = column.lower()
+        # Drop the column from non-source tables' group_by/select.
+        for table_key, roles in selected_columns.items():
+            if table_key == source_key or not isinstance(roles, dict):
+                continue
+            for role in ("select", "group_by"):
+                cols = roles.get(role)
+                if isinstance(cols, list):
+                    roles[role] = [c for c in cols if str(c).lower() != column_l]
+        # Ensure the column is present on the source table.
+        src_roles = selected_columns.setdefault(source_key, {})
+        for role in ("select", "group_by"):
+            cols = src_roles.setdefault(role, [])
+            if column_l not in {str(c).lower() for c in cols}:
+                cols.append(column)
+        logger.info(
+            "ColumnSelector: enforced pinned dimension %s on %s (removed from other tables)",
+            column, source_key,
+        )
+
+
 def _apply_explicit_join_override(
     join_spec: list[dict[str, Any]],
     selected_columns: dict[str, Any],
@@ -625,6 +680,14 @@ class ExplorerNodes:
             any(t in {"fact"} for t in table_types_state.values())
             and any(t in {"dim", "ref"} for t in table_types_state.values())
         )
+        # Пользователь явно привязал измерение к таблице («X возьми в T по K»).
+        # Тогда детерминированный binder обязателен, даже если T классифицирована
+        # как unknown (и has_fact_and_dim=False): только он гарантированно возьмёт
+        # колонку из указанной таблицы, а не денормализованную копию из факта.
+        has_pinned_dim_source = bool(
+            spec is not None
+            and any(getattr(dim, "source_table", None) for dim in spec.dimensions)
+        )
         deterministic_aggregate_spec = bool(
             spec is not None
             and spec.task == "answer_data"
@@ -632,7 +695,7 @@ class ExplorerNodes:
             and spec.metrics
             and len(spec.metrics) == 1
             and spec.dimensions
-            and has_fact_and_dim
+            and (has_fact_and_dim or has_pinned_dim_source)
         )
         if spec is not None and (
             spec.strategy == "count_attributes"
@@ -936,6 +999,10 @@ class ExplorerNodes:
                         validated_roles, real_col_names, user_input
                     )
                 selected_columns[table_key] = validated_roles
+
+        # Backstop: enforce user-pinned dimension sources («X возьми в T по K»),
+        # so a denormalized copy in the fact can't shadow the canonical column.
+        _enforce_dim_source_pins(selected_columns, spec, self.schema)
 
         # --- JOIN-спецификация ---
         raw_join_keys = parsed.get("join_keys", [])

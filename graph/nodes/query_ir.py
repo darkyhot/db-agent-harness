@@ -10,6 +10,7 @@ from core.catalog_grounding import ground_query_spec
 from core.log_safety import summarize_dict_keys, summarize_text
 from core.query_ir import QuerySpec, SourceConstraint, query_spec_json_schema
 from core.semantic_frame import derive_semantic_frame
+from core.user_hint_extractor import _resolve_table_hint
 from graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,8 @@ class QueryIRNodes:
                 "graph_iterations": iterations,
             }
 
+        _sanitize_dimension_target_aliases(spec, self.schema)
+        _pin_dimension_sources(spec, self.schema)
         _strip_unstated_physical_hints(spec, user_input)
 
         # Если пользователь явно назвал таблицу каталога в запросе (например
@@ -540,13 +543,94 @@ def _build_query_interpreter_system_prompt() -> str:
     )
 
 
+def _sanitize_dimension_target_aliases(spec: QuerySpec, schema_loader: Any) -> None:
+    """Strip a leading SQL-alias prefix from a dimension target.
+
+    A plan-edit like «вместо o.segment_name надо s.segment_name» makes the LLM
+    emit ``target='s.segment_name'`` — an alias-qualified name that is not a real
+    catalog column, which later poisons grounding (the dim source gets dropped).
+    When the bare suffix after a short ``<alias>.`` prefix IS a real column, keep
+    only the suffix. Schema/table-qualified names (``schema.table.col``) are left
+    untouched; we only unwrap a single short identifier prefix.
+    """
+    for dim in spec.dimensions:
+        target = str(dim.target or "").strip()
+        if target.count(".") != 1:
+            continue
+        alias, _, bare = target.partition(".")
+        # short alias like o/s/t/agg — not a schema name
+        if not alias or len(alias) > 4 or not alias.isidentifier():
+            continue
+        if not bare or not bare.isidentifier():
+            continue
+        try:
+            found = schema_loader.find_tables_with_column(bare)
+        except Exception:
+            found = None
+        if found is not None and not getattr(found, "empty", True):
+            logger.info(
+                "QueryInterpreter: unwrap alias-prefixed dimension target %s → %s",
+                target, bare,
+            )
+            dim.target = bare
+
+
+def _pin_dimension_sources(spec: QuerySpec, schema_loader: Any) -> None:
+    """Pin a dimension to the table the user explicitly named for it.
+
+    The model expresses «<X> возьми в <TABLE> по <key>» as an *entity*
+    (``canonical=<TABLE>``, ``target_column_hint=<X-column>``) plus a
+    ``join_constraint`` — but leaves ``dimension.source_table`` empty. When a fact
+    also carries a denormalized copy of that column, downstream binding picks the
+    fact and the join becomes pointless. Here we lift the explicit table onto the
+    matching dimension's ``source_table`` (and ``join_key`` from the join), so the
+    column is read from the named table. Runs before ``_strip_unstated_physical_hints``
+    while ``target_column_hint`` is still present; the strip keeps these because the
+    table name and key are literally in the user text.
+    """
+    if not spec.entities or not spec.dimensions:
+        return
+    join_key = next(
+        (str(jc.key).strip() for jc in spec.join_constraints if jc.key),
+        None,
+    )
+    for entity in spec.entities:
+        canonical = str(entity.canonical or "").strip()
+        hint = str(entity.target_column_hint or "").strip()
+        if not canonical or not hint:
+            continue
+        resolved = _resolve_table_hint(canonical, schema_loader)
+        if resolved is None:
+            continue
+        full = f"{resolved[0]}.{resolved[1]}"
+        for dim in spec.dimensions:
+            if str(dim.target or "").strip().lower() != hint.lower():
+                continue
+            if not dim.source_table:
+                dim.source_table = full
+                logger.info(
+                    "QueryInterpreter: pin dimension %s → source_table=%s (entity=%s)",
+                    dim.target, full, entity.name,
+                )
+            if join_key and not dim.join_key:
+                dim.join_key = join_key
+
+
 def _strip_unstated_physical_hints(spec: QuerySpec, user_input: str) -> None:
     """Drop physical hints that were inferred from catalog instead of user text."""
     haystack = str(user_input or "").lower()
 
     def _mentioned(value: str | None) -> bool:
         item = str(value or "").strip().lower()
-        return bool(item and item in haystack)
+        if not item:
+            return False
+        if item in haystack:
+            return True
+        # A pinned source_table is stored as schema.table while the user usually
+        # types only the bare table name — treat the bare suffix as mentioned too.
+        if "." in item and item.rsplit(".", 1)[-1] in haystack:
+            return True
+        return False
 
     for entity in spec.entities:
         if entity.target_column_hint and not _mentioned(entity.target_column_hint):

@@ -260,8 +260,12 @@ def _bind_metric_dimension_columns(
         # выбирать именно label-колонки в dim/ref).
         dim_target_str = str(dim.target or "")
         dim_role = "date" if _target_looks_calendar(dim_target_str) else "label"
+        # Если пользователь явно привязал измерение к таблице («сегмент возьми в
+        # T по инн»), ищем колонку ТОЛЬКО в ней — иначе денормализованная копия
+        # в факте перебьёт канонический источник.
+        pinned_structures = _restrict_to_source_table(table_structures, dim.source_table)
         choice = _choose_column_across_tables(
-            table_structures=table_structures,
+            table_structures=pinned_structures or table_structures,
             table_types=table_types,
             schema_loader=schema_loader,
             target=dim.target,
@@ -617,6 +621,28 @@ def _column_is_boolean_flag(
             return True
         return False
     return False
+
+
+def _restrict_to_source_table(
+    table_structures: dict[str, str],
+    source_table: str | None,
+) -> dict[str, str] | None:
+    """Return the single-table view pinned by ``dim.source_table``.
+
+    ``source_table`` may be a full ``schema.table`` or a bare table name; match it
+    against the keys of ``table_structures`` (suffix-aware). Returns ``None`` when
+    no pin is set or it doesn't resolve to a present table (caller falls back to
+    the full set).
+    """
+    pin = str(source_table or "").strip().lower()
+    if not pin:
+        return None
+    pin_table = pin.rsplit(".", 1)[-1]
+    for key, value in table_structures.items():
+        key_l = key.lower()
+        if key_l == pin or key_l.rsplit(".", 1)[-1] == pin_table:
+            return {key: value}
+    return None
 
 
 def _choose_column_across_tables(

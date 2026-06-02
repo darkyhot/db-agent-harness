@@ -145,6 +145,31 @@ class JoinConstraint(StrictModel):
     evidence: list[Evidence] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_shapes(cls, data: Any) -> Any:
+        """Канонизировать структурные формы join-констрейнта от LLM.
+
+        Модель периодически отдаёт ``left``/``right`` объектами
+        ``{"table": ..., "column": ...}`` вместо строки-имени таблицы (а ключ
+        при этом кладёт в ``column`` и оставляет ``key: null``). Разворачиваем:
+        сторона → её ``table`` (или None), а ``column`` поднимаем в ``key``,
+        если ключ ещё пуст — так join-ключ не теряется. Строки проходят как есть.
+        """
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for side in ("left", "right"):
+            value = data.get(side)
+            if not isinstance(value, dict):
+                continue
+            table = value.get("table") or value.get("name") or value.get("source")
+            column = value.get("column") or value.get("col") or value.get("field")
+            data[side] = str(table).strip() if table not in (None, "") else None
+            if column and data.get("key") in (None, "", []):
+                data["key"] = column
+        return data
+
     @field_validator("key", mode="before")
     @classmethod
     def _normalize_key(cls, value: Any) -> str | None:

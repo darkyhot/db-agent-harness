@@ -114,6 +114,59 @@ def test_query_spec_coerces_list_join_key():
     assert empty_spec.join_constraints[0].key is None
 
 
+def test_query_spec_normalizes_object_join_sides():
+    # GigaChat иногда отдаёт left/right объектами {"table":..., "column":...},
+    # а ключ кладёт в column и оставляет key: null. Раньше это валило валидацию
+    # (left/right: Input should be a valid string). Сторона → table (или None),
+    # column поднимается в key.
+    base = {
+        "task": "answer_data",
+        "strategy": "aggregate",
+        "metrics": [{"operation": "sum", "target": "outflow_qty", "confidence": 1.0}],
+        "dimensions": [
+            {"target": "report_dt", "confidence": 1.0},
+            {"target": "segment_name", "confidence": 1.0},
+        ],
+        "filters": [],
+        "clarification_needed": False,
+        "confidence": 1.0,
+    }
+
+    # Точная форма из живого прогона agent(27): table=null, column=inn, key=null.
+    null_table = {**base, "join_constraints": [
+        {
+            "left": {"table": None, "column": "inn"},
+            "right": {"table": None, "column": "inn"},
+            "key": None,
+            "confidence": 1.0,
+        }
+    ]}
+    spec, errors = QuerySpec.from_dict(null_table)
+    assert errors == []
+    assert spec is not None
+    jc = spec.join_constraints[0]
+    assert jc.left is None
+    assert jc.right is None
+    assert jc.key == "inn"
+
+    # Если table заполнен — он становится стороной, column всё равно поднимается в key.
+    with_table = {**base, "join_constraints": [
+        {
+            "left": {"table": "uzp_dwh_fact_outflow", "column": "inn"},
+            "right": {"table": "uzp_data_epk_consolidation", "column": "inn"},
+            "key": None,
+            "confidence": 1.0,
+        }
+    ]}
+    spec2, errors2 = QuerySpec.from_dict(with_table)
+    assert errors2 == []
+    assert spec2 is not None
+    jc2 = spec2.join_constraints[0]
+    assert jc2.left == "uzp_dwh_fact_outflow"
+    assert jc2.right == "uzp_data_epk_consolidation"
+    assert jc2.key == "inn"
+
+
 def test_query_interpreter_strips_unstated_physical_hints():
     spec, errors = QuerySpec.from_dict({
         "task": "answer_data",

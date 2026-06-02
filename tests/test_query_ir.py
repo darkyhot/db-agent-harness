@@ -64,6 +64,56 @@ def test_query_spec_accepts_valid_payload():
     assert spec.to_legacy_user_hints()["group_by_hints"] == ["order_dt"]
 
 
+def test_query_spec_coerces_list_join_key():
+    # GigaChat/DeepSeek иногда отдают одноключевой join как список ["inn"].
+    # Раньше это валило валидацию (key: Input should be a valid string) и
+    # уводило запрос в clarification. Список должен разворачиваться в строку.
+    payload = {
+        "task": "answer_data",
+        "strategy": "aggregate",
+        "metrics": [{"operation": "sum", "target": "outflow_qty", "confidence": 1.0}],
+        "dimensions": [
+            {"target": "report_dt", "confidence": 1.0},
+            {"target": "segment_name", "confidence": 1.0},
+        ],
+        "filters": [],
+        "join_constraints": [
+            {
+                "left": "uzp_dwh_fact_outflow",
+                "right": "uzp_data_epk_consolidation",
+                "key": ["inn"],
+                "confidence": 1.0,
+            }
+        ],
+        "clarification_needed": False,
+        "confidence": 1.0,
+    }
+
+    spec, errors = QuerySpec.from_dict(payload)
+
+    assert errors == []
+    assert spec is not None
+    assert spec.join_constraints[0].key == "inn"
+
+    # Обычная строка по-прежнему работает.
+    string_payload = {**payload, "join_constraints": [
+        {"left": "a", "right": "b", "key": "inn", "confidence": 1.0}
+    ]}
+    string_spec, string_errors = QuerySpec.from_dict(string_payload)
+    assert string_errors == []
+    assert string_spec is not None
+    assert string_spec.join_constraints[0].key == "inn"
+
+    # Пустой список → None.
+    empty_payload = {**payload, "join_constraints": [
+        {"left": "a", "right": "b", "key": [], "confidence": 1.0}
+    ]}
+    empty_spec, empty_errors = QuerySpec.from_dict(empty_payload)
+    assert empty_errors == []
+    assert empty_spec is not None
+    assert empty_spec.join_constraints[0].key is None
+
+
 def test_query_interpreter_strips_unstated_physical_hints():
     spec, errors = QuerySpec.from_dict({
         "task": "answer_data",

@@ -1,0 +1,25 @@
+# Кейс agent(26): «живой» интерпретатор (DeepSeek) на запросе оттока с сегментом из
+# uzp_data_epk_consolidation по инн. На проме GigaChat-3-Ultra отдавал join-ключ списком
+# (key: ["inn"]), что валило валидацию QuerySpec (key: Input should be a valid string) и
+# уводило запрос в clarification. После фикса _normalize_key список разворачивается в строку.
+# Контракт: SUM(outflow_qty), INNER JOIN fact↔epk по inn, GROUP BY (report_dt, segment_name),
+# реальное выполнение SQL. Без pinned query_spec — нужен именно живой LLM-путь.
+query: "Посчитай сумму оттока по дате и сегменту (сегмент возьми в uzp_data_epk_consolidation по инн)"
+intent_must_be: analytics
+sql_must_contain:
+  - "SUM"
+  - "OUTFLOW_QTY"
+  - "REPORT_DT"
+  - "SEGMENT_NAME"
+  - "UZP_DWH_FACT_OUTFLOW"
+  - "UZP_DATA_EPK_CONSOLIDATION"
+  - "JOIN"
+  - "INN"
+  - "GROUP BY"
+sql_must_not_contain:
+  - "SELECT *"
+sql_alias_no_cyrillic: true
+should_reach_node: sql_validator
+execute_succeeds: true
+expected_rowcount: {min: 1}
+max_retries: 2

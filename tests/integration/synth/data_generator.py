@@ -33,6 +33,7 @@ SHARED_KEY_COLUMNS = {
     "new_gosb_id",
     "epk_id",
     "saphr_id",
+    "inn",
 }
 
 # Имена колонок, которые трактуем как даты «отчётного периода» и
@@ -148,6 +149,11 @@ def _seed_shared_keys(shared_pool: dict[str, list[Any]], rng: random.Random) -> 
     )
     shared_pool.setdefault(
         "saphr_id", list({rng.randint(1_000_000, 9_999_999) for _ in range(150)})
+    )
+    # ИНН — общий ключ между fact_outflow (часть PK) и uzp_data_epk_consolidation.
+    # Компактный пул гарантирует пересечение, чтобы INNER JOIN по inn возвращал строки.
+    shared_pool.setdefault(
+        "inn", list({rng.randint(1_000_000_000, 9_999_999_999) for _ in range(200)})
     )
 
 

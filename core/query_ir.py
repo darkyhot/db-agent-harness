@@ -145,6 +145,26 @@ class JoinConstraint(StrictModel):
     evidence: list[Evidence] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
+    @field_validator("key", mode="before")
+    @classmethod
+    def _normalize_key(cls, value: Any) -> str | None:
+        """Принять одноключевой join, сериализованный LLM как список.
+
+        Модель иногда отдаёт ``key: ["inn"]`` вместо ``key: "inn"``. Downstream
+        ключ всегда трактуется как имя одной колонки, поэтому разворачиваем
+        список в первый непустой элемент (составные ключи не поддерживаются).
+        """
+        if isinstance(value, list):
+            for item in value:
+                text = str(item).strip()
+                if text:
+                    return text
+            return None
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
 
 class ClarificationSpec(StrictModel):
     """Typed clarification contract shown to the user instead of guessing."""

@@ -128,14 +128,21 @@ def fetch_table_profile_sample(
     if not safe_columns:
         return pd.DataFrame()
 
-    projection = ", ".join(f'"{column}"' for column in safe_columns)
-    sql = (
-        f"SELECT {projection} "
-        f'FROM "{schema}"."{table}" '
-        f"ORDER BY random() "
-        f"LIMIT {int(sample_limit)}"
-    )
     try:
+        # Адаптивный сэмпл — безопасен для больших таблиц/вью (без ORDER BY
+        # random() на полном объёме). Кэш-путь рефреша его не дёргает (берёт
+        # уже собранную выборку), сюда попадает только не-кэшированный enrichment.
+        if hasattr(db_manager, "get_metadata_sample"):
+            return db_manager.get_metadata_sample(
+                schema, table, n=int(sample_limit), columns=safe_columns,
+            )
+        projection = ", ".join(f'"{column}"' for column in safe_columns)
+        sql = (
+            f"SELECT {projection} "
+            f'FROM "{schema}"."{table}" '
+            f"ORDER BY random() "
+            f"LIMIT {int(sample_limit)}"
+        )
         return db_manager.execute_query(sql, limit=sample_limit)
     except KerberosAuthError:
         raise

@@ -40,6 +40,63 @@ _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 # не прерывались преждевременно на уровне оркестрации.
 STATEMENT_TIMEOUT_MS = 600_000  # 600 секунд (10 минут)
 
+# Адаптивный сэмплинг метаданных. Для маленьких объектов (≤ порога) дёшева
+# честная случайная сортировка ORDER BY random(); для больших — она требует
+# полной сортировки с диск-спиллом и упирается в statement_timeout, поэтому
+# используем бессортировочный SELECT ... WHERE random() < p LIMIT n.
+SAMPLE_SORT_THRESHOLD = 2_000_000
+SAMPLE_OVERSAMPLE = 2.0
+# Когда EXPLAIN не дал оценку строк — считаем объект большим (консервативно),
+# чтобы не словить сортировку на огромной таблице/вью.
+SAMPLE_ASSUMED_ROWS_UNKNOWN = 10_000_000
+
+
+def build_metadata_sample_sql(
+    schema: str,
+    table: str,
+    n: int,
+    est_rows: int | None,
+    *,
+    columns: list[str] | None = None,
+    where: str | None = None,
+) -> str:
+    """Построить SQL для сэмпла метаданных по адаптивной стратегии.
+
+    Чистая функция (без БД) — выбирает стратегию по оценке числа строк est_rows:
+    - 0 < est ≤ SAMPLE_SORT_THRESHOLD → ORDER BY random() LIMIT :n (точная
+      случайная выборка, дёшево на небольших объектах);
+    - est > SAMPLE_SORT_THRESHOLD → WHERE random() < p LIMIT :n, где
+      p = min(1.0, SAMPLE_OVERSAMPLE * n / est) (без сортировки);
+    - est ≤ 0 / None → считаем большим, p из SAMPLE_ASSUMED_ROWS_UNKNOWN.
+
+    Идентификаторы валидируются вызывающей стороной (`_validate_identifier`);
+    `where` должен быть предварительно санитизирован. `n` остаётся плейсхолдером
+    `:n`, `p` форматируется числовым литералом.
+    """
+    projection = "*"
+    if columns:
+        safe_columns = [_validate_identifier(col, "column") for col in columns]
+        projection = ", ".join(f'"{col}"' for col in safe_columns)
+
+    sql = f'SELECT {projection} FROM "{schema}"."{table}"'
+    conditions: list[str] = []
+    if where:
+        conditions.append(where)
+
+    small = est_rows is not None and 0 < est_rows <= SAMPLE_SORT_THRESHOLD
+    if small:
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY random() LIMIT :n"
+        return sql
+
+    denom = est_rows if (est_rows is not None and est_rows > 0) else SAMPLE_ASSUMED_ROWS_UNKNOWN
+    p = min(1.0, SAMPLE_OVERSAMPLE * float(n) / float(denom))
+    conditions.append(f"random() < {p:.10g}")
+    sql += " WHERE " + " AND ".join(conditions)
+    sql += " LIMIT :n"
+    return sql
+
 
 def _has_top_level_limit(sql: str) -> bool:
     """Проверить наличие LIMIT на верхнем уровне SQL statement."""
@@ -523,6 +580,69 @@ class DatabaseManager:
         sql = text(sql_str)
         with self._connect() as conn:
             df = pd.read_sql(sql, conn, params={"n": n})
+        return df
+
+    def estimate_row_count(self, schema: str, table: str) -> int | None:
+        """Быстрая оценка числа строк через планировщик (работает и для вью).
+
+        `EXPLAIN (FORMAT JSON) SELECT * FROM obj` не выполняет запрос (только
+        планирует, мгновенно). Для вью планировщик раскрывает её и оценивает
+        строки по статистике базовых таблиц — в отличие от pg_class.reltuples,
+        который для вью всегда 0.
+
+        Returns:
+            Оценку строк (>0) либо None, если оценить не удалось.
+        """
+        schema = _validate_identifier(schema, "schema")
+        table = _validate_identifier(table, "table")
+        explain_sql = f'EXPLAIN (FORMAT JSON) SELECT * FROM "{schema}"."{table}"'
+        try:
+            with self._connect() as conn:
+                raw = conn.execute(text(explain_sql)).scalar()
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+            # payload: [{"Plan": {"Plan Rows": N, ...}}]
+            plan = payload[0]["Plan"]
+            rows = int(plan["Plan Rows"])
+            return rows if rows > 0 else None
+        except KerberosAuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "estimate_row_count: не удалось оценить %s.%s: %s",
+                schema, table, exc,
+            )
+            return None
+
+    def get_metadata_sample(
+        self,
+        schema: str,
+        table: str,
+        n: int = 100_000,
+        *,
+        columns: list[str] | None = None,
+        where: str | None = None,
+    ) -> pd.DataFrame:
+        """Адаптивный сэмпл для сбора метаданных, безопасный для больших объектов.
+
+        Выбирает стратегию заранее по оценке числа строк (EXPLAIN), не запуская
+        дорогую ORDER BY random() на больших таблицах/вью. См.
+        ``build_metadata_sample_sql``.
+        """
+        schema = _validate_identifier(schema, "schema")
+        table = _validate_identifier(table, "table")
+        if not isinstance(n, int) or n < 1:
+            raise ValueError(f"Недопустимое значение n: {n}")
+        est = self.estimate_row_count(schema, table)
+        sql_str = build_metadata_sample_sql(
+            schema, table, n, est, columns=columns, where=where,
+        )
+        strategy = "sort_random" if "ORDER BY random()" in sql_str else "random_filter"
+        logger.info(
+            "get_metadata_sample %s.%s: strategy=%s est=%s n=%d",
+            schema, table, strategy, est, n,
+        )
+        with self._connect() as conn:
+            df = pd.read_sql(text(sql_str), conn, params={"n": n})
         return df
 
     def table_exists(self, schema: str, table: str) -> bool:

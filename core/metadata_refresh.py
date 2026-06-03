@@ -320,6 +320,11 @@ class MetadataRefreshService:
         return schema in ALLOWED_SCHEMAS
 
     def _get_sample_df(self, schema: str, table: str) -> pd.DataFrame:
+        # Адаптивный сэмпл: на больших таблицах/вью ORDER BY random() требует
+        # полной сортировки и упирается в statement_timeout — get_metadata_sample
+        # выбирает бессортировочную стратегию по EXPLAIN-оценке размера.
+        if hasattr(self.db, "get_metadata_sample"):
+            return self.db.get_metadata_sample(schema, table, n=self.sample_limit)
         if hasattr(self.db, "get_random_sample"):
             return self.db.get_random_sample(schema, table, n=self.sample_limit)
         sql = f'SELECT * FROM "{schema}"."{table}" ORDER BY random() LIMIT {self.sample_limit}'

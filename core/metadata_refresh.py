@@ -374,7 +374,17 @@ class MetadataRefreshService:
             )
             return (src_comment, src_columns_map)
 
-        redirect = schema == SN_UZP_SCHEMA and self._table_exists(SN_UZP_VIEW_SCHEMA, table)
+        # Существование вью-источника комментариев проверяем по каталогу
+        # (pg_class), а не через information_schema: у агента может не быть GRANT
+        # на объекты sn_view, но комментарии читаемы из каталога. Fallback на
+        # _table_exists — для стабов/совместимости.
+        _catalog_exists = getattr(self.db, "relation_exists_in_catalog", None)
+        view_exists = (
+            _catalog_exists(SN_UZP_VIEW_SCHEMA, table)
+            if callable(_catalog_exists)
+            else self._table_exists(SN_UZP_VIEW_SCHEMA, table)
+        )
+        redirect = schema == SN_UZP_SCHEMA and view_exists
         logger.info(
             "MetadataRefresh: _get_comment_bundle %s.%s — view-redirect=%s (целевая view-схема %s)",
             schema, table, redirect, SN_UZP_VIEW_SCHEMA,

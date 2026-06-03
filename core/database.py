@@ -665,6 +665,29 @@ class DatabaseManager:
             result = conn.execute(text(sql), {"schema": schema, "table": table})
             return result.scalar()
 
+    def relation_exists_in_catalog(self, schema: str, table: str) -> bool:
+        """Проверить существование отношения по системному каталогу.
+
+        В отличие от ``table_exists`` (information_schema, фильтруется по
+        привилегиям), читает pg_class/pg_namespace напрямую — объект виден даже
+        без табличных GRANT. Нужно для редиректа комментариев на view-схему, где
+        у агента нет прав на сами объекты, но комментарии читаемы из каталога.
+        Покрывает таблицы (r), вью (v), matview (m), партиции (p), foreign (f).
+        """
+        schema = _validate_identifier(schema, "schema")
+        table = _validate_identifier(table, "table")
+        sql = """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = :schema AND c.relname = :table
+                  AND c.relkind IN ('r', 'v', 'm', 'p', 'f')
+            )
+        """
+        with self._connect() as conn:
+            result = conn.execute(text(sql), {"schema": schema, "table": table})
+            return bool(result.scalar())
+
     def get_table_ddl(self, schema: str, table: str) -> str:
         """Получить DDL (структуру) таблицы через information_schema.
 

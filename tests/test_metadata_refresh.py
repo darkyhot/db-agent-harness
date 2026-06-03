@@ -723,3 +723,53 @@ def test_generate_table_description_uses_exact_few_shot_without_llm(tmp_path):
 
     assert result == "Известное описание таблицы"
     assert llm.calls == []
+
+
+class _PrivlessViewStubDB(StubDB):
+    """information_schema видит только uzp-объект (нет GRANT на sn_view),
+    но системный каталог видит вью-источник комментариев."""
+
+    catalog_sees_view = True
+
+    def table_exists(self, schema, table):
+        return schema == "s_grnplm_ld_salesntwrk_pcap_sn_uzp"
+
+    def relation_exists_in_catalog(self, schema, table):
+        if schema == "s_grnplm_as_salesntwrk_pcap_sn_view":
+            return self.catalog_sees_view
+        return True
+
+
+def _run_add_orders(tmp_path, monkeypatch, db):
+    loader = SchemaLoader(data_dir=tmp_path)
+    loader.replace_catalog(
+        pd.DataFrame(columns=["schema_name", "table_name", "description", "grain"]),
+        pd.DataFrame(columns=[
+            "schema_name", "table_name", "column_name", "dType",
+            "is_not_null", "description", "is_primary_key",
+            "not_null_perc", "unique_perc",
+            "foreign_key_target", "sample_values", "partition_key",
+        ]),
+    )
+    monkeypatch.setattr("core.metadata_refresh.inspect", lambda engine: StubInspector())
+    service = MetadataRefreshService(
+        loader, db, StubLLM(), targets_path=tmp_path / "metadata_targets.yaml",
+    )
+    service.add_targets(["s_grnplm_ld_salesntwrk_pcap_sn_uzp.orders"])
+    return pd.read_csv(tmp_path / "attr_list.csv")
+
+
+def test_comment_redirect_uses_catalog_when_information_schema_hides_view(tmp_path, monkeypatch):
+    """Вью-источник не виден в information_schema (нет GRANT), но каталог его
+    видит → редирект всё равно срабатывает и тянет комментарии вью."""
+    attrs_df = _run_add_orders(tmp_path, monkeypatch, _PrivlessViewStubDB())
+    assert set(attrs_df["description"]) == {"ID из view", "Флаг из view"}
+
+
+def test_comment_redirect_skipped_when_catalog_also_misses_view(tmp_path, monkeypatch):
+    """Контроль: если и каталог не видит вью — редиректа нет, описания humanize."""
+    db = _PrivlessViewStubDB()
+    db.catalog_sees_view = False
+    attrs_df = _run_add_orders(tmp_path, monkeypatch, db)
+    # без редиректа комментарии не подтянулись → humanize ("id", "flag")
+    assert set(attrs_df["description"]) == {"id", "flag"}

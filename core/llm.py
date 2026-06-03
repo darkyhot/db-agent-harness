@@ -47,6 +47,12 @@ class RateLimitedLLM:
     MAX_RETRIES: int = 5
     MAX_CACHED_TEMPERATURES: int = 3
 
+    # finish_reason, при которых ответ модели стоит повторить (не исключение, а
+    # HTTP 200 с блокировкой контента). `blacklist` — контент-фильтр GigaChat,
+    # известен флакообразностью: повтор того же промпта часто проходит.
+    # `length`/`stop`/`function_call` сюда не входят — повтор там бессмыслен.
+    _RETRYABLE_FINISH_REASONS: frozenset = frozenset({"blacklist"})
+
     # Глобальные (на уровень класса) поля rate-limit — чтобы несколько
     # инстансов разделяли один таймер.
     _global_last_call_time: float = 0.0
@@ -132,6 +138,26 @@ class RateLimitedLLM:
             try:
                 RateLimitedLLM._global_last_call_time = time.time()
                 response = llm.invoke(messages)
+                finish_reason = ""
+                try:
+                    finish_reason = str(
+                        (getattr(response, "response_metadata", None) or {}).get(
+                            "finish_reason", ""
+                        )
+                    ).lower()
+                except Exception:
+                    finish_reason = ""
+                if (
+                    finish_reason in self._RETRYABLE_FINISH_REASONS
+                    and attempt < self.MAX_RETRIES
+                ):
+                    logger.warning(
+                        "LLM: генерация заблокирована (finish_reason=%s), попытка "
+                        "%d/%d — жду %.1fс и повторяю",
+                        finish_reason, attempt, self.MAX_RETRIES, self.MIN_INTERVAL,
+                    )
+                    time.sleep(self.MIN_INTERVAL)
+                    continue
                 logger.info("LLM ответ получен (попытка %d)", attempt)
                 logger.info("LLM полный ответ:\n%s", response.content)
                 return response.content

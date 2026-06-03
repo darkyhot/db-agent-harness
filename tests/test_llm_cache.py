@@ -142,3 +142,87 @@ class TestGlobalRateLimit:
             with patch("core.llm.time.sleep") as mock_sleep:
                 rllm._wait_for_rate_limit()
                 assert not mock_sleep.called
+
+
+class _Resp:
+    """Минимальный аналог langchain AIMessage."""
+
+    def __init__(self, content: str, finish_reason: str | None = None):
+        self.content = content
+        if finish_reason is not None:
+            self.response_metadata = {"finish_reason": finish_reason}
+
+
+def _make_rllm_with_responses(responses):
+    """RateLimitedLLM, чей GigaChat.invoke поочерёдно отдаёт responses.
+
+    time.sleep замокан (без реальных пауз). Возвращает (rllm, calls-list).
+    """
+    from core import llm as llm_module
+
+    calls = []
+
+    class _FakeGiga:
+        def __init__(self, **kwargs):
+            pass
+
+        def invoke(self, messages):
+            calls.append(messages)
+            return responses[min(len(calls) - 1, len(responses) - 1)]
+
+    ctx = patch.object(llm_module, "GigaChat", _FakeGiga)
+    ctx.start()
+    llm_module.RateLimitedLLM._global_last_call_time = 0.0
+    rllm = llm_module.RateLimitedLLM()
+    return rllm, calls, ctx
+
+
+class TestBlacklistRetry:
+    def test_blacklist_then_success_retries_and_returns_good_content(self):
+        responses = [
+            _Resp("отписка про мнение моделей", finish_reason="blacklist"),
+            _Resp("реальная таблица с данными", finish_reason="stop"),
+        ]
+        rllm, calls, ctx = _make_rllm_with_responses(responses)
+        try:
+            with patch("core.llm.time.sleep"):
+                out = rllm.invoke("prompt")
+        finally:
+            ctx.stop()
+        assert out == "реальная таблица с данными"
+        assert len(calls) == 2
+
+    def test_persistent_blacklist_returns_content_after_max_retries(self):
+        responses = [_Resp("отписка", finish_reason="blacklist")]
+        rllm, calls, ctx = _make_rllm_with_responses(responses)
+        try:
+            with patch("core.llm.time.sleep"):
+                out = rllm.invoke("prompt")
+        finally:
+            ctx.stop()
+        # Исчерпали попытки — вернулся последний content, без зацикливания.
+        assert out == "отписка"
+        assert len(calls) == rllm.MAX_RETRIES
+
+    def test_stop_finish_reason_does_not_retry(self):
+        responses = [_Resp("ответ", finish_reason="stop")]
+        rllm, calls, ctx = _make_rllm_with_responses(responses)
+        try:
+            with patch("core.llm.time.sleep"):
+                out = rllm.invoke("prompt")
+        finally:
+            ctx.stop()
+        assert out == "ответ"
+        assert len(calls) == 1
+
+    def test_message_without_response_metadata_returns_content(self):
+        # Регрессия: старые ответы без response_metadata не должны падать.
+        responses = [_Resp("ответ без метаданных")]
+        rllm, calls, ctx = _make_rllm_with_responses(responses)
+        try:
+            with patch("core.llm.time.sleep"):
+                out = rllm.invoke("prompt")
+        finally:
+            ctx.stop()
+        assert out == "ответ без метаданных"
+        assert len(calls) == 1

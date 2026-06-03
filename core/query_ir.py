@@ -163,11 +163,36 @@ class JoinConstraint(StrictModel):
             value = data.get(side)
             if not isinstance(value, dict):
                 continue
-            table = value.get("table") or value.get("name") or value.get("source")
+            table = (
+                value.get("table")
+                or value.get("canonical")
+                or value.get("name")
+                or value.get("source")
+            )
             column = value.get("column") or value.get("col") or value.get("field")
             data[side] = str(table).strip() if table not in (None, "") else None
             if column and data.get("key") in (None, "", []):
                 data["key"] = column
+        # key как объект {"left_column": "inn", "right_column": "inn"} —
+        # модель иногда сериализует ключ структурой. Сводим к одной колонке:
+        # при совпадении сторон берём её, иначе left_column (downstream join
+        # всюду одноключевой — обе стороны связываются по одному имени).
+        key_val = data.get("key")
+        if isinstance(key_val, dict):
+            left_col = key_val.get("left_column")
+            right_col = key_val.get("right_column")
+            if left_col and right_col and str(left_col).strip() == str(right_col).strip():
+                data["key"] = left_col
+            else:
+                data["key"] = (
+                    left_col
+                    or right_col
+                    or key_val.get("column")
+                    or key_val.get("col")
+                    or key_val.get("field")
+                    or key_val.get("key")
+                    or key_val.get("name")
+                )
         return data
 
     @field_validator("key", mode="before")

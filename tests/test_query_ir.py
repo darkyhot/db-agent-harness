@@ -167,6 +167,45 @@ def test_query_spec_normalizes_object_join_sides():
     assert jc2.key == "inn"
 
 
+def test_query_spec_coerces_dict_join_key():
+    # GigaChat (живой прогон #29) отдал ключ объектом
+    # {"left_column": "inn", "right_column": "inn"}, а стороны — {name, canonical}.
+    # Раньше key стрингифицировался в "{'left_column': ...}" → inn терялся.
+    base = {
+        "task": "answer_data",
+        "strategy": "aggregate",
+        "metrics": [{"operation": "sum", "target": "outflow_qty", "confidence": 1.0}],
+        "dimensions": [{"target": "report_dt", "confidence": 1.0}],
+        "filters": [],
+        "clarification_needed": False,
+        "confidence": 1.0,
+    }
+    payload = {**base, "join_constraints": [{
+        "left": {"name": "отток", "canonical": "uzp_dwh_fact_outflow"},
+        "right": {"name": "сегмент", "canonical": "uzp_data_epk_consolidation"},
+        "key": {"left_column": "inn", "right_column": "inn"},
+        "confidence": 1.0,
+    }]}
+    spec, errors = QuerySpec.from_dict(payload)
+    assert errors == []
+    assert spec is not None
+    jc = spec.join_constraints[0]
+    assert jc.key == "inn"
+    # стороны разворачиваются в canonical-таблицы
+    assert jc.left == "uzp_dwh_fact_outflow"
+    assert jc.right == "uzp_data_epk_consolidation"
+
+    # Несовпадающие колонки → берём left_column (downstream одноключевой).
+    diff = {**base, "join_constraints": [
+        {"left": "a", "right": "b", "key": {"left_column": "fk_id", "right_column": "id"},
+         "confidence": 1.0}
+    ]}
+    spec2, errors2 = QuerySpec.from_dict(diff)
+    assert errors2 == []
+    assert spec2 is not None
+    assert spec2.join_constraints[0].key == "fk_id"
+
+
 def test_query_interpreter_strips_unstated_physical_hints():
     spec, errors = QuerySpec.from_dict({
         "task": "answer_data",

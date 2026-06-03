@@ -250,6 +250,87 @@ def test_explicit_dim_source_binds_segment_from_epk_not_fact():
     assert "segment_name" in epk_group_by, selected
     assert "segment_name" not in fact_group_by, selected
 
+    # bind_columns обязан выдать ЯВНЫЙ join по inn (иначе SqlWriter без правила
+    # JOIN галлюцинирует ключ → row explosion; см. живой прогон #29).
+    join_spec = bound["join_spec"]
+    assert join_spec, "bind_columns должен вернуть explicit join_spec для пина"
+    jc = join_spec[0]
+    assert jc["left"] == f"{FACT_OUTFLOW}.inn"
+    assert jc["right"] == f"{EPK}.inn"
+    # EPK.inn не уникален → safe=False → билдер сделает DISTINCT ON.
+    assert jc["safe"] is False
+
+    # Детерминированный билдер собирает чистый SQL без LLM: DISTINCT ON (inn),
+    # группировка по report_dt+segment_name, без галлюцинированного segment_id.
+    blueprint = build_blueprint(
+        spec.to_legacy_intent(),
+        selected,
+        join_spec,
+        table_types,
+        {},
+        user_input="Посчитай сумму оттока по дате и сегменту",
+        user_hints=spec.to_legacy_user_hints(),
+        schema_loader=loader,
+        semantic_frame={},
+    )
+    assert blueprint["strategy"] == "fact_dim_join"
+    sql = SqlBuilder().build(
+        blueprint["strategy"], selected, join_spec, blueprint, table_types,
+    )
+    assert sql is not None
+    norm = " ".join(sql.split()).upper()
+    assert "DISTINCT ON (INN)" in norm, sql
+    assert "SUM(" in norm and "OUTFLOW_QTY" in norm
+    assert "REPORT_DT" in norm and "SEGMENT_NAME" in norm
+    assert "SEGMENT_ID" not in norm, sql
+    assert norm.count(" JOIN ") == 1, sql
+
+
+def test_explicit_join_recovers_inn_from_dict_key_shape():
+    """Живой прогон #29: GigaChat отдал join key объектом, стороны — объектами.
+
+    key={'left_column':'inn','right_column':'inn'}, left/right={name,canonical}.
+    Раньше key стрингифицировался в мусор → inn терялся → пустой join_spec →
+    LLM галлюцинировал segment_id. Проверяем извлечение inn end-to-end.
+    """
+    loader = _loader()
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "strategy": "aggregate",
+        "metrics": [{"operation": "sum", "target": "outflow_qty", "confidence": 1.0}],
+        "dimensions": [
+            {"target": "report_dt", "confidence": 1.0},
+            {"target": "segment_name", "source_table": EPK, "confidence": 1.0},
+        ],
+        "join_constraints": [{
+            "left": {"name": "отток", "canonical": "uzp_dwh_fact_outflow"},
+            "right": {"name": "сегмент", "canonical": "uzp_data_epk_consolidation"},
+            "key": {"left_column": "inn", "right_column": "inn"},
+            "confidence": 1.0,
+        }],
+        "clarification_needed": False,
+        "confidence": 1.0,
+    })
+    assert spec is not None, errors
+    assert spec.join_constraints[0].key == "inn"
+
+    tables = [FACT_OUTFLOW, EPK]
+    table_structures = {t: loader.get_table_info(*t.split(".", 1)) for t in tables}
+    table_types = {
+        t: detect_table_type(t.split(".", 1)[1], loader.get_table_columns(*t.split(".", 1)))
+        for t in tables
+    }
+    bound = bind_columns(
+        query_spec=spec,
+        table_structures=table_structures,
+        table_types=table_types,
+        schema_loader=loader,
+    )
+    assert bound is not None
+    join_spec = bound["join_spec"]
+    assert join_spec and join_spec[0]["left"] == f"{FACT_OUTFLOW}.inn"
+    assert join_spec[0]["right"] == f"{EPK}.inn"
+
 
 def test_implicit_outflow_segment_uses_more_complete_joinable_dimension_source():
     loader = _loader()

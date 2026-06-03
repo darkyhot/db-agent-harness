@@ -51,7 +51,13 @@ def bind_columns(
             and len(result["selected_columns"]) >= 2
             and not result.get("join_spec")
         ):
-            result["join_spec"] = _derive_join_spec_from_pk(
+            # Сначала — явный ключ пользователя («сегмент возьми в T по инн»):
+            # PK-вывод не срабатывает, когда dim-таблица unknown-типа (как
+            # консолидированная витрина), а ключ задан явно в QuerySpec.
+            explicit = _explicit_join_spec_from_spec(
+                spec, result["selected_columns"], table_types, schema_loader
+            )
+            result["join_spec"] = explicit or _derive_join_spec_from_pk(
                 result["selected_columns"], table_types, schema_loader
             )
         return result
@@ -206,6 +212,91 @@ def _derive_join_spec_from_pk(
                 dim, fact, len(pairs), safe,
             )
     return join_spec
+
+
+def _explicit_join_spec_from_spec(
+    spec: QuerySpec,
+    selected_columns: dict[str, dict[str, list[str]]],
+    table_types: dict[str, str],
+    schema_loader: Any,
+) -> list[dict[str, Any]]:
+    """Построить join_spec из ЯВНОГО ключа пользователя («X возьми в T по инн»).
+
+    ``_derive_join_spec_from_pk`` молчит, когда dim-таблица unknown-типа (напр.
+    консолидированная витрина) — у неё нет fact↔dim сигнатуры по типу. Но если
+    измерение явно привязано к таблице (``dim.source_table``) и задан join-ключ
+    (``join_constraints[*].key`` или ``dim.join_key``), строим пару напрямую:
+    ``fact.key = dim.key``. safe=False по умолчанию (→ DISTINCT ON дедуп в
+    билдере), кроме случая, когда ключ — это весь PK справочника.
+    """
+    # Ключ join: явный из QuerySpec.
+    key = next(
+        (str(jc.key).strip() for jc in spec.join_constraints if jc.key),
+        None,
+    )
+    if not key:
+        key = next(
+            (str(d.join_key).strip() for d in spec.dimensions if getattr(d, "join_key", None)),
+            None,
+        )
+    if not key:
+        return []
+
+    # Пин-таблица измерения (dim) и парная ей fact-таблица.
+    pinned = next(
+        (str(d.source_table).strip() for d in spec.dimensions if getattr(d, "source_table", None)),
+        None,
+    )
+    dim_key = _restrict_to_source_table(selected_columns, pinned)
+    if not dim_key:
+        return []
+    dim_table = next(iter(dim_key))
+
+    def _has_column(table_key: str, col: str) -> bool:
+        parts = table_key.split(".", 1)
+        if len(parts) != 2:
+            return False
+        cols_df = schema_loader.get_table_columns(parts[0], parts[1])
+        if cols_df is None or cols_df.empty:
+            return False
+        return col.lower() in {c.lower() for c in cols_df["column_name"].tolist()}
+
+    if not _has_column(dim_table, key):
+        return []
+
+    # fact — другая выбранная таблица, в которой тоже есть ключ.
+    fact_table = next(
+        (
+            t for t in selected_columns
+            if t != dim_table and _has_column(t, key)
+        ),
+        None,
+    )
+    if not fact_table:
+        return []
+
+    # safe=True только если ключ — это ровно весь PK справочника (тогда дедуп не
+    # нужен); иначе False → билдер сделает DISTINCT ON по ключу.
+    safe = False
+    parts = dim_table.split(".", 1)
+    if len(parts) == 2:
+        dim_cols = schema_loader.get_table_columns(parts[0], parts[1])
+        if dim_cols is not None and not dim_cols.empty and "is_primary_key" in dim_cols.columns:
+            pk_cols = dim_cols.loc[
+                dim_cols["is_primary_key"].astype(bool), "column_name"
+            ].tolist()
+            safe = len(pk_cols) == 1 and pk_cols[0].lower() == key.lower()
+
+    logger.info(
+        "ColumnBinding: explicit join_spec %s.%s = %s.%s (safe=%s)",
+        fact_table, key, dim_table, key, safe,
+    )
+    return [{
+        "left": f"{fact_table}.{key}",
+        "right": f"{dim_table}.{key}",
+        "safe": safe,
+        "strategy": "fact_dim_join",
+    }]
 
 
 def _bind_metric_dimension_columns(

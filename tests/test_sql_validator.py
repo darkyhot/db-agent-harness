@@ -515,3 +515,47 @@ class TestValidateReadThresholds:
         v = SQLValidator(db)
         result = v.validate("SELECT * FROM hr.emp e CROSS JOIN hr.dept WHERE 1=1")
         assert result.is_valid is False
+
+
+class TestValidateKerberosPropagation:
+    """Протухший Kerberos-тикет на EXPLAIN не должен глотаться в строковую ошибку."""
+
+    def test_kerberos_auth_error_propagates(self):
+        from core.exceptions import KerberosAuthError, KERBEROS_USER_MESSAGE
+
+        db = _MockDB()
+
+        def _raise(_sql):
+            raise KerberosAuthError(KERBEROS_USER_MESSAGE)
+
+        db.explain_query = _raise
+        v = SQLValidator(db)
+        with pytest.raises(KerberosAuthError):
+            v.validate("SELECT * FROM hr.emp WHERE id = 1")
+
+    def test_generic_kerberos_marker_wrapped_and_propagated(self):
+        from psycopg2 import OperationalError
+
+        from core.exceptions import KerberosAuthError
+
+        db = _MockDB()
+
+        def _raise(_sql):
+            raise OperationalError("FATAL: GSS authentication failed for user")
+
+        db.explain_query = _raise
+        v = SQLValidator(db)
+        with pytest.raises(KerberosAuthError):
+            v.validate("SELECT * FROM hr.emp WHERE id = 1")
+
+    def test_non_kerberos_explain_error_still_string(self):
+        db = _MockDB()
+
+        def _raise(_sql):
+            raise RuntimeError("relation does not exist")
+
+        db.explain_query = _raise
+        v = SQLValidator(db)
+        result = v.validate("SELECT * FROM hr.nope WHERE id = 1")
+        assert result.is_valid is False
+        assert any("Синтаксическая ошибка (EXPLAIN)" in e for e in result.errors)

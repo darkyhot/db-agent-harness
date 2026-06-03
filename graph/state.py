@@ -19,6 +19,9 @@ class AgentState(TypedDict):
     current_step: int
     tool_calls: list
     last_error: str | None
+    # Не-ретраябельная (фатальная) ошибка — например, протухший Kerberos-тикет.
+    # Установка короткозамыкает граф в summarizer без цикла исправлений.
+    fatal_error: str
     retry_count: int
     # Direction 6.5: суммарный счётчик retry через все replan-итерации.
     # retry_count сбрасывается при replanning (локальный счётчик шага),

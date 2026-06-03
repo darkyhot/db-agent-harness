@@ -277,7 +277,7 @@ class OrchestratorNodes:
         # summarize/finish без готового answer привёл бы к outer-summarizer с
         # пустым контекстом и LLM-ответу "Данных недостаточно". Безопасно
         # деградируем в аналитику.
-        if step in ("summarize", "finish") and not answer:
+        if step in ("summarize", "finish"):
             has_real_work = any(
                 h.get("step") in (
                     "execute_sql", "run_analytics",
@@ -285,10 +285,23 @@ class OrchestratorNodes:
                 ) and h.get("ok")
                 for h in history
             )
-            if not has_real_work:
+            if step == "summarize" and not has_real_work:
+                # summarize означает «сформировать ответ по работе ТЕКУЩЕГО хода».
+                # Если работы нет, а answer всё же пришёл — это эхо предыдущего
+                # ответа из сессионной памяти (новый вопрос → orch_history пуст).
+                # Деградируем в аналитику и отбрасываем эхо, чтобы оно не утекло
+                # в final_answer ниже.
                 logger.warning(
-                    "Orchestrator: '%s' без выполненной работы в orch_history → run_analytics",
-                    step,
+                    "Orchestrator: summarize без выполненной работы в текущем ходе → "
+                    "run_analytics (отбрасываю возможное эхо прошлого ответа)",
+                )
+                step = "run_analytics"
+                answer = ""
+            elif step == "finish" and not answer and not has_real_work:
+                # finish без answer и без работы привёл бы к outer-summarizer с
+                # пустым контекстом → «Данных недостаточно». Безопасно в аналитику.
+                logger.warning(
+                    "Orchestrator: finish без answer и без работы в текущем ходе → run_analytics",
                 )
                 step = "run_analytics"
 

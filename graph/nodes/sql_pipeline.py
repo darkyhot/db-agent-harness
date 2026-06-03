@@ -13,6 +13,7 @@ import re
 import time
 from typing import Any
 
+from core.exceptions import KerberosAuthError
 from core.confidence import (
     build_fallback_policy,
     build_planning_confidence,
@@ -2163,7 +2164,21 @@ class SqlPipelineNodes:
             return {"sql_to_validate": None, "pending_sql_tool_call": None}
 
         logger.info("Validator: проверка SQL: %s", summarize_sql(sql))
-        result = self.validator.validate(sql)
+        try:
+            result = self.validator.validate(sql)
+        except KerberosAuthError as e:
+            # Протухший Kerberos-тикет на этапе EXPLAIN — фатально и
+            # не-ретраябельно: помечаем fatal_error, граф уходит в summarizer.
+            logger.error("Validator: Kerberos-тикет протух — фатальная ошибка")
+            return {
+                "fatal_error": str(e),
+                "last_error": str(e),
+                "sql_to_validate": None,
+                "pending_sql_tool_call": None,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": str(e)}
+                ],
+            }
 
         # Требуется подтверждение пользователя
         if result.needs_confirmation:
@@ -2214,7 +2229,20 @@ class SqlPipelineNodes:
             tool_args = {"sql": sql}
 
         t0 = time.monotonic()
-        tool_result = self._call_tool(tool_name, tool_args)
+        try:
+            tool_result = self._call_tool(tool_name, tool_args)
+        except KerberosAuthError as e:
+            # Тикет протух уже при выполнении SQL — фатально, без ретраев.
+            logger.error("Validator: Kerberos-тикет протух при выполнении — фатально")
+            return {
+                "fatal_error": str(e),
+                "last_error": str(e),
+                "sql_to_validate": None,
+                "pending_sql_tool_call": None,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": str(e)}
+                ],
+            }
         duration_ms = int((time.monotonic() - t0) * 1000)
         exec_result = str(tool_result)
         structured_payload = None

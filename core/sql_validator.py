@@ -7,6 +7,11 @@ from typing import Any
 
 import sqlparse
 
+from core.exceptions import (
+    KERBEROS_USER_MESSAGE,
+    KerberosAuthError,
+    is_kerberos_auth_error,
+)
 from core.log_safety import summarize_sql
 
 logger = logging.getLogger(__name__)
@@ -653,7 +658,13 @@ class SQLValidator:
         try:
             plan = self._db.explain_query(sql)
             result.explain_plan = plan
+        except KerberosAuthError:
+            # Протухший тикет — не-ретраябельно: пробрасываем наверх, чтобы
+            # узел-валидатор пометил fatal_error и короткозамкнул граф.
+            raise
         except Exception as e:
+            if is_kerberos_auth_error(e):
+                raise KerberosAuthError(KERBEROS_USER_MESSAGE) from e
             result.add_error(f"Синтаксическая ошибка (EXPLAIN): {e}")
             return
 
@@ -825,7 +836,13 @@ class SQLValidator:
         try:
             plan = self._db.explain_query(sql)
             result.explain_plan = plan
+        except KerberosAuthError:
+            # Протухший тикет — не-ретраябельно: пробрасываем наверх, чтобы
+            # узел-валидатор пометил fatal_error и короткозамкнул граф.
+            raise
         except Exception as e:
+            if is_kerberos_auth_error(e):
+                raise KerberosAuthError(KERBEROS_USER_MESSAGE) from e
             result.add_error(f"Синтаксическая ошибка (EXPLAIN): {e}")
             return
 

@@ -12,6 +12,11 @@ import time
 from typing import Any
 
 from core.column_binding import bind_columns, derive_entity_flag_filters
+from core.exceptions import (
+    KERBEROS_USER_MESSAGE,
+    KerberosAuthError,
+    is_kerberos_auth_error,
+)
 from core.join_analysis import detect_table_type, format_join_analysis
 from core.join_selection import normalize_join_spec
 from core.query_ir import QuerySpec
@@ -474,6 +479,24 @@ class ExplorerNodes:
                         sample_text = sample_df.to_markdown(index=False)
                     self._sample_cache[cache_key] = (time.monotonic(), sample_text)
                 except Exception as e:
+                    if isinstance(e, KerberosAuthError) or is_kerberos_auth_error(e):
+                        # Протухший Kerberos-тикет — фатально и не-ретраябельно.
+                        # Не строим/не показываем план: короткозамыкаем граф в
+                        # summarizer с понятным сообщением про kinit.
+                        logger.error(
+                            "TableExplorer: Kerberos-тикет протух — фатальная ошибка, "
+                            "прерываю прогон",
+                        )
+                        return {
+                            "fatal_error": KERBEROS_USER_MESSAGE,
+                            "last_error": KERBEROS_USER_MESSAGE,
+                            "tables_context": "",
+                            "table_structures": {},
+                            "table_samples": {},
+                            "table_types": {},
+                            "join_analysis_data": {},
+                            "explorer_error": {"type": "kerberos", "message": KERBEROS_USER_MESSAGE},
+                        }
                     logger.warning(
                         "TableExplorer: ошибка семпла %s.%s: %s",
                         schema_name, table_name, e,

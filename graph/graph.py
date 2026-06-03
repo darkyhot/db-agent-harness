@@ -53,6 +53,10 @@ def _is_timed_out(state: AgentState) -> bool:
 
 def _check_limits(state: AgentState) -> str | None:
     """Общая проверка лимитов. Возвращает 'summarizer' если лимит достигнут."""
+    if state.get("fatal_error"):
+        # Фатальная (не-ретраябельная) ошибка — короткозамыкаем в summarizer,
+        # минуя цикл исправлений и любые DB-узлы.
+        return "summarizer"
     if state.get("graph_iterations", 0) >= MAX_GRAPH_ITERATIONS:
         logger.warning("Достигнут лимит итераций графа (%d)", MAX_GRAPH_ITERATIONS)
         return "summarizer"
@@ -192,6 +196,11 @@ def _route_after_validator(state: AgentState) -> str:
 
     if state.get("needs_clarification"):
         return END
+
+    if state.get("fatal_error"):
+        # Фатальная ошибка (напр. Kerberos) — сразу в summarizer, без цикла
+        # исправлений.
+        return "summarizer"
 
     if _is_timed_out(state):
         return "summarizer"
@@ -706,6 +715,7 @@ def create_initial_state(
         current_step=0,
         tool_calls=[],
         last_error=None,
+        fatal_error="",
         retry_count=0,
         total_retry_count=0,
         sql_to_validate=None,

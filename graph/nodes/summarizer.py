@@ -142,6 +142,20 @@ class SummarizerNodes:
 
     def summarizer(self, state: AgentState) -> dict[str, Any]:
         """Узел формирования финального ответа пользователю."""
+        # Фатальная (не-ретраябельная) ошибка — напр. протухший Kerberos-тикет.
+        # Показываем её как основной ответ (про kinit), не зарывая в SQL-only
+        # вывод и без попытки что-либо доформулировать через LLM.
+        fatal = str(state.get("fatal_error") or "").strip()
+        if fatal:
+            self.memory.add_message("assistant", fatal)
+            logger.warning("Summarizer: фатальная ошибка — возвращаю её как ответ: %s", fatal)
+            return {
+                "final_answer": fatal,
+                "messages": state["messages"] + [
+                    {"role": "assistant", "content": fatal}
+                ],
+            }
+
         # Сохраняем примеры исправлений в долгосрочную память
         new_examples = state.get("correction_examples", [])
         if new_examples:

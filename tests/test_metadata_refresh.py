@@ -543,6 +543,72 @@ def test_metadata_service_add_targets_rebuilds_few_shots_without_scanning_manife
     assert any(item["column_name"] == "id" and item["description"] == "ID из view" for item in column_few_shots["columns"])
 
 
+def _attr_row(table: str, column: str, description: str) -> dict:
+    return {
+        "schema_name": "dm",
+        "table_name": table,
+        "column_name": column,
+        "dType": "bigint",
+        "is_not_null": True,
+        "description": description,
+        "is_primary_key": False,
+        "not_null_perc": 100.0,
+        "unique_perc": 100.0,
+        "foreign_key_target": "",
+        "sample_values": "",
+        "partition_key": False,
+    }
+
+
+def _few_shots_service(tmp_path):
+    loader = SchemaLoader(data_dir=tmp_path)
+    return MetadataRefreshService(
+        loader, StubDB(), StubLLM(), targets_path=tmp_path / "metadata_targets.yaml",
+    )
+
+
+def test_rebuild_few_shots_accumulates_across_refreshes(tmp_path):
+    """Описания из прошлого рефреша сохраняются, даже если объекта уже нет в каталоге."""
+    service = _few_shots_service(tmp_path)
+
+    # Первый рефреш: clients
+    service._rebuild_few_shot_files(
+        pd.DataFrame([{"schema_name": "dm", "table_name": "clients", "description": "Клиенты", "grain": ""}]),
+        pd.DataFrame([_attr_row("clients", "client_id", "Идентификатор клиента")]),
+    )
+    # Второй рефреш: только orders, clients ушёл из каталога
+    service._rebuild_few_shot_files(
+        pd.DataFrame([{"schema_name": "dm", "table_name": "orders", "description": "Заказы", "grain": ""}]),
+        pd.DataFrame([_attr_row("orders", "order_id", "Идентификатор заказа")]),
+    )
+
+    tf = yaml.safe_load((tmp_path / "table_description_few_shots.yaml").read_text(encoding="utf-8"))
+    cf = yaml.safe_load((tmp_path / "column_description_few_shots.yaml").read_text(encoding="utf-8"))
+    table_names = {item["table_name"] for item in tf["tables"]}
+    column_names = {item["column_name"] for item in cf["columns"]}
+    # Накопление: и старые (clients/client_id), и новые (orders/order_id).
+    assert {"clients", "orders"} <= table_names
+    assert {"client_id", "order_id"} <= column_names
+
+
+def test_rebuild_few_shots_keeps_existing_description_on_conflict(tmp_path):
+    """При совпадении ключа накопленное описание не перетирается новым."""
+    (tmp_path / "column_description_few_shots.yaml").write_text(
+        "columns:\n- column_name: status\n  description: СТАРОЕ описание\n",
+        encoding="utf-8",
+    )
+    service = _few_shots_service(tmp_path)
+    service._rebuild_few_shot_files(
+        pd.DataFrame([{"schema_name": "dm", "table_name": "t", "description": "Таблица", "grain": ""}]),
+        pd.DataFrame([_attr_row("t", "status", "НОВОЕ описание")]),
+    )
+
+    cf = yaml.safe_load((tmp_path / "column_description_few_shots.yaml").read_text(encoding="utf-8"))
+    statuses = [item for item in cf["columns"] if item["column_name"] == "status"]
+    assert len(statuses) == 1
+    assert statuses[0]["description"] == "СТАРОЕ описание"
+
+
 def test_build_column_prompt_supports_batch_with_yaml_few_shots(tmp_path):
     loader = SchemaLoader(data_dir=tmp_path)
     service = MetadataRefreshService(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections import OrderedDict
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -345,23 +346,51 @@ class MetadataRefreshService:
                 src_columns = inspector.get_columns(table, schema=src_schema)
             except Exception as exc:  # noqa: BLE001
                 _raise_if_kerberos_auth_error(exc)
+                # diagnostic: раньше ошибка рефлексии глоталась молча и таблица
+                # без видимой причины уходила в humanize-фолбэк.
+                logger.warning(
+                    "MetadataRefresh: рефлексия колонок упала для %s.%s — комментарии не прочитаны: %s",
+                    src_schema, table, exc,
+                )
                 return ("", {})
             try:
                 src_table_comment = inspector.get_table_comment(table, schema=src_schema)
                 src_comment = str(src_table_comment.get("text") or "").strip()
             except Exception as exc:  # noqa: BLE001
                 _raise_if_kerberos_auth_error(exc)
+                logger.warning(
+                    "MetadataRefresh: get_table_comment упал для %s.%s: %s",
+                    src_schema, table, exc,
+                )
                 src_comment = ""
             src_columns_map = {
                 str(col.get("name") or ""): str(col.get("comment") or "").strip()
                 for col in src_columns
             }
+            non_empty = sum(1 for v in src_columns_map.values() if v)
+            logger.info(
+                "MetadataRefresh: _read_comments %s.%s — колонок=%d, непустых комментариев=%d, table_comment=%s",
+                src_schema, table, len(src_columns_map), non_empty, bool(src_comment),
+            )
             return (src_comment, src_columns_map)
 
-        if schema == SN_UZP_SCHEMA and self._table_exists(SN_UZP_VIEW_SCHEMA, table):
+        redirect = schema == SN_UZP_SCHEMA and self._table_exists(SN_UZP_VIEW_SCHEMA, table)
+        logger.info(
+            "MetadataRefresh: _get_comment_bundle %s.%s — view-redirect=%s (целевая view-схема %s)",
+            schema, table, redirect, SN_UZP_VIEW_SCHEMA,
+        )
+        if redirect:
             table_comment, column_comments = _read_comments(SN_UZP_VIEW_SCHEMA)
             if table_comment or any(column_comments.values()):
+                logger.info(
+                    "MetadataRefresh: %s.%s — комментарии взяты из view-redirect (%s)",
+                    schema, table, SN_UZP_VIEW_SCHEMA,
+                )
                 return (table_comment, column_comments)
+            logger.info(
+                "MetadataRefresh: %s.%s — в view-схеме комментариев нет, читаю собственную схему",
+                schema, table,
+            )
 
         table_comment, column_comments = _read_comments(schema)
         return (table_comment, column_comments)
@@ -382,6 +411,10 @@ class MetadataRefreshService:
             "Если видишь аббревиатуру, не пытайся её разворачивать."
         )
         examples_block = f"\nПримеры:\n{examples}\n" if examples else ""
+        logger.info(
+            "MetadataRefresh: _build_column_prompt %s.%s — блок «Примеры» в промпте=%s",
+            schema, table, bool(examples),
+        )
         user_prompt = (
             f"Схема: {schema}\n"
             f"Таблица: {table}\n"
@@ -400,6 +433,10 @@ class MetadataRefreshService:
     ) -> tuple[str, str]:
         examples = _format_table_examples_for_prompt(
             _read_yaml_examples(self.table_few_shots_path, "tables")
+        )
+        logger.info(
+            "MetadataRefresh: _build_table_prompt %s.%s — блок «Примеры» в промпте=%s",
+            schema, table, bool(examples),
         )
         attrs = "\n".join(
             f"- {row.column_name}: {row.description or row.column_name}"
@@ -451,6 +488,10 @@ class MetadataRefreshService:
             for item in examples
             if str(item.get("column_name", "")).strip() and str(item.get("description", "")).strip()
         }
+        logger.info(
+            "MetadataRefresh: генерация колонок %s.%s — примеров в справочнике=%d (файл %s), без описания=%d",
+            schema, table, len(example_map), self.column_few_shots_path.name, len(missing_columns),
+        )
 
         resolved: dict[str, str] = {}
         unresolved: list[str] = []
@@ -461,6 +502,10 @@ class MetadataRefreshService:
             else:
                 unresolved.append(column)
 
+        logger.info(
+            "MetadataRefresh: %s.%s — из справочника разрешено=%d, в LLM уйдёт=%d",
+            schema, table, len(resolved), len(unresolved),
+        )
         if not unresolved:
             return resolved
         if self.llm is None:
@@ -479,6 +524,12 @@ class MetadataRefreshService:
         generated: dict[str, str] = {}
         for idx, column in enumerate(unresolved):
             generated[column] = lines[idx] if idx < len(lines) and lines[idx] else _humanize_name(column)
+        # diagnostic: видно язык/качество сгенерированных описаний (пример пары).
+        sample_pair = next(iter(generated.items()), None)
+        logger.info(
+            "MetadataRefresh: %s.%s — LLM сгенерировал %d описаний колонок, пример: %s",
+            schema, table, len(generated), sample_pair,
+        )
         return {**resolved, **generated}
 
     def _generate_table_description(
@@ -495,6 +546,10 @@ class MetadataRefreshService:
             if str(item.get("table_name", "")).strip() and str(item.get("description", "")).strip()
         }
         matched = table_example_map.get(_normalize_name(table))
+        logger.info(
+            "MetadataRefresh: генерация описания таблицы %s.%s — примеров=%d, найдено в справочнике=%s",
+            schema, table, len(table_example_map), bool(matched),
+        )
         if matched:
             return matched
         if self.llm is None:
@@ -559,19 +614,28 @@ class MetadataRefreshService:
             for col in columns
             if not str(comment_map.get(str(col.get("name") or ""), "") or "").strip()
         ]
+        generation_gate = schema == SN_T_UZP_SCHEMA and allow_generation
         generated_comments = {}
-        if schema == SN_T_UZP_SCHEMA and allow_generation:
+        if generation_gate:
             generated_comments = self._generate_column_descriptions(schema, table, missing_comments)
 
+        # diagnostic-счётчики: откуда взялось описание каждой колонки.
+        src_counts = {"comment": 0, "generated": 0, "humanize": 0}
         rows: list[dict[str, Any]] = []
         for column in columns:
             name = str(column.get("name") or "")
             dtype = str(column.get("type") or "").strip().lower()
-            description = (
-                str(comment_map.get(name, "") or "").strip()
-                or generated_comments.get(name, "")
-                or _humanize_name(name)
-            )
+            comment_desc = str(comment_map.get(name, "") or "").strip()
+            generated_desc = generated_comments.get(name, "")
+            if comment_desc:
+                description = comment_desc
+                src_counts["comment"] += 1
+            elif generated_desc:
+                description = generated_desc
+                src_counts["generated"] += 1
+            else:
+                description = _humanize_name(name)
+                src_counts["humanize"] += 1
             not_null_perc = 0.0
             unique_perc = 0.0
             sample_values = ""
@@ -595,11 +659,21 @@ class MetadataRefreshService:
             })
 
         table_description = str(table_comment or "").strip()
+        table_desc_source = "comment"
         if schema == SN_T_UZP_SCHEMA and not table_description and allow_generation:
             columns_df = pd.DataFrame(rows)
             table_description = self._generate_table_description(schema, table, columns_df, sample_df)
+            table_desc_source = "generated"
         elif not table_description:
             table_description = _humanize_name(table)
+            table_desc_source = "humanize"
+
+        logger.info(
+            "MetadataRefresh: %s.%s — описания колонок: comment=%d, generated=%d, humanize=%d "
+            "(всего %d); генерация_включена=%s; описание_таблицы=%s",
+            schema, table, src_counts["comment"], src_counts["generated"],
+            src_counts["humanize"], len(rows), generation_gate, table_desc_source,
+        )
 
         table_row = {
             "schema_name": schema,
@@ -627,27 +701,22 @@ class MetadataRefreshService:
 
     def _persist_few_shot_files(
         self,
-        table_examples: list[tuple[str, str, str]],
-        column_examples: list[tuple[str, str, str]],
+        table_descriptions: "OrderedDict[str, str]",
+        column_descriptions: "OrderedDict[str, str]",
     ) -> None:
+        """Записать накопленные справочники few-shot (table_name/column_name → description)."""
         self.table_few_shots_path.parent.mkdir(parents=True, exist_ok=True)
         self.column_few_shots_path.parent.mkdir(parents=True, exist_ok=True)
         table_payload = {
             "tables": [
-                {
-                    "table_name": table,
-                    "description": description,
-                }
-                for _, table, description in table_examples
+                {"table_name": table, "description": description}
+                for table, description in table_descriptions.items()
             ]
         }
         column_payload = {
             "columns": [
-                {
-                    "column_name": column_name,
-                    "description": description,
-                }
-                for _, column_name, description in column_examples
+                {"column_name": column_name, "description": description}
+                for column_name, description in column_descriptions.items()
             ]
         }
         self.table_few_shots_path.write_text(
@@ -664,6 +733,10 @@ class MetadataRefreshService:
         tables_df: pd.DataFrame | None = None,
         attrs_df: pd.DataFrame | None = None,
     ) -> None:
+        """Накопить справочники few-shot: существующие записи сохраняются, новые
+        уникальные ключи дописываются (merge, не перезапись). Так справочник
+        копит описания между рефрешами и не теряет те, чьих объектов уже нет в
+        текущем каталоге."""
         if tables_df is None:
             tables_df = self.schema_loader.tables_df.copy()
         if attrs_df is None:
@@ -674,34 +747,43 @@ class MetadataRefreshService:
             attrs_df = pd.DataFrame(columns=ATTR_COLUMNS)
 
         tables_df, attrs_df = self._sort_catalog(tables_df, attrs_df)
-        table_examples: list[tuple[str, str, str]] = []
-        column_examples: list[tuple[str, str, str]] = []
-        seen_columns: set[str] = set()
 
+        # Существующие накопленные записи (сохраняем как есть, в исходном порядке).
+        table_descriptions: "OrderedDict[str, str]" = OrderedDict()
+        for item in _read_yaml_examples(self.table_few_shots_path, "tables"):
+            name = str(item.get("table_name", "") or "").strip()
+            description = str(item.get("description", "") or "").strip()
+            if name and description:
+                table_descriptions.setdefault(name, description)
+
+        column_descriptions: "OrderedDict[str, str]" = OrderedDict()
+        for item in _read_yaml_examples(self.column_few_shots_path, "columns"):
+            name = str(item.get("column_name", "") or "").strip().lower()
+            description = str(item.get("description", "") or "").strip()
+            if name and description:
+                column_descriptions.setdefault(name, description)
+
+        # Новые осмысленные описания из текущего каталога — добавляем только
+        # отсутствующие ключи (keep-existing: накопленное не перетираем).
         for row in tables_df.itertuples(index=False):
-            schema = str(row.schema_name or "").strip()
             table = str(row.table_name or "").strip()
             description = str(row.description or "").strip()
-            if not schema or not table or not description:
+            if not table or not description:
                 continue
             if description == _humanize_name(table):
                 continue
-            table_examples.append((schema, table, description))
+            table_descriptions.setdefault(table, description)
 
         for row in attrs_df.itertuples(index=False):
-            table = str(row.table_name or "").strip()
             column_name = str(row.column_name or "").strip().lower()
             description = str(row.description or "").strip()
-            if not table or not column_name or not description:
+            if not column_name or not description:
                 continue
             if description == _humanize_name(column_name):
                 continue
-            if column_name in seen_columns:
-                continue
-            seen_columns.add(column_name)
-            column_examples.append((table, column_name, description))
+            column_descriptions.setdefault(column_name, description)
 
-        self._persist_few_shot_files(table_examples, column_examples)
+        self._persist_few_shot_files(table_descriptions, column_descriptions)
 
     def refresh_tables(
         self,

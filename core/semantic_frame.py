@@ -305,11 +305,35 @@ def _derive_filter_intents(
             "value": value,
         })
 
+    # Стволы метрики/сущности/дименшна QuerySpec (то, что измеряется/группируется/
+    # называется) за вычетом filter-таргетов. Фраза, совпадающая с ними, — это НЕ
+    # фильтр (напр. «зарплатных зачислений» = sum(amt) по сущности), и не должна
+    # порождать filter-intent, иначе ловит ложную кларификацию.
+    _filter_hint_stems = {
+        _stem(tok)
+        for raw in (intent or {}).get("filter_conditions", []) or []
+        if isinstance(raw, dict)
+        for tok in _tokenize(str(raw.get("column_hint") or ""))
+    }
+    _metric_entity_stems = {
+        _stem(tok)
+        for e in (intent or {}).get("entities", []) or []
+        for tok in _tokenize(str(e))
+        if len(_stem(tok)) >= 3
+    } - _filter_hint_stems
+
     freeform_phrases = _extract_freeform_phrases(user_input)
     normalized_input = _normalize_text(user_input)
     known_query_texts = {str(item.get("query_text") or "") for item in intents}
     for idx, phrase in enumerate(freeform_phrases):
         if phrase in known_query_texts:
+            continue
+        if _metric_entity_stems and any(
+            _stem(tok) in _metric_entity_stems
+            for tok in _tokenize(phrase)
+            if len(_stem(tok)) >= 3
+        ):
+            # Фраза совпала с измеряемой/группируемой сущностью — не фильтр.
             continue
         phrase_token_count = len(_tokenize(phrase))
         normalized_phrase = _normalize_text(phrase)

@@ -698,6 +698,14 @@ def resolve_where(
         key=lambda kv: _rule_priority(kv[0]),
     )
     explicit_applied_table_keys: set[str] = set()
+    # Есть ли явный фильтр (query_spec/explicit) среди интентов. Если да — не
+    # блокируем SQL кларификацией от derived fuzzy-интента (phrase/text/flag):
+    # пользователь уже задал фильтр явно, а нечёткая фраза (часто = метрика/
+    # сущность) не должна останавливать пайплайн.
+    _has_explicit_request = any(
+        str(req_id).split(":", 1)[0] in {"explicit", "query_spec"}
+        for req_id, _ in ranked_items
+    )
 
     for request_id, candidates in ranked_items:
         if str(request_id) in set(direct_applied):
@@ -809,6 +817,20 @@ def resolve_where(
             elif str(request_id) in user_filter_choices:
                 # Уже выбрано через user_filter_choices (handled above)
                 pass
+            elif (
+                str(request_id).split(":", 1)[0] in {"phrase", "text", "flag"}
+                and _has_explicit_request
+            ):
+                # Защита: derived fuzzy-интент не блокирует SQL кларификацией,
+                # когда есть явный query_spec/explicit фильтр. Дропаем как
+                # неразрешённый и продолжаем.
+                reasoning.append(f"skip_clarification:{request_id}:explicit_filter_present")
+                logger.info(
+                    "WhereResolver: skip clarification for derived intent %s — "
+                    "explicit/query_spec filter present",
+                    request_id,
+                )
+                continue
             else:
                 best_label = candidate_label(best)
                 second_label = candidate_label(second)
@@ -1736,9 +1758,12 @@ def _should_skip_exact_calendar_date_filter(
 
 def _condition_from_filter_spec(column: str, spec: FilterSpec) -> str:
     operator = str(spec.operator or "=").strip().upper()
+    value = spec.value
+    # Членство по списку: нормализуем =any/any и list-значение в IN.
+    if operator in {"=ANY", "ANY", "=IN"} or isinstance(value, (list, tuple)):
+        operator = "NOT IN" if operator in {"!=ANY", "<>ANY", "NOT IN"} else "IN"
     if operator not in {"=", "!=", "<>", "<", ">", "<=", ">=", "LIKE", "ILIKE", "IN", "NOT IN"}:
         operator = "="
-    value = spec.value
     if value is None:
         return f"{column} IS NULL" if operator in {"=", "IS"} else f"{column} IS NOT NULL"
     if operator in {"IN", "NOT IN"}:

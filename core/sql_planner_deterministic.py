@@ -981,9 +981,23 @@ def _compute_where_from_intent(
                 continue
             hint = str(fc.get("column_hint", "")).lower().strip()
             operator = str(fc.get("operator", "=")).strip()
-            value = str(fc.get("value", "")).strip()
+            raw_value = fc.get("value")
+            value = str(raw_value if raw_value is not None else "").strip()
 
-            if not hint or not value:
+            # Членство по списку: =any/any/list-значение → IN (...).
+            op_norm = operator.upper()
+            is_membership = isinstance(raw_value, (list, tuple)) or op_norm in {
+                "=ANY", "ANY", "=IN", "IN", "NOT IN", "!=ANY", "<>ANY",
+            }
+            if is_membership:
+                in_op = "NOT IN" if op_norm in {"!=ANY", "<>ANY", "NOT IN"} else "IN"
+                values = (
+                    list(raw_value)
+                    if isinstance(raw_value, (list, tuple))
+                    else [v.strip() for v in value.strip("[]()").split(",") if v.strip()]
+                )
+
+            if not hint or (not value and not is_membership):
                 continue
             if (
                 (date_from or date_to)
@@ -1002,8 +1016,8 @@ def _compute_where_from_intent(
                 )
                 continue
 
-            # Проверяем оператор на допустимость
-            if not _OPERATOR_RE.match(operator):
+            # Проверяем оператор на допустимость (членство уже нормализовано в IN).
+            if not is_membership and not _OPERATOR_RE.match(operator):
                 logger.warning(
                     "DeterministicPlanner: недопустимый оператор %r в filter_conditions — пропускаем",
                     operator,
@@ -1021,6 +1035,17 @@ def _compute_where_from_intent(
                     if hint in col_lower or col_lower in hint:
                         matched_col = col_real
                         break
+
+            if matched_col and is_membership:
+                if not values:
+                    continue
+                rendered = ", ".join(
+                    v if re.fullmatch(r"-?\d+(\.\d+)?", str(v).strip())
+                    else "'" + str(v).strip().replace("'", "''") + "'"
+                    for v in values
+                )
+                conditions.append(f"{matched_col} {in_op} ({rendered})")
+                continue
 
             if matched_col:
                 op_upper = operator.strip().upper()

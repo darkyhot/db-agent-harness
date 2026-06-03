@@ -209,8 +209,34 @@ def _escape_sql_literal(value: str) -> str:
     return str(value).replace("'", "''")
 
 
+def _render_in_literal(value: Any) -> str:
+    """Отрендерить элемент списка для IN: число — без кавычек, текст — в кавычках."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+(\.\d+)?", text):
+        return text
+    return f"'{_escape_sql_literal(text)}'"
+
+
 def _build_condition(column: str, operator: str, value: Any, profile: dict[str, Any], semantics: dict[str, Any]) -> str:
     op = str(operator or "=").upper()
+    # Членство по списку → IN/NOT IN. Проверяем ПЕРВЫМ: list-значение должно
+    # стать `col IN (...)` независимо от того, какой оператор пришёл сверху
+    # (=any, =, ILIKE для enum-колонки и т.п.) и не превратиться в битое
+    # `col ILIKE '%[1, 2]%'`.
+    is_list = isinstance(value, (list, tuple))
+    if is_list or op in {"=ANY", "ANY", "=IN", "IN", "NOT IN", "!=ANY", "<>ANY"}:
+        values = list(value) if is_list else [
+            item.strip() for item in str(value).split(",") if item.strip()
+        ]
+        in_op = "NOT IN" if op in {"NOT IN", "!=ANY", "<>ANY"} else "IN"
+        if values:
+            rendered = ", ".join(_render_in_literal(item) for item in values)
+            return f"{column} {in_op} ({rendered})"
+
     semantic_class = str(semantics.get("semantic_class", "") or "")
     value_mode = str(profile.get("value_mode", "") or "")
     dtype = str(profile.get("dType", "") or "").lower()

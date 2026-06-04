@@ -647,6 +647,15 @@ def resolve_where(
     )
     applied_rules.extend(direct_applied)
     applied_rules.extend(calendar_applied)
+    # Колонки, уже закреплённые явным query_spec-фильтром (применён ВНЕ цикла через
+    # direct_applied, поэтому F6-coverage его не видит). Используем ниже, чтобы не
+    # навешивать на ту же колонку дубль из ranked-правил (explicit/text), напр.
+    # `enrollment_type IN ('1',...)` поверх верного `enrollment_type IN (1,...)`.
+    _direct_applied_cols = {
+        str(spec.target or "").split(".")[-1].strip().lower()
+        for idx, spec in enumerate(direct_filter_specs)
+        if f"query_spec:{idx}" in set(direct_applied) and spec.target
+    }
     semantic_filter_specs = _filter_specs_for_semantic_frame(
         selected_columns,
         direct_filter_specs,
@@ -854,6 +863,17 @@ def resolve_where(
         best_condition = str(best.get("condition") or "")
         best_column = str(best.get("column") or "")
         best_table_key = str(best.get("table_key") or "")
+        # Guard B: колонка уже закреплена явным query_spec-фильтром (применён вне
+        # цикла). Не навешиваем на неё ranked-дубль (explicit/text), напр. строковый
+        # `enrollment_type IN ('1',...)` поверх числового `enrollment_type IN (1,...)`.
+        if best_column and best_column.strip().lower() in _direct_applied_cols:
+            reasoning.append(f"already_pinned_by_query_spec:{request_id}:{best_column}")
+            logger.info(
+                "WhereResolver: пропущен ranked-фильтр %s — колонка %s уже закреплена "
+                "явным query_spec-фильтром",
+                request_id, best_column,
+            )
+            continue
         # Guard: оператор сравнения (`>`,`>=`,`<`,`<=`) имеет смысл только для
         # numeric/date колонок. Если ранжирование привязало числовой порог к
         # текстовой label-колонке (например `new_gosb_name >= 3` под «от 3
@@ -880,6 +900,34 @@ def resolve_where(
                 )
                 reasoning.append(
                     f"comparison_on_nonnumeric:{request_id}:{best_column} ({_dt})"
+                )
+                continue
+        # Guard A: ILIKE/LIKE имеет смысл только для text-колонки. Зеркально гарду
+        # сравнения выше. Если ранжирование привязало ILIKE к числовой/датовой
+        # колонке (например `enrollment_type ILIKE '%16%'` на smallint — литерал «16»
+        # из списка совпал с value-профилем enum_like-кода), такое условие невалидно
+        # (`smallint ~~* unknown`) и ломает SQL — дропаем до превью плана.
+        if (
+            _parsed_cond is not None
+            and _parsed_cond[1] in {"ILIKE", "LIKE"}
+            and best_column
+            and best_table_key
+            and schema_loader is not None
+            and "." in best_table_key
+        ):
+            _sch, _tbl = best_table_key.split(".", 1)
+            try:
+                _dt = str(schema_loader.get_column_dtype(_sch, _tbl, best_column) or "")
+            except Exception:  # noqa: BLE001
+                _dt = ""
+            if _dt and _dtype_bucket(_dt) != "text":
+                logger.info(
+                    "WhereResolver: пропущен ranked-фильтр %s ILIKE — оператор поиска "
+                    "по подстроке на не-text колонке (dtype=%s)",
+                    best_column, _dt,
+                )
+                reasoning.append(
+                    f"ilike_on_nontext:{request_id}:{best_column} ({_dt})"
                 )
                 continue
         # Direction: dtype-check. Извлекаем литерал из condition и проверяем

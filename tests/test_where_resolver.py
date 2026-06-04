@@ -95,6 +95,97 @@ def test_where_resolver_adds_factual_outflow_task_subtype(tmp_path):
     assert any(cands[0]["column"] == "task_subtype" for cands in result["filter_candidates"].values() if cands)
 
 
+def _payroll_loader(tmp_path):
+    """Витрина с numeric enum_like колонками (как uzp_data_payroll_m): enrollment_type /
+    acc_subtype — smallint-коды, на которых ILIKE невалиден (`smallint ~~* unknown`)."""
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["uzp_data_payroll_m"],
+        "description": ["Зарплатные зачисления"],
+        "grain": ["month"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 4,
+        "table_name": ["uzp_data_payroll_m"] * 4,
+        "column_name": ["report_dt", "amt", "enrollment_type", "acc_subtype"],
+        "dType": ["date", "numeric", "int2", "int2"],
+        "description": [
+            "Отчетная дата",
+            "Сумма зачисления",
+            "Тип зачисления",
+            "Подтип счета",
+        ],
+        "is_primary_key": [False, False, False, False],
+        "unique_perc": [0.5, 90.0, 0.05, 0.04],
+        "not_null_perc": [99.0, 100.0, 100.0, 100.0],
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_where_resolver_drops_ilike_on_numeric_enum_and_query_spec_dup(tmp_path, monkeypatch):
+    """Регрессия agent(35): живой GigaChat-прогон строил план с мусорными
+    `enrollment_type ILIKE '%16%'` / `acc_subtype ILIKE '%16.0%'` (литерал «16» из
+    списка совпал с value-профилем numeric enum_like-кодов) поверх верного
+    `enrollment_type IN (...)`. ILIKE на smallint ломал EXPLAIN; чистилось только
+    LLM-коррекцией ПОСЛЕ ошибки. Гард A режет ILIKE на не-text колонке, Гард B —
+    дубль ranked-правила по уже закреплённой query_spec-колонке. Оба — до превью плана.
+
+    Ranked-кандидаты подаём напрямую (monkeypatch), чтобы детерминированно
+    воспроизвести именно спуриозные ILIKE/дубль, не завязываясь на лексикон-матчинг."""
+    import core.where_resolver as wr
+    from core.query_ir import FilterSpec
+
+    loader = _payroll_loader(tmp_path)
+    table_key = "dm.uzp_data_payroll_m"
+
+    def _cand(column, condition):
+        return {
+            "request_kind": "text_search", "table_key": table_key,
+            "schema": "dm", "table": "uzp_data_payroll_m", "column": column,
+            "condition": condition, "score": 80.0, "confidence": "high",
+            "evidence": [], "target": column,
+        }
+
+    # explicit:0 — дубль закреплённой query_spec-колонки (Гард B);
+    # text:* — ILIKE на numeric smallint-колонках (Гард A).
+    monkeypatch.setattr(wr, "rank_filter_candidates", lambda **_: {
+        "explicit:0": [_cand("enrollment_type", "enrollment_type IN ('1', '2', '16', '18')")],
+        f"text:{table_key}.acc_subtype": [_cand("acc_subtype", "acc_subtype ILIKE '%16.0%'")],
+        f"text:{table_key}.enrollment_type": [_cand("enrollment_type", "enrollment_type ILIKE '%16%'")],
+    })
+    monkeypatch.setattr(wr, "table_can_satisfy_frame", lambda *a, **k: True)
+
+    spec_value = ["1", "2", "16", "18"]
+    result = resolve_where(
+        user_input="Посчитай по дате суммы зп зачислений с типами 1,2,16,18",
+        intent={"filter_conditions": [
+            {"column_hint": "enrollment_type", "operator": "=any", "value": spec_value},
+        ]},
+        selected_columns={table_key: {
+            "select": ["report_dt"], "aggregate": ["amt"], "filter": ["enrollment_type"],
+        }},
+        selected_tables=[table_key],
+        schema_loader=loader,
+        semantic_frame={},
+        filter_specs=[FilterSpec(target="enrollment_type", operator="=any", value=spec_value)],
+        base_conditions=[],
+    )
+    conditions = result["conditions"]
+    # Никаких ILIKE на numeric-колонках — Гард A отсёк type-error до превью.
+    assert not any("ILIKE" in cond.upper() for cond in conditions), conditions
+    # Колонка enrollment_type закреплена ровно одним условием (IN из query_spec),
+    # ranked-дубль снят Гардом B.
+    enrollment_conds = [c for c in conditions if "enrollment_type" in c]
+    assert len(enrollment_conds) == 1, enrollment_conds
+    assert "IN (" in enrollment_conds[0]
+    assert not any("acc_subtype" in cond for cond in conditions), conditions
+    # Гарды реально сработали (а не «кандидатов не было»).
+    assert any(r.startswith("ilike_on_nontext:") for r in result["reasoning"]), result["reasoning"]
+    assert any(r.startswith("already_pinned_by_query_spec:") for r in result["reasoning"]), result["reasoning"]
+
+
 def test_where_resolver_respects_explicit_column_clarification(tmp_path):
     loader = _loader(tmp_path)
     loader.ensure_value_profiles()

@@ -1816,7 +1816,7 @@ def _condition_from_filter_spec(column: str, spec: FilterSpec) -> str:
         return f"{column} IS NULL" if operator in {"=", "IS"} else f"{column} IS NOT NULL"
     if operator in {"IN", "NOT IN"}:
         values = value if isinstance(value, list) else [item.strip() for item in str(value).split(",")]
-        rendered = ", ".join(_render_literal(item) for item in values)
+        rendered = ", ".join(_render_in_member(item) for item in values)
         return f"{column} {operator} ({rendered})"
     if operator in {"LIKE", "ILIKE"}:
         return f"{column} {operator} {_render_literal(str(value))}"
@@ -1830,3 +1830,19 @@ def _render_literal(value: Any) -> str:
         return str(value)
     text = str(value).replace("'", "''")
     return f"'{text}'"
+
+
+def _render_in_member(value: Any) -> str:
+    """Элемент IN-списка: число (в т.ч. числовая строка) — без кавычек, иначе в кавычках.
+    Зеркало `filter_ranking._render_in_literal` и numeric-детекта в
+    `_compute_where_from_intent`. Нужно, чтобы числовой `IN (1, 2)` из query_spec-пути
+    совпал с тем же условием из base_conditions и схлопнулся в `_add_unique` (иначе
+    `IN (1, 2)` vs `IN ('1', '2')` остаются двумя условиями)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+(\.\d+)?", text):
+        return text
+    return _render_literal(text)

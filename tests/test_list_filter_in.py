@@ -46,6 +46,16 @@ class TestConditionFromFilterSpecMembership:
         spec = FilterSpec(target="t", operator="=", value="5")
         assert _condition_from_filter_spec("t", spec) == "t = '5'"
 
+    def test_numeric_string_list_rendered_unquoted(self):
+        """Фикс C (agent 36): числовые строки в IN рендерятся без кавычек, чтобы
+        совпасть с base_conditions из _compute_where_from_intent и дедупнуться."""
+        spec = FilterSpec(target="enrollment_type", operator="=any", value=["1", "16", "18"])
+        assert _condition_from_filter_spec("enrollment_type", spec) == "enrollment_type IN (1, 16, 18)"
+
+    def test_text_string_list_stays_quoted(self):
+        spec = FilterSpec(target="status", operator="=any", value=["a", "b"])
+        assert _condition_from_filter_spec("status", spec) == "status IN ('a', 'b')"
+
 
 class TestDeriveFilterIntentsSkipsMetricEntity:
     def test_phrase_matching_entity_is_not_a_filter(self):

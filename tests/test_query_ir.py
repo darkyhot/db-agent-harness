@@ -868,6 +868,92 @@ def test_detect_entity_coverage_split_silent_when_all_peers_cover(tmp_path):
     ) == []
 
 
+def _three_fact_loader(tmp_path):
+    """Три fact-витрины. Верхняя по score (sale_funnel) покрывает «задача», но для
+    count не «поставляет метрику» (count считает строки, а не колонку); две нижние
+    случайно содержат токен → resolve_entity_to_columns матчит их."""
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"] * 3,
+        "table_name": ["sale_funnel", "fact_outflow", "payroll"],
+        "description": ["Воронка по задачам", "Факт оттока", "Зарплатная ведомость"],
+        "grain": ["task", "event", "month"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": ["sale_funnel", "sale_funnel", "fact_outflow", "fact_outflow", "payroll"],
+        "column_name": ["report_dt", "task_category", "report_dt", "is_task", "amt"],
+        "dType": ["date", "text", "date", "boolean", "numeric"],
+        "description": ["Дата", "Категория задачи", "Дата", "Признак задачи", "Сумма"],
+        "is_primary_key": [False] * 5,
+        "unique_perc": [1.0, 2.0, 1.0, 2.0, 90.0],
+        "not_null_perc": [100.0] * 5,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_ambiguous_strong_sources_count_keeps_entity_top(tmp_path, monkeypatch):
+    """Регресс agent(37): для count `_supplies_metric` роняла entity-витрину
+    (sale_funnel, score 63), оставляя ложную ничью из двух «поставляющих» витрин
+    (fact_outflow 20.9, payroll 11; gap 0.47<0.55) — и перехватывала развилку до
+    _detect_entity_coverage_split. Фикс D: для count supplies-pruning не применяется,
+    верхняя витрина остаётся → ничьи нет → детектор молчит ([])."""
+    import core.catalog_grounding as cg
+    from core.catalog_grounding import _detect_ambiguous_strong_sources
+    from core.query_ir import SourceBinding
+
+    loader = _three_fact_loader(tmp_path)
+    monkeypatch.setattr(cg, "detect_table_type", lambda *a, **k: "fact")
+
+    class _Res:
+        def __init__(self, matched, confidence):
+            self.matched, self.confidence = matched, confidence
+            self.column, self.table_key = "", ""
+
+    # sale_funnel НЕ поставляет метрику; fact_outflow/payroll — поставляют.
+    def _fake_resolve(*, candidate_table_keys, **_):
+        tk = (candidate_table_keys or [""])[0]
+        if "sale_funnel" in tk:
+            return _Res(False, 0.0)
+        return _Res(True, 0.9)
+    monkeypatch.setattr(
+        "core.entity_resolver.resolve_entity_to_columns", _fake_resolve,
+    )
+
+    sources = [
+        SourceBinding(schema="dm", table="sale_funnel", reason="catalog_score", confidence=0.95, score=63.0),
+        SourceBinding(schema="dm", table="fact_outflow", reason="catalog_score", confidence=0.95, score=20.9),
+        SourceBinding(schema="dm", table="payroll", reason="catalog_score", confidence=0.92, score=11.0),
+    ]
+
+    count_spec, _ = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": None, "label": "Количество задач", "confidence": 1.0}],
+        "entities": [{"name": "задача", "canonical": "задача", "confidence": 1.0}],
+        "filters": [],
+        "confidence": 1.0,
+    })
+    # count: supplies-pruning отключён → top(63) уцелел → ничьи нет → [].
+    assert _detect_ambiguous_strong_sources(
+        list(sources), schema_loader=loader, query_spec=count_spec,
+    ) == []
+
+    # Контроль: для sum supplies-pruning остаётся — sale_funnel выбывает,
+    # остаётся ложная ничья из двух «поставляющих» витрин (старое поведение).
+    sum_spec, _ = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "sum", "target": "amt", "confidence": 1.0}],
+        "entities": [{"name": "задача", "canonical": "задача", "confidence": 1.0}],
+        "filters": [],
+        "confidence": 1.0,
+    })
+    sum_tied = _detect_ambiguous_strong_sources(
+        list(sources), schema_loader=loader, query_spec=sum_spec,
+    )
+    assert {s.full_name for s in sum_tied} == {"dm.fact_outflow", "dm.payroll"}
+
+
 def test_catalog_grounder_node_surfaces_disambiguation_options(tmp_path):
     """Узел catalog_grounder должен пробросить варианты H2-неоднозначности.
 

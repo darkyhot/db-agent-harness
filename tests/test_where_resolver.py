@@ -170,17 +170,17 @@ def test_where_resolver_drops_ilike_on_numeric_enum_and_query_spec_dup(tmp_path,
         schema_loader=loader,
         semantic_frame={},
         filter_specs=[FilterSpec(target="enrollment_type", operator="=any", value=spec_value)],
-        base_conditions=[],
+        # base_conditions как реальный _compute_where_from_intent: numeric-aware IN.
+        # query_spec-путь должен отрендерить ИДЕНТИЧНО и схлопнуться (Фикс C), а не
+        # добавить второй `IN ('1',...)` строкой.
+        base_conditions=["enrollment_type IN (1, 2, 16, 18)"],
     )
     conditions = result["conditions"]
     # Никаких ILIKE на numeric-колонках — Гард A отсёк type-error до превью.
     assert not any("ILIKE" in cond.upper() for cond in conditions), conditions
-    # Колонка enrollment_type закреплена ровно одним условием (IN из query_spec),
-    # ranked-дубль снят Гардом B.
-    enrollment_conds = [c for c in conditions if "enrollment_type" in c]
-    assert len(enrollment_conds) == 1, enrollment_conds
-    assert "IN (" in enrollment_conds[0]
-    assert not any("acc_subtype" in cond for cond in conditions), conditions
+    # Ровно одно условие всего: дубль base/query_spec схлопнут (Фикс C), ranked-дубль
+    # снят Гардом B, acc_subtype ILIKE — Гардом A.
+    assert conditions == ["enrollment_type IN (1, 2, 16, 18)"], conditions
     # Гарды реально сработали (а не «кандидатов не было»).
     assert any(r.startswith("ilike_on_nontext:") for r in result["reasoning"]), result["reasoning"]
     assert any(r.startswith("already_pinned_by_query_spec:") for r in result["reasoning"]), result["reasoning"]

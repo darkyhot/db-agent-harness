@@ -802,7 +802,21 @@ def _detect_ambiguous_strong_sources(
         # resolves to that metric, the others are not real alternatives.
         # They tied on dimension/entity match (e.g. shared `gosb_name`
         # column), but cannot answer the metric question. Drop them.
-        if query_spec is not None and query_spec.metrics:
+        #
+        # ВАЖНО: только для НЕ-count агрегатов (sum/avg/min/max). Для чистого
+        # count «таблица поставляет метрику» ≈ «содержит колонку под метрику»,
+        # но count считает СТРОКИ сущности (напр. задачи в sale_funnel_task),
+        # а не значения колонки — поэтому entity-витрина легитимно «не поставляет
+        # метрику» и не должна выпадать из кандидатов (иначе развилку из верных
+        # витрин подменяет ложная ничья из тех, что случайно содержат токен).
+        # Эту неоднозначность для count разруливает score-независимый
+        # _detect_entity_coverage_split ниже. Гейт зеркалит require_numeric_metric
+        # из metric-cleanup-блока ground_query (live-run #4).
+        require_numeric_metric = any(
+            str(getattr(m, "operation", "") or "").lower() in {"sum", "avg", "min", "max"}
+            for m in (query_spec.metrics if query_spec else [])
+        )
+        if query_spec is not None and query_spec.metrics and require_numeric_metric:
             # Используем общий extractor: target + fallback на label/evidence,
             # если LLM оставил target=null. Это критерий «таблица отвечает
             # на суть метрики», а не «таблица содержит числовую колонку».

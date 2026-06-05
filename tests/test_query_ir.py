@@ -954,6 +954,118 @@ def test_ambiguous_strong_sources_count_keeps_entity_top(tmp_path, monkeypatch):
     assert {s.full_name for s in sum_tied} == {"dm.fact_outflow", "dm.payroll"}
 
 
+def test_source_covers_entity_per_entity(tmp_path):
+    """agent(38): per-entity покрытие. В каталоге сущности расходятся по витринам:
+    «задача» покрыта только sale_funnel, «фактический отток» — только fact_outflow.
+    Агрегатная _primary_source_covers_entities считала бы обе «покрывающими»."""
+    from core.catalog_grounding import _source_covers_entity
+    from core.query_ir import SourceBinding
+
+    loader = _entity_split_loader(tmp_path)
+    spec, _ = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": None, "confidence": 1.0}],
+        "entities": [
+            {"name": "задача", "canonical": "задача", "confidence": 1.0},
+            {"name": "фактический отток", "canonical": "фактический отток", "confidence": 1.0},
+        ],
+        "filters": [],
+        "confidence": 1.0,
+    })
+    task_e, outflow_e = spec.entities
+    sf = SourceBinding(schema="dm", table="sale_funnel", reason="catalog_score", confidence=0.95, score=22.0)
+    fo = SourceBinding(schema="dm", table="fact_outflow", reason="catalog_score", confidence=0.95, score=22.0)
+    assert _source_covers_entity(sf, task_e, loader) is True
+    assert _source_covers_entity(sf, outflow_e, loader) is False
+    assert _source_covers_entity(fo, task_e, loader) is False
+    assert _source_covers_entity(fo, outflow_e, loader) is True
+
+
+def test_minimal_covering_reopened_on_multi_entity_split(tmp_path):
+    """agent(38): запрос с ДВУМЯ сущностями («задача» + «фактический отток»).
+    minimal-covering prune схлопывает на fact_outflow (única покрывает слот-фильтр
+    is_task), но та покрывает «отток» и НЕ покрывает «задача» (её покрывает
+    sale_funnel). Старый cancel-guard (survivor покрывает хоть одну сущность → ok)
+    молча брал fact_outflow. Новый per-entity guard видит, что вторая сущность
+    покрыта только отброшенным кандидатом → откатывает prune → развилка витрин.
+    """
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm", "dm", "dm"],
+        "table_name": ["fact_outflow", "sale_funnel", "employee_assignment"],
+        "description": [
+            "Информация по фактическим оттокам",
+            "Воронка продаж по задачам",
+            "Данные по закреплению сотрудников за организациями",
+        ],
+        "grain": ["event", "task", "employee"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 7,
+        "table_name": [
+            "fact_outflow", "fact_outflow", "fact_outflow",
+            "sale_funnel", "sale_funnel", "sale_funnel",
+            "employee_assignment",
+        ],
+        "column_name": [
+            "report_dt", "inn", "is_task",
+            "report_dt", "task_subtype", "task_category",
+            "end_dttm",
+        ],
+        "dType": ["date", "text", "boolean", "date", "text", "text", "timestamp"],
+        "description": [
+            "Отчетная дата", "ИНН", "Признак выставленной задачи",
+            "Отчетная дата", "Подтип задачи", "Категория задачи",
+            "Дата окончания закрепления",
+        ],
+        "is_primary_key": [False] * 7,
+        "unique_perc": [1.0, 90.0, 2.0, 1.0, 10.0, 2.0, 5.0],
+        "not_null_perc": [100.0] * 7,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    loader = SchemaLoader(data_dir=tmp_path)
+
+    spec, errors = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "count", "target": None, "distinct_policy": "auto", "confidence": 1.0}],
+        "entities": [
+            {"name": "задача", "canonical": "задача", "confidence": 1.0},
+            {"name": "фактический отток", "canonical": "фактический отток", "confidence": 1.0},
+        ],
+        "filters": [
+            {"target": "is_task", "operator": "=", "value": True, "value_kind": "literal", "confidence": 1.0},
+            {"target": "report_dt", "operator": "=", "value": "2026-02-01", "value_kind": "literal", "confidence": 1.0},
+        ],
+        "time_range": None,
+        "source_constraints": [],
+        "join_constraints": [],
+        "clarification_needed": False,
+        "confidence": 1.0,
+    })
+    assert spec is not None, errors
+
+    result = ground_query_spec(
+        query_spec=spec,
+        schema_loader=loader,
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 2026",
+        max_sources=3,
+    )
+
+    main = (
+        result.plan_ir.main_source.full_name
+        if result.plan_ir and result.plan_ir.main_source else None
+    )
+    assert not (not result.needs_clarification and main == "dm.fact_outflow"), (
+        f"grounder молча выбрал fact_outflow: needs_clar={result.needs_clarification}, "
+        f"main={main}"
+    )
+    assert result.needs_clarification is True
+    option_prefixes = {
+        str(opt).split(" — ", 1)[0] for opt in (result.clarification.options or [])
+    }
+    assert {"dm.sale_funnel", "dm.fact_outflow"} <= option_prefixes, option_prefixes
+
+
 def test_catalog_grounder_node_surfaces_disambiguation_options(tmp_path):
     """Узел catalog_grounder должен пробросить варианты H2-неоднозначности.
 

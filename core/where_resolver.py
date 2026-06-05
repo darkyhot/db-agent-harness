@@ -381,6 +381,43 @@ def _is_categorical_filter_column(schema_loader, table_key: str, column: str) ->
     return _dtype_bucket(dtype) == "text"
 
 
+def _flag_root(col: str) -> str:
+    """Корень булева флага после `is_`: is_task_in_progress → 'task'.
+    Зеркало graph.nodes.sql_pipeline._flag_root (core не импортирует graph)."""
+    c = str(col or "").lower()
+    if c.startswith("is_"):
+        c = c[3:]
+    m = re.match(r"([a-zа-яё0-9]+)", c)
+    return m.group(1) if m else c
+
+
+def _is_grain_set_flag(column: str, table_key: str, schema_loader) -> bool:
+    """True когда `column` — булев флаг из grain-набора: на таблице ≥2 булевых
+    флага с тем же корнем (is_task_closed / is_task_closed_success /
+    is_task_in_progress). Такой флаг задаёт ЗЕРНО таблицы (каждая строка = задача),
+    а не различающий признак, поэтому фильтр `is_task=true` по нему избыточен.
+    Зеркало graph.nodes.sql_pipeline._flag_in_grain_set."""
+    if not schema_loader or not column or "." not in (table_key or ""):
+        return False
+    root = _flag_root(column)
+    if not root:
+        return False
+    schema, table = table_key.split(".", 1)
+    try:
+        cols_df = schema_loader.get_table_columns(schema, table)
+    except Exception:  # noqa: BLE001
+        return False
+    if cols_df is None or getattr(cols_df, "empty", True):
+        return False
+    cnt = 0
+    for _, row in cols_df.iterrows():
+        name = str(row.get("column_name") or "").lower()
+        dtype = str(row.get("dType") or row.get("data_type") or "").lower()
+        if ("bool" in dtype or name.startswith("is_")) and root in name:
+            cnt += 1
+    return cnt >= 2
+
+
 def _value_bucket(value: Any) -> str:
     """Категоризовать Python-значение в ту же группу, что _dtype_bucket."""
     if isinstance(value, bool):
@@ -838,6 +875,23 @@ def resolve_where(
                     "WhereResolver: skip clarification for derived intent %s — "
                     "explicit/query_spec filter present",
                     request_id,
+                )
+                continue
+            elif (
+                _is_grain_set_flag(str(best.get("column") or ""), str(best.get("table_key") or ""), schema_loader)
+                and _is_grain_set_flag(str(second.get("column") or ""), str(second.get("table_key") or ""), schema_loader)
+            ):
+                # agent(38): фильтр `is_task=true` на task-grain витрине фаззи-матчится
+                # в grain-набор флагов (is_task_closed / is_task_closed_success /
+                # is_task_in_progress). Это не выбор пользователя между признаками, а
+                # зерно таблицы (каждая строка = задача) → фильтр избыточен. Не
+                # клертфицируем и дропаем интент (SQL-скраб всё равно убирает
+                # grain-флаги из WHERE).
+                reasoning.append(f"skip_clarification:{request_id}:grain_set_flag")
+                logger.info(
+                    "WhereResolver: skip clarification %s — кандидаты %s/%s из "
+                    "grain-набора флагов (подразумевается зерном таблицы)",
+                    request_id, best.get("column"), second.get("column"),
                 )
                 continue
             else:

@@ -276,12 +276,27 @@ def ground_query_spec(
         )
     ):
         survivor = sources[0]
-        if _primary_source_covers_entities(survivor, query_spec, schema_loader) is False:
+        # (а) survivor не покрывает НИ ОДНУ сущность — явно неверная витрина.
+        covers_none = (
+            _primary_source_covers_entities(survivor, query_spec, schema_loader) is False
+        )
+        # (б) multi-entity split: survivor покрывает одну сущность («задача»), но
+        # ДРУГУЮ («фактический отток») покрывает только отброшенный кандидат —
+        # это тоже развилка витрин, нельзя схлопывать молча. Восстанавливаем и
+        # отдаём выбор entity-coverage split / H2.
+        _dropped = [s for s in sources_before_minimal if s.full_name != survivor.full_name]
+        entity_split = any(
+            not _source_covers_entity(survivor, e, schema_loader)
+            and any(_source_covers_entity(d, e, schema_loader) for d in _dropped)
+            for e in query_spec.entities
+        )
+        if covers_none or entity_split:
             logger.info(
                 "CatalogGrounder: minimal-covering prune отменён — survivor %s "
-                "не покрывает сущности %s; восстанавливаем %d кандидата(ов) для "
-                "выбора по score/H2",
+                "не покрывает %s сущности %s; восстанавливаем %d кандидата(ов) "
+                "для выбора по entity-split/score/H2",
                 survivor.full_name,
+                "ни одной" if covers_none else "часть",
                 [e.name for e in query_spec.entities],
                 len(sources_before_minimal),
             )
@@ -1011,6 +1026,48 @@ def _primary_source_covers_entities(
         if token in haystack:
             return True
     return False
+
+
+def _source_covers_entity(source, entity, schema_loader) -> bool:
+    """Покрывает ли источник КОНКРЕТНУЮ сущность (per-entity вариант
+    `_primary_source_covers_entities`, который агрегирует токены ВСЕХ сущностей).
+
+    Нужно для multi-entity развилки: «сколько задач по фактическому оттоку» даёт
+    сущности «задача» (→ sale_funnel_task) и «фактический отток» (→ fact_outflow).
+    Агрегатная проверка считает обе витрины «покрывающими» (каждая покрывает свою
+    сущность), а per-entity показывает, что survivor не покрывает вторую сущность —
+    значит развилку нельзя схлопывать молча."""
+    if source is None or schema_loader is None or entity is None:
+        return False
+    tokens: set[str] = set()
+    for raw in (
+        getattr(entity, "name", None),
+        getattr(entity, "canonical", None),
+        getattr(entity, "target_column_hint", None),
+    ):
+        if not raw:
+            continue
+        for tok in re.split(r"[^\w]+", str(raw).lower()):
+            if len(tok) >= 3:
+                tokens.add(tok)
+    if not tokens:
+        return False
+    try:
+        cols_df = schema_loader.get_table_columns(source.schema, source.table)
+    except Exception:  # noqa: BLE001
+        return False
+    if cols_df is None or cols_df.empty:
+        return False
+    parts: list[str] = []
+    for _, row in cols_df.iterrows():
+        parts.append(str(row.get("column_name", "") or "").lower())
+        parts.append(str(row.get("description", "") or "").lower())
+    try:
+        parts.append(str(schema_loader.get_table_info(source.schema, source.table) or "").lower())
+    except Exception:  # noqa: BLE001
+        pass
+    haystack = " ".join(parts)
+    return any(token in haystack for token in tokens)
 
 
 def _explicit_constraint_name(constraint) -> tuple[str | None, str | None]:

@@ -186,6 +186,72 @@ def test_where_resolver_drops_ilike_on_numeric_enum_and_query_spec_dup(tmp_path,
     assert any(r.startswith("already_pinned_by_query_spec:") for r in result["reasoning"]), result["reasoning"]
 
 
+def _grain_task_loader(tmp_path):
+    """Task-grain витрина: ≥2 булевых флага общего корня (is_task_*) → каждая строка
+    есть задача, отдельный «is_task=true» избыточен."""
+    tables_df = pd.DataFrame({
+        "schema_name": ["dm"],
+        "table_name": ["sale_funnel_task"],
+        "description": ["Воронка продаж по задачам"],
+        "grain": ["task"],
+    })
+    attrs_df = pd.DataFrame({
+        "schema_name": ["dm"] * 5,
+        "table_name": ["sale_funnel_task"] * 5,
+        "column_name": ["report_dt", "task_code", "is_task_closed", "is_task_closed_success", "is_task_in_progress"],
+        "dType": ["date", "text", "boolean", "boolean", "boolean"],
+        "description": ["Дата", "Код задачи", "Признак закрытия задачи", "Признак успешного закрытия", "Признак выполнения"],
+        "is_primary_key": [False] * 5,
+        "unique_perc": [1.0, 90.0, 2.0, 2.0, 2.0],
+        "not_null_perc": [100.0] * 5,
+    })
+    tables_df.to_csv(tmp_path / "tables_list.csv", index=False)
+    attrs_df.to_csv(tmp_path / "attr_list.csv", index=False)
+    return SchemaLoader(data_dir=tmp_path)
+
+
+def test_where_resolver_drops_grain_set_flag_clarification(tmp_path, monkeypatch):
+    """agent(38): фильтр is_task на task-grain витрине фаззи-матчится в grain-набор
+    флагов (is_task_closed / is_task_closed_success) и поднимал кларификацию «по
+    какому признаку фильтровать». Это зерно таблицы, а не выбор пользователя → не
+    клертфицируем, дропаем интент."""
+    import core.where_resolver as wr
+
+    loader = _grain_task_loader(tmp_path)
+    tk = "dm.sale_funnel_task"
+
+    def _c(col, score):
+        return {
+            "column": col, "table_key": tk, "schema": "dm", "table": "sale_funnel_task",
+            "condition": f"{col} = true", "score": score, "confidence": "medium",
+            "evidence": [], "target": "is_task",
+        }
+
+    monkeypatch.setattr(wr, "rank_filter_candidates", lambda **_: {
+        "query_spec:0": [_c("is_task_closed", 50.0), _c("is_task_closed_success", 48.0)],
+    })
+    monkeypatch.setattr(wr, "table_can_satisfy_frame", lambda *a, **k: True)
+
+    result = resolve_where(
+        user_input="Сколько задач по фактическому оттоку поставили в феврале 2026",
+        intent={"filter_conditions": []},
+        selected_columns={tk: {
+            "aggregate": ["task_code"],
+            "filter": ["is_task_closed", "is_task_closed_success", "is_task_in_progress"],
+        }},
+        selected_tables=[tk],
+        schema_loader=loader,
+        semantic_frame={},
+        base_conditions=[],
+    )
+    assert result["needs_clarification"] is False, result.get("clarification_message")
+    assert not any("is_task" in cond for cond in result["conditions"]), result["conditions"]
+    assert any(
+        r.startswith("skip_clarification:") and "grain_set_flag" in r
+        for r in result["reasoning"]
+    ), result["reasoning"]
+
+
 def test_where_resolver_respects_explicit_column_clarification(tmp_path):
     loader = _loader(tmp_path)
     loader.ensure_value_profiles()

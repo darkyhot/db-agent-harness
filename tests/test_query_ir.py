@@ -939,8 +939,23 @@ def test_ambiguous_strong_sources_count_keeps_entity_top(tmp_path, monkeypatch):
         list(sources), schema_loader=loader, query_spec=count_spec,
     ) == []
 
-    # Контроль: для sum supplies-pruning остаётся — sale_funnel выбывает,
-    # остаётся ложная ничья из двух «поставляющих» витрин (старое поведение).
+    # Контроль: для sum supplies-pruning остаётся — НЕ-поставляющая витрина
+    # (payroll) выбывает, а лидер (sale_funnel) и близкий по score поставляющий
+    # сосед (fact_outflow) образуют ничью. Лидер-инвариант (Фикс F) не мешает
+    # резать настоящих не-поставщиков.
+    def _fake_resolve_sum(*, candidate_table_keys, **_):
+        tk = (candidate_table_keys or [""])[0]
+        if "payroll" in tk:
+            return _Res(False, 0.0)  # payroll не поставляет sum-метрику
+        return _Res(True, 0.9)       # sale_funnel + fact_outflow поставляют
+    monkeypatch.setattr(
+        "core.entity_resolver.resolve_entity_to_columns", _fake_resolve_sum,
+    )
+    sum_sources = [
+        SourceBinding(schema="dm", table="sale_funnel", reason="catalog_score", confidence=0.95, score=63.0),
+        SourceBinding(schema="dm", table="fact_outflow", reason="catalog_score", confidence=0.95, score=60.0),
+        SourceBinding(schema="dm", table="payroll", reason="catalog_score", confidence=0.92, score=11.0),
+    ]
     sum_spec, _ = QuerySpec.from_dict({
         "task": "answer_data",
         "metrics": [{"operation": "sum", "target": "amt", "confidence": 1.0}],
@@ -949,9 +964,53 @@ def test_ambiguous_strong_sources_count_keeps_entity_top(tmp_path, monkeypatch):
         "confidence": 1.0,
     })
     sum_tied = _detect_ambiguous_strong_sources(
+        sum_sources, schema_loader=loader, query_spec=sum_spec,
+    )
+    assert {s.full_name for s in sum_tied} == {"dm.sale_funnel", "dm.fact_outflow"}
+
+
+def test_ambiguous_strong_sources_never_drops_score_leader(tmp_path, monkeypatch):
+    """Фикс F (agent 39, bulletproof): даже если supplies-pruning сработал (sum) и
+    выкинул сильнейший по score источник (лидера) — H2 не имеет права прятать его за
+    выбором из более слабых витрин. Лидер всегда остаётся кандидатом."""
+    import core.catalog_grounding as cg
+    from core.catalog_grounding import _detect_ambiguous_strong_sources
+    from core.query_ir import SourceBinding
+
+    loader = _three_fact_loader(tmp_path)
+    monkeypatch.setattr(cg, "detect_table_type", lambda *a, **k: "fact")
+
+    class _Res:
+        def __init__(self, matched, confidence):
+            self.matched, self.confidence = matched, confidence
+            self.column, self.table_key = "", ""
+
+    # Лидер (sale_funnel) НЕ поставляет метрику; два более слабых — поставляют.
+    def _fake_resolve(*, candidate_table_keys, **_):
+        tk = (candidate_table_keys or [""])[0]
+        return _Res(False, 0.0) if "sale_funnel" in tk else _Res(True, 0.9)
+    monkeypatch.setattr(
+        "core.entity_resolver.resolve_entity_to_columns", _fake_resolve,
+    )
+
+    # Близкие скоры → без Фикса F supplies-pruning вернул бы ничью [fact_outflow,
+    # payroll] БЕЗ лидера. С фиксом лидер возвращается в набор.
+    sources = [
+        SourceBinding(schema="dm", table="sale_funnel", reason="catalog_score", confidence=0.95, score=30.0),
+        SourceBinding(schema="dm", table="fact_outflow", reason="catalog_score", confidence=0.95, score=28.0),
+        SourceBinding(schema="dm", table="payroll", reason="catalog_score", confidence=0.95, score=27.0),
+    ]
+    sum_spec, _ = QuerySpec.from_dict({
+        "task": "answer_data",
+        "metrics": [{"operation": "sum", "target": "amt", "confidence": 1.0}],
+        "entities": [{"name": "задача", "canonical": "задача", "confidence": 1.0}],
+        "filters": [],
+        "confidence": 1.0,
+    })
+    tied = _detect_ambiguous_strong_sources(
         list(sources), schema_loader=loader, query_spec=sum_spec,
     )
-    assert {s.full_name for s in sum_tied} == {"dm.fact_outflow", "dm.payroll"}
+    assert "dm.sale_funnel" in {s.full_name for s in tied}, [s.full_name for s in tied]
 
 
 def test_source_covers_entity_per_entity(tmp_path):

@@ -812,6 +812,14 @@ def _detect_ambiguous_strong_sources(
         if len(candidates) < 2:
             return []
 
+        # Robustness-инвариант (Фикс F, agent 37/39): сильнейший по score источник
+        # (лидер) НИКОГДА не должен выпасть из набора H2. Иначе развилка предложит
+        # выбор из более слабых витрин, СПРЯТАВ лучший ответ (count «сколько задач»
+        # → sale_funnel(63) пропадал, оставались fact_outflow(20.9)+payroll(11)).
+        # Запоминаем лидера ДО supplies-pruning и возвращаем его, если выкинут —
+        # независимо от require_numeric_metric-эвристики и состояния деплоя.
+        _score_leader = max(candidates, key=_discriminator)
+
         # Among the remaining (fact) candidates: if the query asks for a
         # specific metric and only some facts actually carry a column that
         # resolves to that metric, the others are not real alternatives.
@@ -859,8 +867,13 @@ def _detect_ambiguous_strong_sources(
                 supplies = [c for c in candidates if _supplies_metric(c)]
                 if supplies and len(supplies) < len(candidates):
                     candidates = supplies
-                if len(candidates) < 2:
-                    return []
+
+        # Фикс F: вернуть лидера, если supplies-pruning (или иной фильтр выше) его
+        # выкинул — развилка не имеет права прятать сильнейший по score источник.
+        if _score_leader is not None and _score_leader not in candidates:
+            candidates.append(_score_leader)
+        if len(candidates) < 2:
+            return []
     candidates.sort(key=_discriminator, reverse=True)
     top_score = _discriminator(candidates[0])
     if top_score <= 0.0:
